@@ -4,7 +4,7 @@
 
 Two small autonomous rovers keeping quiet watch over the land where cultural heritage sites meet the growing risk of wildfire.
 
-Built by **Aryan Wadhawan** and **Alex Tang** — Grade 7, David Leeder Middle School, Toronto. Gold medal at WRO Canada Nationals 2026. Advancing to WRO International Finals, San Juan, Puerto Rico — December 2026.
+Built by **Aryan Wadhawan** and **Alex Tang** — Grade 8, David Leeder Middle School, Toronto. Gold medal at WRO Canada Nationals 2026. Advancing to WRO International Finals, San Juan, Puerto Rico — December 2026.
 
 ---
 
@@ -63,7 +63,7 @@ The rover carries two cameras that see the world in fundamentally different ways
 | **RGB camera** | Visible light, like human eyes | Recognizing shapes — trees, fire, ground features via YOLO vision AI |
 | **Thermal camera** | Infrared heat directly | Detecting embers under leaves, heat behind smoke, hot ground before flames appear |
 
-**Only when both cameras agree does the rover act.** This one requirement — cross-validated perception — is how a system built by two Grade 7 students avoids the false positives (shadows, sun-warmed rocks) that would otherwise waste water and undermine trust.
+**Only when both cameras agree does the rover act.** This one requirement — cross-validated perception — is how a system built by two Grade 8 students avoids the false positives (shadows, sun-warmed rocks) that would otherwise waste water and undermine trust.
 
 ## System architecture
 
@@ -123,7 +123,7 @@ Full deployment details in `/docs/`.
 
 ## Honest limits
 
-FPMS is a competition prototype built by two Grade 7 students. A small robot cannot replace a fire crew, community fire knowledge, or the professional systems that already exist to protect land and life.
+FPMS is a competition prototype built by two Grade 8 students. A small robot cannot replace a fire crew, community fire knowledge, or the professional systems that already exist to protect land and life.
 
 What we are trying to show is a smaller thing — a working example of a bigger idea. That technology, when it is built respectfully, kept transparent to the people it affects, and offered without any claim to authority, can contribute in modest ways to protecting places that matter.
 
@@ -173,7 +173,7 @@ fpms/
 
 To the Indigenous fire stewards whose thousands of years of practice inform the proactive half of this project, and to the communities we hope to learn from.
 
-To Deputy Grand Chief Mike Metatawabin of Nishnawbe Aski Nation, for engaging with a first-cup outreach from a Grade 7 student.
+To Deputy Grand Chief Mike Metatawabin of Nishnawbe Aski Nation, for engaging with a first-cup outreach from a Grade 8 student.
 
 To our teachers, mentors, and families at David Leeder Middle School.
 
