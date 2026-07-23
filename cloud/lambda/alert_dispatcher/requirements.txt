@@ -1,0 +1,2 @@
+# boto3 is provided by the Lambda Python 3.11 runtime.
+# Real channels (email, SMS, Slack) get added here when we wire them up.

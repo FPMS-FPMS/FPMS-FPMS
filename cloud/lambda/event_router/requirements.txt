@@ -1,0 +1,2 @@
+# boto3 is provided by the Lambda Python 3.11 runtime — do not bundle it.
+# Add only extras this handler genuinely needs; keep the zip small.

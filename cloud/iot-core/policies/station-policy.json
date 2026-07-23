@@ -1,0 +1,29 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectAsSelf",
+      "Effect": "Allow",
+      "Action": ["iot:Connect"],
+      "Resource": ["arn:aws:iot:us-east-1:000000000000:client/${iot:Connection.Thing.ThingName}"]
+    },
+    {
+      "Sid": "PublishStationEvents",
+      "Effect": "Allow",
+      "Action": ["iot:Publish"],
+      "Resource": [
+        "arn:aws:iot:us-east-1:000000000000:topic/fpms/station/events/*",
+        "arn:aws:iot:us-east-1:000000000000:topic/fpms/station/telemetry/*"
+      ]
+    },
+    {
+      "Sid": "SubscribeToRefillRequests",
+      "Effect": "Allow",
+      "Action": ["iot:Subscribe", "iot:Receive"],
+      "Resource": [
+        "arn:aws:iot:us-east-1:000000000000:topicfilter/fpms/station/commands/*",
+        "arn:aws:iot:us-east-1:000000000000:topic/fpms/station/commands/*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+# FPMS local AWS emulation — LocalStack + Mosquitto + rule-bridge.
+#
+# Runs three containers on one Docker network:
+#   1. localstack       — mocks S3, Lambda, SNS, IAM (LocalStack Community edition)
+#   2. mosquitto        — real MQTT broker on port 1883, stands in for AWS IoT Core
+#   3. iot-rule-bridge  — subscribes to Mosquitto, invokes Lambdas (emulates IoT Rules)
+#
+# The rover's onboard code sees a normal MQTT broker on rover1.local:1883 and normal
+# S3 endpoints at http://localhost:4566. When we move to real AWS, only the endpoints
+# change — the code and topic taxonomy stay identical.
+
+name: fpms-cloud
+
+services:
+  localstack:
+    container_name: fpms-localstack
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"           # LocalStack edge — every AWS service goes through here
+      - "4510-4559:4510-4559" # Reserved for Lambda-invoked helpers
+    environment:
+      - SERVICES=s3,lambda,sns,iam,logs,sts,iot,iotdata
+      - DEBUG=${LOCALSTACK_DEBUG:-0}
+      - PERSISTENCE=1
+      - LAMBDA_RUNTIME_EXECUTOR=docker
+      - LAMBDA_REMOVE_CONTAINERS=true
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - LS_LOG=${LOCALSTACK_LOG:-warn}
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./init:/etc/localstack/init/ready.d:ro
+      - ../lambda:/opt/fpms/lambda:ro
+      - ../iot-core:/opt/fpms/iot-core:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  mosquitto:
+    container_name: fpms-mosquitto
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"           # MQTT (rovers publish here)
+      - "9001:9001"           # WebSocket MQTT (dashboard subscribes)
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -t '$$SYS/#' -C 1 -W 2 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  iot-rule-bridge:
+    container_name: fpms-rule-bridge
+    build: ../iot-core/rule-bridge
+    depends_on:
+      localstack:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    environment:
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - LOG_LEVEL=${BRIDGE_LOG:-INFO}
+    restart: unless-stopped
+
+volumes:
+  localstack-data:
+  mosquitto-data:
+  mosquitto-log:

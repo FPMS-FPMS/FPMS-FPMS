@@ -1,0 +1,5 @@
+.env
+lambda/build/
+lambda/**/__pycache__/
+iot-core/rule-bridge/__pycache__/
+local-dev/__pycache__/

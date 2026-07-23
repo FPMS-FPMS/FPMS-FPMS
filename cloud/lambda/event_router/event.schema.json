@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fpms.dev/schemas/rover-event.json",
+  "title": "FPMS rover MQTT event",
+  "description": "Shape every rover event on fpms/<thing>/events/<type> must satisfy. The rule bridge does not validate — Lambda handler and downstream tools do.",
+  "type": "object",
+  "required": ["event_id", "timestamp", "thing"],
+  "properties": {
+    "event_id": { "type": "string", "description": "Rover-generated unique id (uuid or monotonic-ms) — enables idempotent archival." },
+    "timestamp": { "type": "string", "format": "date-time", "description": "ISO-8601 UTC. Rover clock — cloud does not overwrite." },
+    "thing": { "type": "string", "enum": ["rover1", "rover2", "station"] },
+    "location": {
+      "type": "object",
+      "properties": {
+        "lat": { "type": "number" },
+        "lon": { "type": "number" },
+        "frame": { "type": "string", "enum": ["gps", "map"] }
+      }
+    },
+    "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] },
+    "photos": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri", "description": "s3://... or presigned URL to photo already uploaded by rover." }
+    }
+  },
+  "additionalProperties": true
+}
