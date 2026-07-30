@@ -1,5 +1,62 @@
+# Paths are relative to this file (cloud/).
+
+# --- secrets and local config ------------------------------------------------
 .env
+**/.env
+.dev.vars
+**/.dev.vars
+.claude/
+**/settings.local.json
+
+# --- a second clone of this same repo lives here -----------------------------
+# It has its own .git, so `git add` would record it as an accidental submodule
+# (a bare commit pointer, not files). Its four files are byte-identical to the
+# repo root and it holds no unique commits, so nothing is lost by ignoring it.
+# Safe to delete entirely.
+FPMS-FPMS/
+
+# --- Python ------------------------------------------------------------------
+**/__pycache__/
+*.pyc
+.venv/
+dashboard/.venv/
+
+# --- Node --------------------------------------------------------------------
+node_modules/
+dashboard/frontend/node_modules/
+
+# --- build output ------------------------------------------------------------
 lambda/build/
 lambda/**/__pycache__/
 iot-core/rule-bridge/__pycache__/
 local-dev/__pycache__/
+dashboard/build/
+dashboard/dist/
+dashboard/dist-new/
+# Built SPA. Regenerate with `npm run build`. The Worker deploy uploads it from
+# disk, so it must EXIST locally before `wrangler deploy` — it just is not
+# versioned.
+dashboard/frontend/dist/
+*.tsbuildinfo
+
+# --- vendored third-party binaries -------------------------------------------
+dashboard/bin/cloudflared.exe
+
+# --- ML model artifacts ------------------------------------------------------
+# .pt is a stock Ultralytics checkpoint (re-downloadable). The .onnx/.rknn are
+# derived from it via models/convert_yolo26.sh, which needs x86 Linux with
+# onnx==1.14.1 and numpy<2 — a real re-conversion, not a download.
+dashboard/models/*.onnx
+dashboard/models/*.pt
+dashboard/models/*_rknn_model/
+
+# --- wrangler local state ----------------------------------------------------
+.wrangler/
+**/.wrangler/
+
+# --- installers / packaged binaries ------------------------------------------
+*.exe
+*.msi
+
+# --- logs / scratch ----------------------------------------------------------
+*.log
