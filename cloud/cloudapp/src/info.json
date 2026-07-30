@@ -1,0 +1,96 @@
+{
+ "name": "FPMS",
+ "tagline": "Protecting the past with the power of the present.",
+ "summary": "Two small autonomous rovers keeping quiet watch over land where cultural heritage sites meet the growing risk of wildfire.",
+ "team": [
+  {
+   "name": "Aryan Wadhawan",
+   "role": "Systems, programming, cultural outreach lead"
+  },
+  {
+   "name": "Alex Tang",
+   "role": "Hardware, mechanical design, integration lead"
+  }
+ ],
+ "school": "David Leeder Middle School, Toronto (Grade 8)",
+ "achievements": [
+  "\ud83e\udd47 Gold, WRO Canada Nationals 2026 \u2014 Montreal",
+  "\ud83c\udf0e Advancing to WRO International Finals, San Juan, Puerto Rico \u2014 December 2026"
+ ],
+ "mission": {
+  "reactive": {
+   "title": "Reactive \u2014 When something is already burning",
+   "body": "Thermal + vision AI detect a hotspot. Both cameras must agree before the rover acts. It drives to the source, releases water from a small onboard pump, and logs every decision to the cloud."
+  },
+  "proactive": {
+   "title": "Proactive \u2014 Before anything is burning",
+   "body": "The rover scans vegetation for dry brush, ground temperature, and fuel buildup \u2014 building a live risk map that can support Indigenous cultural burning practices. The community always makes the burn decisions."
+  }
+ },
+ "how_it_sees": [
+  {
+   "camera": "RGB",
+   "sees": "Visible light",
+   "good_at": "Recognizing shapes (YOLO)"
+  },
+  {
+   "camera": "Thermal",
+   "sees": "Infrared heat",
+   "good_at": "Embers under leaves, hot ground before flames"
+  }
+ ],
+ "hardware_rover1": [
+  {
+   "component": "Radxa ROCK 5B+ (RK3588)",
+   "purpose": "Main compute \u2014 Nav2, SLAM, YOLO26 on 6 TOPS NPU"
+  },
+  {
+   "component": "Yahboom V3.0 motor board (STM32F103)",
+   "purpose": "Motor control, encoder/IMU fusion"
+  },
+  {
+   "component": "4\u00d7 Yahboom 520 motors, 86mm off-road wheels",
+   "purpose": "Locomotion"
+  },
+  {
+   "component": "LDROBOT D500 LiDAR",
+   "purpose": "2D SLAM mapping"
+  },
+  {
+   "component": "HBV RGB camera",
+   "purpose": "YOLO vision"
+  },
+  {
+   "component": "Waveshare thermal camera (LWIR)",
+   "purpose": "Heat detection"
+  },
+  {
+   "component": "MG90S servo",
+   "purpose": "Shared camera pan"
+  },
+  {
+   "component": "R385 pump",
+   "purpose": "Water suppression"
+  },
+  {
+   "component": "Yahboom 9600mAh 12V Li-ion",
+   "purpose": "Main power"
+  }
+ ],
+ "stack": [
+  "Ubuntu 22.04 LTS",
+  "ROS2 Humble + Cyclone DDS",
+  "Nav2 + SLAM Toolbox",
+  "YOLO26 via Rockchip RKNN (FP16, 15+ FPS measured)",
+  "EKF via robot_localization",
+  "AWS IoT Core (MQTT/TLS), S3, Lambda + SNS",
+  "FastAPI dashboard"
+ ],
+ "principles": [
+  "Cross-validated perception (RGB + thermal must agree)",
+  "Event-based, not streaming \u2014 video stays on the rover",
+  "Everything the rover does is public by default",
+  "Technology supports Indigenous fire stewardship \u2014 it does not replace it"
+ ],
+ "repo": "https://github.com/FPMS-FPMS"
+}

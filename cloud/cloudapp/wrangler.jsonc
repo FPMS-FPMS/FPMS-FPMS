@@ -1,0 +1,72 @@
+{
+  // FPMS Cloud app — the public streaming deployment, entirely on Cloudflare.
+  //
+  // No server, no broker, no AWS. Rovers POST telemetry over HTTPS (works from
+  // any cellular network), a Durable Object fans it out to viewers over
+  // WebSockets, and the frontend the edge app already builds is served as
+  // static assets.
+  //
+  // Deploy:
+  //   npx wrangler secret put FPMS_PASSWORD       // viewer login
+  //   npx wrangler secret put FPMS_INGEST_TOKEN   // what rovers authenticate with
+  //   npx wrangler secret put FPMS_ALERT_WEBHOOK  // optional: where alerts go
+  //   npx wrangler deploy
+  //
+  // JSONC rather than TOML because newer Workers features are JSON-only.
+  "name": "fpms-cloud",
+  "main": "src/worker.js",
+
+  // Kept current deliberately: an old date silently opts out of runtime fixes.
+  "compatibility_date": "2026-07-28",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "workers_dev": true,
+  // One public door only, same reasoning as the gateway Worker.
+  "preview_urls": false,
+
+  // Without this, a failure in production is invisible — there is no server to
+  // SSH into and read logs from.
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  },
+
+  // Serve the frontend the edge app already builds. Nothing is duplicated:
+  // this points straight at its dist output, so both apps ship the same UI.
+  "assets": {
+    "directory": "../dashboard/frontend/dist",
+    "binding": "ASSETS",
+    // React Router owns client-side routes, so unknown paths return index.html.
+    "not_found_handling": "single-page-application"
+  },
+
+  // Analysis agents run on a schedule so a problem surfaces even when nobody
+  // has the dashboard open — which is most of the time.
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+
+  // Workers AI: the vision-language model behind scene descriptions. Runs on
+  // Cloudflare's GPUs rather than the rover — an RK3588 with 3.9 GB RAM cannot
+  // host a useful VLM without destroying the 15 fps detection loop.
+  "ai": { "binding": "AI" },
+
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "TelemetryHub" }]
+  },
+
+  // Free-plan Durable Objects must use the SQLite storage backend.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TelemetryHub"] }],
+
+  // Telemetry archive — the S3/DynamoDB equivalent. D1 rather than R2 because
+  // R2 requires enabling billing on the dashboard, and D1's free tier does not.
+  // 5 GB and 100k writes/day: two rovers at a 5s interval use ~35k/day.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fpms-history",
+      "database_id": "2c8afd6a-3074-4856-b971-6aef926508a3"
+    }
+  ]
+}
