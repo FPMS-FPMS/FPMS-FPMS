@@ -287,6 +287,35 @@ async function publicCamera(env, url, hubStub) {
 }
 
 /**
+ * Everything the public page needs, in one response.
+ *
+ * Each part is independently fault-tolerant: if the archive query fails, the
+ * page still gets fleet status rather than nothing. The individual endpoints
+ * remain available for anyone consuming the feed programmatically.
+ */
+async function publicAll(env, url, hubStub) {
+  const readJson = async (p) => {
+    try {
+      return await (await p).json();
+    } catch {
+      return null;
+    }
+  };
+
+  const [summary, events, reports] = await Promise.all([
+    readJson(publicSummary(env, hubStub)),
+    readJson(publicEvents(env, url)),
+    readJson(publicReports(env, url)),
+  ]);
+
+  return publicJson({
+    ...(summary || { status: "unavailable", rovers: [], counts: {} }),
+    events: events?.events || [],
+    reports: reports?.reports || [],
+  });
+}
+
+/**
  * Route dispatcher. Returns a Response for public paths, or null so worker.js
  * can carry on to its authenticated routing.
  */
@@ -308,6 +337,16 @@ export async function handlePublic(request, env, url, path, hubStub) {
 
   if (!path.startsWith("/api/public/")) return null;
   if (request.method !== "GET") return publicJson({ error: "method not allowed" }, 405);
+
+  // One call for everything the page renders.
+  //
+  // This exists for a availability reason, not tidiness. The page used to fetch
+  // summary + events + reports separately on every tick; at a 10s interval that
+  // is 18 requests/minute per open tab, or ~26k/day from ONE tab left open
+  // against a 100k/day free-tier ceiling. A handful of idle tabs would take the
+  // dashboard down. Combining them cuts that by 3x, and the page's polling
+  // changes cut it by another ~10x.
+  if (path === "/api/public/all") return publicAll(env, url, hubStub);
 
   if (path === "/api/public/summary") return publicSummary(env, hubStub);
   if (path === "/api/public/events") return publicEvents(env, url);
@@ -530,14 +569,54 @@ const PUBLIC_PAGE = `<!doctype html>
     }).join("");
   }
 
-  function refresh() {
-    getJSON("/api/public/summary").then(renderSummary);
-    getJSON("/api/public/events?limit=20").then(renderEvents);
-    getJSON("/api/public/reports?limit=5").then(renderReports);
+  // Polling is deliberately conservative. This page is public and may sit open
+  // on a wall display for days; at 3 requests every 10s a single forgotten tab
+  // would burn ~26k requests/day against a 100k/day ceiling and eventually take
+  // the dashboard down for everyone. One combined request every 30s, paused
+  // entirely while the tab is hidden, is roughly 1/20th of that.
+  var PERIOD_MS = 30000;
+  var timer = null;
+  var failures = 0;
+
+  function render(d) {
+    renderSummary(d);
+    renderEvents(d);
+    renderReports(d);
   }
 
-  refresh();
-  setInterval(refresh, 10000);
+  function refresh() {
+    return getJSON("/api/public/all?limit=20").then(function (d) {
+      if (d) {
+        failures = 0;
+        render(d);
+      } else {
+        // Back off on repeated failure rather than hammering a struggling
+        // origin — but never slower than 5 minutes, so it recovers on its own.
+        failures = Math.min(failures + 1, 4);
+      }
+      return d;
+    });
+  }
+
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    if (document.hidden) return;              // nobody is looking; stop asking
+    var wait = PERIOD_MS * Math.pow(2, failures);
+    timer = setTimeout(function () { refresh().then(schedule); }, Math.min(wait, 300000));
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    } else {
+      // Refresh immediately on return so the page is never showing stale data
+      // to someone actually looking at it.
+      refresh().then(schedule);
+    }
+  });
+
+  refresh().then(schedule);
 })();
 </script>
 </body>
