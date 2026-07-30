@@ -1,0 +1,29 @@
+# FPMS Gateway — permanent public front door for the HQ dashboard.
+#
+# Deploy (from this directory):
+#   npx wrangler login
+#   npx wrangler kv namespace create FPMS_KV     # paste the id below
+#   npx wrangler secret put FPMS_GATEWAY_SECRET  # paste the shared secret
+#   npx wrangler deploy
+#
+# Deploy prints the permanent URL: https://fpms-gateway.<subdomain>.workers.dev
+
+# The Worker name is the first label of the public URL:
+#   https://<name>.<account-subdomain>.workers.dev
+name = "fpms"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+# workers.dev gives a stable free hostname with no domain purchase required.
+workers_dev = true
+
+# One public door only. Preview URLs would publish extra *.workers.dev hostnames
+# that reach the same dashboard — and that dashboard exposes SSH and a terminal.
+preview_urls = false
+
+# FPMS_GATEWAY_SECRET is intentionally NOT set here — it is a Worker secret
+# (`wrangler secret put`), so it never lands in this file or in git.
+
+[[kv_namespaces]]
+binding = "FPMS_KV"
+id = "abaf09e992c649bc9c96399d1e69338a"

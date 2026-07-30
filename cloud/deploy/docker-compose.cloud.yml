@@ -1,0 +1,87 @@
+# FPMS Cloud app — the public streaming deployment.
+#
+# Two containers on one small always-on host (AWS EC2 t3.micro is free for 12
+# months, and any 1 GB VPS works):
+#
+#   mosquitto  — MQTT broker the field rovers publish to over TLS on 8883
+#   dashboard  — the FPMS UI in *cloud* role: data streaming only, no terminal,
+#                no SSH, no LAN scan. Hardware control lives in the edge app.
+#
+# Cloudflare sits in front for free SSL, CDN and DDoS protection, so this stack
+# only ever needs to serve plain HTTP on 8000 to Cloudflare.
+#
+#   docker compose -f docker-compose.cloud.yml up -d
+#
+# Required in .env next to this file:
+#   FPMS_PASSWORD           dashboard login
+#   FPMS_MQTT_USERNAME      broker account the rovers use
+#   FPMS_MQTT_PASSWORD      broker password
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: fpms-mosquitto
+    restart: unless-stopped
+    ports:
+      # 8883 = MQTT over TLS. Field rovers on cellular connect here.
+      - "8883:8883"
+      # 1883 stays bound to loopback so only the dashboard container reaches it
+      # via the compose network — never exposed to the internet unencrypted.
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - ./mosquitto/certs:/mosquitto/config/certs:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    image: fpms-dashboard:latest
+    container_name: fpms-dashboard
+    restart: unless-stopped
+    depends_on:
+      mosquitto:
+        condition: service_started
+    environment:
+      # Cloud role: machine-control routes are refused for every request, not
+      # just ones that look remote. On a custom domain there is no tunnel
+      # hostname to detect, so hostname-based detection alone is not enough.
+      FPMS_ROLE: cloud
+      FPMS_PUBLIC_SAFE_MODE: "1"
+      # Talks to the broker over the compose network, not the public 8883.
+      FPMS_MQTT_HOST: mosquitto
+      FPMS_MQTT_PORT: "1883"
+      FPMS_MQTT_USERNAME: ${FPMS_MQTT_USERNAME}
+      FPMS_MQTT_PASSWORD: ${FPMS_MQTT_PASSWORD}
+      FPMS_PASSWORD: ${FPMS_PASSWORD}
+      FPMS_HEADLESS: "1"
+      FPMS_BIND_HOST: 0.0.0.0
+      FPMS_BIND_PORT: "8000"
+      # --- AWS services (S3 archive, SNS alerts, IoT, CloudWatch) ------------
+      # Defaults to "local", which points boto3 at LocalStack. Set
+      # FPMS_AWS_MODE=cloud in .env plus credentials to use your real account —
+      # then the AWS tab, S3 archiving and SNS alerts operate for real.
+      # Prefer an EC2 IAM instance role over static keys: leave the key vars
+      # empty and boto3 picks the role up from instance metadata automatically.
+      FPMS_AWS_MODE: ${FPMS_AWS_MODE:-local}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      FPMS_ARCHIVE_BUCKET: ${FPMS_ARCHIVE_BUCKET:-fpms-archive}
+    ports:
+      # Plain HTTP is fine here: Cloudflare terminates TLS at the edge and is
+      # the only thing that should reach this port. Lock the security group /
+      # firewall to Cloudflare IP ranges (see Deploy-Cloud.sh).
+      - "8000:8000"
+
+volumes:
+  mosquitto-data:
+  mosquitto-logs:
