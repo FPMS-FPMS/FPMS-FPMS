@@ -1,0 +1,842 @@
+# =============================================================================
+# nav2_params.yaml - Nav2 (ROS 2 Humble) parameters for the FPMS rover.
+#
+# READ cloud/dashboard/rover/NAV2_BRIEF.md BEFORE CHANGING ANYTHING HERE.
+# Almost every number below is derived from a fact in that file, and the
+# derivation is written next to it. Changing a value without re-reading the
+# derivation is how this file goes wrong.
+#
+# -----------------------------------------------------------------------------
+# THE TWO FACTS THAT SHAPE THIS ENTIRE FILE
+# -----------------------------------------------------------------------------
+#
+# 1. THE ARENA IS 1.2 m x 1.2 m.
+#    Stock Nav2 defaults are sized for rooms: 0.05 m costmap cells, 0.55 m
+#    inflation radius, 3x3 m local costmap, 0.6 m lookahead. Applied here, a
+#    0.55 m inflation radius from four walls that are 1.2 m apart marks every
+#    single cell in the arena as inflated - there is no zero-cost cell anywhere
+#    and the planner reports "no valid path" from a completely empty floor.
+#    Every spatial parameter here is shrunk to the arena and the shrink is
+#    justified in place.
+#
+# 2. THE FIRMWARE CANNOT EXPRESS SLOW MOTION (NAV2_BRIEF.md section 3b).
+#    The drive board regulates INTEGER encoder counts per 10 ms. One count per
+#    period is 0.0145 m/s on the wire; below that the setpoint is under a single
+#    count and the feedback is pure quantisation noise. Measured: 0.0041 stalls
+#    then lurches, 0.012 is noise, 0.100 is clean. On top of that there is a
+#    200/400 PWM dead zone, so commanded duty is either exactly 0 or 50-100 %.
+#    There is no gentle duty and there is no slow speed.
+#
+#    Wire 0.0145 corresponds to roughly 0.09 m/s of real ground speed, and with
+#    margin about 0.18 m/s. THEREFORE: no velocity parameter in this file is
+#    allowed to be smaller than that. Anywhere Nav2 would normally taper a
+#    velocity towards zero - approach scaling, curvature regulation, cost
+#    regulation, a velocity smoother ramp - the taper is either clamped at the
+#    floor or switched off outright, and it says so. A Nav2 stack that asks this
+#    rover for 0.02 m/s does not move slowly; it stalls, then lurches.
+#
+#    "Slow and controlled" on this chassis is achieved by SHORT BOUNDED SEGMENTS
+#    WITH STOPS BETWEEN THEM, not by a low continuous setpoint. The controller
+#    choice below is made on exactly that basis.
+#
+# -----------------------------------------------------------------------------
+# UNITS WARNING - READ THIS BEFORE LETTING THE ROVER MOVE
+# -----------------------------------------------------------------------------
+# NAV2_BRIEF.md section 3b also records that the firmware passes linear.x to
+# wheel m/s "with no gain", yet commanding 0.10 produces roughly 0.61 m/s
+# actual - about 6x. The board's units are NOT SI metres per second.
+#
+# Every velocity in this file is in TRUE SI m/s, because that is what the
+# nav_msgs/Odometry on /odom and the costmap geometry are in, and mixing units
+# inside Nav2 would make the goal checker, the progress checker and the
+# collision look-ahead all silently wrong.
+#
+# The 6x conversion is therefore NOT done here. It is done by a shim node
+# between Nav2 and the board. That is why the launch file remaps Nav2's output
+# to /cmd_vel_nav and NOT to /cmd_vel: with no shim running the rover does not
+# move at all, which is the correct failure mode. Publishing 0.18 "real" m/s
+# straight onto /cmd_vel would command roughly 1.1 m/s and cross this arena in
+# about a second. See README.md, "The cmd_vel unit shim".
+# =============================================================================
+
+# =============================================================================
+# AMCL
+#
+# Heading on this rover is OPEN-LOOP INTEGRATED GYRO Z (fpms_odom_tf.py). It
+# drifts without bound and that node already advertises the fact: it publishes
+# POSE_YAW_VAR = 0.20^2, i.e. an 11 degree 1-sigma. The motion model below is
+# tuned to match that honesty - rotational noise is set high so AMCL leans on
+# the scan for heading, translational noise is set low because wheel distance is
+# the one thing this chassis measures well (the pre-ROS phase 6 run logged
+# 0.6 % distance error).
+#
+# HONEST LIMITATION, STATED UP FRONT: an empty 1.2 m square box is close to
+# degenerate for AMCL. Four identical flat walls give a likelihood field with
+# 4-fold rotational symmetry, and sliding along a wall you can see is not
+# observable at all. AMCL will hold heading acceptably and will drift in
+# position along whichever wall it is parallel to. Two mitigations, both
+# recommended: (a) set_initial_pose below, from the known start box, and (b) put
+# at least one asymmetric object in the arena AND in arena_map.pgm. Without (b),
+# expect AMCL to contribute little beyond bounding the odometry drift.
+# =============================================================================
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+    # --- frames: must match fpms_odom_tf.py exactly (ODOM_FRAME/BASE_FRAME) ---
+    base_frame_id: "base_footprint"
+    odom_frame_id: "odom"
+    global_frame_id: "map"
+
+    # !! PLACEHOLDER !! The LiDAR bridge agent owns this topic name. It must
+    # match here, in global_costmap and in local_costmap - THREE places, all
+    # three must agree. It deliberately is not "/scan": NAV2_BRIEF.md section 2
+    # records that the drive board publishes a DEAD /scan with all ranges 0.0,
+    # and Nav2 reads a 0.0 range as an obstacle sitting on the sensor origin.
+    # Subscribing to that topic by accident surrounds the rover with a solid
+    # ring of phantom obstacles and nothing will ever plan.
+    scan_topic: "/scan_lidar"
+
+    # --- motion model ---
+    # Differential, not omni. The chassis is 4WD skid-steer and the board
+    # ignores linear.y entirely (NAV2_BRIEF.md section 2). An omni model would
+    # let the particle filter believe in sideways motion that cannot happen.
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+
+    # alpha1 rotation noise from rotation - LARGE. This is the "do not trust the
+    #        odometry heading" knob and it is the whole point of this block. The
+    #        heading is an integrated rate gyro with no absolute reference.
+    alpha1: 0.80
+    # alpha2 rotation noise from translation - LARGE. A skid-steer scrubs; a
+    #        commanded straight line comes out as a slow curve, which appears as
+    #        heading error accumulated during pure translation.
+    alpha2: 0.40
+    # alpha3 translation noise from translation - SMALL. Wheel distance is the
+    #        trustworthy channel (0.6 % over the phase 6 runs), and
+    #        fpms_odom_tf.py takes position from /odom_raw POSE deltas, never
+    #        from the sign-inverted twist (section 3a).
+    alpha3: 0.20
+    # alpha4 translation noise from rotation - MODERATE. In-place skid rotation
+    #        drags the contact patches and walks the centre a little.
+    alpha4: 0.20
+    alpha5: 0.20   # omni strafe term; inert for a differential model
+
+    # --- laser model ---
+    laser_model_type: "likelihood_field"
+    # 360 points at 1 degree. Four flat walls carry almost no information, so
+    # subsampling to 60 beams costs nothing in accuracy and saves the Pi real
+    # work while it is also running YOLO.
+    max_beams: 60
+    laser_min_range: 0.12   # LiDAR spec floor
+    # ESTIMATE. LiDAR spec max is 6.0 m but the arena diagonal is only 1.70 m -
+    # anything beyond about 2 m is furniture in the room outside the arena and
+    # must not be matched against a map that does not contain it.
+    laser_max_range: 2.0
+    # DEFAULT IS 2.0 AND THAT DEFAULT IS ACTIVELY HARMFUL HERE. This is the
+    # distance out to which the likelihood field is smeared around each obstacle
+    # cell. At 2.0 m in a 1.2 m arena every cell in the map is "near an
+    # obstacle", the field goes flat, and every particle scores identically -
+    # AMCL then cannot discriminate between any two poses. 0.20 m keeps the
+    # field peaked on the actual walls.
+    laser_likelihood_max_dist: 0.20
+    sigma_hit: 0.05        # tight: walls are flat and close, returns are crisp
+    z_hit: 0.60
+    z_rand: 0.30
+    z_max: 0.05
+    z_short: 0.05
+    lambda_short: 0.10
+
+    # --- particle filter ---
+    # More particles than a 1.2 m box would normally need, because the heading
+    # is bad and the box is symmetric: the spread has to cover heading, not area.
+    min_particles: 500
+    max_particles: 2000
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_slow: 0.001   # enabled: a symmetric arena CAN latch onto the
+    recovery_alpha_fast: 0.100   # wrong wall, and needs to be able to recover
+    resample_interval: 1
+
+    # Nav2 defaults are 0.25 m / 0.20 rad. Crossing this entire arena is 1.2 m,
+    # so the default would trigger roughly four scan updates for a full-arena
+    # traverse and AMCL would be dead-reckoning nearly all the time. These are
+    # sized so a traverse produces ~20 updates.
+    update_min_d: 0.05
+    update_min_a: 0.10
+
+    # ESTIMATE. fpms_odom_tf.py deliberately stamps with the Pi's ROS clock
+    # rather than the board's (the board's clock lands outside tf2's buffer and
+    # Nav2 rejects it with a confusing extrapolation error), so this only has to
+    # absorb Pi-side scheduling jitter, not clock skew.
+    transform_tolerance: 0.5
+    save_pose_rate: 0.5
+    tf_broadcast: true
+    always_reset_initial_pose: false
+
+    # The start box is known: bottom-right, nose FORWARD = 90 deg = up the
+    # arena. Straight out of frontend/src/lib/arena.ts ROVER_START and
+    # FORWARD_HEADING_DEG, converted to metres. Seeding this matters more than
+    # usual precisely because the box is symmetric - global localisation from
+    # scratch in a featureless square is a coin flip between four answers.
+    set_initial_pose: true
+    initial_pose:
+      x: 0.972
+      y: 0.228
+      z: 0.0
+      yaw: 1.5708   # +pi/2 rad = 90 deg = +y = "up the arena" = FORWARD
+
+# =============================================================================
+# BT NAVIGATOR
+#
+# !! THE DEFAULT BEHAVIOUR TREE CONTAINS A PARAMETER THIS ROVER CANNOT OBEY !!
+#
+# navigate_to_pose_w_replanning_and_recovery.xml drives its BackUp recovery with
+# backup_speed="0.025" (m/s). Per section 3b that is under a fifth of the
+# firmware floor: the rover will stall, lurch, and the recovery will time out
+# without having backed up. The Spin recovery is fine because its velocity comes
+# from behavior_server's min/max_rotational_vel, which are clamped below.
+#
+# Fix before relying on recovery: copy the default XML, set backup_speed to at
+# least 0.18, and point default_nav_to_pose_bt_xml at your copy. The exact
+# commands are in README.md, "Fix the BackUp recovery speed". Until then, expect
+# the BackUp branch of recovery to fail. This is not a Nav2 bug and no parameter
+# in this file can override it - the speed lives in the XML.
+# =============================================================================
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /odom            # published by fpms_odom_tf.py
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    transform_tolerance: 0.3
+
+    # Uncomment and repoint these after making the BackUp fix described above.
+    # default_nav_to_pose_bt_xml: "/home/ubuntu/fpms_nav2/fpms_nav_to_pose.xml"
+    # default_nav_through_poses_bt_xml: "/home/ubuntu/fpms_nav2/fpms_nav_through_poses.xml"
+
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+
+# =============================================================================
+# CONTROLLER SERVER
+#
+# -----------------------------------------------------------------------------
+# CONTROLLER CHOICE: RegulatedPurePursuit, NOT DWB. Reasoning.
+# -----------------------------------------------------------------------------
+#
+# DWB samples a velocity space and scores simulated trajectories. Its whole
+# method assumes that every velocity between min_vel_x and max_vel_x is
+# available, and its primary tool for both obstacle avoidance and goal approach
+# is TO SLOW DOWN. On this firmware the bottom of that velocity space does not
+# physically exist (section 3b), so DWB spends most of its search evaluating
+# trajectories the rover cannot execute, and the ones it likes best near a goal
+# or an obstacle are exactly the sub-floor ones that stall and then lurch. You
+# can raise DWB's min_vel_x to the floor, but then DWB has no way to slow down
+# at all and you have paid for a trajectory search whose main feature you just
+# disabled.
+#
+# RegulatedPurePursuit is a better fit for four concrete reasons:
+#
+#   1. It has ONE cruise speed - desired_linear_vel - which it holds. That is
+#      precisely the shape of control this firmware supports: pick a speed the
+#      loop can hold, hold it, stop.
+#   2. Its speed reductions are individually switchable and individually
+#      floored (use_regulated_linear_velocity_scaling,
+#      use_cost_regulated_linear_velocity_scaling,
+#      regulated_linear_scaling_min_speed, min_approach_linear_velocity). There
+#      is a named parameter for "never go below this", which is exactly the
+#      guarantee section 3b demands. DWB has no equivalent single knob.
+#   3. It is geometric. It steers at a lookahead point on the path and corrects
+#      continuously, rather than scoring candidate trajectories using a yaw
+#      estimate that is an open-loop integrated gyro. Bad heading hurts a pure
+#      pursuit controller far less than it hurts a trajectory scorer.
+#   4. use_rotate_to_heading turns it into turn-in-place-then-drive-straight,
+#      which is exactly the segment-and-stop strategy section 3b prescribes AND
+#      exactly what already worked on this chassis: the pre-ROS phase 6 run used
+#      turn-then-drive segments and logged 0.6 % distance error and +/-1-4 deg
+#      turns. This is the only controller strategy with measured evidence behind
+#      it on this specific robot.
+#
+# What RPP costs us, stated plainly: it does not itself avoid obstacles (it only
+# collision-checks ahead and stops), so obstacle avoidance is the planner's job
+# plus a replan. In a 1.2 m arena with a known map that is an acceptable trade.
+#
+# -----------------------------------------------------------------------------
+# EXPECTED BEHAVIOUR YOU SHOULD NOT MISTAKE FOR A BUG: FISHTAILING
+# -----------------------------------------------------------------------------
+# For a differential drive, wheel speed = v +/- omega * b with half-track
+# b = 0.085 m. The wheel-speed quantum is one encoder count, ~0.09 m/s of real
+# ground speed, so the smallest resolvable omega is about
+# 0.09 / (2 * 0.085) = 0.53 rad/s (less if skid slip widens the effective
+# track). Steering resolution is therefore roughly HALF A RADIAN PER SECOND.
+# The rover cannot follow a gentle arc; it will track a curve as a series of
+# coarse corrections and look like it is fishtailing. That is quantisation, not
+# tuning, and no gain here will fix it. It is a further argument for a longer
+# lookahead and for a low rotate_to_heading_min_angle, both set below.
+# =============================================================================
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+
+    # 20 Hz because the pre-ROS phase 6 autonomy ran a 20 Hz loop on this exact
+    # chassis and worked. /odom_raw only arrives at 10-11 Hz, but the controller
+    # reads pose from TF, not from the odom rate, so 20 Hz is honest here.
+    controller_frequency: 20.0
+
+    # Reported velocities below these are treated as zero. min_y is left at the
+    # Nav2 default of 0.5, which for a differential robot is the idiomatic way
+    # of saying "there is no y channel, ignore whatever appears there".
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+
+    failure_tolerance: 0.3
+
+    # NOTE: ROS 2 Humble spells this SINGULAR (progress_checker_plugin) and the
+    # goal checker list PLURAL. Iron and later renamed the first to
+    # progress_checker_plugins. If you port this file forward, that rename is
+    # the first thing that will break, silently, as an ignored parameter.
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker", "loose_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      # Nav2 default is 0.5 m, which is 42 % of this arena - the rover could sit
+      # still for most of a mission and still be judged "progressing". At the
+      # 0.18 m/s cruise below, 0.10 m takes 0.6 s, so 10 s is generous even
+      # allowing for a rotate-to-heading pause.
+      required_movement_radius: 0.10
+      movement_time_allowance: 10.0
+
+    # ------------------------------------------------------------------------
+    # GOAL TOLERANCES - AND WHAT IS NOT ACHIEVABLE
+    #
+    # SAY IT PLAINLY: A GOAL TOLERANCE SMALLER THAN THE FIRMWARE'S MINIMUM STEP
+    # IS UNACHIEVABLE ON THIS ROVER. Closing the last few centimetres onto a
+    # goal requires short, low-speed corrective moves, and short low-speed moves
+    # are the exact thing section 3b says do not exist: the setpoint falls under
+    # one encoder count, the 200/400 dead zone then applies 50 % duty anyway,
+    # and the rover lurches past the goal instead of easing into it. Asking for
+    # xy_goal_tolerance: 0.02 does not give you 2 cm accuracy - it gives you an
+    # oscillation around the goal until the progress checker or the BT times
+    # out, and the failure message will point at the controller, not at the
+    # firmware.
+    #
+    # 0.10 m is the tightest xy tolerance worth requesting until the encoder /
+    # wheel constants are fixed in firmware. Anything under ~0.05 m should be
+    # treated as unavailable.
+    #
+    # yaw: 0.20 rad is ~11.5 deg, chosen to equal the 1-sigma heading
+    # uncertainty fpms_odom_tf.py itself publishes (POSE_YAW_VAR = 0.20^2). You
+    # cannot meaningfully demand a heading tolerance tighter than the standard
+    # deviation of your own heading estimate; you would just be accepting on
+    # noise.
+    # ------------------------------------------------------------------------
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.20
+
+    # For waypoints where the final heading genuinely does not matter. Every
+    # enforced final heading costs an in-place spin, and an in-place spin on
+    # this chassis cannot be done gently (see behavior_server below) - so do not
+    # pay for one unless the mission needs it. Select this per-goal via the BT's
+    # goal_checker_id port.
+    loose_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      stateful: true
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 3.15   # > pi: heading is not checked at all
+
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+
+      # ====================================================================
+      # THE MOST IMPORTANT NUMBERS IN THIS FILE.
+      #
+      # Section 3b: stable control needs >= ~0.0145 m/s on the wire, which is
+      # ~0.09 m/s real, and with margin ~0.18 m/s. 0.18 is therefore the cruise
+      # speed - not a preference, a floor imposed by integer encoder counts per
+      # 10 ms PID period. At 0.18 m/s a full 1.2 m arena traverse takes 6.7 s,
+      # which is a perfectly controllable mission speed.
+      #
+      # DO NOT LOWER desired_linear_vel "to be safe". Lowering it below ~0.09
+      # makes the rover LESS safe, not more: it drops the setpoint under one
+      # encoder count, the velocity loop loses feedback, and the 50 % duty
+      # feed-forward turns the result into stall-then-lurch. The safe way to go
+      # slowly here is shorter path segments with stops, not a smaller number.
+      # ====================================================================
+      desired_linear_vel: 0.18
+
+      # ESTIMATE, needs on-hardware tuning. At 0.18 m/s a 0.25 m lookahead is
+      # ~1.4 s of preview and about one rover length (0.24 m). Shorter would cut
+      # corners less but would demand steering resolution the wheels cannot
+      # deliver (see the fishtailing note above); longer would smooth the ride
+      # but starts cutting corners noticeably on a 1.2 m arena where legs are
+      # only 0.7-1.0 m.
+      lookahead_dist: 0.25
+      min_lookahead_dist: 0.18
+      max_lookahead_dist: 0.35
+      lookahead_time: 1.4
+      # Off deliberately: velocity-scaled lookahead scales the lookahead with
+      # the current speed, and the speed here is a constant by necessity. There
+      # is nothing to scale with.
+      use_velocity_scaled_lookahead_dist: false
+      use_interpolation: true
+
+      # ====================================================================
+      # EVERY VELOCITY TAPER IS DISABLED OR FLOORED. This block is the direct
+      # implementation of section 3b.
+      # ====================================================================
+
+      # Curvature regulation would slow the rover on tight turns. There is no
+      # slower speed to slow to, so it is off. Tight turns are instead handled
+      # by rotate-to-heading below, which stops and spins - the segment-and-stop
+      # strategy section 3b actually prescribes.
+      use_regulated_linear_velocity_scaling: false
+      # Cost regulation would slow the rover near obstacles. Same reason. In a
+      # 1.2 m arena the rover is ALWAYS near a wall, so this would have held the
+      # speed permanently pinned at its minimum anyway.
+      use_cost_regulated_linear_velocity_scaling: false
+      # Belt and braces. Even with both scalings off, this is the hard floor RPP
+      # will not command below, and it is set to the firmware floor with margin
+      # rather than to Nav2's 0.25 default (which happens to be fine) or to
+      # something "gentle" (which would not be).
+      regulated_linear_scaling_min_speed: 0.18
+      regulated_linear_scaling_min_radius: 0.30
+
+      # Approach scaling would taper the speed towards min_approach_linear_
+      # velocity over the last approach_velocity_scaling_dist metres. Nav2's
+      # default min is 0.05 m/s - a third of the firmware floor, i.e. guaranteed
+      # stall-then-lurch on every single goal approach. Setting the minimum
+      # equal to the cruise speed makes the taper mathematically inert while
+      # leaving the parameter legible.
+      min_approach_linear_velocity: 0.18
+      approach_velocity_scaling_dist: 0.10
+
+      # ====================================================================
+      # ROTATE-TO-HEADING: turn-then-drive, the proven strategy on this chassis
+      # ====================================================================
+      # Note allow_reversing and use_rotate_to_heading are MUTUALLY EXCLUSIVE in
+      # Nav2 - setting both true makes RPP throw on configure. Reversing is
+      # given up willingly: the LiDAR only looks forward-ish and there is no
+      # rear sensing at all.
+      use_rotate_to_heading: true
+      allow_reversing: false
+      # ESTIMATE. 0.45 rad is ~26 deg, below Nav2's 0.785 default so the rover
+      # prefers stopping and spinning over trying to arc. Deliberate: an arc
+      # demands fine omega, and omega quantises at ~0.5 rad/s here, whereas an
+      # in-place spin is a single bounded segment - which phase 6 executed to
+      # +/-1-4 deg.
+      rotate_to_heading_min_angle: 0.45
+      # Above the in-place rotation floor. Pure spin needs each wheel at or
+      # above ~0.09 m/s, so omega must be at least 0.09 / 0.085 = 1.06 rad/s on
+      # geometric track, less if skid slip widens the effective track. 1.2 sits
+      # above the geometric floor with margin.
+      rotate_to_heading_angular_vel: 1.2
+      max_angular_accel: 3.2
+
+      # ====================================================================
+      # SAFETY
+      # ====================================================================
+      # RPP does not steer around obstacles; it stops for them. Keep this on -
+      # it is the only in-controller collision check there is.
+      use_collision_detection: true
+      # ESTIMATE. 1.0 s at 0.18 m/s is 0.18 m of look-ahead, slightly more than
+      # one robot radius. Nav2's 1.0 default happens to be right for this speed.
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      # Arena diagonal is 1.70 m, so this covers the whole world. It bounds how
+      # far along the path RPP will search for the closest pose, which stops it
+      # latching onto a later leg of a path that doubles back.
+      max_robot_pose_search_dist: 1.8
+
+      transform_tolerance: 0.3
+      cost_scaling_dist: 0.30
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 10.0   # must match inflation_layer below
+
+# =============================================================================
+# LOCAL COSTMAP
+#
+# SIZE DERIVATION - this is why it is 0.9 m and not Nav2's default 3.0 m:
+# the rolling window must contain the pure-pursuit lookahead point plus the
+# inflation band around it, or RPP steers at a carrot that is off the edge of
+# its own costmap and the collision check silently sees free space.
+#     required half-window = lookahead_dist (0.25) + inflation_radius (0.20)
+#                          = 0.45 m  ->  0.90 m window
+# A 3.0 m default window in a 1.2 m arena covers the entire world twice over,
+# which defeats the entire point of having a rolling local costmap and just
+# burns Pi cycles re-rasterising walls that are already in the static map.
+# =============================================================================
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_footprint
+
+      # ESTIMATE, biased low on purpose. The Pi is simultaneously running the
+      # camera, YOLO and the MQTT uplink (fpms-rover-agent), which must keep
+      # working. A 0.9 m window at 0.01 m is only 90x90 cells; 5 Hz is ample
+      # against a ~10 Hz LiDAR.
+      update_frequency: 5.0
+      publish_frequency: 2.0
+
+      width: 0.9
+      height: 0.9
+      resolution: 0.01
+      rolling_window: true
+      track_unknown_space: false
+      always_send_full_costmap: true
+
+      # ==================================================================
+      # ROBOT RADIUS
+      #
+      # frontend/src/lib/arena.ts is the repo's source of truth for the
+      # chassis: ROVER_LEN_MM 240, ROVER_WID_MM 180. A circular footprint is
+      # correct here BECAUSE the rover rotates in place - a rotate-to-heading
+      # sweeps the CIRCUMSCRIBED circle, not the half-width:
+      #     sqrt(0.12^2 + 0.09^2) = 0.15 m
+      # Using 0.12 (the half-length) would under-report the swept footprint by
+      # 30 mm and let the rear corners clip a wall during a spin, in an arena
+      # where the working margin is only a few centimetres.
+      #
+      # !! DISCREPANCY TO RESOLVE WITH A RULER !! NAV2_BRIEF.md's task notes
+      # say the chassis is ~230 mm wide, arena.ts says 180 mm. If 230 is
+      # right, this must become 0.17 (sqrt(0.12^2 + 0.115^2) = 0.166). Checked
+      # both ways: at 0.17 the free-centre region is still [0.17, 1.03]^2 and
+      # all three mission waypoints (0.228 / 0.972) still fit, so the mission
+      # survives either value - but the collision margin does not, so measure it.
+      # ==================================================================
+      robot_radius: 0.15
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          # !! PLACEHOLDER - must equal amcl/scan_topic and the global_costmap
+          # copy. Owned by the LiDAR bridge agent.
+          topic: "/scan_lidar"
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          # LiDAR spec is 0.12-6.0 m. The arena diagonal is 1.70 m, so returns
+          # past ~1.8 m are the room OUTSIDE the arena - furniture, legs,
+          # people. Marking those would paint obstacles into a costmap whose
+          # map does not contain them and whose planner cannot route around
+          # them. Clipped here rather than in the LiDAR bridge so the bridge
+          # can stay a faithful sensor driver.
+          obstacle_max_range: 1.80
+          obstacle_min_range: 0.12
+          raytrace_max_range: 2.00
+          raytrace_min_range: 0.0
+          # false: treat inf as "no return", which is what the bridge is
+          # required to publish for a zero range (NAV2_BRIEF.md section 7 - a
+          # literal 0.0 reads as an obstacle at the sensor origin). Setting
+          # this true would convert those into obstacles at range_max instead,
+          # painting a phantom ring.
+          inf_is_valid: false
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        # ==================================================================
+        # INFLATION - THE PARAMETER MOST LIKELY TO MAKE THE WHOLE ARENA
+        # IMPASSABLE IF COPIED FROM A DEFAULT.
+        #
+        # Nav2's default is 0.55 m. Four walls 1.2 m apart, each inflating
+        # 0.55 m, leaves a zero-cost region of [0.55, 0.65]^2 - a 10 cm square
+        # in the dead centre of the arena. Every mission waypoint would be in
+        # inflated space and most of the floor would be inscribed. That is the
+        # "whole arena is a single obstacle" failure, and it is a default, not
+        # a mistake anyone made.
+        #
+        # 0.20 m is derived from the mission, not guessed. Each zone centre
+        # sits 0.228 m from the nearest wall (48 mm arena margin + 180 mm half
+        # zone). inflation_radius must stay under that so all three waypoints
+        # land in genuinely zero-cost cells:
+        #     zero-cost region = [0.20, 1.00]^2
+        #     Zone A  (0.228, 0.972)  inside, 28 mm margin
+        #     Zone B  (0.972, 0.972)  inside, 28 mm margin
+        #     Water   (0.228, 0.228)  inside, 28 mm margin
+        #     Start   (0.972, 0.228)  inside, 28 mm margin
+        # 28 mm is thin. It is also all the arena has. If a waypoint ever
+        # reports as an invalid goal, this number is the first suspect.
+        #
+        # The usable gradient band is only inflation_radius - robot_radius =
+        # 0.05 m wide, so cost_scaling_factor has to be high (Nav2's 3.0 would
+        # decay by only exp(-0.15) = 86 % across the whole band, making the
+        # band uniformly near-lethal). At 10.0 the band decays to about 60 %.
+        # The gradient's job here is only to break ties towards the middle of
+        # the arena; the actual standoff is robot_radius, not inflation.
+        # ==================================================================
+        inflation_radius: 0.20
+        cost_scaling_factor: 10.0
+        inflate_unknown: false
+        inflate_around_unknown: false
+
+# =============================================================================
+# GLOBAL COSTMAP
+#
+# Sized by the static map (arena_map.pgm), so width/height/origin below are only
+# the pre-map fallback. Resolution MUST match arena_map.yaml's 0.01 or the
+# static layer resamples and the 20 mm wall band smears.
+# =============================================================================
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: map
+      robot_base_frame: base_footprint
+
+      # Slow on purpose. The arena is static and known; the global costmap
+      # exists to hold the walls, not to react. Reaction is the local costmap's
+      # job at 5 Hz.
+      update_frequency: 1.0
+      publish_frequency: 1.0
+
+      # 0.01 m, not Nav2's 0.05. At 0.05 the 0.15 m robot radius is 3 cells and
+      # the 0.05 m inflation band is ONE cell - the whole cost gradient
+      # collapses into a single step and the free corridor between an inflated
+      # wall and an inflated zone edge quantises to two or three cells, which is
+      # where a planner starts reporting "no valid path" across empty floor.
+      # 0.01 m over a 1.4 m map is 140x140 = 19600 cells: trivial for an RK3588.
+      resolution: 0.01
+
+      # Fallback extent only; the static map overrides these once it loads.
+      width: 2
+      height: 2
+      origin_x: -0.10
+      origin_y: -0.10
+
+      rolling_window: false
+      track_unknown_space: false
+      always_send_full_costmap: true
+
+      robot_radius: 0.15   # see the derivation in local_costmap above
+
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        enabled: true
+        map_subscribe_transient_local: true
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          # !! PLACEHOLDER - third and last copy. All three must agree.
+          topic: "/scan_lidar"
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+          obstacle_max_range: 1.80
+          obstacle_min_range: 0.12
+          raytrace_max_range: 2.00
+          raytrace_min_range: 0.0
+          inf_is_valid: false
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        inflation_radius: 0.20      # derivation in local_costmap above
+        cost_scaling_factor: 10.0
+        inflate_unknown: false
+        inflate_around_unknown: false
+
+# =============================================================================
+# MAP SERVER
+# =============================================================================
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    # Overwritten by fpms_nav2.launch.py from its `map` argument. Left empty so
+    # a stale absolute path in this file can never quietly serve the wrong arena.
+    yaml_filename: ""
+
+map_saver:
+  ros__parameters:
+    use_sim_time: false
+    save_map_timeout: 5.0
+    free_thresh_default: 0.196
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: true
+
+# =============================================================================
+# PLANNER SERVER
+#
+# PLANNER CHOICE: NavFn (Dijkstra), NOT Smac Hybrid-A*.
+#
+# Smac's Hybrid-A* enforces a minimum turning radius so that the path is
+# kinematically feasible for a car-like vehicle. This rover is skid-steer: it
+# turns in place, so a minimum turning radius is a constraint it does not have,
+# and imposing one would generate wide arcs that do not fit inside a 1.2 m box.
+# NavFn's grid path is not kinematically feasible in general, and that is fine
+# here precisely because RPP's rotate-to-heading absorbs the corners by stopping
+# and spinning - which is the motion this chassis is best at.
+#
+# Dijkstra rather than A*: the grid is at most 140x140 = 19600 cells. Exhaustive
+# search is microseconds, and it produces cleaner, more centred paths than an
+# A* heuristic does on a grid this coarse relative to the robot.
+# =============================================================================
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      # How far from the requested goal the planner may terminate. Kept tighter
+      # than the controller's 0.10 m xy_goal_tolerance so the plan ends inside
+      # the region the goal checker will accept, rather than handing RPP a path
+      # that stops short of a goal the checker then refuses.
+      tolerance: 0.05
+      use_astar: false
+      # false: the arena is fully mapped and walled. Allowing unknown space
+      # would let the planner route THROUGH the map border into the room
+      # outside, which the rover cannot reach and the walls will not permit.
+      allow_unknown: false
+
+# =============================================================================
+# BEHAVIOR (RECOVERY) SERVER
+#
+# Spin and BackUp both mean "move a small bounded amount", which is the regime
+# section 3b says is hardest for this firmware. Spin is salvageable because its
+# velocity comes from the parameters below and they can be floored. BackUp is
+# NOT salvageable from here - its speed is a port on the BT XML node, default
+# 0.025 m/s, well under the floor. See the bt_navigator block above.
+# =============================================================================
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    global_frame: odom
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.3
+
+    # Nav2's default is 2.0 s. At 0.18 m/s that projects 0.36 m ahead, which is
+    # 30 % of the arena and will find a wall during almost any recovery, so the
+    # recovery aborts before it has done anything. 1.0 s = 0.18 m is enough to
+    # avoid driving into something without vetoing every recovery in a small box.
+    simulate_ahead_time: 1.0
+
+    # ESTIMATE, and the one that most needs a stopwatch on real hardware.
+    # In-place rotation needs each wheel at or above the ~0.09 m/s floor.
+    # On the geometric half-track of 0.085 m that is omega >= 1.06 rad/s. Skid
+    # steer scrubs, so the EFFECTIVE half-track is larger than geometric -
+    # commonly 1.3-1.8x - which lowers the true floor to roughly 0.6-0.8 rad/s.
+    # 0.9 is picked inside that band. Nav2's 0.4 default is below it on any
+    # assumption and would make every Spin recovery stall then lurch.
+    min_rotational_vel: 0.9
+    max_rotational_vel: 1.4
+    rotational_acc_lim: 3.2
+
+# =============================================================================
+# WAYPOINT FOLLOWER - drives the three-zone mission (see README.md)
+# =============================================================================
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 20
+    # false: one unreachable zone must not silently abandon the rest of the
+    # patrol. The failure is reported per-waypoint in the action result.
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: true
+      # A real stop between legs, not a token pause. This IS the "short bounded
+      # segments with stops between" strategy from section 3b, expressed at the
+      # mission level: it lets the drive loop settle to a true zero and gives
+      # fpms_odom_tf.py a stationary window to re-estimate its gyro bias
+      # (BIAS_REEST_SEC is 1.5 s, hence 2000 ms and not 500).
+      waypoint_pause_duration: 2000
+
+# =============================================================================
+# VELOCITY SMOOTHER - DELIBERATELY ABSENT.
+#
+# nav2_velocity_smoother is in the default Nav2 bringup and it is the single
+# worst thing you could add to this stack. Its job is to ramp velocity, and a
+# ramp from 0 to 0.18 m/s manufactures exactly the sub-floor setpoints - 0.02,
+# 0.05, 0.09 - that section 3b measured as stall-then-lurch. It would convert
+# every single start and stop into the failure mode this whole file exists to
+# avoid.
+#
+# The only node permitted between controller_server and the drive board is the
+# unit shim described in README.md, and it must SNAP, never ramp:
+#
+#     if |v| < FLOOR/2:  v = 0
+#     elif |v| < FLOOR:  v = sign(v) * FLOOR
+#
+# i.e. commanded speed is either zero or at least the floor, never in between.
+# If you find yourself adding a smoother to "make it less jerky", the jerkiness
+# is the 200/400 PWM dead zone and it is in the firmware. It cannot be smoothed
+# out from ROS; it can only be scheduled around with stops.
+# =============================================================================

@@ -1,53 +1,95 @@
 #!/usr/bin/env python3
-"""Motor deadband sweep for the Yahboom MicroROS Board V2.0 (ESP32-S3) rover.
+"""Firmware velocity-floor sweep for the Yahboom MicroROS Board V2.0 rover.
 
-WHY THIS EXISTS
-  fpms_teleop.py needs a MIN_CMD floor: a commanded speed below which it
-  should never bother asking the board to move, because the board can't
-  actually do anything useful with it. This script measures that floor by
-  stepping /cmd_vel up from zero and watching /odom_raw for the point where
-  the response becomes real, proportional motion.
+WHAT THIS ACTUALLY MEASURES -- READ THIS BEFORE QUOTING A NUMBER FROM IT
+  The lowest /cmd_vel setpoint the board's velocity loop can still HOLD.
+  That is NOT a mechanical deadband, and the difference decides what you do
+  about it:
 
-THE HAZARD THIS SCRIPT IS BUILT AROUND
-  MEASURED 2026-07-31 (see fpms_teleop.py CALIBRATION comments): commanding
-  linear.x = 0.0041 produced NO motion for ~3s and then a 290mm BACKWARD
-  lurch plus unintended rotation. The board firmware appears to run a
-  closed-loop wheel controller whose integrator winds up while the commanded
-  velocity sits under the motor deadband, then releases all at once in a
-  direction that is not reliably the commanded one. A naive "ramp vx up
-  until the wheels turn" sweep is exactly the procedure that produces this:
-  it holds sub-deadband commands for as long as it takes to notice motion,
-  which is precisely long enough to build a dangerous release.
+    * A MECHANICAL DEADBAND is stiction in the drivetrain. It scales with
+      load, you clear it with torque, and a MIN_CMD floor is a reasonable
+      way to live with it.
+    * What this rover has is QUANTISATION, and it is in the firmware, not
+      the motors. The velocity loop regulates INTEGER encoder counts per
+      10 ms PID period (MOTOR_ENCODER_CIRCLE 1040, MOTOR_WHEEL_CIRCLE
+      150.8 mm, MOTOR_PID_PERIOD 10). One count per period is 0.0145 m/s ON
+      THE WIRE. Below that the setpoint is under a single count and the
+      feedback is pure quantisation noise, so the loop has nothing to
+      regulate against. The wheels are not stuck -- the controller is
+      blind. The 200/400 PWM_MOTOR_DEAD_ZONE is a 50 % duty feed-forward,
+      so commanded duty is either exactly 0 or 50-100 %: there is no gentle
+      duty to fall back on either.
 
-  Every design choice below exists to defuse that:
-    * Each step's hold is short (default 1.5s) -- shorter than the ~3s it
-      took the known lurch to build, so windup has less time to accumulate
-      before the step ends regardless of what the operator sees.
-    * Every hold is followed by >=1.0s of published zero Twist before the
-      next (larger) step starts, so a windup that DID accumulate discharges
-      instead of carrying forward and appearing as a bigger, more confusing
-      lurch on a later, larger step.
-    * The observed odom is checked EVERY control tick, not just at the end
-      of a step: a reading opposite the commanded sign beyond tolerance is
-      treated as the windup/lurch hazard happening live and aborts the
-      whole sweep immediately, publishing zero and stopping.
-    * Two thresholds are reported, not one: "first motion at all" can be a
-      lurch caught mid-release; "first SMOOTH PROPORTIONAL motion" requires
-      motion to appear promptly (not after a stall) and to hold steady
-      rather than spike, which is what actually distinguishes a real
-      deadband breakaway from a windup release landing in the sample window.
-    * --on-blocks is a hard, unbypassable interlock on ever publishing a
-      real command: this sweep exists BECAUSE sub-deadband commands can move
-      the rover unpredictably, so the wheels must be free before any of it
-      is allowed to run for real.
-    * --dry-run exercises 100% of the same decision logic (step sequencing,
+  Expect the answer to land near 0.0145 wire. Observations already do:
+  0.0041 wire (0.28 counts/10 ms) stalls then lurches, 0.012 (0.83) is
+  noise, 0.100 (6.9) is clean and correct. A result far BELOW 0.0145 is a
+  reason to distrust the measurement, not a discovery.
+
+  THIS FLOOR IS NOT FIXABLE FROM THIS FILE, from PID gains, or from a
+  MIN_CMD constant. A floor only stops you ASKING for a speed the loop
+  cannot hold; it does not give the loop resolution it does not have. The
+  real fix is the encoder/wheel constants, i.e. a firmware rebuild. Until
+  then, "slow and controlled" comes from SHORT BOUNDED SEGMENTS WITH STOPS
+  BETWEEN, run at a speed the loop can actually hold (>= ~0.0145 wire,
+  ~0.18 m/s real with margin), never from a low continuous setpoint.
+  See NAV2_BRIEF.md section 3b -- that file wins over this one.
+
+WHY THE FIRST LIVE RUN OF THIS SCRIPT ABORTED (2026-07-31) -- DO NOT REDO IT
+  It aborted itself, on correct motion, and the bug was in this file.
+  Every reading came from /odom_raw's twist.linear.x, which is
+  SIGN-INVERTED relative to its own pose.position (NAV2_BRIEF.md 3a;
+  fpms_teleop.py ODOM_TWIST_SIGN). So the wrong-way detector saw every
+  correct forward step as a reversal and killed the sweep -- while a
+  GENUINE reversal would have been reported as agreeing with the command
+  and passed in silence. A safety guard wired exactly backwards is worse
+  than no guard, because it is trusted.
+
+  The "290 mm BACKWARD lurch at 0.0041" this script was originally built
+  around was the same artefact: a 290 mm FORWARD move read through the
+  inverted sign. There is no evidence of PID windup and none of a
+  stall-then-release. That premise is retracted.
+
+  EVERYTHING OBSERVED HERE IS NOW DIFFERENTIATED POSE -- position and yaw
+  deltas out of /odom_raw's pose, exactly as fpms_teleop.py's lurch guard
+  does it. Pose was right in every trial; twist was wrong in every trial.
+  If you are about to reintroduce a twist read into a guard: don't.
+
+  What survives the retraction, because it costs nothing and is right for
+  a sweep that deliberately commands setpoints the loop cannot hold:
+    * Each step's hold is short (default 1.5s), and every hold is followed
+      by >=1.0s of published zero Twist before the next, larger step. A
+      sub-floor setpoint produces uncontrolled motion by definition, and
+      the answer to uncontrolled motion is to stop commanding it promptly
+      and let the chassis settle before asking for more.
+    * Observed POSE VELOCITY is checked every control tick, not just at the
+      end of a step: motion opposite the commanded sign beyond tolerance
+      aborts the whole sweep immediately, publishing zero. Fed from pose,
+      this now means what it says.
+    * Two thresholds are reported, not one. "First motion at all" can be
+      quantisation noise or an uncontrolled lurch caught mid-release;
+      "first SMOOTH PROPORTIONAL motion" additionally requires motion to
+      appear promptly and to hold steady, which is what distinguishes the
+      loop actually regulating from the loop flailing.
+    * --on-blocks is a hard, unbypassable interlock on publishing anything
+      real: this sweep exists BECAUSE sub-floor setpoints move the rover
+      unpredictably, so the wheels must be free before it runs for real.
+    * --dry-run exercises the same decision logic (step sequencing,
       resume/state-file handling, the motion/smooth classifier, the summary
-      table) against a synthetic model, with no rclpy import, no ROS_DOMAIN_ID
-      requirement, and no possibility of ever touching /cmd_vel. It is the
-      way to review this script.
+      table) against a synthetic model, with no rclpy import, no
+      ROS_DOMAIN_ID requirement, and no possibility of touching /cmd_vel.
+      It is the way to review this script.
     * On every exit path -- normal completion, an abort, an uncaught
       exception, or SIGINT/SIGTERM -- zero Twist is published repeatedly
       before the process ends.
+
+UNITS -- THE COMMAND AND THE OBSERVATION ARE NOT IN THE SAME SCALE
+  Commanded magnitudes are WIRE units (what goes into Twist.linear.x).
+  Observed magnitudes are REAL m/s and rad/s differentiated from pose. The
+  firmware passes linear.x 1:1 to wheel m/s with no gain, yet 0.10 wire
+  measures ~0.61 m/s real (~6x) -- the fitted hardware does not match the
+  firmware's constants. So the noise floors and wrong-way tolerances below
+  are in OBSERVED units, and every threshold this script REPORTS is in
+  COMMANDED wire units. Do not mix them.
 
 RESUMABILITY
   Progress is written to a JSON state file after every completed step
@@ -56,11 +98,11 @@ RESUMABILITY
   rover already sat through; without --resume, an existing file is refused
   rather than silently overwritten.
 
-WHAT IS MEASURED
-  /cmd_vel linear.x and angular.z, swept independently, each in both signs
-  (deadbands are commonly asymmetric on brushed motors, so +/- are measured
-  and reported separately, never assumed equal). /odom_raw twist is the
-  observed signal. /battery gates the whole thing on pack voltage.
+WHAT IS SWEPT
+  /cmd_vel linear.x and angular.z, independently, each in both signs (+/-
+  are measured and reported separately, never assumed equal -- the
+  quantisation is symmetric in theory but nothing here assumes theory).
+  /odom_raw POSE is the observed signal. /battery gates it on pack voltage.
 
 ROS2 Humble. ROS_DOMAIN_ID=20 is mandatory for this rover (see
 fpms-teleop.service / micro-ros-agent.service) and is enforced before any
@@ -91,19 +133,44 @@ ABSOLUTE_MAX_LIN = 0.20
 ABSOLUTE_MAX_ANG = 0.40
 ABS_MAX = {"lin": ABSOLUTE_MAX_LIN, "ang": ABSOLUTE_MAX_ANG}
 
-# Below this, a sampled odom twist is indistinguishable from encoder /
-# estimator noise at rest. Deliberately not exposed on the CLI: a mistyped
-# flag here would silently change what counts as "moving", which is a
-# safety-relevant classification, not a tuning knob.
-NOISE_FLOOR_LIN = 0.004   # m/s
-NOISE_FLOOR_ANG = 0.010   # rad/s
+# The floor this sweep expects to find, derived from firmware constants
+# rather than measured here: one encoder count per PID period is
+# (150.8 mm / 1040 counts) / 10 ms = 0.0145 m/s ON THE WIRE. Printed beside
+# the result so the measurement is read against the prediction instead of
+# in a vacuum. NOT used to decide anything -- a constant that quietly
+# steered the classifier towards its own value would make the sweep
+# pointless.
+QUANT_FLOOR_WIRE = 0.0145   # m/s of commanded linear.x
 
-# A late-window reading this far opposite the commanded sign is treated as
-# the windup/lurch hazard actively happening, not as "no motion" -- it
-# aborts the whole sweep rather than just marking one step as non-smooth.
-# Also not CLI-exposed, for the same reason as the noise floors above.
-WRONG_WAY_TOL_LIN = 0.015   # m/s
-WRONG_WAY_TOL_ANG = 0.030   # rad/s
+# THE ONE PLACE /odom_raw's twist IS ALLOWED IN THIS FILE, and it is a
+# DIAGNOSTIC ONLY -- no guard, classifier or threshold consumes it.
+# twist.linear.x is sign-inverted relative to the pose in the SAME message
+# (NAV2_BRIEF.md 3a). Reading it uncorrected is what aborted the first live
+# sweep on correct forward motion. It is still worth recording, corrected,
+# next to the pose-derived number: if the two ever stop disagreeing by
+# exactly this factor, the firmware changed and every conclusion in this
+# file needs re-checking. One constant, applied at the single read site
+# (DeadbandNode._on_odom), same discipline as fpms_teleop.py.
+ODOM_TWIST_SIGN = -1
+
+# Below this, a sampled velocity is indistinguishable from odometry noise at
+# rest. In OBSERVED units (differentiated pose: real m/s and rad/s), not
+# wire units -- see the UNITS section of the module docstring. Deliberately
+# not exposed on the CLI: a mistyped flag here would silently change what
+# counts as "moving", which is a safety-relevant classification, not a
+# tuning knob.
+NOISE_FLOOR_LIN = 0.004   # m/s, observed
+NOISE_FLOOR_ANG = 0.010   # rad/s, observed
+
+# Pose moving this far opposite the commanded sign is the rover genuinely
+# going the wrong way -- it aborts the whole sweep rather than just marking
+# one step as non-smooth. Also in observed units, and also not CLI-exposed.
+#
+# This test is only trustworthy because it is fed from differentiated pose.
+# Fed from twist.linear.x it was exactly inverted: it fired on every correct
+# step and would have stayed silent through a real reversal.
+WRONG_WAY_TOL_LIN = 0.015   # m/s, observed
+WRONG_WAY_TOL_ANG = 0.030   # rad/s, observed
 
 # How long to wait at sweep start (and at the start of every step) for a
 # first /battery and /odom_raw reading before refusing to command anything.
@@ -117,15 +184,21 @@ CONFIRM_STEPS = 2
 
 # A step's late-window sample-to-sample spread must stay under this fraction
 # of its own mean (or under the noise floor, if the mean is tiny) to count
-# as steady. A stall-then-lurch shows the opposite signature: near-zero for
-# most of the window, then a brief large excursion -- i.e. high variance.
+# as steady. A setpoint under the quantisation floor shows the opposite
+# signature: near-zero for most of the window, then a brief large excursion
+# as the feed-forward duty breaks through -- i.e. high variance. That is the
+# loop failing to regulate, not the wheels breaking free.
 SMOOTH_JITTER_FRAC = 0.6
 
-# Recommended MIN_CMD = measured smooth threshold * this margin. It buys a
-# little headroom for measurement noise and the short (by design) 2-step
-# confirmation window. It is NOT a substitute for the loaded-floor caveat
-# printed in the summary -- a no-load, wheels-off-the-ground measurement is
-# a lower bound, not the number to ship without on-floor verification.
+# Lowest setpoint worth COMMANDING = measured smooth threshold * this margin.
+# It buys headroom for measurement noise and for the short (by design) 2-step
+# confirmation window.
+#
+# It is NOT a deadband, and raising a command to it does not make a slower
+# command safe -- there is no slower command. Below the floor the loop is
+# blind (see the module docstring), so the only correct response is to plan
+# missions that never ask for it. See also the caveat printed in the summary:
+# a no-load, wheels-off measurement is a lower bound.
 MARGIN_FACTOR = 1.15
 
 DEFAULT_STATE_FILE = "deadband_sweep_state.json"
@@ -148,6 +221,25 @@ def log(*a):
 
 def clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
+
+
+def yaw_from_quat(q):
+    """Planar yaw out of a quaternion, inline. Deliberately not
+    tf_transformations: it imports transforms3d, which on this rover dies with
+    `np.maximum_sctype was removed in NumPy 2.0` because a user-local NumPy 2.x
+    shadows the system one. Fixing that would mean touching the NumPy the
+    working camera/YOLO path depends on, to save these three lines. Same
+    approach as fpms_odom_tf.py and fpms_teleop.py."""
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+def wrap_pi(a):
+    """Shortest signed angle. Without this, a yaw difference across the +/-pi
+    seam reads as ~2pi of rotation in one 10 Hz frame -- which the wrong-way
+    check would see as a violent reversal and abort the sweep on."""
+    return math.atan2(math.sin(a), math.cos(a))
 
 
 def jround(v, nd=6):
@@ -243,18 +335,23 @@ def analyze_step(commanded, mean_early, std_early, n_early,
     a dry-run review is exercising the exact same decision logic a real
     sweep uses, not a parallel reimplementation that could quietly drift.
 
+    Every mean/std passed in is DIFFERENTIATED POSE, never twist. The whole
+    classifier is sign-sensitive, and twist's sign on this board is wrong.
+
     motion   -- threshold (a): the late-window mean exceeds the noise floor
                 in the COMMANDED direction. Fires on the first twitch,
-                including a stall-then-release lurch if the release happens
-                to land inside the late sample window.
+                including an uncontrolled sub-floor lurch if it happens to
+                land inside the late sample window.
 
     smooth   -- threshold (b), the one that matters: motion is ALSO present
                 in the early window (i.e. it started promptly, not after a
-                multi-second stall) and the late window is comparatively
-                steady rather than spiky (see SMOOTH_JITTER_FRAC). A lurch
-                is near-zero-then-a-spike -- high variance, and effectively
-                zero in the early window; genuine proportional response at a
-                held command is flat and present from close to the start.
+                stall) and the late window is comparatively steady rather
+                than spiky (see SMOOTH_JITTER_FRAC). Below the firmware's
+                quantisation floor the loop cannot regulate, and what comes
+                out is near-zero-then-a-spike -- high variance, effectively
+                zero early. Once the setpoint is worth at least one encoder
+                count per PID period, the response is flat and present from
+                close to the start. That transition is what this detects.
 
     wrong_way -- the late-window mean has the opposite sign of the command
                 and exceeds `wrong_way_tol`. This is never folded into "no
@@ -281,7 +378,12 @@ def analyze_step(commanded, mean_early, std_early, n_early,
     return motion, smooth, wrong_way
 
 
-def _finish_step(axis, sign, mag, commanded, early, late, cfg, simulated):
+def _finish_step(axis, sign, mag, commanded, early, late, cfg, simulated,
+                 twist_late=None):
+    """Reduce one step's samples to a record. `early`/`late` are pose-derived
+    velocities. `twist_late` is the board's own (sign-corrected) twist over
+    the same window, carried for the record ONLY -- it is never fed to
+    analyze_step, which is the entire point."""
     mean_e = statistics.mean(early) if early else None
     std_e = statistics.pstdev(early) if len(early) > 1 else (0.0 if early else None)
     mean_l = statistics.mean(late) if late else None
@@ -294,11 +396,21 @@ def _finish_step(axis, sign, mag, commanded, early, late, cfg, simulated):
         commanded, mean_e, std_e, len(early), mean_l, std_l, len(late),
         noise_floor, wrong_tol)
 
+    mean_tw = statistics.mean(twist_late) if twist_late else None
+
     return {
         "axis": axis, "sign": sign, "mag": round(mag, 6),
         "commanded": round(commanded, 6),
-        "mean_early": jround(mean_e), "std_early": jround(std_e), "n_early": len(early),
-        "mean_late": jround(mean_l), "std_late": jround(std_l), "n_late": len(late),
+        # Every mean/std below is POSE-DERIVED. The key names say so, because
+        # a bare "mean_late" in a state file is exactly the field someone
+        # later assumes came out of msg.twist.
+        "mean_early_pose": jround(mean_e), "std_early_pose": jround(std_e),
+        "n_early": len(early),
+        "mean_late_pose": jround(mean_l), "std_late_pose": jround(std_l),
+        "n_late": len(late),
+        # Diagnostic only, sign-corrected by ODOM_TWIST_SIGN. Compare it
+        # against mean_late_pose; do not classify on it.
+        "mean_late_twist_corrected": jround(mean_tw),
         "motion": motion, "smooth": smooth, "wrong_way": wrong_way,
         "simulated": simulated, "t": time.time(),
     }
@@ -389,15 +501,25 @@ def sweep_axis(axis_key, axis, sign, cfg, state, store, step_fn, stop_flag):
 
 
 # ================================================================= DRY RUN
-# Synthetic per-axis/direction deadband model, deliberately asymmetric
-# between + and - to exercise the asymmetry-reporting path in the summary.
-# These numbers are NOT a measurement of anything -- they exist only so
+# Synthetic per-axis/direction model of the FIRMWARE QUANTISATION FLOOR, not
+# of a mechanical deadband: below `floor` (wire units) the loop is blind and
+# the output is noise with the occasional uncontrolled excursion; at or above
+# it the response is proportional to the WHOLE command with no offset, at the
+# measured ~6x wire->real gain, because nothing is being overcome -- the
+# controller simply starts working.
+#
+# Made slightly asymmetric between + and - to exercise the asymmetry-reporting
+# path in the summary. These numbers are NOT a measurement: they exist so
 # --dry-run has something plausible to run the real classifier against.
 DRY_RUN_MODEL = {
-    "lin+": {"deadband": 0.014, "gain": 0.8, "noise": 0.0015},
-    "lin-": {"deadband": 0.018, "gain": 0.8, "noise": 0.0015},
-    "ang+": {"deadband": 0.030, "gain": 0.6, "noise": 0.0040},
-    "ang-": {"deadband": 0.024, "gain": 0.6, "noise": 0.0040},
+    # `wobble` is the sub-floor excursion, in observed units. Kept deliberately
+    # UNDER WRONG_WAY_TOL_* so the dry run exercises the "rejected as not
+    # smooth" path rather than the abort path -- a review run that always
+    # aborts teaches nothing about the sweep it is meant to review.
+    "lin+": {"floor": 0.0145, "gain": 6.0, "noise": 0.0015, "wobble": 0.010},
+    "lin-": {"floor": 0.0175, "gain": 6.0, "noise": 0.0015, "wobble": 0.010},
+    "ang+": {"floor": 0.0300, "gain": 2.0, "noise": 0.0040, "wobble": 0.020},
+    "ang-": {"floor": 0.0240, "gain": 2.0, "noise": 0.0040, "wobble": 0.020},
 }
 
 
@@ -407,27 +529,31 @@ def run_step_dry(axis, sign, mag, cfg, model, rng):
         f"{cfg['hold_s']:.1f}s, then publish zero for {cfg['gap_s']:.1f}s "
         "(SIMULATED -- no ROS, no /cmd_vel)")
 
-    deadband, gain, noise = model["deadband"], model["gain"], model["noise"]
+    floor, gain, noise = model["floor"], model["gain"], model["noise"]
     n = max(1, int(round(cfg["sample_window_s"] * cfg["control_hz"])))
 
-    if mag < deadband:
-        # Below the synthetic deadband: mostly silent. Occasionally (as the
-        # real hazard this script exists to avoid) a small stall-then-wobble
-        # that shows up ONLY in the late window -- exactly the pattern
-        # analyze_step's early/late split is built to reject as "smooth".
+    if mag < floor:
+        # Under the floor: the setpoint is worth less than one encoder count
+        # per PID period, so mostly silence. Occasionally the 50% feed-forward
+        # duty breaks through as an uncontrolled excursion in the late window
+        # only -- exactly the pattern analyze_step's early/late split exists
+        # to refuse to call "smooth".
         early = [rng.uniform(-noise, noise) for _ in range(n)]
         if rng.random() < 0.15:
-            wobble = -0.35 * gain * deadband
+            wobble = -model["wobble"]
             late = [sign * wobble + rng.uniform(-noise, noise) for _ in range(n)]
         else:
             late = [rng.uniform(-noise, noise) for _ in range(n)]
     else:
-        # At/above the synthetic deadband: genuine proportional response,
+        # At/above the floor: the loop regulates. Proportional to the whole
+        # command (no subtracted offset -- there is no stiction to overcome),
         # already mostly spun up early and steady by the late window.
-        target = gain * (mag - deadband)
+        target = gain * mag
         early = [sign * target * 0.7 + rng.uniform(-noise, noise) for _ in range(n)]
         late = [sign * target + rng.uniform(-noise, noise) for _ in range(n)]
 
+    # No twist_late: the dry path models pose only, because pose is the only
+    # thing the classifier is allowed to see.
     return _finish_step(axis, sign, mag, commanded, early, late, cfg, simulated=True)
 
 
@@ -496,17 +622,67 @@ def run_live_sweep(cfg, state, store, stop_flag):
             self.pub_cmd = self.create_publisher(Twist, "/cmd_vel", qos)
             self.create_subscription(Odometry, "/odom_raw", self._on_odom, qos)
             self.create_subscription(UInt16, "/battery", self._on_battery, qos)
-            self.odom_vx = None
-            self.odom_wz = None
+            # Observed motion, DIFFERENTIATED FROM POSE. These are the only
+            # numbers any decision in this file is allowed to be made on.
+            self.pose_vx = None       # real m/s along the previous heading
+            self.pose_wz = None       # real rad/s about z
+            self.twist_vx = None      # the board's own claim, sign-corrected
+            self._prev = None         # (x, y, yaw, t) of the previous frame
+            # Bumped once per frame that yielded a velocity. Sampling keys off
+            # this instead of the control tick -- see sample().
+            self.vel_seq = 0
             self.odom_last = None
             self.battery_v = None
 
         def _on_odom(self, msg):
+            """Velocity from POSE DELTAS, the same way fpms_teleop.py feeds its
+            lurch guard.
+
+            The previous version of this method read msg.twist.twist.linear.x,
+            and that single line is what aborted the first live sweep: twist is
+            sign-inverted relative to the pose in its own message, so the
+            wrong-way check fired on every correct step and would have passed a
+            real reversal. Pose was right in every trial ever run on this
+            board. Do not put twist back in front of a guard."""
             try:
+                x = float(msg.pose.pose.position.x)
+                y = float(msg.pose.pose.position.y)
+                yaw = yaw_from_quat(msg.pose.pose.orientation)
+                if not (math.isfinite(x) and math.isfinite(y)
+                        and math.isfinite(yaw)):
+                    return
+                now = time.monotonic()
                 with self.lock:
-                    self.odom_vx = float(msg.twist.twist.linear.x)
-                    self.odom_wz = float(msg.twist.twist.angular.z)
-                    self.odom_last = time.monotonic()
+                    if self._prev is not None:
+                        px, py, pyaw, pt = self._prev
+                        dt = now - pt
+                        # Same absurd-gap rule as fpms_teleop's integrator: a
+                        # stalled link resuming must not manufacture a huge
+                        # apparent velocity, which here would abort the sweep.
+                        if 0.0 < dt < 0.5:
+                            # Signed along the heading the frame STARTED from,
+                            # so a skid-steer yaw does not read as translation.
+                            along = ((x - px) * math.cos(pyaw)
+                                     + (y - py) * math.sin(pyaw))
+                            vx = along / dt
+                            wz = wrap_pi(yaw - pyaw) / dt
+                            # Light smoothing, matching fpms_teleop. One noisy
+                            # frame must not be able to abort a sweep; a real
+                            # wrong-way move lasts many frames and still shows
+                            # through, as does the spiky signature the smooth
+                            # test looks for.
+                            self.pose_vx = (vx if self.pose_vx is None
+                                            else 0.5 * self.pose_vx + 0.5 * vx)
+                            self.pose_wz = (wz if self.pose_wz is None
+                                            else 0.5 * self.pose_wz + 0.5 * wz)
+                            self.vel_seq += 1
+                    self._prev = (x, y, yaw, now)
+                    self.odom_last = now
+                    # Diagnostic only -- recorded, never classified on. See
+                    # ODOM_TWIST_SIGN for why this is the single read site.
+                    tw = float(msg.twist.twist.linear.x)
+                    if math.isfinite(tw):
+                        self.twist_vx = ODOM_TWIST_SIGN * tw
             except Exception as e:
                 log(f"odom callback error {e}")
 
@@ -517,9 +693,17 @@ def run_live_sweep(cfg, state, store, stop_flag):
             except Exception as e:
                 log(f"battery callback error {e}")
 
-        def component(self, axis):
+        def sample(self, axis):
+            """(pose velocity, frame counter, sign-corrected twist).
+
+            The counter is returned so the caller can sample once per NEW odom
+            frame rather than once per control tick: /odom_raw runs at ~10 Hz
+            and the control loop at 20, so tick-rate sampling would enter every
+            reading twice and halve the apparent spread that the smooth test is
+            entirely built on."""
             with self.lock:
-                return self.odom_vx if axis == "lin" else self.odom_wz
+                v = self.pose_vx if axis == "lin" else self.pose_wz
+                return v, self.vel_seq, self.twist_vx
 
         def publish(self, axis, value):
             t = Twist()
@@ -578,7 +762,9 @@ def run_live_sweep(cfg, state, store, stop_flag):
         cmd_sign = 1.0 if commanded >= 0 else -1.0
 
         t0 = time.monotonic()
-        early, late = [], []
+        early, late, twist_late = [], [], []
+        # Only a NEW odom frame is a new sample; see DeadbandNode.sample().
+        _, last_seq, _ = node.sample(axis)
         while True:
             t_rel = time.monotonic() - t0
             if t_rel >= cfg["hold_s"]:
@@ -591,27 +777,34 @@ def run_live_sweep(cfg, state, store, stop_flag):
             rclpy.spin_once(node, timeout_sec=dt)
             check_watchdogs(node)
 
-            val = node.component(axis)
-            if val is not None:
-                # Checked every tick, not just at the end of the hold: this
-                # is the windup-release hazard potentially happening live,
-                # and the right response is to cut to zero now rather than
-                # keep commanding while it finds out how far it can lurch.
+            val, seq, tw = node.sample(axis)
+            if val is not None and seq != last_seq:
+                last_seq = seq
+                # Checked on every frame, not just at the end of the hold: if
+                # the rover is genuinely running away from the command, the
+                # right response is to cut to zero now rather than keep
+                # commanding while it finds out how far it can go.
+                #
+                # `val` is DIFFERENTIATED POSE. This is the check that fired on
+                # correct motion and killed the first live sweep when it was
+                # fed twist.linear.x instead (NAV2_BRIEF.md 3a).
                 if commanded != 0 and (val * cmd_sign) < -wrong_tol:
                     raise AbortSweep(
-                        f"observed {axis}={val:+.4f} opposite to commanded "
+                        f"pose says {axis}={val:+.4f} opposite to commanded "
                         f"{commanded:+.4f} beyond tolerance {wrong_tol:.3f} "
-                        "-- possible windup/lurch in progress")
+                        "-- rover is moving the wrong way")
                 if t_rel <= cfg["sample_window_s"]:
                     early.append(val)
                 if t_rel >= cfg["hold_s"] - cfg["sample_window_s"]:
                     late.append(val)
+                    if tw is not None:
+                        twist_late.append(tw)
 
-        # >=1.0s of published zero here is essential, not a pause between
-        # steps: it is what lets a below-deadband integrator discharge
-        # before the NEXT, larger step is commanded, so windup can never
-        # carry forward and taint a later step's reading. See module
-        # docstring and the --gap-s validation in main().
+        # >=1.0s of published zero here is a settle window, not a pause
+        # between steps: a sub-floor setpoint drives the chassis
+        # uncontrolled, and the next step is LARGER, so the rover is brought
+        # to a stop and left there before it is asked for more. See the
+        # module docstring and the --gap-s validation in main().
         t1 = time.monotonic()
         while time.monotonic() - t1 < cfg["gap_s"]:
             if stop_flag.is_set():
@@ -621,11 +814,12 @@ def run_live_sweep(cfg, state, store, stop_flag):
             check_watchdogs(node)
 
         result = _finish_step(axis, sign, mag, commanded, early, late, cfg,
-                              simulated=False)
+                              simulated=False, twist_late=twist_late)
         if result["wrong_way"]:
             raise AbortSweep(
-                f"post-step check: {axis} mean_late={result['mean_late']} "
-                "opposite to commanded -- aborting sweep")
+                f"post-step check: {axis} pose mean_late="
+                f"{result['mean_late_pose']} opposite to commanded "
+                "-- aborting sweep")
         return result
 
     rclpy.init(args=None)
@@ -666,8 +860,14 @@ def run_live_sweep(cfg, state, store, stop_flag):
 def print_summary(cfg, state):
     print()
     print("=" * 78)
-    print("DEADBAND SWEEP SUMMARY")
+    print("FIRMWARE VELOCITY-FLOOR SWEEP SUMMARY")
     print("=" * 78)
+    print("Lowest /cmd_vel setpoint the firmware's velocity loop can HOLD.")
+    print("This is a QUANTISATION floor (integer encoder counts per 10ms PID")
+    print("period), NOT a mechanical deadband. Nothing below is a claim about")
+    print("stiction, torque or wheel load. All magnitudes are COMMANDED WIRE")
+    print("units; the motion behind them was measured as differentiated pose.")
+    print("-" * 78)
     print(f"{'axis':<6}{'dir':<6}{'first motion':<16}{'first SMOOTH (*)':<20}{'status'}")
     print("-" * 78)
 

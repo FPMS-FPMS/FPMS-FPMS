@@ -156,8 +156,16 @@ LASER_FRAME = "laser_frame"
 #
 # Set PUBLISH_LASER_STATIC_TF=False if a URDF / robot_state_publisher is ever
 # introduced, so this node does not fight it for ownership of the transform.
+#
+# THAT HAS NOW HAPPENED: rover/nav2/fpms_tf.launch.py introduces base_link and
+# owns base_footprint -> base_link -> laser_frame (plus base_link ->
+# imu_frame) as static transforms. If this flag were still True, that launch
+# file and this node would both broadcast a transform ending in laser_frame -
+# one via base_footprint directly, one via base_link - giving laser_frame two
+# competing parents and an actively broken (non-tree) TF graph. See
+# rover/nav2/TF_TREE.md for the expected tree and how to verify it.
 # ============================================================================
-PUBLISH_LASER_STATIC_TF = True
+PUBLISH_LASER_STATIC_TF = False
 LASER_X_OFFSET_M = 0.0       # MEASURE ME
 LASER_Y_OFFSET_M = 0.0       # MEASURE ME
 LASER_Z_OFFSET_M = 0.10      # MEASURE ME
