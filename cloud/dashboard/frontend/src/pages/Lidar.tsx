@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { LidarView } from "../components/LidarView";
+import { ArenaMap } from "../components/ArenaMap";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import { useChannel } from "../lib/ws";
 import { apiPost } from "../lib/api";
 
@@ -23,11 +25,18 @@ export default function Lidar() {
       <Card>
         <CardHeader title="How this stream works" subtitle="Behind the scenes" />
         <p className="text-sm leading-relaxed text-slate-300">
-          Each rover publishes 360-range LiDAR frames at 5 Hz on
+          Each rover publishes 360-range LiDAR frames at 2 Hz on
           {" "}<code className="rounded bg-black/50 px-1 py-0.5 text-xs">fpms/&lt;rover&gt;/telemetry/lidar</code>{" "}
           to the local Mosquitto broker (standing in for AWS IoT Core). This dashboard
           subscribes over WebSocket — no cloud round-trip, no per-frame cost. Data never
           leaves your LAN.
+        </p>
+        <p className="mt-3 text-sm leading-relaxed text-slate-400">
+          The arena map is world-fixed: the 120 cm x 120 cm grid, the zones and the water
+          station stay put, and only the rover moves within them. Returns are segmented
+          into walls, trees and unclassified obstacles, then voted across five frames so
+          the labels hold still. These rovers publish no odometry, so the pose is assumed
+          from a known start corner — the SIMULATED badge says so on the map itself.
         </p>
       </Card>
     </div>
@@ -49,7 +58,7 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
     <Card>
       <CardHeader
         title={thing.toUpperCase()}
-        subtitle="LiDAR grid · 360 ranges · 5 Hz"
+        subtitle="Arena map · world-fixed · 360 ranges · 2 Hz"
         right={
           <div className="flex items-center gap-2">
             <StatusPill
@@ -60,24 +69,40 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
           </div>
         }
       />
-      <div className="flex items-center justify-center">
-        <LidarView envelope={state.data} accent={accent} />
-      </div>
 
-      <div className="mt-4 grid grid-cols-3 gap-3 text-center">
-        <Metric label="Nearest" value={fmt(state.data?.data?.min_mm, 0, " mm")} />
-        <Metric
-          label="Position"
-          value={
-            // Rovers without odometry publish no x/y. Showing "—" is correct;
-            // calling .toFixed() on the missing field used to throw and, with no
-            // error boundary, blanked the whole dashboard.
-            isNum(pose.data?.data?.x_m) && isNum(pose.data?.data?.y_m)
-              ? `${pose.data.data.x_m.toFixed(2)}, ${pose.data.data.y_m.toFixed(2)}`
-              : "—"
-          }
-        />
-        <Metric label="Battery" value={fmt(pose.data?.data?.battery_pct, 1, "%")} />
+      {/* The map is the view that can lie to you: it depends on the arena
+          constants, the pose and the body->world transform all being right.
+          Wrapped so a fault in any of that reports itself instead of taking
+          the page down. */}
+      <ErrorBoundary label={`${thing} arena map`}>
+        <ArenaMap thing={thing} accent={accent} poseEnvelope={pose.data} />
+      </ErrorBoundary>
+
+      {/* Raw polar inset. When the arena map looks wrong this answers the only
+          question that matters first — is it the data or the transform? If the
+          polar view is also empty or ragged, the sensor is the problem; if it
+          looks clean, the fault is in the world projection. */}
+      <div className="mt-4 flex items-start gap-4">
+        <div className="shrink-0">
+          <div className="lbl mb-1 text-[10px]">Sensor / polar</div>
+          <LidarView envelope={state.data} accent={accent} size={140} />
+        </div>
+        <div className="grid flex-1 grid-cols-2 gap-3 text-center">
+          <Metric label="Nearest" value={fmt(state.data?.data?.min_mm, 0, " mm")} />
+          <Metric label="Points" value={fmt(state.data?.data?.points, 0)} />
+          <Metric
+            label="Position"
+            value={
+              // Rovers without odometry publish no x/y. Showing "—" is correct;
+              // calling .toFixed() on the missing field used to throw and, with no
+              // error boundary, blanked the whole dashboard.
+              isNum(pose.data?.data?.x_m) && isNum(pose.data?.data?.y_m)
+                ? `${pose.data.data.x_m.toFixed(2)}, ${pose.data.data.y_m.toFixed(2)}`
+                : "—"
+            }
+          />
+          <Metric label="Battery" value={fmt(pose.data?.data?.battery_pct, 1, "%")} />
+        </div>
       </div>
 
       <div className="mt-4 flex justify-end gap-2">

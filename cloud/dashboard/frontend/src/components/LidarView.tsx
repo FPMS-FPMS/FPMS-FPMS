@@ -20,6 +20,11 @@ export function LidarView({
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
 
+  // Sizing is a separate effect from drawing. Setting canvas.width resets the
+  // backing store and the transform, so doing it per frame both throws away
+  // the previous buffer and stacks another ctx.scale(dpr) on the last one.
+  // This effect only runs when `size` actually changes; setTransform (rather
+  // than scale) makes it idempotent.
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
@@ -28,8 +33,12 @@ export function LidarView({
     canvas.height = size * dpr;
     canvas.style.width = `${size}px`;
     canvas.style.height = `${size}px`;
-    const ctx = canvas.getContext("2d")!;
-    ctx.scale(dpr, dpr);
+    canvas.getContext("2d")?.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }, [size]);
+
+  useEffect(() => {
+    const ctx = ref.current?.getContext("2d");
+    if (!ctx) return;
     draw(ctx, size, envelope, accent);
   }, [envelope, size, accent]);
 
@@ -99,6 +108,7 @@ function draw(
   ctx.fillStyle = accent;
   for (let i = 0; i < ranges.length; i++) {
     const r = ranges[i];
+    if (!(r > 0)) continue; // 0.0 = no return, not a hit at zero range
     const norm = Math.min(1, r / maxRange);
     const px = cx + Math.cos(((i - 90) * Math.PI) / 180) * norm * rmax;
     const py = cy + Math.sin(((i - 90) * Math.PI) / 180) * norm * rmax;
@@ -107,17 +117,25 @@ function draw(
   }
   ctx.globalAlpha = 1;
 
-  // filled polygon (ghost)
+  // Ghost outline. Empty bins are 0.0, and connecting through them dragged the
+  // polygon into the centre once per gap — the "starburst" that made every
+  // scan look like a sensor fault. Break the path at each gap instead of
+  // closing one continuous loop.
   ctx.beginPath();
+  let penDown = false;
   for (let i = 0; i < ranges.length; i++) {
     const r = ranges[i];
+    if (!(r > 0)) {
+      penDown = false;
+      continue;
+    }
     const norm = Math.min(1, r / maxRange);
     const px = cx + Math.cos(((i - 90) * Math.PI) / 180) * norm * rmax;
     const py = cy + Math.sin(((i - 90) * Math.PI) / 180) * norm * rmax;
-    if (i === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
+    if (penDown) ctx.lineTo(px, py);
+    else ctx.moveTo(px, py);
+    penDown = true;
   }
-  ctx.closePath();
   ctx.strokeStyle = "rgba(249,115,22,0.35)";
   ctx.lineWidth = 1;
   ctx.stroke();

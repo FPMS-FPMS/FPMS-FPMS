@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import Intro from "./pages/Intro";
+import Control from "./pages/Control";
 import Devices from "./pages/Devices";
 import Aws from "./pages/Aws";
 import Lidar from "./pages/Lidar";
@@ -67,6 +68,10 @@ export default function App() {
     <Layout controlsDisabled={locked}>
       <Routes>
         <Route path="/" element={<Intro />} />
+        <Route
+          path="/control"
+          element={locked ? <NotAvailableRemotely what="Control" /> : <Control />}
+        />
         <Route
           path="/devices"
           element={locked ? <NotAvailableRemotely what="Devices" /> : <Devices />}
