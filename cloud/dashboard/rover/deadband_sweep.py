@@ -124,7 +124,7 @@ import time
 # ===================================================================== CONFIG
 # Absolute ceilings this script will NEVER exceed on /cmd_vel, regardless of
 # what --cap-lin/--cap-ang are given. This sweep only ever needs to probe a
-# small neighbourhood around a deadband well under 1 m/s (the firmware's own
+# small neighbourhood around a floor well under 1 m/s (the firmware's own
 # clamp), so these are generous relative to the default caps (0.10 / 0.20)
 # but still nowhere near fast. Applied as the LAST step before every publish,
 # same pattern as fpms_teleop's hard clamp immediately before building a
@@ -497,7 +497,7 @@ def sweep_axis(axis_key, axis, sign, cfg, state, store, step_fn, stop_flag):
     store.save()
     if ax_state["first_smooth"] is None:
         log(f"{axis_key}: reached cap {cap:.4f} without confirming smooth "
-            "motion; the deadband may exceed the sweep cap")
+            "motion; the holdable floor may lie above the sweep cap")
 
 
 # ================================================================= DRY RUN
@@ -888,8 +888,10 @@ def print_summary(cfg, state):
             print(f"{axis:<6}{sign_label:<6}{fm_s:<16}{fs_s:<20}{status}")
             recs[axis_key] = fs
     print("-" * 78)
-    print("(*) first SMOOTH PROPORTIONAL motion -- the number a MIN_CMD "
-          "floor should be based on.")
+    print("(*) first SMOOTH PROPORTIONAL motion -- the lowest setpoint the")
+    print("    velocity loop actually regulated. 'first motion' above it is")
+    print("    the loop failing to regulate: quantisation noise, or the 50%")
+    print("    feed-forward duty breaking through. Motion is not control.")
 
     def recommend(axis):
         p, m = recs.get(f"{axis}+"), recs.get(f"{axis}-")
@@ -898,9 +900,13 @@ def print_summary(cfg, state):
         return rec, p, m
 
     print()
-    print("RECOMMENDATION")
-    for axis, label, cap_key in (("lin", "MIN_CMD_LIN", "cap_lin"),
-                                 ("ang", "MIN_CMD_ANG", "cap_ang")):
+    print("LOWEST SETPOINT WORTH COMMANDING (wire units)")
+    print("  NOT a deadband, and NOT a floor to snap commands up to. Below")
+    print("  this the loop is blind, so the answer is to never ask for it:")
+    print("  plan motion as short bounded segments with stops between, run")
+    print("  at a speed the loop can hold. See NAV2_BRIEF.md section 3b.")
+    for axis, label, cap_key in (("lin", "HOLDABLE_LIN", "cap_lin"),
+                                 ("ang", "HOLDABLE_ANG", "cap_ang")):
         rec, p, m = recommend(axis)
         if rec is None:
             print(f"  {label} = UNKNOWN -- neither direction confirmed "
@@ -910,22 +916,44 @@ def print_summary(cfg, state):
         if p is not None and m is not None:
             detail = f"(= max({p:.4f}, {m:.4f}) x {MARGIN_FACTOR:.2f} margin)"
             rel = abs(abs(p) - abs(m)) / max(abs(p), abs(m)) if max(abs(p), abs(m)) else 0.0
-            asym = (f"\n  NOTE: {axis}+ and {axis}- differ by {rel*100:.0f}% -- "
-                    "asymmetric deadband, as is common on brushed motors. "
-                    "Consider a per-direction floor instead of one "
-                    f"{label}.") if rel > 0.20 else ""
+            asym = (f"\n  NOTE: {axis}+ and {axis}- differ by {rel*100:.0f}%. "
+                    "Quantisation alone is symmetric, so a gap this large is "
+                    "either a measurement artefact or something real that is "
+                    "NOT the quantisation floor -- investigate before "
+                    "quoting either number.") if rel > 0.20 else ""
         else:
             have = p if p is not None else m
             detail = f"(only one direction confirmed: {have:.4f}; x {MARGIN_FACTOR:.2f} margin)"
             asym = ""
         print(f"  {label} = {rec:.4f}   {detail}{asym}")
 
+    # The prediction, printed next to the result. A measured linear floor far
+    # below one encoder count per PID period means the classifier called
+    # quantisation noise "motion", not that the firmware beat its own maths.
+    rec_lin, _, _ = recommend("lin")
+    print()
+    print(f"  Predicted from firmware constants: {QUANT_FLOOR_WIRE:.4f} wire "
+          "(1 encoder count / 10ms PID period).")
+    if rec_lin is not None:
+        ratio = rec_lin / QUANT_FLOOR_WIRE
+        print(f"  Measured linear result is {ratio:.2f}x that.", end=" ")
+        print("Far below 1.0 means the measurement is suspect, not the maths."
+              if ratio < 0.7 else
+              "Consistent with the quantisation explanation."
+              if ratio < 2.0 else
+              "Well above it -- something else is also limiting; do not "
+              "attribute all of it to quantisation.")
+
     print()
     print("CAVEAT: this is a NO-LOAD measurement (wheels off the ground,")
-    print("--on-blocks). Rolling friction and ground contact under real")
-    print("load only ever RAISE the effective deadband. Treat every number")
-    print("above as a LOWER BOUND -- verify MIN_CMD on the floor before")
-    print("trusting it, and when in doubt round up.")
+    print("--on-blocks). Load does not change the quantisation floor -- the")
+    print("counts-per-period maths is the same -- but it can add a real")
+    print("stiction requirement ON TOP. Treat every number above as a LOWER")
+    print("BOUND, verify on the floor, and round up when in doubt.")
+    print()
+    print("NOT FIXABLE BY TUNING. No PID gain and no MIN_CMD constant buys")
+    print("the loop resolution it does not have; the fix is the firmware's")
+    print("encoder/wheel constants, i.e. a rebuild.")
 
     if state.get("aborted"):
         print()
@@ -941,9 +969,12 @@ STOP_FLAG = threading.Event()
 def build_argparser():
     p = argparse.ArgumentParser(
         prog="deadband_sweep.py",
-        description="Measure the FPMS rover's motor deadband so a MIN_CMD "
-                    "floor can be set. See the module docstring for the "
-                    "safety model before running this for real.",
+        description="Measure the lowest /cmd_vel setpoint this rover's "
+                    "firmware velocity loop can actually HOLD. That floor is "
+                    "quantisation (integer encoder counts per PID period), "
+                    "not a mechanical deadband -- the file name predates the "
+                    "finding. See the module docstring before running it for "
+                    "real.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Review first (no ROS, nothing moves, no --on-blocks needed):\n"
@@ -1007,11 +1038,12 @@ def main():
     # ---- validation up front, before anything touches ROS or hardware ----
     if args.gap_s < 1.0:
         sys.exit(
-            "refuse: --gap-s must be >= 1.0s. This is the window the "
-            "firmware needs to discharge a wound-up integrator before the "
-            "next, larger step is commanded (see module docstring); less "
-            "than 1.0s risks carrying windup forward into the next step's "
-            "measurement.")
+            "refuse: --gap-s must be >= 1.0s. A setpoint under the firmware's "
+            "velocity floor drives the chassis uncontrolled, and the next "
+            "step is always LARGER; this is the window in which the rover is "
+            "commanded to zero and allowed to settle before being asked for "
+            "more (see module docstring). Less than 1.0s risks carrying "
+            "motion forward into the next step's measurement.")
     if min(args.step_lin, args.cap_lin, args.step_ang, args.cap_ang) <= 0:
         sys.exit("refuse: step/cap values must be positive")
     if args.cap_lin > ABSOLUTE_MAX_LIN:
@@ -1031,11 +1063,14 @@ def main():
     if not args.dry_run and not args.on_blocks:
         sys.exit(
             "refuse to run: --on-blocks was not given.\n"
-            "This sweep commands real motor motion, including magnitudes "
-            "below the motor deadband where the firmware is known to wind "
-            "up an integrator and release it as a lurch in an "
-            "unpredictable direction (measured 2026-07-31: 0.0041 "
-            "commanded -> 290mm BACKWARD after ~3s of stillness).\n"
+            "This sweep commands real motor motion, and most of its steps "
+            "sit BELOW the setpoint the firmware's velocity loop can hold "
+            "(~0.0145 on the wire = one encoder count per 10ms PID period). "
+            "Down there the loop has no feedback to regulate against and the "
+            "50% feed-forward duty is all that reaches the motors, so the "
+            "rover stalls and then moves in a way nothing is controlling. "
+            "Measured: 0.0041 commanded produced ~3s of stillness and then a "
+            "290mm move.\n"
             "--on-blocks is the operator's attestation that the wheels are "
             "elevated and clear of any surface, person, or obstruction "
             "before that can happen.\n"

@@ -1,0 +1,44 @@
+[Unit]
+Description=FPMS LiDAR -> ROS 2 (MQTT telemetry/lidar -> sensor_msgs/LaserScan on /scan_lidar)
+# Deliberately NO Requires=/BindsTo=/PartOf=/After= on micro-ros-agent or
+# fpms-rover-agent.
+#
+# micro-ros-agent is untouchable: its serial link costs 90-225s to
+# re-establish, so a dependency edge here would let a trivial restart of this
+# bridge become a multi-minute outage of /odom_raw, /imu and /cmd_vel. This node
+# does not read a single topic from that board, so there is nothing to wait for.
+#
+# fpms-rover-agent is the actual source of the data, which is exactly the
+# dependency worth NOT declaring. An After= would only order the two at boot and
+# buy nothing (MQTT has no start-up ordering requirement - paho retries until
+# the feed appears), while a Requires= would let a restart of this bridge take
+# down the camera, YOLO and the dashboard LiDAR view with it. If the agent is
+# down, scans simply stop arriving and this node's watchdog logs it within a
+# second - a visible, self-correcting failure that needs no help from systemd.
+#
+# network-online is the only real wait: the MQTT broker is off-board.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+# bash -lc so /opt/ros/humble/setup.bash can be sourced; exec so SIGTERM lands
+# on python rather than on the shell wrapping it.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_lidar_ros.py'
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

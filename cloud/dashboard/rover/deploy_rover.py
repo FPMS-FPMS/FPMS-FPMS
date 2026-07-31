@@ -111,6 +111,11 @@ DEPLOY_FILES: tuple[DeployFile, ...] = (
     # (fpms-odom-tf.service) still has to be placed and enabled by hand the
     # first time; after that this entry keeps the code current.
     DeployFile("fpms_odom_tf.py", "/home/ubuntu/fpms_odom_tf.py", "fpms-odom-tf", False),
+    # LiDAR -> ROS for Nav2: re-publishes fpms-rover-agent's MQTT scan as
+    # sensor_msgs/LaserScan on /scan_lidar. Installed and enabled on the rover.
+    # Restarting it is cheap and cannot disturb the agent that feeds it — it
+    # only ever subscribes to MQTT.
+    DeployFile("fpms_lidar_ros.py", "/home/ubuntu/fpms_lidar_ros.py", "fpms-lidar-ros", False),
 )
 
 # Services that exist on this rover but that this script must NEVER restart,

@@ -76,6 +76,64 @@ const REBOOT_SLACK_S = 2;
 const ACK_TIMEOUT_MS = 3000;
 const LOG_LIMIT = 40;
 
+/**
+ * Mission telemetry older than this stops being the rover's state and starts
+ * being history. Shorter than TELEMETRY_STALE_MS on purpose: a mission is a
+ * machine driving itself across a room, and "the progress bar is six seconds
+ * out of date" is a materially different situation from a health panel being
+ * six seconds out of date.
+ */
+const MISSION_STALE_MS = 6000;
+
+/**
+ * Which executor drives a mission.
+ *
+ * deadreckon is the default because it is the only one that has ever worked:
+ * turn-then-drive segments with dead-reckoned localisation, measured at 0.6%
+ * distance error and ±1–4° on turns. nav2 is offered but not defaulted — the
+ * navigation stack needs a live scan topic in ROS, a complete TF tree and a
+ * map, and on this rover the board's /scan is dead and the real LiDAR
+ * publishes to MQTT only. Selecting it before that chain is up sends a
+ * mission to a planner that cannot localise.
+ */
+const MISSION_BACKENDS = [
+  {
+    id: "deadreckon",
+    label: "dead reckoning",
+    note: "proven — 0.6% distance error, ±1–4° turns",
+    warn: null as string | null,
+  },
+  {
+    id: "nav2",
+    label: "Nav2",
+    note: "requires the navigation stack to be up",
+    warn:
+      "Nav2 needs a live LaserScan in ROS, a complete TF tree and a map before it can localise. Those are not up on this rover yet — the board's /scan publishes all zeros and the working LiDAR goes to MQTT, not ROS. A mission sent on this backend will not plan.",
+  },
+] as const;
+
+type MissionBackend = (typeof MISSION_BACKENDS)[number]["id"];
+
+const DEFAULT_MISSION_BACKEND: MissionBackend = "deadreckon";
+
+/** The four routes offered. Kept as data so the buttons and the wiring agree. */
+const MISSIONS: { name: string; label: string; primary?: boolean }[] = [
+  { name: "home", label: "RETURN HOME", primary: true },
+  { name: "m1", label: "MISSION 1" },
+  { name: "m2", label: "MISSION 2" },
+  { name: "water", label: "WATER REFILL" },
+];
+
+/**
+ * Phases that mean "not driving". A phase outside this set — including one we
+ * have never seen — counts as running, because the failure that matters is
+ * showing "idle" while the rover is moving, not the reverse.
+ */
+const MISSION_IDLE_PHASES = new Set([
+  "idle", "ready", "none", "done", "complete", "completed", "finished",
+  "aborted", "cancelled", "canceled", "failed", "error", "stopped",
+]);
+
 type Action = "stop" | "jog" | "nudge" | "turn" | "mission" | "set_coordinate";
 
 type LogKind = "sent" | "ack" | "nack" | "stale" | "nohw" | "timeout" | "error" | "event";
@@ -113,6 +171,14 @@ export default function Drive() {
   const ev = useChannel<any>("events");
   const drive = useChannel<any>(thing ? `drive:${thing}` : null);
   const tele = readTelemetry(drive.data);
+
+  // Mission progress, published by the mission executor on
+  // fpms/<thing>/telemetry/mission. The executor may not be running at all,
+  // so every consumer below treats "no data" as a first-class state rather
+  // than as zeroes.
+  const missionCh = useChannel<any>(thing ? `mission:${thing}` : null);
+  const mission = readMission(readTelemetry(missionCh.data));
+  const [backend, setBackend] = useState<MissionBackend>(DEFAULT_MISSION_BACKEND);
 
   // Staleness is a function of wall time, not of arriving data — without a tick
   // a feed that simply stops would keep rendering its last value as current
@@ -250,12 +316,29 @@ export default function Drive() {
   };
 
   /**
+   * Abort whatever mission is running on `targets`, without touching the
+   * motion lockout — an abort has to work precisely when the link check has
+   * decided things are wrong, so it goes through `fire` and never `move`.
+   */
+  const abortMission = (targets: string[]) =>
+    fire("mission", targets, { name: "abort" });
+
+  /**
    * Fleet emergency stop. Ignores the rover selector on purpose: an e-stop that
    * only halts the rover you happen to have selected is a trap. Never disabled
    * and never confirm-gated — a dialog on an e-stop costs a click during an
    * emergency, and an accidental stop is the safe outcome.
+   *
+   * The stop goes first because it is the command that has always existed and
+   * halts the motors. The mission abort goes with it because a stop alone is
+   * not enough against an executor: a mission driving segments republishes
+   * cmd_vel continuously, so a single halt would be overwritten by the next
+   * tick and the rover would carry on as if nothing had been pressed.
    */
-  const stopAll = () => fire("stop", bays);
+  const stopAll = () => {
+    fire("stop", bays);
+    abortMission(bays);
+  };
   const stopRef = useRef(stopAll);
   stopRef.current = stopAll;
   useEffect(() => {
@@ -467,6 +550,28 @@ export default function Drive() {
           <DeadbandCard tele={tele} />
         </ErrorBoundary>
 
+        {/* What the rover is doing to itself, as opposed to what the stick is
+            doing to it. Sits above the mission buttons so the answer to "did
+            that go anywhere?" is on screen before the next click. */}
+        <ErrorBoundary label="Drive mission">
+          <MissionCard
+            thing={thing}
+            mission={mission}
+            channel={{
+              connected: missionCh.connected,
+              lastAt: missionCh.lastAt,
+              messages: missionCh.messages,
+            }}
+            ageMs={missionCh.lastAt === null ? null : now - missionCh.lastAt}
+            fallbackPose={{
+              x_mm: num(tele?.x_mm),
+              y_mm: num(tele?.y_mm),
+              heading_deg: num(tele?.heading_deg),
+            }}
+            onAbort={thing ? () => abortMission([thing]) : undefined}
+          />
+        </ErrorBoundary>
+
         <div className="grid gap-5 lg:grid-cols-2">
           <Card>
             <CardHeader
@@ -577,39 +682,76 @@ export default function Drive() {
           </Card>
 
           <Card>
-            <CardHeader title="Missions" subtitle="Hands the route to the rover" />
+            <CardHeader
+              title="Missions"
+              subtitle="Hands the route to the rover"
+              right={
+                <span className="chip font-mono" title="Backend the next mission will be sent with">
+                  via {backend}
+                </span>
+              }
+            />
+
+            {/* The selector sits above the buttons it changes. A backend
+                picked in another card is a setting nobody reads before
+                clicking. */}
+            <div className="mb-4">
+              <div className="lbl mb-2">Driven by</div>
+              <div className="flex flex-wrap gap-2">
+                {MISSION_BACKENDS.map((b) => (
+                  <button
+                    key={b.id}
+                    onClick={() => setBackend(b.id)}
+                    className={`chip ${
+                      backend === b.id
+                        ? "border-ember-500/40 bg-ember-500/10 text-ember-200"
+                        : ""
+                    }`}
+                    title={b.warn ?? b.note}
+                  >
+                    <span className="font-mono">{b.id}</span>
+                    <span className="ml-1.5 text-[10px] text-slate-500">· {b.note}</span>
+                  </button>
+                ))}
+              </div>
+              {MISSION_BACKENDS.map((b) =>
+                b.id === backend && b.warn ? (
+                  <div
+                    key={b.id}
+                    className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90"
+                  >
+                    <b>{b.label} is not ready on this rover.</b> {b.warn} Switch back
+                    to <span className="font-mono">deadreckon</span> unless you are
+                    deliberately testing the stack.
+                  </div>
+                ) : null,
+              )}
+            </div>
+
             <div className="flex flex-wrap gap-2">
-              <ConfirmButton
-                className="btn-primary"
-                label="RETURN HOME"
-                onFire={() => move("mission", { name: "home" })}
-                disabled={motionDisabled}
-                hint={motionDisabled ? disabledHint : undefined}
-              />
-              <ConfirmButton
-                label="MISSION 1"
-                onFire={() => move("mission", { name: "m1" })}
-                disabled={motionDisabled}
-                hint={motionDisabled ? disabledHint : undefined}
-              />
-              <ConfirmButton
-                label="MISSION 2"
-                onFire={() => move("mission", { name: "m2" })}
-                disabled={motionDisabled}
-                hint={motionDisabled ? disabledHint : undefined}
-              />
-              <ConfirmButton
-                label="WATER REFILL"
-                onFire={() => move("mission", { name: "water" })}
-                disabled={motionDisabled}
-                hint={motionDisabled ? disabledHint : undefined}
-              />
+              {MISSIONS.map((m) => (
+                <ConfirmButton
+                  key={m.name}
+                  className={m.primary ? "btn-primary" : "btn"}
+                  label={m.label}
+                  onFire={() => move("mission", { name: m.name, backend })}
+                  disabled={motionDisabled}
+                  hint={
+                    motionDisabled
+                      ? disabledHint
+                      : `Run ${m.name} using the ${backend} backend`
+                  }
+                />
+              ))}
             </div>
             <p className="mt-3 text-xs text-slate-500">
               All four are confirm-gated: each one drives the rover somewhere on
               its own, and from here a rover on blocks and a rover on the floor
-              look identical. Take the stick or hit STOP ALL to cut a mission
-              short.
+              look identical. Each is sent as{" "}
+              <span className="font-mono">{`{name, backend}`}</span> — progress
+              comes back in the Mission card above. Take the stick or hit STOP ALL
+              to cut a mission short; STOP ALL aborts the mission as well as
+              halting the motors.
             </p>
           </Card>
 

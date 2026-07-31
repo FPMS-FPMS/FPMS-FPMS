@@ -1,0 +1,55 @@
+[Unit]
+Description=FPMS mission executor (MQTT mission -> zone, dock, retrace home)
+# Deliberately NO Requires=/BindsTo=/PartOf=/After= on micro-ros-agent,
+# fpms-rover-agent or fpms-teleop. The micro-ROS serial link costs 90-225s to
+# re-establish, so a dependency edge here would let a trivial mission tweak take
+# every topic on the robot down with it. The reverse coupling is avoided too: if
+# micro-ROS is down there is simply no odometry, and this node refuses to start
+# a mission and aborts a running one within ROS_DEAD_S. A refusal that names the
+# missing link is a cleaner failure than systemd shuffling units around.
+#
+# network-online is the only thing worth waiting for (DDS discovery + broker).
+After=network-online.target
+Wants=network-online.target
+
+# ---- BEFORE ENABLING THIS UNIT ---------------------------------------------
+# 1. fpms_teleop.py must no longer answer `mission`. Delete the "mission" entry
+#    from its TELEOP_ACTIONS map and its _cmd_mission stub, or both processes
+#    answer the same verb and the dashboard shows whichever reply wins the race
+#    — including "no navigation implemented" for a mission that is driving.
+#    rover/test_commands.py has a cross-file check for exactly this.
+# 2. fpms-teleop's idle control tick publishes a ZERO Twist every 0.5s. That is
+#    correct while teleop owns the wire and fatal while this node does:
+#    interleaving 2 Hz zeros into a 20 Hz setpoint is the stall-then-lurch the
+#    firmware's encoder quantisation produces. Suppress that heartbeat while
+#    fpms/<thing>/telemetry/mission is fresh, or stop fpms-teleop for the run.
+#    Until then this node refuses every mission with a nack naming the other
+#    writer, which is the guard doing its job, not a bug.
+# ----------------------------------------------------------------------------
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+# MANDATORY. The board publishes on domain 20 and nowhere else; on any other
+# domain this node sees no topics, and every mission refuses with "link down".
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_missions.py'
+# SIGTERM lands on the python process, which aborts any running mission, then
+# publishes zero Twist x10 before exiting. The generous stop timeout exists so
+# that shutdown is never cut short by systemd killing us mid-stop — a service
+# killed between "cut the drive" and "command zero" leaves a rover still moving.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

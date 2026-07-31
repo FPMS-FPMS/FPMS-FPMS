@@ -1,0 +1,89 @@
+# =============================================================================
+# arena_map.yaml - the 1200 x 1200 mm FPMS arena as a Nav2 occupancy grid.
+#
+# -----------------------------------------------------------------------------
+# HOW TO GENERATE arena_map.pgm  (the .pgm is NOT committed - it is derived)
+# -----------------------------------------------------------------------------
+#     cd cloud/dashboard/rover/nav2
+#     python3 make_arena_map.py --out /tmp/arena_map
+#     diff /tmp/arena_map.yaml arena_map.yaml   # numbers only; expect comments
+#     cp /tmp/arena_map.pgm ./arena_map.pgm     # to differ, values must not
+#
+# make_arena_map.py is in this directory. Read its docstring for the pixel
+# arithmetic, the row-flip, and the argument for drawing the arena rather than
+# SLAM-scanning it (short version: the arena's dimensions are already known
+# exactly, and SLAM's pose estimate would come from the same drifting gyro this
+# map exists to correct).
+#
+# WHY GENERATE TO /tmp AND COPY THE .pgm BACK, rather than `--out arena_map`:
+# the script emits a .pgm, a .yaml and a _zones.json from one stem. Its .yaml is
+# numerically identical to this file but carries none of the reasoning below,
+# so running it in place would silently replace this documentation with a
+# six-line machine dump. Generating elsewhere and copying only the raster keeps
+# the derivation and lets the diff prove the two still agree. If that diff ever
+# shows a changed VALUE, this file is stale - take the script's number, because
+# the script is what the .pgm was actually rasterised from.
+#
+# The script also emits arena_map_zones.json, the zone centres and start pose
+# derived from the same constants as frontend/src/lib/arena.ts. Prefer reading
+# waypoints from that sidecar over retyping them; see README.md.
+#
+# -----------------------------------------------------------------------------
+# THE FRAME - map == arena world, exactly, with no conversion anywhere
+# -----------------------------------------------------------------------------
+# frontend/src/lib/arena.ts defines the arena world frame as: origin at the
+# BOTTOM-LEFT corner, +x right, +y UP, millimetres. Nav2's map frame is also
+# right-handed with +y up and +z out of the floor, and metres.
+#
+# So this map is laid out so that map metres ARE arena millimetres / 1000, with
+# the SAME origin corner. Zone A's centre at arena (228, 972) mm is Nav2
+# (0.228, 0.972) m and nothing else has to happen. That is a deliberate choice:
+# every coordinate bug this project could have had in the dashboard <-> Nav2
+# handoff is removed by making the two frames identical rather than related.
+#
+# The frontend's Y FLIP (worldToCanvasY) is a CANVAS concern only - canvas +y
+# points down. It has nothing to do with this file and must not be applied to
+# any coordinate sent to Nav2.
+#
+# -----------------------------------------------------------------------------
+# EXTENT
+# -----------------------------------------------------------------------------
+#   image      140 x 140 px at 0.01 m/px = 1.40 x 1.40 m
+#   origin     (-0.10, -0.10) - the world coordinate of the image's BOTTOM-LEFT
+#              corner, so the image covers x,y in [-0.10, 1.30]
+#   arena      the free interior is exactly [0.0, 1.2] x [0.0, 1.2]
+#   walls      the 0.10 m border outside that is occupied
+#
+# The border is not decoration. If the image stopped at the arena edge, Nav2
+# would treat everything beyond it as outside the costmap, the inflation layer
+# would have no obstacle cells to inflate from at the boundary, and the planner
+# would cheerfully route the robot centre to x = 0.005 - i.e. into the wall. The
+# wall has to be IN the picture for the costmap to know about it.
+# =============================================================================
+
+image: arena_map.pgm
+
+# 0.01 m/px. MUST MATCH global_costmap.resolution in nav2_params.yaml - a
+# mismatch makes the static layer resample and smears the wall band, which in a
+# 1.2 m arena is a measurable fraction of the usable floor.
+#
+# 0.01 rather than the usual 0.05: at 0.05 the whole arena is 24 x 24 cells, the
+# robot radius is 3 cells, and the 0.05 m inflation band rounds to a single
+# cell. There is no room for that much quantisation in a box this size.
+resolution: 0.01
+
+# [x, y, yaw] of the image's bottom-left corner in the map frame. yaw 0 - the
+# arena axes and the map axes are the same axes.
+origin: [-0.10, -0.10, 0.0]
+
+# trinary: pixels above occupied_thresh are lethal, below free_thresh are free,
+# in between are unknown. make_arena_map.py emits only 0 and 254, so nothing is
+# unknown - which is what planner_server's allow_unknown: false expects.
+mode: trinary
+
+# 0 = the usual convention (dark pixels are occupied). If the map ever comes out
+# with the walls free and the floor lethal, this is the flag that is wrong.
+negate: 0
+
+occupied_thresh: 0.65
+free_thresh: 0.196
