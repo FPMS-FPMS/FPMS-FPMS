@@ -72,11 +72,29 @@ const FORWARD_INK = "rgba(226,232,240,0.72)";
 const MONO = '10px "JetBrains Mono", ui-monospace, monospace';
 const MONO_SM = '9px "JetBrains Mono", ui-monospace, monospace';
 
+/** One waypoint of a planned route, in world millimetres. */
+export type RoutePoint = {
+  x_mm: number;
+  y_mm: number;
+  kind?: string;
+  dock?: boolean;
+};
+
 type Props = {
   thing: string;
   accent?: string;
   /** Raw pose envelope. Heartbeat-rate (0.2 Hz), so passing it as a prop is free. */
   poseEnvelope?: unknown;
+  /**
+   * Nominal planned route from the mission executor's preview, world mm.
+   *
+   * NOMINAL is the operative word and the reason this is drawn as a dashed
+   * line rather than a solid one. Execution re-measures the bearing after every
+   * leg and inserts correction turns, so the driven path deviates from this.
+   * Drawing it as a confident solid track would overstate what the rover
+   * actually promises to do.
+   */
+  route?: readonly RoutePoint[] | null;
 };
 
 /** Snap to a half-pixel so a 1px stroke lands on one device row, not two. */
@@ -84,7 +102,7 @@ function hair(v: number): number {
   return Math.round(v) + 0.5;
 }
 
-function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope }: Props) {
+function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const staticRef = useRef<HTMLCanvasElement>(null);
   const dynRef = useRef<HTMLCanvasElement>(null);
@@ -96,6 +114,11 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope }: Props) {
   // stale value without adding a dependency that would restart the loop.
   const poseEnvRef = useRef<unknown>(poseEnvelope);
   poseEnvRef.current = poseEnvelope;
+
+  // Same treatment as the pose: read inside the rAF loop, so it must not be a
+  // loop dependency or every new plan would tear down and restart rendering.
+  const routeRef = useRef<readonly RoutePoint[] | null | undefined>(route);
+  routeRef.current = route;
 
   const engineRef = useRef<ClusterEngine | null>(null);
   if (engineRef.current === null) engineRef.current = createClusterEngine();
@@ -164,6 +187,7 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope }: Props) {
         accent,
         lidar.metaRef.current.connected,
         drawMsRef.current,
+        routeRef.current,
       );
       drawMsRef.current = performance.now() - t0;
     };
@@ -438,12 +462,19 @@ function drawDynamic(
   accent: string,
   connected: boolean,
   lastDrawMs: number,
+  route?: readonly RoutePoint[] | null,
 ): void {
   if (size <= 0) return;
   const s = scaleFor(size, PAD_PX);
   const pad = PAD_PX;
 
   ctx.clearRect(0, 0, size, size);
+
+  // ---- planned route ------------------------------------------------------
+  // First, so the scan, the tracked objects and the rover all draw OVER it. A
+  // plan is intent; everything else on this canvas is measurement, and
+  // measurement should never be obscured by intent.
+  drawRoute(ctx, route, s, pad);
 
   // ---- point cloud --------------------------------------------------------
   if (frame && frame.ptCount > 0) {
@@ -513,6 +544,82 @@ function drawDynamic(
 
   // ---- HUD ----------------------------------------------------------------
   drawHud(ctx, size, frame, pose, connected, lastDrawMs);
+}
+
+/** Ink for the planned route. Cool and desaturated so it never competes with
+ *  the accent-coloured live scan — the plan is context, the scan is truth. */
+const ROUTE_INK = "rgba(125,211,252,0.85)";
+const ROUTE_FILL = "rgba(125,211,252,0.16)";
+
+/**
+ * Draw the nominal planned route: dashed spine, a node per waypoint, and a
+ * ringed target at the end.
+ *
+ * Dashed, not solid, and that is a deliberate honesty choice — see the `route`
+ * prop. Docking legs are drawn as filled nodes because that is where the rover
+ * deliberately slows, and an operator watching the map should be able to see
+ * where the careful part of the route begins without reading a table.
+ */
+function drawRoute(
+  ctx: CanvasRenderingContext2D,
+  route: readonly RoutePoint[] | null | undefined,
+  s: number,
+  pad: number,
+): void {
+  if (!route || route.length < 2) return;
+
+  const px = (p: RoutePoint) => worldToCanvasX(p.x_mm, s, pad);
+  const py = (p: RoutePoint) => worldToCanvasY(p.y_mm, s, pad);
+
+  ctx.save();
+
+  // Spine.
+  ctx.strokeStyle = ROUTE_INK;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([5, 4]);
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(px(route[0]), py(route[0]));
+  for (let i = 1; i < route.length; i++) ctx.lineTo(px(route[i]), py(route[i]));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Waypoint nodes. The first is the start and already carries the rover, so
+  // it is skipped — two markers on one spot reads as an error.
+  for (let i = 1; i < route.length - 1; i++) {
+    const p = route[i];
+    ctx.beginPath();
+    ctx.arc(px(p), py(p), p.dock ? 3 : 2, 0, Math.PI * 2);
+    if (p.dock) {
+      ctx.fillStyle = ROUTE_INK;
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = ROUTE_INK;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // Target.
+  const end = route[route.length - 1];
+  const ex = px(end);
+  const ey = py(end);
+  ctx.beginPath();
+  ctx.arc(ex, ey, 7, 0, Math.PI * 2);
+  ctx.fillStyle = ROUTE_FILL;
+  ctx.fill();
+  ctx.strokeStyle = ROUTE_INK;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(ex - 4, ey);
+  ctx.lineTo(ex + 4, ey);
+  ctx.moveTo(ex, ey - 4);
+  ctx.lineTo(ex, ey + 4);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.restore();
 }
 
 function drawRover(

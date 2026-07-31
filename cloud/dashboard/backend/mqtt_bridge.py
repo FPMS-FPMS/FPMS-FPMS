@@ -41,6 +41,16 @@ TOPIC_FILTERS = [
     # subscription the panel reads "no telemetry" forever and the operator gets
     # no warning that the link is down.
     ("fpms/+/telemetry/drive", 0),
+    # Mission progress and planned route, from fpms_missions.py. The Drive page
+    # already subscribed the "mission:<thing>" channel these produce, but nothing
+    # subscribed the MQTT topics behind it — so the mission card could never have
+    # shown anything. It would sit at "no mission" through an entire run, with no
+    # error anywhere to explain why.
+    ("fpms/+/telemetry/mission", 0),
+    # qos=1 for the plan: unlike the others it is published once per preview
+    # rather than on a heartbeat, so a dropped message is not corrected a moment
+    # later by the next one. It just leaves a map with no route on it.
+    ("fpms/+/telemetry/mission_plan", 1),
     ("fpms/+/events/#", 1),
 ]
 

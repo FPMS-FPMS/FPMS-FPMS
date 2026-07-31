@@ -3,6 +3,7 @@ import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import ErrorBoundary from "../components/ErrorBoundary";
 import Joystick, { type StickValue } from "../components/Joystick";
+import { ArenaMap, type RoutePoint } from "../components/ArenaMap";
 import { useChannel } from "../lib/ws";
 import { apiPostJson } from "../lib/api";
 import { useThings } from "../lib/things";
@@ -134,6 +135,65 @@ const MISSION_IDLE_PHASES = new Set([
   "aborted", "cancelled", "canceled", "failed", "error", "stopped",
 ]);
 
+/**
+ * Normalised mission state. Every field is optional because every field can be
+ * genuinely absent: the executor may not be running, may have no pose, and may
+ * have no LiDAR. A missing field is NOT zero — rendering `undefined` as 0 once
+ * blanked this dashboard, and a mission card that says "0 mm remaining" when it
+ * means "I have no idea" is the same class of lie.
+ */
+type MissionState = {
+  mission: string | null;
+  backend: string | null;
+  phase: string | null;
+  segmentI: number | null;
+  segmentsN: number | null;
+  segmentKind: string | null;
+  remainingMm: number | null;
+  travelledMm: number | null;
+  etaS: number | null;
+  elapsedS: number | null;
+  targetX: number | null;
+  targetY: number | null;
+  poseAssumed: boolean;
+  odomSource: string | null;
+  linkOk: boolean | null;
+  battV: number | null;
+  frontMm: number | null;
+  lidarOk: boolean | null;
+  running: boolean;
+};
+
+function readMission(raw: unknown): MissionState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const d = raw as any;
+  const phase = typeof d.phase === "string" ? d.phase : null;
+  const tgt = d.target && typeof d.target === "object" ? d.target : {};
+  return {
+    mission: typeof d.mission === "string" ? d.mission : null,
+    backend: typeof d.backend === "string" ? d.backend : null,
+    phase,
+    segmentI: num(d.segment_i),
+    segmentsN: num(d.segments_n),
+    segmentKind: typeof d.segment_kind === "string" ? d.segment_kind : null,
+    remainingMm: num(d.distance_remaining_mm),
+    travelledMm: num(d.distance_travelled_mm),
+    etaS: num(d.eta_s),
+    elapsedS: num(d.elapsed_s),
+    targetX: num(tgt.x_mm),
+    targetY: num(tgt.y_mm),
+    poseAssumed: !!d.pose_assumed,
+    odomSource: typeof d.odom_source === "string" ? d.odom_source : null,
+    linkOk: typeof d.link_ok === "boolean" ? d.link_ok : null,
+    battV: num(d.batt_v),
+    frontMm: num(d.front_mm),
+    lidarOk: typeof d.lidar_ok === "boolean" ? d.lidar_ok : null,
+    // Unknown phases count as RUNNING. Showing "idle" while the rover is
+    // driving is the dangerous error; the reverse is only untidy.
+    running: phase !== null && !MISSION_IDLE_PHASES.has(phase),
+  };
+}
+
 type Action = "stop" | "jog" | "nudge" | "turn" | "mission" | "set_coordinate";
 
 type LogKind = "sent" | "ack" | "nack" | "stale" | "nohw" | "timeout" | "error" | "event";
@@ -177,6 +237,37 @@ export default function Drive() {
   // so every consumer below treats "no data" as a first-class state rather
   // than as zeroes.
   const missionCh = useChannel<any>(thing ? `mission:${thing}` : null);
+
+  // The planned route, from a preview. Published once per plan rather than on a
+  // heartbeat, so it is held until a new plan replaces it.
+  // Same channel the LiDAR page's map reads, so both views place the rover in
+  // exactly the same spot. Two pose sources would eventually disagree, and the
+  // operator would have no way to tell which map was lying.
+  const poseCh = useChannel<any>(thing ? `pose:${thing}` : null);
+
+  const planCh = useChannel<any>(thing ? `mission_plan:${thing}` : null);
+  const planRaw = readTelemetry(planCh.data) as any;
+
+  // useChannel has no clear(), so dismissal is local: remember which plan was
+  // dismissed by its timestamp. Keyed on the plan itself rather than a boolean
+  // so the NEXT preview reappears automatically instead of staying hidden
+  // behind a flag the operator has forgotten they set.
+  const [dismissedPlanTs, setDismissedPlanTs] = useState<number | null>(null);
+  const planTs = Number.isFinite(planRaw?.ts) ? planRaw.ts : null;
+  const plan = planTs !== null && planTs === dismissedPlanTs ? null : planRaw;
+
+  const planRoute: RoutePoint[] | null = Array.isArray(plan?.waypoints)
+    ? plan.waypoints
+        .filter(
+          (w: any) => Number.isFinite(w?.x_mm) && Number.isFinite(w?.y_mm),
+        )
+        .map((w: any) => ({
+          x_mm: w.x_mm,
+          y_mm: w.y_mm,
+          kind: w.kind,
+          dock: !!w.dock,
+        }))
+    : null;
   const mission = readMission(readTelemetry(missionCh.data));
   const [backend, setBackend] = useState<MissionBackend>(DEFAULT_MISSION_BACKEND);
 
@@ -278,6 +369,20 @@ export default function Drive() {
   const move = (action: Action, params: Record<string, unknown> = {}) => {
     if (!thing || motionLocked) return;
     fire(action, [thing], params);
+  };
+
+  /**
+   * Ask the executor what route it WOULD drive. Commands no motion.
+   *
+   * Deliberately not gated on `motionLocked`. Every other control on this page
+   * is, and correctly so — but a preview moves nothing, and the moment an
+   * operator most wants to see the intended route is exactly when the rover is
+   * locked out and they are working out whether it is safe to release it.
+   * Withholding the map then would be backwards.
+   */
+  const planMission = (name: string) => {
+    if (!thing) return;
+    fire("mission", [thing], { name, backend, preview: true });
   };
 
   /**
@@ -572,6 +677,37 @@ export default function Drive() {
           />
         </ErrorBoundary>
 
+        {/* Birdseye. The arena is fixed — grid, zones and orientation never
+            rotate — and the rover moves across it. That is the whole contract
+            of this view: if the map moved with the rover, "where is it" would
+            have no answer you could point at. */}
+        {thing ? (
+          <ErrorBoundary label="Drive arena map">
+            <Card>
+              <CardHeader
+                title="Arena"
+                subtitle="Fixed birdseye · the rover moves, the map does not"
+                right={
+                  planRoute ? (
+                    <span className="chip font-mono" title="A planned route is shown">
+                      route · {planRoute.length} pts
+                    </span>
+                  ) : (
+                    <span className="chip font-mono text-slate-500">no plan</span>
+                  )
+                }
+              />
+              <div className="mx-auto w-full max-w-[560px]">
+                <ArenaMap
+                  thing={thing}
+                  poseEnvelope={poseCh.data}
+                  route={planRoute}
+                />
+              </div>
+            </Card>
+          </ErrorBoundary>
+        ) : null}
+
         <div className="grid gap-5 lg:grid-cols-2">
           <Card>
             <CardHeader
@@ -726,6 +862,55 @@ export default function Drive() {
                   </div>
                 ) : null,
               )}
+            </div>
+
+            {/* PLAN FIRST. Separate row, above the buttons that actually drive,
+                because the intended order of operations is plan -> look at the
+                map -> commit. These need no confirmation and no motion lock:
+                they move nothing. */}
+            <div className="mb-4">
+              <div className="lbl mb-2">
+                Plan first · shows the route, drives nothing
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {MISSIONS.filter((m) => m.name !== "home").map((m) => (
+                  <button
+                    key={m.name}
+                    className="chip"
+                    onClick={() => planMission(m.name)}
+                    disabled={!thing}
+                    title={`Preview the route to ${m.name} without moving`}
+                  >
+                    PLAN {m.label.replace(/^MISSION /, "")}
+                  </button>
+                ))}
+                {planRoute ? (
+                  <button
+                    className="chip"
+                    onClick={() => setDismissedPlanTs(planTs)}
+                    title="Remove the planned route from the map"
+                  >
+                    CLEAR PLAN
+                  </button>
+                ) : null}
+              </div>
+              {plan ? (
+                <div className="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
+                  <span className="font-mono">{plan.mission}</span> ·{" "}
+                  {Math.round(plan.distance_mm)} mm ·{" "}
+                  {plan.segments?.length ?? 0} segments · ETA ~
+                  {Math.round(plan.eta_s)} s
+                  {plan.returns_home ? " · returns home" : ""}
+                  <div className="mt-1 text-[11px] text-sky-200/70">
+                    Nominal route. The executor re-measures its bearing after
+                    every leg and inserts corrections, so the driven path will
+                    differ from this line.
+                    {plan.pose_assumed
+                      ? " Start pose is ASSUMED — nothing localises this rover, so the whole route is only as right as that assumption."
+                      : ""}
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div className="flex flex-wrap gap-2">
@@ -1698,4 +1883,183 @@ function compact(v: unknown): string {
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * What the rover is doing to itself, right now.
+ *
+ * The hard rule here is that this card must never imply motion it cannot
+ * substantiate, and never imply stillness it cannot substantiate either. Both
+ * directions have a cost, but they are not symmetric: an operator who believes
+ * a moving rover is parked will walk up to it. So staleness is surfaced loudly,
+ * unknown phases count as running, and absent numbers render as "--" rather
+ * than as zero.
+ */
+function MissionCard({
+  thing,
+  mission,
+  channel,
+  ageMs,
+  fallbackPose,
+  onAbort,
+}: {
+  thing: string | null;
+  mission: MissionState | null;
+  channel: { connected: boolean; lastAt: number | null; messages: number };
+  ageMs: number | null;
+  fallbackPose: { x_mm: number | null; y_mm: number | null; heading_deg: number | null };
+  onAbort?: () => void;
+}) {
+  const stale = ageMs !== null && ageMs > MISSION_STALE_MS;
+  const running = !!mission?.running;
+
+  // Stale telemetry from a RUNNING mission is the dangerous case: the last
+  // thing we heard was "driving", and we have not heard since.
+  const blind = running && stale;
+
+  const seg =
+    mission?.segmentI !== null && mission?.segmentI !== undefined && mission?.segmentsN
+      ? `${mission.segmentI}/${mission.segmentsN}`
+      : "--";
+
+  return (
+    <Card>
+      <CardHeader
+        title="Mission"
+        subtitle={
+          mission?.mission
+            ? `${mission.mission}${mission.backend ? ` · via ${mission.backend}` : ""}`
+            : "Nothing running"
+        }
+        right={
+          <div className="flex items-center gap-2">
+            {blind ? (
+              <span className="chip-hot" title="Last known state was DRIVING, and telemetry has since stopped">
+                telemetry lost while driving
+              </span>
+            ) : stale ? (
+              <span className="chip" title="Mission telemetry is old">
+                stale {Math.round((ageMs ?? 0) / 1000)}s
+              </span>
+            ) : null}
+            <span className="chip font-mono">
+              {running ? (mission?.phase ?? "running") : "idle"}
+            </span>
+            <StatusPill
+              connected={channel.connected}
+              lastAt={channel.lastAt}
+              messages={channel.messages}
+            />
+          </div>
+        }
+      />
+
+      {!channel.messages ? (
+        <p className="text-sm text-slate-400">
+          No mission telemetry has arrived on this channel. Either the executor
+          is not running on {thing ?? "this rover"} (
+          <span className="font-mono">systemctl status fpms-missions</span>), or
+          it cannot reach the broker.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-4">
+            <Stat label="Phase" value={mission?.phase ?? "--"} />
+            <Stat label="Segment" value={seg} />
+            <Stat
+              label="Remaining"
+              value={mission?.remainingMm !== null && mission?.remainingMm !== undefined
+                ? `${Math.round(mission.remainingMm)} mm`
+                : "--"}
+            />
+            <Stat
+              label="Travelled"
+              value={mission?.travelledMm !== null && mission?.travelledMm !== undefined
+                ? `${Math.round(mission.travelledMm)} mm`
+                : "--"}
+            />
+            <Stat
+              label="Elapsed"
+              value={mission?.elapsedS ? `${Math.round(mission.elapsedS)} s` : "--"}
+            />
+            <Stat
+              label="ETA"
+              value={mission?.etaS ? `~${Math.round(mission.etaS)} s` : "--"}
+            />
+            <Stat
+              label="Battery"
+              value={mission?.battV !== null && mission?.battV !== undefined
+                ? `${mission.battV.toFixed(1)} V`
+                : "--"}
+            />
+            <Stat
+              label="Front clear"
+              value={mission?.frontMm !== null && mission?.frontMm !== undefined
+                ? `${Math.round(mission.frontMm)} mm`
+                : "--"}
+            />
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+            <span className="font-mono">
+              target{" "}
+              {mission?.targetX !== null && mission?.targetX !== undefined
+                ? `(${Math.round(mission.targetX)}, ${Math.round(mission.targetY ?? 0)}) mm`
+                : "--"}
+            </span>
+            <span className="font-mono">
+              pose{" "}
+              {fallbackPose.x_mm !== null
+                ? `(${Math.round(fallbackPose.x_mm)}, ${Math.round(fallbackPose.y_mm ?? 0)}) mm`
+                : "--"}
+            </span>
+            {mission?.odomSource ? (
+              <span className="chip font-mono">odom · {mission.odomSource}</span>
+            ) : null}
+            {mission?.linkOk === false ? (
+              <span className="chip-hot">micro-ROS link down</span>
+            ) : null}
+            {mission?.lidarOk === false ? (
+              <span className="chip-hot">LiDAR stale — obstacle guard blind</span>
+            ) : null}
+          </div>
+
+          {mission?.poseAssumed ? (
+            <div className="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+              <b>Pose is assumed, not measured.</b> Nothing localises this rover,
+              so its position is dead-reckoned from an assumed start. Every
+              coordinate on this card and every route on the map inherits that
+              assumption — if the rover did not start where the dashboard thinks,
+              all of it is offset by the same amount.
+            </div>
+          ) : null}
+
+          {blind ? (
+            <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-100/90">
+              <b>The rover was driving when telemetry stopped.</b> Treat it as
+              still moving until you can see otherwise. Stop it before
+              approaching.
+            </div>
+          ) : null}
+        </>
+      )}
+
+      {onAbort ? (
+        <div className="mt-4">
+          <button className="btn-hot" onClick={onAbort} disabled={!thing}>
+            ABORT MISSION
+          </button>
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="lbl">{label}</div>
+      <div className="font-mono text-slate-200">{value}</div>
+    </div>
+  );
 }
