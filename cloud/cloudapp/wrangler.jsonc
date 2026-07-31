@@ -24,6 +24,34 @@
   // One public door only, same reasoning as the gateway Worker.
   "preview_urls": false,
 
+  // Workers Caching. Without this, the `Cache-Control: public, max-age=10` that
+  // src/public.js has always set on /api/public/* was decoration: nothing was
+  // reading it, and every poll of the anonymous status page executed the Worker
+  // and re-ran its D1 queries. With it, a cache HIT is returned by Cloudflare
+  // WITHOUT invoking the Worker — no CPU, no D1 read, no Durable Object call —
+  // and simultaneous misses for the same key collapse into one invocation.
+  //
+  // It works on workers.dev: the cache belongs to the Worker, not to a zone.
+  // (The Cache API, `caches.default`, does NOT — it is only functional on custom
+  // domains and pages.dev. That is why public.js does not use it.)
+  //
+  // KNOW WHAT THIS COSTS BEFORE COPYING IT ELSEWHERE
+  // Cloudflare bills a cache HIT at the standard per-request rate, and enabling
+  // caching also starts billing requests that are otherwise free — including the
+  // "assets" requests below. So this buys D1/CPU headroom, not request headroom:
+  // the 100k/day free-plan ceiling is unchanged for the API and slightly tighter
+  // for the dashboard bundle. That trade is deliberate. The quota this system
+  // actually exhausts is D1 reads, driven by machine polling of /api/public/*;
+  // asset traffic is a handful of authenticated humans, and the public /live
+  // page is self-contained HTML that requests no assets at all.
+  //
+  // To get the assets back to free, caching would have to move to a named
+  // entrypoint ("exports" per-entrypoint cache config) so it covers only the
+  // public API. That needs a code change in src/worker.js, not just config.
+  //
+  // Requires Wrangler >= 4.69.0.
+  "cache": { "enabled": true },
+
   // Without this, a failure in production is invisible — there is no server to
   // SSH into and read logs from.
   "observability": {

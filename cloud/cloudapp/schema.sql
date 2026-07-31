@@ -20,6 +20,18 @@ CREATE INDEX IF NOT EXISTS idx_readings_lookup ON readings (thing, subtype, ts D
 -- telemetry, so they get a dedicated partial-ish index.
 CREATE INDEX IF NOT EXISTS idx_readings_events ON readings (kind, ts DESC);
 
+-- The scheduled agents (agents.js loadWindow) query "everything since <ts>"
+-- across ALL things/subtypes/kinds — i.e. WHERE ts >= ? ORDER BY ts DESC.
+-- Neither index above helps that query: both lead with a column (thing, kind)
+-- that isn't part of this predicate, and SQLite can only use an index's prefix,
+-- so it can't skip into either one on ts alone. Without an index that leads
+-- with ts, this becomes a full table scan of `readings` on every cron tick —
+-- LIMIT only caps rows returned, not rows the engine has to read to get there.
+-- This index exists specifically to give that query a leading column it can
+-- search on. It is NOT redundant with idx_readings_lookup/idx_readings_events
+-- even though ts appears in both — do not remove it as a "duplicate".
+CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings (ts DESC);
+
 -- Analysis reports produced by the scheduled agents.
 CREATE TABLE IF NOT EXISTS reports (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,

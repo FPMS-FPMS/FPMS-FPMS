@@ -26,7 +26,20 @@ export function worstSeverity(findings) {
   );
 }
 
-/** Pull the recent window once; every agent reads from the same snapshot. */
+/**
+ * Pull the recent window once; every agent reads from the same snapshot.
+ *
+ * This is called on every cron tick (runAgents below), so it has to stay
+ * cheap regardless of how large `readings` gets. The WHERE/ORDER BY here are
+ * deliberately both on `ts` alone (no thing/subtype/kind filter) so the query
+ * can be satisfied entirely by idx_readings_ts (ts DESC) in schema.sql — a
+ * single index range-scan that also already returns rows in the order we
+ * want, so SQLite never falls back to a full table scan or a separate sort
+ * step. Keep the predicate ts-only if you touch this: adding another column
+ * to WHERE without a matching composite index would defeat that index again.
+ * `limit` bounds rows *returned*, not rows *scanned* — the index is what
+ * bounds the scan.
+ */
 export async function loadWindow(db, seconds = 3600, limit = 2000) {
   const since = Date.now() / 1000 - seconds;
   const { results } = await db

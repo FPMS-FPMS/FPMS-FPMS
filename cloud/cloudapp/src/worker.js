@@ -72,6 +72,56 @@ const PERSIST_MIN_MS = 10_000;
 // for data nothing queries. Stored as a byte count instead.
 const ARCHIVE_FRAMES = false;
 
+// How old the newest camera frame may be before vision() refuses to look at it.
+//
+// `latest:camera:<thing>` is a durable key with no TTL, so a rover that went
+// offline in March leaves its last frame readable forever. Without this gate the
+// 15-minute cron paid a real, billed AI inference on that same frozen image
+// every run — and worse, if the model ever read smoke in it, the operator was
+// paged about a months-old scene indefinitely. Refusing early costs nothing and
+// tells the truth: there is no recent frame, not "no hazard".
+const VISION_MAX_FRAME_AGE_S = 300;
+
+// Roster caps.
+//
+// Anyone holding the ingest token can invent thing/subtype names, and every new
+// channel becomes a PERMANENT `latest:<channel>` storage key (~27 KB when it
+// holds a camera frame) that snapshot() then lists on every public poll. Nothing
+// reclaims those keys, so growth is one-way. These caps sit far above any real
+// fleet — they exist to bound a typo or an abuse, not to limit legitimate use,
+// and a name already known is never rejected.
+const MAX_THINGS = 64;
+const MAX_SUBTYPES = 32;
+
+// "pub" is the WebSocket tag acceptPublisher() puts on a rover's OWN socket. An
+// item with subtype "pub" builds channel "pub:<thing>", getWebSockets() then
+// returns that publisher socket, and publishItems() echoes the frame straight
+// back to the rover that sent it. Reserved, and enforced in normalizeItems().
+const RESERVED_SUBTYPES = new Set(["pub"]);
+
+// Retention. Nothing else in this system deletes anything, so without this the
+// archive only ever grows: at stream rate `readings` reaches the 5 GB D1 ceiling
+// and then every INSERT fails — ingest, events and alerting all stop together.
+// Reports are kept longer because they are small and are the operator's history.
+const READINGS_RETENTION_DAYS = 30;
+const REPORTS_RETENTION_DAYS = 90;
+
+// At most one prune pass per this interval, gated in the Durable Object. The
+// cron fires 96 times a day; pruning that often is pure billed writes for no
+// benefit, since a day of retention drift is invisible at 30-day granularity.
+const PRUNE_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+// Rows deleted per table per pass. Bounded so a large first backlog is worked
+// off gradually instead of one statement timing out — and a statement that
+// always times out prunes nothing at all, forever.
+const PRUNE_BATCH = 2000;
+
+// How many consecutive unchanged analysis runs may pass before a report row is
+// written anyway. The cron runs every 15 minutes, so 24 is roughly a 6-hourly
+// heartbeat: enough for "the watchdog is alive" to be provable from the table,
+// without the 96 near-identical rows/day the old unconditional insert wrote.
+const REPORT_HEARTBEAT_RUNS = 24;
+
 // NOTE (next step, not done here): row COUNT is still one insert per reading,
 // which at stream rate exceeds the 100k/day D1 row quota (each insert also
 // writes the two index rows from schema.sql, so ~3 billed rows per reading).
@@ -112,7 +162,11 @@ export default {
       if (path === "/api/history") return history(env, url);
       if (path === "/api/reports") return reports(env, url);
       if (path === "/api/forget" && request.method === "POST") {
-        return hubStub(env).fetch(`https://hub/forget?things=${url.searchParams.get("things") || ""}`);
+        // Encoded, not interpolated raw: an operator-supplied `things` value
+        // containing & or # would otherwise truncate the list at the DO or
+        // smuggle an extra query parameter into the hub request.
+        const forget = url.searchParams.get("things") || "";
+        return hubStub(env).fetch(`https://hub/forget?things=${encodeURIComponent(forget)}`);
       }
       if (path === "/api/analyze" && request.method === "POST") {
         // Manual trigger — the same code path the cron runs, so testing it
@@ -126,6 +180,12 @@ export default {
       if (path === "/api/analyst/report") return json(await analystReport(env, url));
       if (path === "/api/alerts/status") return json(alertsStatus(env));
       if (path === "/api/network") return networkStub(url);
+
+      // An unmatched /api/ path is an API error, not a page. Falling through to
+      // ASSETS.fetch answered every typo'd or removed endpoint with index.html
+      // and status 200, so callers saw a "successful" response full of HTML and
+      // failed at JSON.parse instead of reading a clean 404.
+      if (path.startsWith("/api/")) return json({ error: "not found", path }, 404);
 
       // Static frontend. Assets are public: the React app renders its own
       // login screen, exactly as the edge app does.
@@ -156,6 +216,19 @@ export default {
           message: "scheduled analysis failed",
           error: err instanceof Error ? err.message : String(err),
         }))),
+    );
+
+    // Retention rides the same cron rather than getting its own trigger: this
+    // is the only unattended code path in the app, and pruning has to happen
+    // whether or not anyone ever opens the dashboard. Its own throttle lives in
+    // the Durable Object, so 96 runs a day produce at most a handful of passes.
+    // Independent of the analysis promise on purpose — a failing agent run must
+    // not also stop the archive from being trimmed.
+    ctx.waitUntil(
+      pruneArchive(env).catch((err) => console.error(JSON.stringify({
+        message: "scheduled prune failed",
+        error: err instanceof Error ? err.message : String(err),
+      }))),
     );
   },
 };
@@ -192,10 +265,27 @@ export default {
  */
 const VISION_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
-/** Ungated prose-only fallback. Kept because it needs no licence acceptance. */
-const LEGACY_VISION_MODEL = "@cf/llava-hf/llava-1.5-7b-hf";
-
-const VISION_MODELS = [VISION_MODEL, LEGACY_VISION_MODEL];
+/**
+ * There is deliberately NO fallback model.
+ *
+ * `@cf/llava-hf/llava-1.5-7b-hf` used to sit here as an "ungated prose-only
+ * fallback". Two independent reasons it is gone, both worth keeping written
+ * down so nobody re-adds it:
+ *
+ *  1. It has been REMOVED from the Workers AI catalog (same fate as
+ *     uform-gen2-qwen-500m above), so every attempt was a guaranteed 404. Each
+ *     vision failure therefore paid a second doomed round-trip before returning
+ *     the error it already had — latency on the alert path for nothing.
+ *  2. Even when it worked it failed the one case that matters — see the
+ *     benchmark note above, where it described a smoke plume and then answered
+ *     NO. A fallback that returns a confident false negative on visible smoke is
+ *     worse than no answer at all: "vision unavailable" is honest, "no hazard"
+ *     is a lie the operator will act on.
+ *
+ * The list stays an array so a genuinely better second model can be added later
+ * without reshaping the loop below.
+ */
+const VISION_MODELS = [VISION_MODEL];
 
 /**
  * Text reasoning model — the "edge LM". Deliberately the SAME model as vision.
@@ -250,6 +340,22 @@ async function vision(env, url) {
   const frame = latest?.data?.frame;
   if (!frame) return { thing, error: "no camera frame available yet" };
 
+  // FRESHNESS GATE — before any env.AI.run, because the AI call is the billed
+  // part and a stale frame cannot produce a useful verdict at any price.
+  //
+  // Timestamps are unix SECONDS throughout this codebase (see the hub's publish
+  // path, which stamps Date.now() / 1000), so both sides of this subtraction are
+  // seconds. Reject rather than answer: the caller gets "no recent camera frame"
+  // — which analyzeAndReport correctly treats as "no vision finding" — instead
+  // of a hazard verdict about a scene that may be months old.
+  const frameTs = Number(latest?.ts);
+  const frameAgeS = Number.isFinite(frameTs) && frameTs > 0
+    ? Math.round(Date.now() / 1000 - frameTs)
+    : null;
+  if (frameAgeS === null || frameAgeS > VISION_MAX_FRAME_AGE_S) {
+    return { thing, error: "no recent camera frame", frame_age_s: frameAgeS };
+  }
+
   const prompt = url.searchParams.get("prompt") || VISION_PROMPT;
 
   try {
@@ -257,58 +363,37 @@ async function vision(env, url) {
     for (const model of VISION_MODELS) {
       try {
         const started = Date.now();
-        const structured = model !== LEGACY_VISION_MODEL;
 
-        let raw = "";
-        let obj = null;
-
-        if (structured) {
-          // Chat-style multimodal input with a real JSON schema. The model
-          // returns an already-parsed object, which is why the old
-          // /HAZARD:\s*(YES|NO)/ regex is gone — there is no prose to parse.
-          const result = await env.AI.run(model, {
-            messages: [{
-              role: "user",
-              content: [
-                { type: "text", text: prompt },
-                { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frame}` } },
-              ],
-            }],
-            response_format: {
-              type: "json_schema",
-              json_schema: {
-                type: "object",
-                properties: {
-                  hazard: { type: "boolean" },
-                  kind: { type: "string" },
-                  description: { type: "string" },
-                },
-                required: ["hazard", "description"],
+        // Chat-style multimodal input with a real JSON schema. The model
+        // returns an already-parsed object, which is why the old
+        // /HAZARD:\s*(YES|NO)/ regex is gone — there is no prose to parse.
+        // (The prose-parsing branch that used to live here went with the
+        // LLaVA fallback; see the VISION_MODELS comment.)
+        const result = await env.AI.run(model, {
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frame}` } },
+            ],
+          }],
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              type: "object",
+              properties: {
+                hazard: { type: "boolean" },
+                kind: { type: "string" },
+                description: { type: "string" },
               },
+              required: ["hazard", "description"],
             },
-            max_tokens: 256,
-          });
-          const r = result?.response;
-          obj = typeof r === "string" ? safeParseJson(r) : r;
-          raw = typeof r === "string" ? r : JSON.stringify(r ?? "");
-        } else {
-          // Legacy prose path, kept only for the ungated fallback model, which
-          // takes raw bytes rather than a data URI.
-          const bytes = Uint8Array.from(atob(frame), (c) => c.charCodeAt(0));
-          const result = await env.AI.run(model, {
-            image: [...bytes],
-            prompt: `${prompt}\nReply with "HAZARD: YES" or "HAZARD: NO" then a short description.`,
-            max_tokens: 256,
-          });
-          raw = (result?.description ?? result?.response ?? "").trim();
-          const m = raw.match(/HAZARD:\s*(YES|NO)/i);
-          if (m) {
-            obj = {
-              hazard: m[1].toUpperCase() === "YES",
-              description: raw.replace(/HAZARD:\s*(YES|NO)\s*/i, "").trim(),
-            };
-          }
-        }
+          },
+          max_tokens: 256,
+        });
+        const r = result?.response;
+        const obj = typeof r === "string" ? safeParseJson(r) : r;
+        const raw = typeof r === "string" ? r : JSON.stringify(r ?? "");
 
         if (!obj && !raw) { lastErr = `${model} returned nothing`; continue; }
 
@@ -326,9 +411,14 @@ async function vision(env, url) {
             ? obj.description
             : raw.slice(0, 400),
           model,
-          structured,
+          // Always true now that the prose fallback is gone. Kept in the
+          // response so existing consumers of this shape do not break.
+          structured: true,
           latency_ms: Date.now() - started,
-          frame_ts: latest.ts,
+          frame_ts: frameTs,
+          // Reported alongside the verdict so a caller can see how fresh the
+          // evidence was without re-deriving it from frame_ts.
+          frame_age_s: frameAgeS,
           detections: latest?.data?.detections ?? [],
         };
       } catch (e) {
@@ -452,7 +542,14 @@ async function reports(env, url) {
       })),
     });
   } catch (err) {
-    return json({ error: "query failed", detail: String(err) }, 500);
+    // The detail goes to the log, never to the caller — raw D1 text names
+    // tables, columns and binding internals. Same rule the top-level handler
+    // applies; this path used to contradict it.
+    console.error(JSON.stringify({
+      message: "reports query failed",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return json({ error: "query failed" }, 500);
   }
 }
 
@@ -575,6 +672,15 @@ function normalizeItems(items) {
     if (!THING_RE.test(thing) || !SUBTYPE_RE.test(subtype)) {
       throw new Error("each item needs a valid thing and subtype");
     }
+    // SUBTYPE_RE happily accepts "pub", and publishItems() would then build the
+    // channel "pub:<thing>" — byte-identical to the tag acceptPublisher() puts
+    // on the rover's own publisher socket. getWebSockets("pub:rover2") would
+    // return that socket and the rover would be sent its own frames back. This
+    // is the enforcement point that makes acceptPublisher's "cannot collide"
+    // claim actually true.
+    if (RESERVED_SUBTYPES.has(subtype.toLowerCase())) {
+      throw new Error(`subtype "${subtype}" is reserved`);
+    }
     return {
       thing,
       subtype,
@@ -584,8 +690,29 @@ function normalizeItems(items) {
   });
 }
 
+/**
+ * Operator session check. FAILS CLOSED, exactly like ingestAuthed().
+ *
+ * This used to `return true` when FPMS_PASSWORD was unset, on the reasoning that
+ * an unconfigured app should be usable. That is the wrong default for a secret
+ * that can go missing: a binding dropped during a redeploy, a secret deleted by
+ * accident, or a `wrangler deploy` from a machine without it, and the ENTIRE
+ * authenticated surface silently opens to the internet — raw telemetry and
+ * camera frames, unmetered AI spend via /api/vision and /api/analyze, the
+ * operator's alert address, and the personal names in info.json. Nothing about
+ * that failure is visible from the outside; the app just keeps working.
+ *
+ * Closed is recoverable (set the secret) and loud. Anonymous visitors still have
+ * the whitelisted public projection in public.js, which is what it is for.
+ */
 async function authed(request, env) {
-  if (!env.FPMS_PASSWORD) return true; // no password configured -> open
+  if (!env.FPMS_PASSWORD) {
+    console.error(JSON.stringify({
+      message: "FPMS_PASSWORD is not configured — denying every authenticated request",
+      hint: "npx wrangler secret put FPMS_PASSWORD",
+    }));
+    return false;
+  }
   const bearer = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
   // Boolean() matters: `bearer && ...` yields "" when the header is absent, and
   // that leaks into JSON as `"authenticated": ""` instead of false.
@@ -621,7 +748,11 @@ async function login(request, env) {
 
 async function authStatus(request, env) {
   return json({
-    auth_required: !!env.FPMS_PASSWORD,
+    // Always true, because authed() now fails closed: with no password
+    // configured the API denies everything rather than opening up, so reporting
+    // auth_required:false would tell the frontend to render a dashboard whose
+    // every request 401s. A login screen is the honest thing to show.
+    auth_required: true,
     authenticated: await authed(request, env),
     is_lan: false,
     client_host: request.headers.get("CF-Connecting-IP") || null,
@@ -840,8 +971,57 @@ async function notify(env, alerts) {
 async function analyzeAndReport(env, { force = false } = {}) {
   if (!env.DB) return { error: "archive not configured" };
 
-  const snap = await hubStub(env).fetch("https://hub/snapshot").then((r) => r.json());
-  const report = await runAgents(env.DB, snap.things_seen || []);
+  // A cold or unreachable hub must not take the analysis down with it — the
+  // agents can still read D1 without knowing the roster.
+  const snap = await hubStub(env)
+    .fetch("https://hub/snapshot")
+    .then((r) => r.json())
+    .catch((err) => {
+      console.error(JSON.stringify({
+        message: "analysis: hub snapshot failed — continuing without the roster",
+        error: err instanceof Error ? err.message : String(err),
+      }));
+      return {};
+    });
+
+  let report;
+  try {
+    report = await runAgents(env.DB, snap.things_seen || []);
+  } catch (err) {
+    // DEGRADED PATH — the archive read failed.
+    //
+    // This call had no try/catch, so a D1 error propagated straight out: no
+    // report row, no email, one log line nobody is watching. The watchdog went
+    // silent at precisely the moment it lost its data, and silence from a fire
+    // watch is indistinguishable from "all clear". Worse, D1's read quota can be
+    // spent by anonymous traffic on the public page, so an outside visitor could
+    // switch fire alerting off without touching anything authenticated.
+    //
+    // So: synthesise a critical report saying the archive is unreachable. Being
+    // blind IS the emergency to report. Everything downstream — vision, the edge
+    // LM, the email gate — still runs on it, which is the whole point: the
+    // operator hears something rather than nothing.
+    console.error(JSON.stringify({
+      message: "agent run failed — emitting degraded report",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    report = {
+      ts: Date.now() / 1000,
+      severity: "critical",
+      summary: "Telemetry archive unreachable — the fire watch is BLIND, no telemetry could be analysed.",
+      findings: [{
+        agent: "archive",
+        severity: "critical",
+        detail:
+          "Could not read the telemetry archive (D1). No rover data was analysed " +
+          "on this run, so nothing below should be read as an all-clear. Check the " +
+          "D1 binding and the daily read quota. Error: " +
+          (err instanceof Error ? err.message : String(err)).slice(0, 200),
+      }],
+      sample_size: 0,
+      degraded: true,
+    };
+  }
 
   // Ask the VLM what the newest frame actually shows. Rule-based agents know
   // the numbers; this is the only part that can say "smoke behind the ridge".
@@ -849,6 +1029,9 @@ async function analyzeAndReport(env, { force = false } = {}) {
   for (const thing of (snap.things_seen || []).slice(0, 2)) {
     try {
       const v = await vision(env, new URL(`https://x/?thing=${encodeURIComponent(thing)}`));
+      // A stale-frame refusal comes back with `error` and no `description`, so
+      // it adds no finding and burns no inference — which is why an offline
+      // rover no longer produces a vision verdict about a frozen scene.
       if (v.description) {
         report.findings.push({
           agent: `vision:${thing}`,
@@ -928,11 +1111,138 @@ async function analyzeAndReport(env, { force = false } = {}) {
     emailed = email.ok;
   }
 
-  await env.DB.prepare(
-    "INSERT INTO reports (ts, severity, summary, findings, emailed) VALUES (?, ?, ?, ?, ?)",
-  ).bind(report.ts, report.severity, report.summary, JSON.stringify(report.findings), emailed ? 1 : 0).run();
+  // Store on state change, not on every run.
+  //
+  // The cron fires every 15 minutes and this used to insert unconditionally: 96
+  // rows/day of near-identical "All clear — N readings analysed", each one also
+  // writing the index rows declared in schema.sql, against a 100k billed
+  // rows/day free tier. The signature already tells us whether anything
+  // changed, so reuse it and keep a periodic heartbeat row so a reader can
+  // still tell "nothing changed" from "the cron stopped running".
+  //
+  // Always stored regardless: a forced run (the operator asked for it and
+  // expects to see it) and any run that sent an email (the row is the record
+  // the email refers to).
+  let stored = false;
+  let storeGate = { store: true, reason: "forced" };
+  if (!force && !emailed) {
+    storeGate = await hubStub(env)
+      .fetch(
+        `https://hub/report-store-gate?severity=${encodeURIComponent(report.severity)}` +
+        `&sig=${encodeURIComponent(signature)}`,
+      )
+      .then((r) => r.json())
+      .catch((err) => {
+        // Fail towards storing: a missing history row is unrecoverable, a
+        // duplicate one is merely a row.
+        console.error(JSON.stringify({
+          message: "report store gate unavailable — storing anyway",
+          error: err instanceof Error ? err.message : String(err),
+        }));
+        return { store: true, reason: "gate unavailable" };
+      });
+  }
 
-  return { ...report, emailed, email, gate };
+  if (storeGate.store) {
+    try {
+      await env.DB.prepare(
+        "INSERT INTO reports (ts, severity, summary, findings, emailed) VALUES (?, ?, ?, ?, ?)",
+      ).bind(report.ts, report.severity, report.summary, JSON.stringify(report.findings), emailed ? 1 : 0).run();
+      stored = true;
+    } catch (err) {
+      // Never throw from here. On the degraded path above D1 is already down,
+      // and letting the insert fail the whole function would undo the email that
+      // has just gone out — the caller would see an error for a run that did
+      // in fact alert.
+      console.error(JSON.stringify({
+        message: "report insert failed",
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  return { ...report, emailed, email, gate, stored, store_reason: storeGate.reason };
+}
+
+/**
+ * Delete aged-out rows so that month six looks like week one.
+ *
+ * Nothing else in this codebase deletes anything. Left alone, `readings` grows
+ * until it hits D1's 5 GB database limit, at which point every INSERT starts
+ * failing and ingest, the event trail and alerting stop together — a storage
+ * problem that presents as a fire-detection outage.
+ *
+ * NOTE: SQLite (and therefore D1) does NOT return freed pages to the file on
+ * DELETE — the space is only marked reusable inside the database. Row count and
+ * query cost come down immediately, but the reported database SIZE will not
+ * shrink without a VACUUM, which D1 does not expose as a statement you can run
+ * from a Worker. The point of this function is to bound growth, not to reclaim
+ * what has already been written.
+ */
+async function pruneArchive(env) {
+  if (!env.DB) return { skipped: "archive not configured" };
+
+  // Throttled in the Durable Object because a Worker has nowhere durable to
+  // keep "when did I last prune" — module state does not survive, and isolates
+  // are shared between unrelated requests.
+  let gate;
+  try {
+    gate = await hubStub(env)
+      .fetch("https://hub/prune-gate", { method: "POST" })
+      .then((r) => r.json());
+  } catch (err) {
+    console.error(JSON.stringify({
+      message: "prune gate unavailable — skipping this run",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return { skipped: "gate unavailable" };
+  }
+  if (!gate.allowed) return { skipped: "not due", next_in_s: gate.next_in_s };
+
+  const now = Date.now() / 1000;
+  // Table names are literals from this list, never caller input — the cutoff and
+  // the batch size are bound parameters, as everywhere else in this file.
+  const plan = [
+    ["readings", now - READINGS_RETENTION_DAYS * 86400],
+    ["reports", now - REPORTS_RETENTION_DAYS * 86400],
+  ];
+
+  const deleted = {};
+  for (const [table, cutoff] of plan) {
+    try {
+      // `DELETE ... LIMIT` needs SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which D1's
+      // build does not have, so bound it through the rowid instead. Bounding
+      // matters: the first prune after this ships may face months of backlog,
+      // and one unbounded DELETE would exceed the statement time limit, roll
+      // back, and delete nothing on every run forever. A batch per pass drains
+      // it gradually, which is the difference between slow and never.
+      const res = await env.DB
+        .prepare(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE ts < ? LIMIT ?)`)
+        .bind(cutoff, PRUNE_BATCH)
+        .run();
+      deleted[table] = res?.meta?.changes ?? 0;
+    } catch (err) {
+      deleted[table] = null;
+      console.error(JSON.stringify({
+        message: "prune failed", table,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  console.log(JSON.stringify({
+    message: "archive pruned",
+    readings_deleted: deleted.readings,
+    reports_deleted: deleted.reports,
+    readings_retention_days: READINGS_RETENTION_DAYS,
+    reports_retention_days: REPORTS_RETENTION_DAYS,
+    batch: PRUNE_BATCH,
+    // True when a table filled its batch: there is more to delete and the next
+    // scheduled pass will take another bite.
+    more_pending: deleted.readings === PRUNE_BATCH || deleted.reports === PRUNE_BATCH,
+  }));
+
+  return deleted;
 }
 
 /** Recent readings from the archive: /api/history?thing=&subtype=&limit= */
@@ -967,7 +1277,12 @@ async function history(env, url) {
       })),
     });
   } catch (err) {
-    return json({ error: "query failed", detail: String(err) }, 500);
+    // Logged, not returned — see reports(). Raw D1 error text discloses schema.
+    console.error(JSON.stringify({
+      message: "history query failed",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return json({ error: "query failed" }, 500);
   }
 }
 
@@ -1065,7 +1380,12 @@ export class TelemetryHub extends DurableObject {
   lastCounterPersist = 0;
   memSeen = null;                  // null = not yet loaded this lifetime
   memThings = new Set();
+  memSubtypes = new Set();         // distinct subtypes tracked, for the cap
   memLastAt = null;
+  // thing -> unix SECONDS of its most recent publish. Published by snapshot()
+  // so the public summary can answer "when was this rover last heard from?"
+  // without the full-table scan it used to run per page poll.
+  memLastSeen = new Map();
   pubSeenAt = new Map();           // thing -> Date.now() of last direct publish
 
   async fetch(request) {
@@ -1084,6 +1404,8 @@ export class TelemetryHub extends DurableObject {
     }
     if (url.pathname === "/alert-gate") return this.alertGate(url);
     if (url.pathname === "/report-gate") return this.reportGate(url);
+    if (url.pathname === "/report-store-gate") return this.reportStoreGate(url);
+    if (url.pathname === "/prune-gate") return this.pruneGate();
     if (url.pathname === "/forget") return this.forget(url);
     return new Response("not found", { status: 404 });
   }
@@ -1124,14 +1446,47 @@ export class TelemetryHub extends DurableObject {
     if (this.memSeen === null) {
       this.memSeen = (await this.ctx.storage.get("messages_seen")) || 0;
       this.memThings = new Set((await this.ctx.storage.get("things_seen")) || []);
+      this.memSubtypes = new Set((await this.ctx.storage.get("subtypes_seen")) || []);
+      // Rehydrated like memSeen: without this a cold start would report every
+      // rover as never-seen until its next publish, and the public page would
+      // show a healthy fleet as offline.
+      this.memLastSeen = new Map(
+        Object.entries((await this.ctx.storage.get("last_seen")) || {}),
+      );
     }
     let seen = this.memSeen;
     const things = this.memThings;
+    const subtypes = this.memSubtypes;
     const toArchive = [];
     let notified = 0;
     let allSockets = 0;
+    let dropped = 0;
 
     for (const item of items) {
+      // ROSTER CAP. Every new thing or subtype mints a permanent
+      // `latest:<channel>` key that nothing ever deletes and that snapshot()
+      // lists on every public poll, so a single token holder could grow this
+      // object without limit. Names already known always pass — the cap only
+      // ever refuses a NEW one, so a real fleet never notices it. Dropped
+      // loudly rather than silently: a legitimate rover that cannot get in
+      // must be diagnosable from the logs.
+      if (!things.has(item.thing) && things.size >= MAX_THINGS) {
+        dropped++;
+        console.error(JSON.stringify({
+          message: "thing cap reached — item dropped",
+          thing: item.thing, subtype: item.subtype, cap: MAX_THINGS,
+        }));
+        continue;
+      }
+      if (!subtypes.has(item.subtype) && subtypes.size >= MAX_SUBTYPES) {
+        dropped++;
+        console.error(JSON.stringify({
+          message: "subtype cap reached — item dropped",
+          thing: item.thing, subtype: item.subtype, cap: MAX_SUBTYPES,
+        }));
+        continue;
+      }
+
       const channel =
         item.kind === "events" ? "events" : `${item.subtype}:${item.thing}`;
       const envelope = {
@@ -1184,6 +1539,9 @@ export class TelemetryHub extends DurableObject {
 
       seen += 1;
       things.add(item.thing);
+      subtypes.add(item.subtype);
+      // Unix SECONDS, matching `ts` on the envelope and on every D1 row.
+      this.memLastSeen.set(item.thing, now);
     }
 
     // Awaited rather than fired-and-forgotten: this only runs for events and
@@ -1213,12 +1571,17 @@ export class TelemetryHub extends DurableObject {
       await this.ctx.storage.put({
         messages_seen: seen,
         things_seen: [...things],
+        subtypes_seen: [...subtypes],
         last_message_at: now,
+        // Rides the SAME throttled multi-key write as the counters — it is one
+        // more value in an existing put(), not an extra billed write. A plain
+        // object because storage cannot serialise a Map.
+        last_seen: Object.fromEntries(this.memLastSeen),
       });
     }
 
     return {
-      ok: true, accepted: items.length, messages_seen: seen,
+      ok: true, accepted: items.length - dropped, dropped, messages_seen: seen,
       // Diagnostics: distinguishes "nobody listening" from "tag lookup broken".
       sockets_notified: notified, sockets_open: allSockets,
     };
@@ -1227,10 +1590,14 @@ export class TelemetryHub extends DurableObject {
   /**
    * Accept a rover as a publisher.
    *
-   * The tag is "pub" (plus "pub:<thing>"), which deliberately contains no colon
-   * pattern that could collide with a channel tag like "camera:rover2". If a
-   * publisher were ever returned by getWebSockets(channel), publish() would echo
-   * every frame straight back to the rover it came from.
+   * The tag is "pub" (plus "pub:<thing>"). That second form DOES have the same
+   * "<x>:<thing>" shape as a channel tag such as "camera:rover2", so the safety
+   * property is not structural — it is enforced. An item with subtype "pub"
+   * would build the channel "pub:rover2", getWebSockets() would hand back this
+   * very socket, and publishItems() would echo every frame straight back to the
+   * rover it came from. normalizeItems() rejects the reserved subtype (see
+   * RESERVED_SUBTYPES), which is what makes the collision impossible; an earlier
+   * version of this comment claimed it could not happen, and it could.
    */
   async acceptPublisher(url) {
     const thing = url.searchParams.get("thing");
@@ -1502,12 +1869,91 @@ export class TelemetryHub extends DurableObject {
     });
   }
 
+  /**
+   * Should this analysis report be written to D1?
+   *
+   * The decision needs memory of the previous run, and a Worker has none that
+   * survives — so it lives here beside the email gate, which asks a similar
+   * question for a different action. Deliberately SEPARATE from reportGate:
+   * that one decides whether to wake a human and has its own re-notify window;
+   * this one only decides whether to spend a row. Merging them would couple the
+   * history table's completeness to an email cooldown.
+   */
+  async reportStoreGate(url) {
+    const key =
+      `${url.searchParams.get("severity") || "ok"}|${url.searchParams.get("sig") || ""}`;
+
+    const lastKey = await this.ctx.storage.get("last_stored_report_key");
+    const runs = ((await this.ctx.storage.get("runs_since_stored_report")) || 0) + 1;
+
+    // undefined (never stored) counts as changed, so the very first run after
+    // deploy always lands a row.
+    const changed = lastKey === undefined || key !== lastKey;
+    const heartbeat = runs >= REPORT_HEARTBEAT_RUNS;
+
+    if (changed || heartbeat) {
+      await this.ctx.storage.put({
+        last_stored_report_key: key,
+        runs_since_stored_report: 0,
+      });
+      return Response.json({
+        store: true,
+        reason: changed ? "state changed" : "heartbeat",
+        skipped: runs - 1,
+      });
+    }
+
+    await this.ctx.storage.put("runs_since_stored_report", runs);
+    return Response.json({
+      store: false,
+      reason: "unchanged since last stored report",
+      skipped: runs,
+      // How many more unchanged runs before the heartbeat row.
+      heartbeat_in: REPORT_HEARTBEAT_RUNS - runs,
+    });
+  }
+
+  /**
+   * Throttle for archive pruning. State has to be durable — the cron fires 96
+   * times a day and a Worker cannot remember across invocations — and this
+   * object is the only durable thing the cron path already talks to.
+   */
+  async pruneGate() {
+    const now = Date.now();
+    const last = (await this.ctx.storage.get("last_prune_at")) || 0;
+    if (now - last < PRUNE_MIN_INTERVAL_MS) {
+      return Response.json({
+        allowed: false,
+        next_in_s: Math.ceil((PRUNE_MIN_INTERVAL_MS - (now - last)) / 1000),
+      });
+    }
+    // Claimed BEFORE the delete runs, not after. If the prune then fails or the
+    // request is cut short, the next pass simply happens one interval later —
+    // whereas committing afterwards would let a repeatedly failing prune retry
+    // on every single cron run.
+    await this.ctx.storage.put("last_prune_at", now);
+    return Response.json({ allowed: true, last_prune_at: last || null });
+  }
+
   /** Drop rovers from the roster — used to clear test fixtures. */
   async forget(url) {
     const things = (url.searchParams.get("things") || "").split(",").filter(Boolean);
     const known = new Set((await this.ctx.storage.get("things_seen")) || []);
     for (const t of things) known.delete(t);
     await this.ctx.storage.put("things_seen", [...known]);
+
+    // Forget the last-seen stamps too, in both storage and memory. Left behind,
+    // a forgotten rover would keep reappearing in snapshot()'s last_seen map —
+    // and therefore on the public page — despite being off the roster. Also
+    // frees the roster slot the cap counts.
+    const lastSeen = (await this.ctx.storage.get("last_seen")) || {};
+    for (const t of things) {
+      delete lastSeen[t];
+      this.memLastSeen.delete(t);
+      this.memThings.delete(t);
+    }
+    await this.ctx.storage.put("last_seen", lastSeen);
+
     for (const t of things) {
       const list = await this.ctx.storage.list({ prefix: "latest:" });
       for (const key of list.keys()) {
@@ -1543,9 +1989,35 @@ export class TelemetryHub extends DurableObject {
           ? [...this.memThings]
           : (await this.ctx.storage.get("things_seen")) || [],
       last_message_at: lastAt,
+      // Most recent publish per thing, unix SECONDS — the same unit as every
+      // `ts` in this system.
+      //
+      // This exists so the public summary can answer "when was this rover last
+      // heard from?" without `SELECT thing, MAX(ts) FROM readings GROUP BY
+      // thing`, a full-table scan that ran on EVERY anonymous page poll and is
+      // the most expensive query in the app. The hub already knows the answer
+      // — it is what wrote those rows.
+      last_seen: await this.lastSeenMap(),
       // Lets the dashboard distinguish "no data" from "nobody publishing".
       publishers: this.ctx.getWebSockets("pub").length,
       channels: [...channels].sort(),
     });
+  }
+
+  /**
+   * { thing: unix_seconds } merged from storage and memory.
+   *
+   * Memory wins on a tie because it can be up to PERSIST_MIN_MS ahead of the
+   * last durable write; reporting the older value would show a rover that
+   * published two seconds ago as stale. Storage is what survives hibernation,
+   * so neither source alone is sufficient.
+   */
+  async lastSeenMap() {
+    const out = { ...((await this.ctx.storage.get("last_seen")) || {}) };
+    for (const [thing, ts] of this.memLastSeen) {
+      const n = Number(ts);
+      if (Number.isFinite(n) && !(Number(out[thing]) > n)) out[thing] = n;
+    }
+    return out;
   }
 }

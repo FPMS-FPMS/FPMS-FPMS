@@ -20,8 +20,39 @@
  *    and LiDAR arrays; echoing `data` wholesale would publish them by accident.
  *    Every field a viewer sees is named explicitly in PUBLIC_EVENT_FIELDS.
  * 2. Never expose hostnames, IPs, ports, tokens, emails or file paths.
- * 3. Assume this URL gets scraped. Responses are cached at the edge and every
- *    query is LIMIT-bounded, so a traffic spike cannot run up D1 reads.
+ * 3. Whitelisting applies to GENERATED TEXT too, not just to payload fields.
+ *    Agent findings and model output are free-form prose: they interpolate
+ *    detection labels, wildlife species and obstacle distances into a sentence.
+ *    A sentence has no schema, so there is nothing to whitelist inside it — the
+ *    only safe public projection of one is a fixed phrase chosen from a table
+ *    this file owns. See publicReports, which used to break this rule.
+ * 4. Assume this URL gets scraped, and be precise about what actually protects
+ *    it. Three things do, and each covers a different failure:
+ *      - Workers Caching, enabled by `"cache": { "enabled": true }` in
+ *        wrangler.jsonc. On a HIT, Cloudflare returns the response WITHOUT
+ *        running this Worker at all, so a burst costs no D1 reads, no Durable
+ *        Object calls and no CPU. It also collapses simultaneous misses for the
+ *        same key into a single invocation. It works on workers.dev: the cache
+ *        belongs to the Worker, not to a zone.
+ *      - Every query below is LIMIT-bounded AND time-bounded, so even a stream
+ *        of genuine misses cannot walk the whole `readings` table.
+ *      - A per-IP burst limiter (see scrapeRetryAfter) for the one case caching
+ *        does not cover: a scraper that appends a cache-busting query string
+ *        mints a fresh cache key every request and so always reaches the Worker.
+ *
+ *    What does NOT protect it — this block previously claimed otherwise, and the
+ *    claim was false in both directions, so state it plainly:
+ *      - Caching was never actually enabled. It is now.
+ *      - Caching does not protect the free plan's 100k requests/day ceiling.
+ *        Cloudflare bills a cache HIT at the same per-request rate as a miss; a
+ *        hit only skips the CPU. Caching stops the *database* bill, not the
+ *        request count. Nothing in a Worker can stop the request count, because
+ *        even a 429 is a billed request — that ceiling is a plan decision, not
+ *        a code decision.
+ *      - `caches.default` (the Cache API) is deliberately unused here. It is
+ *        documented as functional on custom domains and pages.dev; on a
+ *        workers.dev subdomain its put/match calls silently do nothing, so
+ *        building the defence on it would look right and protect nothing.
  *
  * The camera feed is gated behind FPMS_PUBLIC_CAMERA because a fire-watch
  * camera also points at a home, and the operator's own label file maps class 0
@@ -39,6 +70,82 @@ const STALE_WINDOW_S = 3600;
 const PUBLIC_CACHE_S = 10;
 
 /**
+ * How far back the "is anything on fire?" lookup may search.
+ *
+ * A fire event older than a day is history, not a live alarm, and the banner it
+ * would raise would be wrong. Bounding it is also what stops the query being
+ * unbounded work — see publicSummary.
+ */
+const FIRE_LOOKBACK_S = 24 * 3600;
+
+/**
+ * Per-IP burst guard for /api/public/*.
+ *
+ * WHY IN-ISOLATE AND NOT IN THE DURABLE OBJECT
+ * --------------------------------------------
+ * A DO-backed counter would be globally accurate, but it costs a subrequest and
+ * a DO invocation on EVERY request — i.e. it spends the exact resource it is
+ * meant to conserve, and it would run on requests that currently touch no
+ * storage at all. A module-scope Map lives in the isolate, costs nothing, and
+ * needs no binding.
+ *
+ * THE TRADEOFF, STATED HONESTLY
+ * -----------------------------
+ * Counters are per isolate, so they are not a global rate limit. A client whose
+ * requests land in several colos (or several isolates in one colo) gets that
+ * multiple of the allowance, and an isolate eviction resets the window. What it
+ * does reliably catch is the realistic threat: one script hammering one URL from
+ * one place, which otherwise sustains 10 req/s indefinitely.
+ *
+ * It also only ever sees traffic that reaches the Worker. Repeat hits on the
+ * same URL are absorbed by Workers Caching before this code runs, so in practice
+ * this limiter exists for cache-busting scrapers — the only ones that cost
+ * anything beyond the request itself.
+ *
+ * 30 requests / 10s is roughly 60x what the page's own 30s poll needs, so a
+ * human with several tabs open, or a shared NAT egress, will not trip it.
+ */
+const SCRAPE_WINDOW_MS = 10_000;
+const SCRAPE_BURST = 30;
+const SCRAPE_CLIENTS_MAX = 1000;
+
+/** ip -> { n, reset_at }. Module scope: one table per isolate, no storage. */
+const scrapeWindows = new Map();
+
+/**
+ * Returns 0 when the request is within budget, otherwise the seconds a caller
+ * should wait (the Retry-After value).
+ */
+function scrapeRetryAfter(request) {
+  // CF-Connecting-IP is set by the edge and cannot be spoofed by the client,
+  // unlike X-Forwarded-For. Missing only in local dev, where "unknown" is fine.
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const now = Date.now();
+
+  let win = scrapeWindows.get(ip);
+  if (!win || now >= win.reset_at) {
+    win = { n: 0, reset_at: now + SCRAPE_WINDOW_MS };
+    scrapeWindows.set(ip, win);
+  }
+  win.n++;
+
+  // Bounded memory. Sweep expired windows first; if the table is still oversized
+  // (a distributed scan hitting one isolate from many addresses) drop it whole.
+  // Losing the counters fails OPEN for one window, which is the right direction
+  // for a public status page: an unbounded Map in a long-lived isolate is a
+  // worse outcome than a scraper getting one free window.
+  if (scrapeWindows.size > SCRAPE_CLIENTS_MAX) {
+    for (const [k, v] of scrapeWindows) if (now >= v.reset_at) scrapeWindows.delete(k);
+    if (scrapeWindows.size > SCRAPE_CLIENTS_MAX) {
+      scrapeWindows.clear();
+      scrapeWindows.set(ip, win);
+    }
+  }
+
+  return win.n > SCRAPE_BURST ? Math.max(1, Math.ceil((win.reset_at - now) / 1000)) : 0;
+}
+
+/**
  * The only event fields an anonymous viewer ever sees. Anything not listed is
  * dropped — including `frame`, `ranges_m`, `ip` and any field added later.
  */
@@ -52,13 +159,44 @@ const PUBLIC_EVENT_TYPES = new Set([
   "camera_recovered", "hazard",
 ]);
 
-function publicJson(obj, status = 200) {
+/**
+ * The complete set of headlines /api/public/reports can ever emit, keyed by the
+ * report's severity. Nothing outside this table reaches a viewer.
+ *
+ * WHY A FIXED TABLE INSTEAD OF THE STORED `summary`
+ * -------------------------------------------------
+ * `reports.summary` is written by runAgents as the first critical/warning
+ * finding's `.detail`, and perRoverAgent builds that detail by interpolating
+ * whatever the fleet saw: YOLO detection labels, wildlife species, nearest
+ * obstacle distances, per-rover names. Today it usually reads "rover2
+ * [critical] no telemetry at all", which is harmless — but that is a property of
+ * the rovers being down, not a property of the code. With a live camera the same
+ * field publishes what the camera saw, to anonymous viewers, with no auth.
+ *
+ * The header of this file gates the camera feed precisely because the operator's
+ * own label file maps class 0 to a person's name. Publishing the detector's
+ * *words* while withholding its *pixels* leaks the same fact and defeats that
+ * gate. Design rule 3: prose has no schema, so it cannot be whitelisted
+ * field-by-field — only replaced by a phrase this file chose in advance.
+ *
+ * Anyone entitled to the real findings reads them through the authenticated API.
+ */
+const PUBLIC_REPORT_HEADLINE = {
+  ok: "All monitored systems nominal.",
+  warning: "A condition needs attention.",
+  critical: "A critical condition was detected.",
+};
+
+/** Severity itself is whitelisted: an unrecognised value must not pass through. */
+const PUBLIC_REPORT_UNKNOWN = { severity: "unknown", summary: "Status reported." };
+
+function publicJson(obj, status = 200, cacheControl = `public, max-age=${PUBLIC_CACHE_S}`) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: {
       "Content-Type": "application/json",
       // Public and cacheable, unlike the authenticated API which is no-store.
-      "Cache-Control": `public, max-age=${PUBLIC_CACHE_S}`,
+      "Cache-Control": cacheControl,
       // A public read-only feed is meant to be embedded and scraped.
       "Access-Control-Allow-Origin": "*",
       // Defence in depth: these responses are pure data, never markup.
@@ -106,9 +244,17 @@ function liveness(lastSeenMs, nowMs) {
 }
 
 /**
- * Fleet status. Reads the Durable Object for live state and falls back to the
- * D1 archive for last-known values, so the page still says something useful
- * when every rover is down — which is exactly when someone checks it.
+ * Fleet status.
+ *
+ * The roster and its freshness come entirely from the Durable Object, which is
+ * the process that receives the telemetry and therefore already knows both.
+ * Every step degrades rather than fails: an unreachable DO leaves an empty
+ * roster, a DO without the per-thing `last_seen` map falls back to the fleet-
+ * wide timestamp, and a failed fire lookup reports "no fire" rather than
+ * guessing. The page still says something useful when every rover is down —
+ * which is exactly when someone checks it.
+ *
+ * D1 is touched once here, for the fire banner, and that query is time-bounded.
  */
 async function publicSummary(env, hubStub) {
   const now = Date.now();
@@ -126,34 +272,47 @@ async function publicSummary(env, hubStub) {
 
   const things = new Map();
 
-  // Channels look like "camera:rover2" — the thing is the half after the colon.
-  const snapSeen = toMs(snap?.last_message_at);
-  for (const ch of (snap?.channels || [])) {
-    const name = String(ch).split(":")[1];
-    if (name) things.set(name, { thing: name, last_seen: snapSeen });
-  }
+  /** Only fills a gap — never overwrites a precise time with an approximate one. */
+  const noteApprox = (name, ms) => {
+    if (name && !things.has(name)) things.set(name, { thing: name, last_seen: ms });
+  };
 
-  // Fill in anything the archive knows about but the hub has forgotten.
-  if (env.DB) {
-    try {
-      const { results } = await env.DB
-        .prepare("SELECT thing, MAX(ts) AS ts FROM readings GROUP BY thing LIMIT 50")
-        .all();
-      for (const r of results || []) {
-        if (!r.thing) continue;
-        const prev = things.get(r.thing);
-        const ts = toMs(r.ts);
-        if (!prev || (ts && (!prev.last_seen || ts > prev.last_seen))) {
-          things.set(r.thing, { thing: r.thing, last_seen: ts });
-        }
-      }
-    } catch (err) {
-      console.error(JSON.stringify({
-        message: "public summary: archive query failed",
-        error: err instanceof Error ? err.message : String(err),
-      }));
+  // Per-thing freshness, straight from the hub. `last_seen` maps a thing to the
+  // unix SECONDS of its most recent publish.
+  //
+  // WHY THIS IS NOT A D1 QUERY ANY MORE
+  // -----------------------------------
+  // This used to be `SELECT thing, MAX(ts) FROM readings GROUP BY thing`. That
+  // reads worse than it looks: `ts` is the THIRD column of idx_readings_lookup
+  // (thing, subtype, ts DESC), so SQLite cannot skip to the newest row per
+  // thing — the leading columns it can seek on are thing and subtype, and the
+  // max it wants lives past both. It must therefore scan every group in full.
+  // On a table that grows by ~35k rows/day, that is a whole-table read on EVERY
+  // public page poll, from an endpoint with no auth in front of it. It was the
+  // single largest consumer of the D1 read quota.
+  //
+  // The hub already has this map in memory and is the authority on it; asking
+  // the archive to recompute what the live process already knows was the bug.
+  const lastSeen = snap?.last_seen;
+  if (lastSeen && typeof lastSeen === "object") {
+    for (const [name, ts] of Object.entries(lastSeen)) {
+      const ms = toMs(ts);
+      if (name && ms) things.set(name, { thing: name, last_seen: ms });
     }
   }
+
+  // Graceful path for a deployment that predates `last_seen`, or a cold DO that
+  // has not rebuilt it yet. Names still come from the roster, and the hub's
+  // single fleet-wide `last_message_at` is the only freshness signal left.
+  //
+  // It is deliberately used only as a fallback: being fleet-wide, it can make a
+  // silent rover look alive. Listing a rover with an approximate time still
+  // beats omitting it, because a page that has quietly dropped a rover answers
+  // "is anything on fire?" with silence rather than with a warning.
+  const snapSeen = toMs(snap?.last_message_at);
+  // Channels look like "camera:rover2" — the thing is the half after the colon.
+  for (const ch of (snap?.channels || [])) noteApprox(String(ch).split(":")[1], snapSeen);
+  for (const name of (snap?.things_seen || [])) noteApprox(String(name), snapSeen);
 
   const rovers = [...things.values()]
     .map((t) => ({
@@ -164,14 +323,25 @@ async function publicSummary(env, hubStub) {
     .sort((a, b) => a.thing.localeCompare(b.thing));
 
   // The most recent unresolved fire event, if any.
+  //
+  // The `ts >= ?` floor is not cosmetic. idx_readings_events is (kind, ts DESC),
+  // so `subtype IN (...)` is not indexed — it is a filter applied to rows the
+  // engine has already read. Walking kind='events' newest-first therefore reads
+  // every event row until it finds a fire one, and when there is no fire event
+  // at all (the normal, permanent case) it reads all of them. LIMIT 1 caps what
+  // comes back, not what gets scanned. The floor turns that into a bounded range
+  // scan: at worst one day of events, and it stops at the first row older than
+  // the cutoff.
   let fire = { active: false, since: null };
   if (env.DB) {
     try {
       const row = await env.DB
         .prepare(
-          "SELECT ts, subtype FROM readings WHERE kind = 'events' " +
+          "SELECT ts, subtype FROM readings WHERE kind = 'events' AND ts >= ? " +
           "AND subtype IN ('fire','fire_cleared') ORDER BY ts DESC LIMIT 1",
         )
+        // Stored in unix seconds, same unit as the rovers send.
+        .bind(now / 1000 - FIRE_LOOKBACK_S)
         .first();
       if (row?.subtype === "fire") fire = { active: true, since: toMs(row.ts) };
     } catch {
@@ -232,19 +402,37 @@ async function publicEvents(env, url) {
   }
 }
 
-/** Analyst report headlines — severity and summary only, never the findings. */
+/**
+ * Analyst report headlines — when a report was produced and how bad it was.
+ *
+ * Deliberately NOT the stored `summary`. That column is agent prose and cannot
+ * be published; see PUBLIC_REPORT_HEADLINE for the full reasoning. `severity` is
+ * a closed vocabulary (ok | warning | critical) and safe on its own, so the
+ * public shape is severity plus the fixed phrase that severity maps to.
+ *
+ * `summary` is still the field name so existing consumers of this feed keep
+ * working — it is now a derived label, not the analyst's sentence.
+ *
+ * Note the SELECT does not even read the column. A field that is never fetched
+ * cannot be leaked by a later refactor that forgets why it was dropped.
+ */
 async function publicReports(env, url) {
   if (!env.DB) return publicJson({ reports: [] });
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 5), 1), 20);
   try {
     const { results } = await env.DB
-      .prepare("SELECT ts, severity, summary FROM reports ORDER BY ts DESC LIMIT ?")
+      .prepare("SELECT ts, severity FROM reports ORDER BY ts DESC LIMIT ?")
       .bind(limit)
       .all();
     return publicJson({
-      reports: (results || []).map((r) => ({
-        ts: toMs(r.ts), severity: r.severity, summary: r.summary,
-      })),
+      reports: (results || []).map((r) => {
+        const headline = PUBLIC_REPORT_HEADLINE[r.severity];
+        // Unrecognised severity falls back to the placeholder rather than
+        // echoing the value: whitelist, never blacklist (design rule 1).
+        return headline
+          ? { ts: toMs(r.ts), severity: r.severity, summary: headline }
+          : { ts: toMs(r.ts), ...PUBLIC_REPORT_UNKNOWN };
+      }),
     });
   } catch (err) {
     console.error(JSON.stringify({
@@ -337,6 +525,25 @@ export async function handlePublic(request, env, url, path, hubStub) {
 
   if (!path.startsWith("/api/public/")) return null;
   if (request.method !== "GET") return publicJson({ error: "method not allowed" }, 405);
+
+  // Burst guard. Cheap by construction: a Map lookup, no storage, no DO call,
+  // no binding. See scrapeRetryAfter for what it does and does not cover.
+  //
+  // The 429 is explicitly no-store. Everything else here is `public, max-age=10`
+  // and Workers Caching honours that, so a cacheable rejection would be handed
+  // to every other viewer arriving at the same colo for the next ten seconds —
+  // one scraper would take the status page down for the neighbourhood, which is
+  // the outcome this endpoint exists to prevent.
+  const retryAfter = scrapeRetryAfter(request);
+  if (retryAfter) {
+    const res = publicJson(
+      { error: "rate limited", hint: `retry in ${retryAfter}s` },
+      429,
+      "no-store",
+    );
+    res.headers.set("Retry-After", String(retryAfter));
+    return res;
+  }
 
   // One call for everything the page renders.
   //
