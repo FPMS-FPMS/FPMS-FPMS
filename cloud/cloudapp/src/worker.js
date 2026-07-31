@@ -880,14 +880,51 @@ async function analyzeAndReport(env, { force = false } = {}) {
 
   let emailed = false;
   let email = null;
+  let gate = null;
+
+  // Which conditions are firing, not how many times we have noticed them. A
+  // persisting fault keeps the same signature; a NEW failing agent changes it
+  // and pages immediately.
+  const signature = report.findings
+    .filter((f) => f.severity !== "ok")
+    .map((f) => `${f.agent}:${f.severity}`)
+    .sort()
+    .join("|");
+
   // Only bother a human when something is actually wrong — an inbox full of
-  // "all clear" is an inbox nobody reads when it finally matters.
-  if (force || report.severity !== "ok") {
-    email = await sendEmail(
-      env,
-      `FPMS ${report.severity.toUpperCase()} — ${report.summary.slice(0, 80)}`,
-      html, text,
+  // "all clear" is an inbox nobody reads when it finally matters. And only when
+  // it is NEWS: see reportGate. Without that, one offline rover sent an email
+  // every 15 minutes until the daily quota was gone.
+  // Fail OPEN if the gate is unreachable — a missed fire alert is far worse
+  // than a duplicate one. But say so loudly: a silently swallowed error here
+  // means the flood protection is off and nobody knows.
+  try {
+    const gateRes = await hubStub(env).fetch(
+      `https://hub/report-gate?severity=${encodeURIComponent(report.severity)}` +
+      `&sig=${encodeURIComponent(signature)}`,
     );
+    if (!gateRes.ok) {
+      const body = await gateRes.text().catch(() => "");
+      throw new Error(`report-gate HTTP ${gateRes.status}: ${body.slice(0, 80)}`);
+    }
+    gate = await gateRes.json();
+  } catch (err) {
+    console.error(JSON.stringify({
+      message: "report gate unavailable — failing open, duplicate alerts possible",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    gate = { allowed: true, reason: "gate unavailable — failing open" };
+  }
+
+  if (force || gate.allowed) {
+    const recovered = gate.reason === "recovered";
+    const subject = recovered
+      ? `FPMS RECOVERED — ${report.summary.slice(0, 80)}`
+      : `FPMS ${report.severity.toUpperCase()} — ${report.summary.slice(0, 80)}`;
+    const note = gate.suppressed
+      ? `\n\n(${gate.suppressed} identical report(s) suppressed since the last email.)`
+      : "";
+    email = await sendEmail(env, subject, html, text + note);
     emailed = email.ok;
   }
 
@@ -895,7 +932,7 @@ async function analyzeAndReport(env, { force = false } = {}) {
     "INSERT INTO reports (ts, severity, summary, findings, emailed) VALUES (?, ?, ?, ?, ?)",
   ).bind(report.ts, report.severity, report.summary, JSON.stringify(report.findings), emailed ? 1 : 0).run();
 
-  return { ...report, emailed, email };
+  return { ...report, emailed, email, gate };
 }
 
 /** Recent readings from the archive: /api/history?thing=&subtype=&limit= */
@@ -1046,6 +1083,7 @@ export class TelemetryHub extends DurableObject {
       );
     }
     if (url.pathname === "/alert-gate") return this.alertGate(url);
+    if (url.pathname === "/report-gate") return this.reportGate(url);
     if (url.pathname === "/forget") return this.forget(url);
     return new Response("not found", { status: 404 });
   }
@@ -1394,6 +1432,74 @@ export class TelemetryHub extends DurableObject {
     await this.ctx.storage.put("last_alert_email", now);
     await this.ctx.storage.put("alerts_suppressed", 0);
     return Response.json({ allowed: true, suppressed });
+  }
+
+  /**
+   * Gate for scheduled-report emails — the uptime alerting path.
+   *
+   * WHY THIS EXISTS
+   * ---------------
+   * The cron emailed on every run where severity != "ok". A rover that goes
+   * offline stays offline, so one unchanging fault produced an email every 15
+   * minutes: 170 identical "rover2 no telemetry" messages in two days, against
+   * a ~100/day Resend allowance. The mailbox becomes noise and, far worse, the
+   * daily quota is spent — so a REAL fire alert cannot send. That is the same
+   * failure the ingest-side cooldown was added to fix; this path never had one.
+   *
+   * The rule is state-change, not level:
+   *   - severity dropped back to ok  -> send ONE recovery notice
+   *   - the set of failing agents changed, or severity got worse -> send now
+   *     (a fire starting while a rover is already flagged silent must not be
+   *     swallowed by a cooldown)
+   *   - otherwise, the same condition persisting -> at most one reminder per
+   *     RENOTIFY_MS
+   *
+   * Net effect: an unchanging fault sends ~4 emails/day instead of 96, a
+   * genuinely new condition still pages immediately, and recovery is reported.
+   */
+  async reportGate(url) {
+    const RENOTIFY_MS = 6 * 60 * 60 * 1000;
+    const RANK = { ok: 0, warning: 1, critical: 2 };
+
+    const sig = url.searchParams.get("sig") || "";
+    const severity = url.searchParams.get("severity") || "ok";
+    const now = Date.now();
+
+    const lastSig = (await this.ctx.storage.get("last_report_sig")) || "";
+    const lastSeverity = (await this.ctx.storage.get("last_report_severity")) || "ok";
+    const lastAt = (await this.ctx.storage.get("last_report_email_at")) || 0;
+    const suppressed = (await this.ctx.storage.get("reports_suppressed")) || 0;
+
+    const commit = async (reason) => {
+      await this.ctx.storage.put({
+        last_report_sig: sig,
+        last_report_severity: severity,
+        last_report_email_at: now,
+        reports_suppressed: 0,
+      });
+      return Response.json({ allowed: true, reason, suppressed });
+    };
+
+    if (severity === "ok") {
+      // Only worth an email if we had previously reported a problem.
+      if (RANK[lastSeverity] > 0) return commit("recovered");
+      await this.ctx.storage.put({
+        last_report_sig: sig, last_report_severity: severity,
+      });
+      return Response.json({ allowed: false, reason: "still ok", suppressed });
+    }
+
+    if (sig !== lastSig) return commit("condition changed");
+    if (RANK[severity] > RANK[lastSeverity]) return commit("severity increased");
+    if (now - lastAt >= RENOTIFY_MS) return commit("periodic reminder");
+
+    await this.ctx.storage.put("reports_suppressed", suppressed + 1);
+    return Response.json({
+      allowed: false,
+      reason: "unchanged condition within re-notify window",
+      suppressed: suppressed + 1,
+      next_in_s: Math.ceil((RENOTIFY_MS - (now - lastAt)) / 1000),
+    });
   }
 
   /** Drop rovers from the roster — used to clear test fixtures. */
