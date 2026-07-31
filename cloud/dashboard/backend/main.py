@@ -676,10 +676,24 @@ async def stream(ws: WebSocket, channel: str) -> None:
 # FPMS_FRONTEND_DIST to the extracted bundle path when running as a frozen exe.
 
 import os
-FRONTEND_DIST = Path(
-    os.environ.get("FPMS_FRONTEND_DIST")
-    or (Path(__file__).resolve().parent.parent / "frontend" / "dist")
-)
+
+# FPMS_FRONTEND_DIST lets a packaged build serve a NEWER UI than the one frozen
+# into it — the exe bundles frontend/dist (see build/fpms.spec), so without an
+# override the installed app shows whatever UI it was built with, no matter how
+# many times the frontend is rebuilt.
+#
+# The override only wins if it actually exists. Taking it blindly would mean a
+# moved or deleted directory serves NO interface at all: every tab gone, which
+# is the exact failure the override was added to prevent.
+_dist_override = os.environ.get("FPMS_FRONTEND_DIST")
+_bundled_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _dist_override and Path(_dist_override).is_dir():
+    FRONTEND_DIST = Path(_dist_override)
+else:
+    if _dist_override:
+        print(f"FPMS_FRONTEND_DIST={_dist_override!r} is not a directory; "
+              f"falling back to the bundled UI", flush=True)
+    FRONTEND_DIST = _bundled_dist
 
 if FRONTEND_DIST.is_dir():
     app.mount(

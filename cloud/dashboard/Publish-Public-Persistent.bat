@@ -92,6 +92,22 @@ set "FPMS_EXE=%~dp0dist\FPMS-Dashboard.exe"
 if exist "%ProgramFiles(x86)%\FPMS Dashboard\FPMS-Dashboard.exe" set "FPMS_EXE=%ProgramFiles(x86)%\FPMS Dashboard\FPMS-Dashboard.exe"
 if exist "%ProgramFiles%\FPMS Dashboard\FPMS-Dashboard.exe" set "FPMS_EXE=%ProgramFiles%\FPMS Dashboard\FPMS-Dashboard.exe"
 
+REM  Explicit opt-in override, checked last so it beats both of the above.
+REM
+REM  Needed because the backend is COMPILED INTO the exe: rebuilding the React
+REM  frontend (or pointing FPMS_FRONTEND_DIST at a newer one) updates the UI,
+REM  but every API route still comes from whichever exe is running. A new tab
+REM  whose buttons hit routes the installed build has never heard of looks
+REM  broken, so a fresh backend needs a fresh exe.
+REM
+REM  Updating the installed copy needs elevation, so this lets a freshly built
+REM  exe be used without reinstalling. It is opt-in precisely because it
+REM  reintroduces the lock the preference order above exists to avoid: while
+REM  this runs, dist\FPMS-Dashboard.exe is held open and an installer cannot
+REM  replace it. Clear the variable before installing a new version.
+if defined FPMS_EXE_OVERRIDE if exist "%FPMS_EXE_OVERRIDE%" set "FPMS_EXE=%FPMS_EXE_OVERRIDE%"
+echo [i] running: %FPMS_EXE%
+
 :appLOOP
 "%FPMS_EXE%" >> "%LOCALAPPDATA%\FPMS\service.log" 2>&1
 echo.
