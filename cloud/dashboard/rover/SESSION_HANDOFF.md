@@ -50,18 +50,32 @@ found instead of a plausible wrong one. Preserve that norm.
   30–60 s, which was flapping MQTT on a 47 s cycle)
 - **Nav2 1.1.20 already installed** — do not reinstall
 
-### Authored but NOT installed on the rover
+### Written, with the physical claims measured (commit `01135d2`)
+- **`fpms_lidar_ros.py` + `fpms-lidar-ros.service`** — MQTT scan → `LaserScan`
+  on `/scan_lidar`. Link 1 of the Nav2 chain is no longer blocking.
+  Two numbers in its docstring are **real measurements taken on this rover**,
+  not estimates, and are worth trusting: the publish rate (1.90 Hz at
+  `FPMS_LIDAR_HZ=2`, 9.83 Hz at 10, ~5060 raw points/s either way) and the
+  MQTT round-trip latency (median 100 ms, p90 179 ms). `FPMS_LIDAR_HZ=10` was
+  written to `/etc/fpms/config.env` on the Pi.
+  It goes through MQTT rather than the serial port on purpose — taking the port
+  would kill the dashboard LiDAR view, and adding `rclpy` to `fpms-rover-agent`
+  would destroy the property that makes that agent reliable. If the feed goes
+  quiet it **stops publishing** instead of repeating the last scan; a frozen
+  scan is worse than an absent one, because Nav2 keeps planning against a world
+  nobody is observing any more.
+- `nav2/` params, bringup, arena map, TF launch — verified locally only
+- `fpms_missions.py` + service — defaults to `deadreckon`, see below
 - `fpms_odom_tf.py` + `fpms-odom-tf.service` — `/odom` and `odom`→`base_footprint`
-- `nav2/make_arena_map.py`, `nav2/fpms_tf.launch.py`, `nav2/TF_TREE.md`
 - `deadband_sweep.py` — fixed to use pose, never re-run since
 
-### Not done
-- **LiDAR → ROS `LaserScan` bridge.** This is link 1 of the Nav2 chain and
-  everything else is blocked on it. The board's own `/scan` is dead (all
-  ranges 0.0); the real LiDAR is owned by `fpms-rover-agent` and published to
-  MQTT only.
-- Nav2 params / launch, mission executor — in flight at session end, check
-  `git log` for what landed.
+### Not verified — the rover was powered off before any of it ran end to end
+Nothing below is known-broken. It is **unproven**, which is not the same thing,
+and the fastest way to waste the next session is to treat it as either.
+- Whether `fpms-lidar-ros` is actually installed and enabled. The docstring and
+  `deploy_rover.py` both say installed; **that was never confirmed with
+  `systemctl status` while the rover was up.** Check it first, assume nothing.
+- The Nav2 launch as a whole, and any mission end to end.
 - The deadband has **never been measured** on corrected data.
 - LiDAR mount offsets are **placeholders**. Measure them before trusting any map.
 
@@ -123,9 +137,17 @@ cycle.
 
 1. `git log --oneline -20` — see what landed after this file was written.
 2. Read `NAV2_BRIEF.md` §3a and §3b. Do not skip them.
-3. Finish the **LiDAR → ROS bridge**. Nothing else in the Nav2 chain can be
-   tested until a real `LaserScan` is on a ROS topic.
-4. Verify the TF tree with the commands in `nav2/TF_TREE.md` before launching
+3. Power the rover on. Windows Mobile Hotspot must be on *first* or the Pi
+   boots with no network and takes ~12 minutes to appear.
+4. **Confirm what is actually running before building on it:**
+   `systemctl is-active fpms-rover-agent fpms-teleop fpms-lidar-ros` and
+   `ros2 topic hz /scan_lidar` (expect ~9.8 Hz). If `/scan_lidar` is silent,
+   that is the whole job — nothing downstream can be tested without it.
+5. Verify the TF tree with the commands in `nav2/TF_TREE.md` before launching
    Nav2. It will fail confusingly if any link is missing.
-5. Re-run `deadband_sweep.py --on-blocks` on the corrected code to get a real
+6. Re-run `deadband_sweep.py --on-blocks` on the corrected code to get a real
    floor, and only then decide whether a `MIN_CMD` is needed at all.
+
+Steps 4 and 5 are the whole reason this file exists. The two multi-hour losses
+described at the top both began by skipping a cheap check and trusting a
+plausible assumption instead.
