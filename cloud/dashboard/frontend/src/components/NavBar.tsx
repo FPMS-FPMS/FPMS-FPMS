@@ -16,6 +16,7 @@ type Props = {
 const tabs = [
   { to: "/", label: "Overview", end: true },
   { to: "/control", label: "Control", hqOnly: true },
+  { to: "/drive", label: "Drive", hqOnly: true },
   { to: "/devices", label: "Devices", hqOnly: true },
   // AWS and Install describe the operator's own machine — an AWS console view
   // and a "download the desktop app" page. Neither means anything in the cloud

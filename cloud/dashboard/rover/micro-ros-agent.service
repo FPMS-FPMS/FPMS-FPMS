@@ -1,0 +1,23 @@
+[Unit]
+Description=micro-ROS Agent (Yahboom MicroROS Board V2.0 / ESP32-S3) on USB port 1.3
+Documentation=https://micro.ros.org
+After=network-online.target dev-serial-by\x2dpath-platform\x2dfc880000.usb\x2dusb\x2d0:1.3:1.0\x2dport0.device
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+SupplementaryGroups=dialout
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# Stable by-path device: both CP2102 adapters share an identical ID_SERIAL,
+# so only the USB topology path distinguishes the ESP32-S3 board (1.3)
+# from the LiDAR (1.2). Never use /dev/ttyUSB1 here - it can renumber.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/ubuntu/uros_ws/install/setup.bash && exec ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0 -b 921600'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

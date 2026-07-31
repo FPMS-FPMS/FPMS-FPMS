@@ -576,6 +576,9 @@ THING_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CONTROL_ACTIONS = {
     "stop", "estop", "auto_on", "auto_off", "test_motors", "read_encoders",
     "ping", "status", "connect", "disconnect", "restart",
+    # Manual driving (Drive page): a streamed analog jog, bounded steps, a
+    # closed-loop turn, named missions, and a pose correction.
+    "jog", "nudge", "turn", "mission", "set_coordinate",
 }
 
 

@@ -35,6 +35,12 @@ TOPIC_FILTERS = [
     ("fpms/+/telemetry/camera", 0),
     ("fpms/+/telemetry/thermal", 0),
     ("fpms/+/telemetry/pose", 0),
+    # Drive/teleop health from fpms_teleop.py on the rover: battery volts, pose,
+    # measured topic rates and micro-ROS link state. The Drive page's health
+    # panel and its motion lockout both key off this, so without the
+    # subscription the panel reads "no telemetry" forever and the operator gets
+    # no warning that the link is down.
+    ("fpms/+/telemetry/drive", 0),
     ("fpms/+/events/#", 1),
 ]
 

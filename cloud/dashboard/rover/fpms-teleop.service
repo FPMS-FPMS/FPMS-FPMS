@@ -1,0 +1,31 @@
+[Unit]
+Description=FPMS teleop bridge (MQTT -> /cmd_vel)
+# Deliberately NO Requires=/BindsTo=/PartOf= on micro-ros-agent or
+# fpms-rover-agent. Those two are long-lived and expensive to restart (the
+# micro-ROS link costs 90-225s to re-establish); a dependency here would let a
+# teleop restart take them down with it. network-online is the only wait.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=ROS_DOMAIN_ID=20
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_teleop.py'
+# SIGTERM lands on the python process, which publishes zero Twist x10 before
+# exiting. The generous stop timeout exists so that shutdown is never cut short
+# by systemd killing us mid-stop.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
