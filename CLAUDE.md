@@ -30,11 +30,14 @@ cloud/
   dashboard/            edge app
     backend/            FastAPI: hub.py (MQTT hub, session state), thermal_analysis.py
     frontend/            React/Vite/Tailwind: CameraView, ThermalView, LidarView, AnalystPanel
-    rover/               code that runs ON the Orange Pi (not the laptop)
+    rover/               code that runs ON the Orange Pi / rover boards (not the laptop)
       fpms_rover_agent.py     the agent (systemd fpms-rover-agent.service on the Pi)
       fpms_yolo26_npu.py      YOLO26 RKNN decode (NPU output -> boxes)
       test_yolo26_decode.py   22 offline checks for the decode, no Pi needed
       profile_steps.py, bench_npu.py   perf profiling scripts
+      fpms_teleop.py           MQTT -> /cmd_vel bridge to the drive board, 0.6s jog
+                                deadman (systemd fpms-teleop.service; needs
+                                micro-ros-agent.service running alongside it)
     models/              yolo26n.pt/.onnx -> convert_yolo26.sh -> yolo26n-rk3588.rknn
   cloudapp/              cloud Worker: src/worker.js, agents.js, public.js; wrangler.jsonc, schema.sql (D1)
   gateway/               tunnel-proxy Worker
@@ -75,6 +78,57 @@ cloud/
   to clear) because a naive threshold flapped 173 times on one borderline frame.
 - **VLM severity must come from a structured field, never keyword-matched from
   prose.** Prose matching once scored "there is no visible smoke" as critical.
+
+## Rover drive board — hard constraints (verified on real hardware)
+
+The rover's drive/motor subsystem is a separate board from the Orange Pi's
+camera/LiDAR stack. These facts cost real time to establish — do not
+re-derive or re-litigate them.
+
+- **It is a Yahboom MicroROS Board V2.0 (ESP32-S3)**, speaking micro-ROS /
+  Micro XRCE-DDS — **not** the Rosmaster STM32 board the old GOLDEN code
+  targets. `Rosmaster_Lib` over direct serial cannot talk to this board: it
+  returns version=-1, battery 0.0V, encoders all zero. Seeing those zeros
+  means you're on the wrong protocol, not looking at dead hardware.
+- **Motor transport is micro-ROS over serial at 921600 baud**, on the stable
+  path `/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0`.
+- **Both onboard CP2102 USB-serial adapters report an identical
+  `ID_SERIAL`.** Only the USB topology path tells them apart — the other one
+  (`...usb-0:1.2:1.0-port0`, `ttyUSB0`) is the LiDAR, owned by
+  fpms-rover-agent. **Never bind by `/dev/ttyUSBn`**: enumeration order is
+  not guaranteed, and getting it wrong sends motor commands to the LiDAR
+  port or vice versa.
+- **The firmware stores its own `ROS_DOMAIN_ID = 20`**, independent of
+  whatever the host defaults to. A session can establish and DDS entities
+  can be created correctly while every `ros2` tool running on domain 0 sees
+  an empty topic list — that looks exactly like a broken link and isn't
+  one. Read the domain back over Yahboom's separate config protocol at
+  115200 baud (frames `0xFF`/`0xF8` host->board, `0xF7` board->host,
+  checksum = `sum % 256`; address `0x06` = domain id, `0x51` = firmware
+  version). That link is independent of the 921600 micro-ROS transport.
+- **The board self-reconnects unaided in 90-225s** after any agent
+  restart. No reset-button press is needed or helpful for this — if the
+  link looks dead right after a restart, wait before touching hardware.
+- **systemd must use `After=` + `Restart=always` on the device unit, not
+  `BindsTo=`.** `BindsTo=` plus udev churn kills the agent.
+- **Topics on `ROS_DOMAIN_ID=20`, node `/YB_Car_Node`, all QoS
+  RELIABLE/VOLATILE:**
+  - `/cmd_vel` `geometry_msgs/msg/Twist` (sub)
+  - `/battery` `std_msgs/msg/UInt16` @1Hz — **decivolts, divide by 10**
+  - `/odom_raw` `nav_msgs/msg/Odometry` @11.2Hz
+  - `/imu` `sensor_msgs/msg/Imu` @25Hz — **orientation is not fused
+    (identity quaternion); integrate heading from `angular_velocity.z`**
+  - `/scan` `sensor_msgs/msg/LaserScan` — **dead, all ranges 0.0, not a
+    usable LiDAR source** (LiDAR data comes from the other CP2102, above)
+  - `/beep`, `/servo_s1`, `/servo_s2`
+  - Differential drive; `linear.y` is ignored. Firmware clamps `vx` to
+    +/-1.0 m/s and `wz` to +/-5.0 rad/s.
+- **Do not lower speeds to make the chassis safer — raise the floor
+  instead.** Below the motor deadband the firmware winds up an integrator
+  while stalled and releases it in a direction that is not reliably the
+  commanded one: commanding 0.0041 m/s made the rover sit still for ~3s
+  then lurch 290mm *backward* with 24 degrees of unintended rotation. The
+  fix for "too fast" is to clear the deadband, never to creep slower.
 
 ## Security
 

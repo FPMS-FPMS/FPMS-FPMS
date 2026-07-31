@@ -52,6 +52,27 @@ const TELEMETRY_STALE_MS = 5000;
 /** Battery reading older than this is reported as stale rather than current. */
 const BATTERY_STALE_S = 5;
 
+/**
+ * Link banner thresholds. Deliberately separate from TELEMETRY_STALE_MS, which
+ * governs the motion lockout — the lockout is a safety decision and the banner
+ * is a status readout, and pinning them together would mean a copy change to one
+ * silently altering the other.
+ *
+ * Under LINK_LIVE_MS the feed is current. Between the two the feed has gone
+ * quiet but a single dropped packet at 1 Hz still looks like this, so it reads
+ * STALE. Past LINK_LOST_MS it is not a hiccup any more: the rover has stopped
+ * publishing and we are waiting for it to come back, which is RECONNECTING.
+ */
+const LINK_LIVE_MS = 3000;
+const LINK_LOST_MS = 10000;
+
+/**
+ * uptime_s must fall by more than this to count as a restart. Telemetry is
+ * sampled, not synchronised, so a packet can carry an uptime a shade below its
+ * predecessor without anything having happened.
+ */
+const REBOOT_SLACK_S = 2;
+
 const ACK_TIMEOUT_MS = 3000;
 const LOG_LIMIT = 40;
 
@@ -101,6 +122,29 @@ export default function Drive() {
     const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
+
+  /**
+   * Link history for the selected rover. drive.lastAt alone cannot answer the
+   * question the operator actually has when the rover goes quiet — "has this
+   * thing ever been here, or did it drop?" — so we keep the session ourselves:
+   * when the first packet landed, when the last one did, how many gaps it has
+   * come back from, and whether uptime_s ever went backwards.
+   *
+   * Reset per rover on purpose. rover1 having been live all afternoon says
+   * nothing whatsoever about rover2, and carrying the history across the
+   * selector would make an empty bay look like a healthy one.
+   */
+  const [link, setLink] = useState<LinkSession>(newSession);
+  useEffect(() => {
+    setLink(newSession());
+  }, [thing]);
+  useEffect(() => {
+    if (drive.lastAt === null) return;
+    const uptime = num(tele?.uptime_s);
+    setLink((s) => advanceSession(s, uptime, Date.now()));
+  }, [drive.messages]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const linkState = linkPhase(link, now);
 
   const teleAgeMs = drive.lastAt === null ? null : now - drive.lastAt;
   const teleStale = teleAgeMs !== null && teleAgeMs > TELEMETRY_STALE_MS;
@@ -314,6 +358,21 @@ export default function Drive() {
           </button>
         </div>
 
+        {/* Link state, directly under the stop bar. The operator is usually
+            standing next to the rover with the laptop in the other hand; this
+            has to answer "is it back yet?" from across the room. */}
+        <ErrorBoundary label="Drive link">
+          <LinkBanner
+            thing={thing}
+            phase={linkState.phase}
+            ageMs={linkState.ageMs}
+            session={link}
+            socketConnected={drive.connected}
+            uptime={tele?.uptime_s}
+            now={now}
+          />
+        </ErrorBoundary>
+
         {/* Loud, unmissable, and above the controls it explains. A greyed-out
             button with no reason next to it sends the operator hunting the
             dashboard for a bug that is on the far end of the link. */}
@@ -379,6 +438,8 @@ export default function Drive() {
             channel={{ connected: drive.connected, lastAt: drive.lastAt, messages: drive.messages }}
             ageMs={teleAgeMs}
             stale={teleStale}
+            reboots={link.reboots}
+            lastRebootAt={link.lastRebootAt}
           />
         </ErrorBoundary>
 
@@ -398,6 +459,13 @@ export default function Drive() {
             requested angle.
           </div>
         </div>
+
+        {/* The caps above say how fast the rover may go. This says how slow it
+            can go — the other end of the same argument, and the one that looks
+            like the dashboard ignoring the request unless it is spelled out. */}
+        <ErrorBoundary label="Drive deadband">
+          <DeadbandCard tele={tele} />
+        </ErrorBoundary>
 
         <div className="grid gap-5 lg:grid-cols-2">
           <Card>
@@ -616,6 +684,390 @@ export default function Drive() {
   );
 }
 
+/* ---- link state ---------------------------------------------------------- */
+
+type LinkPhase = "live" | "stale" | "reconnecting" | "never";
+
+type LinkSession = {
+  /** When the first packet of this session landed. null = none, ever. */
+  firstSeenAt: number | null;
+  lastSeenAt: number | null;
+  packets: number;
+  /** Gaps longer than LINK_LOST_MS that telemetry came back from. */
+  reconnects: number;
+  /** Times uptime_s went backwards — the rover power-cycled or its bridge did. */
+  reboots: number;
+  lastRebootAt: number | null;
+  /** uptime_s from the previous packet — the baseline the next one is judged against. */
+  lastUptimeS: number | null;
+  /** uptime_s immediately before the most recent restart, for the copy. */
+  uptimeBeforeReboot: number | null;
+};
+
+function newSession(): LinkSession {
+  return {
+    firstSeenAt: null,
+    lastSeenAt: null,
+    packets: 0,
+    reconnects: 0,
+    reboots: 0,
+    lastRebootAt: null,
+    lastUptimeS: null,
+    uptimeBeforeReboot: null,
+  };
+}
+
+/**
+ * Fold one arriving packet into the session.
+ *
+ * The restart test is uptime_s going backwards. That is the only signal the
+ * rover gives that survives a power cut: the link dropping tells us nothing
+ * about why, and a rover that reboots quickly enough can come back inside a gap
+ * short enough that nothing else on the page would ever mention it. A silent
+ * reboot mid-session invalidates the odometry, the mode and anything in flight,
+ * so it is worth a counter that persists for the rest of the session.
+ */
+function advanceSession(s: LinkSession, uptimeS: number | null, at: number): LinkSession {
+  const gapMs = s.lastSeenAt === null ? null : at - s.lastSeenAt;
+  const reconnected = gapMs !== null && gapMs > LINK_LOST_MS;
+
+  const prevUptime = s.lastUptimeS;
+  const rebooted =
+    prevUptime !== null && uptimeS !== null && uptimeS + REBOOT_SLACK_S < prevUptime;
+
+  return {
+    firstSeenAt: s.firstSeenAt ?? at,
+    lastSeenAt: at,
+    packets: s.packets + 1,
+    reconnects: s.reconnects + (reconnected ? 1 : 0),
+    reboots: s.reboots + (rebooted ? 1 : 0),
+    lastRebootAt: rebooted ? at : s.lastRebootAt,
+    // A packet without uptime_s must not erase the baseline, or the field
+    // flickering would hide the very restart it is there to catch.
+    lastUptimeS: uptimeS ?? prevUptime,
+    uptimeBeforeReboot: rebooted ? prevUptime : s.uptimeBeforeReboot,
+  };
+}
+
+function linkPhase(s: LinkSession, now: number): { phase: LinkPhase; ageMs: number | null } {
+  if (s.lastSeenAt === null || !Number.isFinite(s.lastSeenAt)) {
+    return { phase: "never", ageMs: null };
+  }
+  const ageMs = Math.max(0, now - s.lastSeenAt);
+  if (ageMs < LINK_LIVE_MS) return { phase: "live", ageMs };
+  if (ageMs < LINK_LOST_MS) return { phase: "stale", ageMs };
+  return { phase: "reconnecting", ageMs };
+}
+
+const LINK_STYLE: Record<LinkPhase, { box: string; dot: string; title: string; chip: string }> = {
+  live: {
+    box: "border-emerald-500/40 bg-emerald-500/5",
+    dot: "bg-emerald-400 text-emerald-400",
+    title: "text-emerald-200",
+    chip: "chip-ok",
+  },
+  stale: {
+    box: "border-amber-500/40 bg-amber-500/5",
+    dot: "bg-amber-400 text-amber-400 pulse-dot",
+    title: "text-amber-100",
+    chip: "chip-warn",
+  },
+  reconnecting: {
+    box: "border-ember-500/40 bg-ember-500/10",
+    dot: "bg-ember-400 text-ember-400 pulse-dot",
+    title: "text-ember-200",
+    chip: "chip-hot",
+  },
+  never: {
+    box: "border-slate-500/30 bg-black/30",
+    dot: "bg-slate-500 text-slate-500",
+    title: "text-slate-300",
+    chip: "chip",
+  },
+};
+
+/**
+ * The four states an operator actually cares about, kept apart on purpose.
+ *
+ * "Never seen" and "was here and dropped" get the same silence on the wire and
+ * mean opposite things standing next to the machine: one is a bay that was never
+ * publishing — bridge not running, wrong rover selected — and the other is a
+ * rover that is rebooting and will come back on its own. Collapsing them into a
+ * single "offline" is what sends someone to power-cycle a rover that was about
+ * to reconnect.
+ */
+function LinkBanner({
+  thing,
+  phase,
+  ageMs,
+  session,
+  socketConnected,
+  uptime,
+  now,
+}: {
+  thing: string | null;
+  phase: LinkPhase;
+  ageMs: number | null;
+  session: LinkSession;
+  socketConnected: boolean;
+  uptime: unknown;
+  now: number;
+}) {
+  const st = LINK_STYLE[phase];
+  const channel = thing ? `drive:${thing}` : "no rover selected";
+  const ago = agoText(ageMs);
+
+  const headline =
+    phase === "live"
+      ? "LIVE — rover is talking to the dashboard"
+      : phase === "stale"
+        ? `STALE — no packet for ${ago}`
+        : phase === "reconnecting"
+          ? `RECONNECTING — silent for ${ago}`
+          : session.firstSeenAt === null && thing
+            ? "OFFLINE — never seen this session"
+            : "OFFLINE — no rover selected";
+
+  const body =
+    phase === "live" ? (
+      <>
+        Telemetry is current on <span className="font-mono">{channel}</span> — last
+        packet {ago} ago, {session.packets} this session.
+        {session.reconnects > 0 && (
+          <>
+            {" "}
+            It has come back from {session.reconnects} dropout
+            {session.reconnects > 1 ? "s" : ""} since the page loaded.
+          </>
+        )}
+      </>
+    ) : phase === "stale" ? (
+      <>
+        The last packet on <span className="font-mono">{channel}</span> was {ago} ago.
+        The rover was live at {clock(session.lastSeenAt)}; one dropped packet looks
+        exactly like this, so nothing is being called yet. Readings below are that
+        old — treat them as history, not as the rover's state now.
+      </>
+    ) : phase === "reconnecting" ? (
+      <>
+        <b>This rover was connected and dropped.</b> First packet at{" "}
+        {clock(session.firstSeenAt)}, last at {clock(session.lastSeenAt)},{" "}
+        {session.packets} in total — then nothing for {ago}. That is a rover
+        powering off, rebooting, or losing its link, not a rover that was never
+        there. The page keeps listening and flips itself back to{" "}
+        <b className="text-emerald-300">LIVE</b> the moment telemetry returns; no
+        reload needed.
+      </>
+    ) : thing ? (
+      <>
+        <b>Nothing has ever arrived</b> on <span className="font-mono">{channel}</span>{" "}
+        since this page loaded — this is not a dropped link, it is a bay that has
+        not published at all. Either the teleop bridge is not running on{" "}
+        <span className="font-mono">{thing}</span>, the rover is off, or the wrong
+        bay is selected above. A rover that had connected and then dropped would
+        say <b className="text-ember-300">RECONNECTING</b> instead.
+      </>
+    ) : (
+      <>Pick a rover above to subscribe to its drive telemetry.</>
+    );
+
+  return (
+    <div className={`rounded-xl border-2 p-4 ${st.box}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <span className={`mt-1.5 inline-block h-3 w-3 shrink-0 rounded-full ${st.dot}`} />
+          <div>
+            <div className={`text-base font-semibold tracking-wide ${st.title}`}>{headline}</div>
+            <p className="mt-1 max-w-3xl text-sm text-slate-300/90">{body}</p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={st.chip}>{PHASE_LABEL[phase]}</span>
+          <span className="chip font-mono" title="Age of the newest drive telemetry packet">
+            last {ago}
+          </span>
+          <span className="chip font-mono" title="Drive telemetry packets received since page load">
+            {session.packets} pkt
+          </span>
+          {session.reconnects > 0 && (
+            <span className="chip-warn font-mono" title="Times telemetry returned after a gap">
+              {session.reconnects} reconnect{session.reconnects > 1 ? "s" : ""}
+            </span>
+          )}
+          <span
+            className={socketConnected ? "chip-ok" : "chip-hot"}
+            title={
+              socketConnected
+                ? "The browser's websocket to the dashboard is open — silence here is the rover's"
+                : "The browser cannot reach the dashboard backend. This is a dashboard-side fault, not the rover."
+            }
+          >
+            {socketConnected ? "ws up" : "ws down"}
+          </span>
+          <span className="chip font-mono" title="uptime_s reported by the rover">
+            up {dur(uptime)}
+          </span>
+        </div>
+      </div>
+
+      {/* A restart mid-session is the thing that quietly costs an hour: the
+          odometry resets, the mode resets, and nothing else on the page says so. */}
+      {session.reboots > 0 && (
+        <div className="mt-3 flex items-start gap-3 rounded-lg border border-ember-500/40 bg-ember-500/10 px-3 py-2">
+          <span className="mt-1 inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-ember-400 text-ember-400 pulse-dot" />
+          <div className="text-sm text-ember-100">
+            <b>
+              ROVER RESTARTED
+              {session.reboots > 1 ? ` ×${session.reboots}` : ""}
+            </b>{" "}
+            — uptime went backwards at {clock(session.lastRebootAt)}
+            {session.uptimeBeforeReboot !== null && (
+              <> (was {dur(session.uptimeBeforeReboot)} before the drop)</>
+            )}
+            {session.lastRebootAt !== null && (
+              <> · {agoText(Math.max(0, now - session.lastRebootAt))} ago</>
+            )}
+            .
+            <div className="mt-0.5 text-xs text-ember-200/80">
+              Odometry, mode and anything in flight before that point are gone —
+              x/y/heading below are measured from wherever the rover happened to be
+              at power-on. Re-set the coordinate before trusting a mission.
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const PHASE_LABEL: Record<LinkPhase, string> = {
+  live: "LIVE",
+  stale: "STALE",
+  reconnecting: "RECONNECTING",
+  never: "NEVER SEEN",
+};
+
+/* ---- deadband ------------------------------------------------------------ */
+
+/**
+ * Why the floor exists, next to the numbers that make it up. The operator asked
+ * for very slow and got a minimum instead; without this block that reads as the
+ * request having been ignored rather than answered.
+ */
+function DeadbandCard({ tele }: { tele: Record<string, unknown> | null }) {
+  const lin = num(tele?.min_cmd_lin);
+  const ang = num(tele?.min_cmd_ang);
+  const measured = lin !== null || ang !== null;
+  const snapped = tele?.deadband_snapped;
+  const isSnapped = snapped === true;
+
+  return (
+    <Card>
+      <CardHeader
+        title="Motor deadband floor"
+        subtitle="Why very slow is not available"
+        right={
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={measured ? "chip-ok" : "chip-warn"}>
+              {measured ? "measured" : "not yet measured"}
+            </span>
+            <span
+              className={isSnapped ? "chip-hot" : snapped === false ? "chip" : "chip-warn"}
+              title={
+                snapped === undefined
+                  ? "The rover is not reporting deadband_snapped yet"
+                  : isSnapped
+                    ? "The last command was below the floor and was raised to it"
+                    : "The last command was already at or above the floor"
+              }
+            >
+              {snapped === undefined
+                ? "snap · not reported"
+                : isSnapped
+                  ? "FLOOR APPLIED"
+                  : "no floor applied"}
+            </span>
+          </div>
+        }
+      />
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div
+          className={`rounded-lg border px-3 py-2 ${
+            lin === null ? "border-amber-500/25 bg-amber-500/5" : "border-white/5 bg-black/20"
+          }`}
+        >
+          <div className="lbl">min linear · min_cmd_lin</div>
+          <div
+            className={`mt-0.5 font-mono text-2xl tabular-nums ${
+              lin === null ? "text-amber-300/80" : "text-slate-200"
+            }`}
+          >
+            {lin === null ? (
+              <span className="text-base">not yet measured</span>
+            ) : (
+              <>
+                {lin.toFixed(3)}
+                <span className="ml-1 text-sm text-slate-500">m/s</span>
+              </>
+            )}
+          </div>
+          <div className="mt-1 text-[11px] text-slate-500">
+            Slowest forward/back command the chassis will actually execute.
+          </div>
+        </div>
+
+        <div
+          className={`rounded-lg border px-3 py-2 ${
+            ang === null ? "border-amber-500/25 bg-amber-500/5" : "border-white/5 bg-black/20"
+          }`}
+        >
+          <div className="lbl">min angular · min_cmd_ang</div>
+          <div
+            className={`mt-0.5 font-mono text-2xl tabular-nums ${
+              ang === null ? "text-amber-300/80" : "text-slate-200"
+            }`}
+          >
+            {ang === null ? (
+              <span className="text-base">not yet measured</span>
+            ) : (
+              <>
+                {ang.toFixed(3)}
+                <span className="ml-1 text-sm text-slate-500">rad/s</span>
+              </>
+            )}
+          </div>
+          <div className="mt-1 text-[11px] text-slate-500">
+            Slowest turn command the chassis will actually execute.
+          </div>
+        </div>
+      </div>
+
+      {isSnapped && (
+        <div className="mt-3 rounded-lg border border-ember-500/40 bg-ember-500/10 px-3 py-2 text-sm text-ember-100">
+          <b>Floor applied to the last command.</b> You asked for less than the
+          deadband, so the rover raised it to the minimum above rather than sending
+          a value it would stall on. The rover is moving faster than requested — it
+          is not moving slower, and it is not ignoring you.
+        </div>
+      )}
+
+      <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-sm text-amber-100/90">
+        <b>Why speeds are floored.</b> Below the motor deadband the chassis does
+        not creep — it stalls, the drivers wind up against a load that will not
+        move, and then it lurches when something finally breaks free. Measured on
+        this chassis: a <span className="font-mono">100 mm</span> forward command
+        came out as a <span className="font-mono">290 mm</span>{" "}
+        <b>backward</b> lurch with <span className="font-mono">24°</span> of
+        unrequested rotation. A command that is floored to a slow-but-real speed is
+        both slower and far more predictable than one that is honoured literally
+        and then discharged all at once. The caps above still apply on top: the
+        floor is a minimum, not a licence to go fast.
+      </div>
+    </Card>
+  );
+}
+
 /* ---- health -------------------------------------------------------------- */
 
 function HealthCard({
@@ -624,12 +1076,17 @@ function HealthCard({
   channel,
   ageMs,
   stale,
+  reboots = 0,
+  lastRebootAt = null,
 }: {
   thing: string | null;
   tele: Record<string, unknown> | null;
   channel: { connected: boolean; lastAt: number | null; messages: number };
   ageMs: number | null;
   stale: boolean;
+  /** Restarts counted this session — annotates the uptime readout. */
+  reboots?: number;
+  lastRebootAt?: number | null;
 }) {
   const battV = num(tele?.battery_v);
   const battAge = num(tele?.battery_age_s);
@@ -729,7 +1186,18 @@ function HealthCard({
             value={fmt(tele?.cmd_scale, 3)}
             hint="speed calibration factor — provisional"
           />
-          <Readout label="Uptime" value={dur(tele?.uptime_s)} />
+          {/* Uptime is only interesting relative to itself: a small number here
+              after a large one earlier is a power cycle. */}
+          <Readout
+            label={reboots > 0 ? `Uptime · restarted ×${reboots}` : "Uptime"}
+            value={dur(tele?.uptime_s)}
+            tone={reboots > 0 ? "text-ember-300" : undefined}
+            hint={
+              reboots > 0
+                ? `uptime_s went backwards ${reboots} time${reboots > 1 ? "s" : ""} this session — last at ${clock(lastRebootAt)}`
+                : "seconds since the rover's teleop bridge started"
+            }
+          />
         </div>
       </div>
 
@@ -937,6 +1405,27 @@ function dur(v: unknown): string {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+/** Elapsed milliseconds as something readable across six orders of magnitude. */
+function agoText(v: unknown): string {
+  const n = num(v);
+  if (n === null) return "—";
+  const s = Math.max(0, n) / 1000;
+  if (s < 10) return `${s.toFixed(1)}s`;
+  if (s < 60) return `${Math.round(s)}s`;
+  return dur(Math.round(s));
+}
+
+/** Wall clock for an epoch-ms instant, or a dash if we never had one. */
+function clock(at: unknown): string {
+  const n = num(at);
+  if (n === null) return "—";
+  try {
+    return new Date(n).toLocaleTimeString();
+  } catch {
+    return "—";
+  }
 }
 
 function cmdVel(tele: Record<string, unknown> | null, key: "vx" | "wz"): unknown {

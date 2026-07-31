@@ -1,7 +1,9 @@
 # FPMS — session handoff
 
 Read this first in a new session. It is the current state of both apps, the
-rover, what is verified, and what is pending. Written 2026-07-29 (updated 2026-07-29: YOLO26 decode landed, rover files rescued into rover/).
+rover, what is verified, and what is pending. Written 2026-07-29 (updated 2026-07-29: YOLO26 decode landed, rover files rescued into rover/; updated
+2026-07-31: rover drive board identified and profiled on real hardware —
+see the new section below and `CLAUDE.md` for the durable facts).
 
 ---
 
@@ -93,6 +95,72 @@ Delivered: **2 fps → 23.6 fps** over the session.
 30.000 fps as the fastest interval at *every* resolution (1920x1080, 1280x720,
 640x480). It is the HBV sensor's USB descriptor. 60 fps needs different
 hardware — a 60 fps USB module or a MIPI CSI camera on the ribbon connector.
+
+---
+
+## Rover drive board (ESP32-S3 MicroROS) — status 2026-07-31
+
+This is a separate subsystem from the camera/YOLO stack above: a Yahboom
+MicroROS Board V2.0 handles motors/odometry/IMU, reached over a different
+serial link than the camera. **All the durable identity/protocol facts
+(board type, 921600 baud path, identical CP2102 `ID_SERIAL`, domain-20
+firmware quirk, topic table, decivolts, dead `/scan`, no IMU orientation
+fusion, "raise don't lower" speed rule) are now in `CLAUDE.md`** — read that
+first; this section is only what's still open or still moving.
+
+**Open / unresolved:**
+- **MIN_CMD (the deadband floor) is estimated, not measured.** A sweep was
+  started to find it properly but was aborted before completing.
+  `rover/deadband_sweep.py` is meant to do this (run with `--on-blocks` —
+  wheels off the ground, so a deadband lurch can't drive the rover into
+  anything) but was **not found in this checkout** as of this update — check
+  before assuming it's there; if it's genuinely gone, it needs rewriting
+  before the sweep can be redone. Do not carry a MIN_CMD value forward from
+  memory instead of from a completed sweep.
+- **CMD_SCALE = 6.1 is provisional.** Commanding 0.10 produced roughly
+  0.61 m/s actual, but that number comes from a single 0.6s run. Re-derive
+  it from a longer, repeated measurement (multiple speeds, several seconds
+  each) before trusting it in any control loop.
+- **MQTT flaps every ~45s** (disconnect/reconnect sawtooth). An earlier
+  version of this note blamed duplicate client IDs — **that was wrong and
+  has already been checked.** The three IDs are distinct
+  (`fpms-dashboard`, `<thing>-agent`, `<thing>-teleop`). Do not re-audit them.
+
+  The real signature is a **keepalive timeout**: both rover clients use
+  `keepalive=30`, and Mosquitto drops a client at 1.5x keepalive = 45s. The
+  observed gaps were 47s and 47s — near-exact.
+
+  Prime suspect is **WiFi power management on the Pi** (Broadcom `dhd`)
+  stalling packets long enough to miss the keepalive, a classic on SBCs.
+  Fix: `iw dev <iface> set power_save off`, made persistent across reboots.
+  If the Pi turns out not to be on WiFi at all, that hypothesis is
+  falsified and broker-side logging is the next step.
+
+  Note: Mosquitto's log is useless for this right now — its conf sets no
+  `log_type` and the file has been empty since 2026-07-27. Enabling
+  connection logging needs elevation (Program Files is not writable).
+
+**New files this session:**
+- `rover/fpms_teleop.py` — MQTT -> `/cmd_vel` bridge, 0.6s jog deadman
+- `rover/deadband_sweep.py` — deadband measurement script (see above: not
+  confirmed present in this checkout right now)
+- `fpms-teleop.service`, `micro-ros-agent.service` — systemd units for the
+  bridge and the micro-ROS agent
+- Frontend Drive tab (joystick + health panel) — owned by the frontend
+  work, not detailed here
+
+**Next steps for whoever picks this up:**
+1. Confirm `rover/deadband_sweep.py` exists; if not, write it (must support
+   `--on-blocks`) before trusting any MIN_CMD number.
+2. Run a real deadband sweep with the wheels off the ground, record the
+   actual floor, replace the estimated MIN_CMD with it.
+3. Re-measure CMD_SCALE with a longer run instead of the single 0.6s
+   sample.
+4. Root-cause the MQTT flap — look for a duplicate/reused client ID between
+   `fpms_teleop.py` and any other MQTT client touching rover topics.
+5. Read `CLAUDE.md`'s "Rover drive board" section before re-probing the
+   board's protocol from scratch — the domain-20 quirk and the identical
+   `ID_SERIAL` gotcha both cost hours the first time.
 
 ---
 

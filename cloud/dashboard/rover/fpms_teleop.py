@@ -98,9 +98,112 @@ def to_cmd_ang(desired_radps):
 # Target ACTUAL speeds, in real m/s and rad/s.
 JOG_MAX_MPS = 0.05        # full joystick deflection
 NUDGE_MPS = 0.04          # F/B 10cm buttons
-DOCK_MPS = 0.025          # slow docking near a waypoint
+DOCK_MPS = 0.025          # slow docking near a waypoint — see MIN_CMD_LIN: this
+                          # is BELOW the deadband floor and gets raised to it
 TURN_MAX_RADPS = 0.4      # slow turning
-DOCK_TURN_RADPS = 0.2     # closed-loop `turn` command
+DOCK_TURN_RADPS = 0.2     # closed-loop `turn` command — likewise floored
+
+
+# ============================================================ DEADBAND FLOOR
+# MEASURED 2026-07-31: a nudge asked for DOCK_MPS = 0.025 m/s, which leaves this
+# file as linear.x = 0.025 / 6.1 = 0.0041 on the wire. The rover sat perfectly
+# still for ~3 seconds and then LURCHED ~290mm BACKWARD with 24 degrees of
+# unintended rotation. That is the signature of a wheel-velocity controller in
+# the ESP32 firmware integrating error while the motors are stalled under their
+# own deadband, then dumping the accumulated integral the instant static
+# friction breaks — in whichever direction the two wheels happen to break first.
+#
+# The conclusion is counter-intuitive and it is the whole point of this section:
+# asking this chassis to go SLOWER THAN IT CAN GO makes it MORE dangerous, not
+# less. "Very very slow" below the deadband is not slow motion, it is stored
+# energy waiting for a release the operator cannot predict. So the fix is a
+# FLOOR — every non-zero command is raised until it clears the deadband. There
+# is no path in this file that may scale a command down toward 0.0041 again.
+#
+# ---- THESE TWO NUMBERS ARE ESTIMATES PENDING A MEASURED SWEEP -------------
+# The sweep that would establish the real deadband (walk linear.x up from 0.002
+# in 0.001 steps, note where the wheels first turn smoothly rather than lurch)
+# was ABORTED and has NOT been run. What is actually known:
+#   * 0.0041 on the wire is BELOW the deadband  (measured: stall then lurch)
+#   * 0.10   on the wire is comfortably above   (measured: 0.61 m/s ground)
+# The truth is somewhere in a factor-of-24 gap, and these defaults are a guess
+# inside it. Re-run the sweep and then set the real values in config.env.
+#
+# MIN_CMD_LIN = 0.035 real m/s (0.0057 on the wire) was chosen as follows:
+#   * it is 1.4x the value measured to be dead, so it is a genuine raise;
+#   * it is 70% of JOG_MAX_MPS, which leaves a usable band between "floor" and
+#     "full stick" — a floor at the cap would delete speed control entirely;
+#   * it errs LOW rather than high because a person stands next to this rover,
+#     and a floor that is too low fails visibly (stall watchdog aborts the move)
+#     while a floor that is too high fails by driving faster than anyone asked.
+#     Failing toward "aborts and tells you" is the correct direction.
+#
+# MIN_CMD_ANG = 0.30 real rad/s (0.049 on the wire) is weaker still — the
+# angular deadband has never been measured at all, not even a failing point.
+# Reasoning by geometry: in a pure spin each wheel runs at w * track/2, so with
+# an assumed ~0.20 m track a wheel-speed floor of 0.035 m/s implies w >= 0.35
+# rad/s. 0.30 is deliberately set just under that, because in a spin the two
+# wheels drive against each other and break static friction more easily than
+# one wheel does in a straight line. If turns still stall, 0.35 via config.env
+# is the next thing to try — that is what the override exists for.
+#
+# ---- WHAT THIS COSTS: the slowest speed that is now ACHIEVABLE ------------
+# Linear:  0.035 m/s = 35 mm/s. The operator asked for 25 mm/s. This is 40%
+#          FASTER than requested, and that is stated plainly rather than hidden:
+#          25 mm/s was never actually available on this chassis. What 25 mm/s
+#          produced was three seconds of nothing followed by 290mm of backward
+#          lurch — an average that flatters the number and a peak that does not.
+#          A 100mm nudge now takes ~2.9s of real motion instead of ~4s of
+#          stall-then-jump. A lurch is not slow. This is the slower option.
+# Angular: 0.30 rad/s = 17.2 deg/s, up from the 0.2 rad/s (11.5 deg/s) the
+#          `turn` command asked for. `turn` is closed-loop on the gyro and cuts
+#          drive at TURN_COAST_FACTOR, so it absorbs the higher rate by stopping
+#          sooner; the reported measured_deg is unaffected.
+#
+# Note also that the acceleration ramp no longer exists BELOW the floor: a start
+# is now a step straight to MIN_CMD_LIN rather than a glide up through 0.004.
+# That is intentional. Gliding up through the deadband is precisely how the
+# integrator gets fed, so a "gentle" ramp through it was never gentle.
+#
+# Overridable from /etc/fpms/config.env without editing this file:
+#   FPMS_MIN_CMD_LIN=0.04
+#   FPMS_MIN_CMD_ANG=0.35
+# Setting either to 0 disables that floor and restores the old (lurching)
+# behaviour; that is allowed only because a measurement rig may need it.
+CFG_NOTES = []
+
+
+def _cfg_float(key, default, lo, hi):
+    """Read a tuning float from config.env, falling back to `default`.
+
+    Never raises. A rover that refuses to boot because someone fat-fingered a
+    tuning constant is worse than a rover running the documented default, and
+    this node is the only thing that can stop the motors. The range check is not
+    cosmetic either: these constants exist to MAKE the rover move, so a typo'd
+    FPMS_MIN_CMD_LIN=5 has to be caught here rather than on the wire.
+
+    Notes are queued instead of logged because log() does not exist yet at
+    import time; TeleopNode prints them once at startup.
+    """
+    raw = CFG.get(key)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+        if not math.isfinite(v) or not (lo <= v <= hi):
+            raise ValueError(f"outside [{lo}, {hi}]")
+        CFG_NOTES.append(f"config: {key}={v} overrides default {default}")
+        return v
+    except Exception as e:
+        CFG_NOTES.append(f"config: {key}={raw!r} rejected ({e}); using {default}")
+        return default
+
+
+# Upper bound is the motion envelope itself: a floor above the clamp would make
+# the floor the only speed the rover has, which is a worse bug than the one this
+# is fixing. snap_up() re-clamps regardless, so this is belt and braces.
+MIN_CMD_LIN = _cfg_float("FPMS_MIN_CMD_LIN", 0.035, 0.0, JOG_MAX_MPS)
+MIN_CMD_ANG = _cfg_float("FPMS_MIN_CMD_ANG", 0.30, 0.0, TURN_MAX_RADPS)
 
 # Ramps, in real units per second. Deceleration is deliberately far more
 # aggressive than acceleration: taking off gently is comfort, stopping promptly
@@ -143,6 +246,26 @@ WRONG_WAY_MM = 50.0       # moving this far opposite the command => abort
 TURN_STALL_CHECK_S = 2.5
 TURN_STALL_MIN_DEG = 2.0
 
+# --- lurch guard ------------------------------------------------------------
+# The stall/wrong-way checks above live inside the nudge and turn state machines
+# and therefore protect exactly two of the four ways this node can drive. The
+# lurch guard sits in the control tick instead, so it covers EVERY motion path —
+# jog included, which is the one an operator is most likely to be standing next
+# to. It answers one question 20 times a second: is the chassis doing something
+# the command does not explain?
+#
+# Two shapes, both observed on 2026-07-31:
+#   * driving the wrong way    — commanded forward, odometry says backward
+#   * moving with no command   — cmd_vel is zero and the rover is still going,
+#                                i.e. the integrator releasing after the command
+#                                that wound it up has already been withdrawn
+LURCH_MIN_MPS = 0.02      # below this, odometry is noise, not motion
+LURCH_CONFIRM_S = 0.25    # must persist this long — one bad frame must not stop
+                          # the rover, and one good frame must not excuse a lurch
+LURCH_COAST_GRACE_S = 1.0  # after cmd_vel goes to zero, real momentum carries the
+                           # rover for a moment; that is coasting, not a lurch
+LURCH_NACK_COOLDOWN_S = 2.0  # rate-limits the COMPLAINT only, never the stop
+
 # --- health thresholds ---
 # 3S LiPo assumption: 3 cells x 3.7V nominal = 11.1V. Below that the pack is
 # into the knee of its discharge curve and motor current will sag it further,
@@ -154,6 +277,28 @@ BATT_STALE_S = 10.0
 
 def clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
+
+
+def snap_up(v, floor, cap):
+    """Raise a non-zero magnitude to `floor`, preserving sign; clamp to `cap`.
+
+    EXACTLY ZERO STAYS EXACTLY ZERO. That is the one property this function must
+    never lose: every stop path in this file converges on a zero, and a floor
+    that turned 0.0 into 0.035 would turn `stop` into a creep. The test is `v ==
+    0.0`, not a tolerance, because a ramp that has genuinely reached zero lands
+    on it exactly and anything else is real (if tiny) commanded motion that the
+    firmware cannot execute smoothly and therefore must be raised.
+
+    The cap is re-applied afterwards so that the floor can never be used to
+    smuggle a value past the motion envelope — if a floor is ever configured
+    above its cap, the cap wins and the rover ends up at its normal maximum
+    rather than beyond it.
+    """
+    if v == 0.0 or floor <= 0.0:
+        return clamp(v, -cap, cap)
+    if abs(v) < floor:
+        v = math.copysign(floor, v)
+    return clamp(v, -cap, cap)
 
 
 def ramp(cur, target, accel_rate, decel_rate, dt):
@@ -271,6 +416,10 @@ class Bus:
                                      "turn_max_radps": TURN_MAX_RADPS,
                                      "dock_mps": DOCK_MPS,
                                      "dock_turn_radps": DOCK_TURN_RADPS,
+                                     # The floors are limits too — they are the
+                                     # bottom of the envelope, not the top.
+                                     "min_cmd_lin": MIN_CMD_LIN,
+                                     "min_cmd_ang": MIN_CMD_ANG,
                                      "batt_low_v": BATT_LOW_V}}, qos=1)
         except Exception as e:
             log(f"MQTT: on_connect error {e}")
@@ -352,6 +501,8 @@ class TeleopNode(Node):
         self.odom_yaw = 0.0
         self.odom_last = 0.0
         self.odom_times = deque(maxlen=40)
+        self.odom_vx = 0.0           # signed real m/s along heading, from deltas
+        self._odom_prev = None       # (x, y, yaw, t) of the previous frame
 
         # --- imu / integrated heading ---
         # The firmware does NOT fuse orientation (it publishes identity), so
@@ -378,6 +529,16 @@ class TeleopNode(Node):
         self._last_zero_pub = 0.0
         self._link_warned = False
         self._jog_nack_at = 0.0
+        self._deadband_snapped = False
+        self._lurch_since = 0.0      # when the current suspicion started
+        self._lurch_nack_at = 0.0
+        self._cmd_zero_since = 0.0   # when cmd_vel last became zero
+        self.lurch_trips = 0
+
+        for note in CFG_NOTES:
+            log(note)
+        log(f"deadband floor: lin {MIN_CMD_LIN} m/s, ang {MIN_CMD_ANG} rad/s "
+            f"(ESTIMATES — sweep not yet run)")
 
         self.create_timer(CONTROL_DT, self._control_tick)
         self.create_timer(1.0 / TELEM_HZ, self._telemetry_tick)
@@ -386,11 +547,33 @@ class TeleopNode(Node):
     # ------------------------------------------------------------ ROS input
     def _on_odom(self, msg):
         try:
+            x = msg.pose.pose.position.x
+            y = msg.pose.pose.position.y
+            yaw = yaw_from_quat(msg.pose.pose.orientation)
+            now = time.monotonic()
             with self.lock:
-                self.odom_x = msg.pose.pose.position.x
-                self.odom_y = msg.pose.pose.position.y
-                self.odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
-                now = time.monotonic()
+                # Signed ground speed along the PREVIOUS heading, differentiated
+                # from position rather than read out of msg.twist. The board's
+                # own state estimate is demonstrably partial — it publishes an
+                # identity orientation — and the lurch guard exists precisely to
+                # contradict the firmware, so it cannot be built on the
+                # firmware's opinion of its own velocity.
+                if self._odom_prev is not None:
+                    px, py, pyaw, pt = self._odom_prev
+                    dt = now - pt
+                    # Same absurd-gap rule as the IMU integrator: a stalled link
+                    # resuming must not manufacture a huge apparent velocity.
+                    if 0.0 < dt < 0.5:
+                        dx, dy = x - px, y - py
+                        along = dx * math.cos(pyaw) + dy * math.sin(pyaw)
+                        # Light smoothing. One noisy frame must not be able to
+                        # halt the rover, and the guard's confirm window means
+                        # the lag this adds costs nothing.
+                        self.odom_vx = 0.5 * self.odom_vx + 0.5 * (along / dt)
+                self._odom_prev = (x, y, yaw, now)
+                self.odom_x = x
+                self.odom_y = y
+                self.odom_yaw = yaw
                 self.odom_last = now
                 self.odom_times.append(now)
         except Exception as e:
@@ -493,7 +676,28 @@ class TeleopNode(Node):
                 self.cur_vx = clamp(self.cur_vx, -JOG_MAX_MPS, JOG_MAX_MPS)
                 self.cur_wz = clamp(self.cur_wz, -TURN_MAX_RADPS, TURN_MAX_RADPS)
 
+                # Track how long the command has been zero, for the coast window
+                # the lurch guard needs. Done after the clamp so it reflects what
+                # is actually about to go out, not what some mode wanted.
+                if abs(self.cur_vx) <= 1e-6 and abs(self.cur_wz) <= 1e-6:
+                    if not self._cmd_zero_since:
+                        self._cmd_zero_since = now
+                else:
+                    self._cmd_zero_since = 0.0
+
+                # LURCH GUARD — every motion path, not just nudge and turn.
+                lurch = self._lurch_guard_unlocked(now)
+                if lurch:
+                    self._halt_for_lurch_unlocked(lurch, now)
+
                 vx, wz, mode = self.cur_vx, self.cur_wz, self.mode
+
+            if lurch:
+                # Out of the lock and straight to zero. Not via the ramp, not
+                # via the idle heartbeat's rate limit: the whole point is that
+                # the rover is already moving in a way nobody commanded.
+                self._safe_zero()
+                return
 
             idle_zero = (mode == "idle" and abs(vx) < 1e-6 and abs(wz) < 1e-6)
             if idle_zero:
@@ -528,6 +732,78 @@ class TeleopNode(Node):
             return self._turn_step_unlocked(now)
 
         return 0.0, 0.0
+
+    # --------------------------------------------------------- lurch guard
+    def _lurch_guard_unlocked(self, now):
+        """Reason the chassis is contradicting the command, or None.
+
+        Caller holds the lock. Deliberately reads only odometry and the
+        post-clamp command, so it is blind to which mode produced that command
+        and therefore cannot be bypassed by adding a new one.
+        """
+        if not self._link_ok_unlocked(now):
+            # No trustworthy odometry to judge with. The link watchdog above
+            # already halts motion in this case; a second opinion built on stale
+            # data would only produce false trips.
+            self._lurch_since = 0.0
+            return None
+
+        speed = self.odom_vx
+        vx_cmd, wz_cmd = self.cur_vx, self.cur_wz
+        if abs(speed) < LURCH_MIN_MPS:
+            self._lurch_since = 0.0
+            return None
+
+        reason = None
+        if abs(vx_cmd) > 1e-6:
+            if (speed * vx_cmd) < 0.0:
+                reason = (f"commanded {vx_cmd:+.3f} m/s but odometry reports "
+                          f"{speed:+.3f} m/s")
+        elif abs(wz_cmd) <= 1e-6:
+            # Zero command, non-zero motion. Real momentum explains the first
+            # moment of this, so only complain once the coast window has passed.
+            if (self._cmd_zero_since
+                    and (now - self._cmd_zero_since) > LURCH_COAST_GRACE_S):
+                reason = (f"cmd_vel has been zero for "
+                          f"{now - self._cmd_zero_since:.1f}s but odometry "
+                          f"reports {speed:+.3f} m/s")
+
+        if reason is None:
+            self._lurch_since = 0.0
+            return None
+
+        # Confirm before acting. A single frame of odometry noise stopping the
+        # rover mid-manoeuvre would train the operator to ignore this guard.
+        if not self._lurch_since:
+            self._lurch_since = now
+            return None
+        if (now - self._lurch_since) < LURCH_CONFIRM_S:
+            return None
+        return reason
+
+    def _halt_for_lurch_unlocked(self, reason, now):
+        """Stop everything. Caller holds the lock; the zero Twist goes out in
+        the control tick as soon as the lock is released."""
+        self.lurch_trips += 1
+        self._lurch_since = 0.0
+        mode_was = self.mode
+        self.mode = "idle"
+        self.nudge = None
+        self.turn = None
+        self.jog_vx = self.jog_wz = 0.0
+        self.cur_vx = self.cur_wz = 0.0
+        self._cmd_zero_since = now
+        err = f"lurch guard: {reason} (mode was {mode_was})"
+        self.last_error = err
+        log(f"LURCH GUARD tripped — {err}; halting")
+        # The stop is unconditional; only the complaint is rate-limited, so a
+        # persistent fault cannot flood the broker but also cannot go unnoticed.
+        if (now - self._lurch_nack_at) > LURCH_NACK_COOLDOWN_S:
+            self._lurch_nack_at = now
+            self._event("events/nack", {"action": mode_was, "error": err,
+                                        "lurch_guard": True,
+                                        "odom_vx": jnum(self.odom_vx, 4),
+                                        "trips": self.lurch_trips})
 
     # -------------------------------------------------------------- nudge
     def _nudge_progress_unlocked(self, n):
@@ -663,18 +939,36 @@ class TeleopNode(Node):
     # ------------------------------------------------------------- publish
     def _publish_twist(self, vx_real, wz_real):
         try:
+            # LAST STEP BEFORE THE WIRE, and the mirror image of the clamp: the
+            # clamp is the ceiling nothing may exceed, this is the floor nothing
+            # non-zero may sit under. Every command path converges here, so no
+            # future mode can reintroduce a sub-deadband creep the way DOCK_MPS
+            # did. Zero is untouched — see snap_up().
+            snapped = (0.0 < abs(vx_real) < MIN_CMD_LIN
+                       or 0.0 < abs(wz_real) < MIN_CMD_ANG)
+            vx_out = snap_up(vx_real, MIN_CMD_LIN, JOG_MAX_MPS)
+            wz_out = snap_up(wz_real, MIN_CMD_ANG, TURN_MAX_RADPS)
+            with self.lock:
+                self._deadband_snapped = snapped
+
             t = Twist()
-            t.linear.x = float(to_cmd(vx_real))
+            t.linear.x = float(to_cmd(vx_out))
             t.linear.y = 0.0
             t.linear.z = 0.0
             t.angular.x = 0.0
             t.angular.y = 0.0
-            t.angular.z = float(to_cmd_ang(wz_real))
+            t.angular.z = float(to_cmd_ang(wz_out))
             self.pub_cmd.publish(t)
         except Exception as e:
             log(f"cmd_vel publish failed {e}")
 
     def _safe_zero(self):
+        # Bypasses _publish_twist entirely: a default Twist is already all
+        # zeros, and a stop must not pass through the floor logic at all.
+        try:
+            self._deadband_snapped = False
+        except Exception:
+            pass
         try:
             self.pub_cmd.publish(Twist())
         except Exception:
@@ -817,10 +1111,18 @@ class TeleopNode(Node):
                           "t0": time.monotonic(), "timeout_s": timeout_s,
                           "dir": d}
             self.mode = "nudge"
-        log(f"nudge start: {d} {mm}mm at {DOCK_MPS} m/s (timeout {timeout_s:.1f}s)")
+        # Report the speed it will ACTUALLY drive at, not the one requested.
+        # DOCK_MPS is below MIN_CMD_LIN and will be floored on the way out; an
+        # ack claiming 0.025 m/s would be advertising the speed that lurched.
+        eff_mps = snap_up(DOCK_MPS, MIN_CMD_LIN, JOG_MAX_MPS)
+        log(f"nudge start: {d} {mm}mm at {eff_mps} m/s "
+            f"(requested {DOCK_MPS}, raised to clear deadband; "
+            f"timeout {timeout_s:.1f}s)")
         self._event("events/ack", {"action": "nudge", "state": "started",
                                    "dir": d, "mm": jnum(mm, 1),
-                                   "speed_mps": DOCK_MPS,
+                                   "speed_mps": jnum(eff_mps, 4),
+                                   "requested_mps": DOCK_MPS,
+                                   "deadband_floored": eff_mps != DOCK_MPS,
                                    "timeout_s": jnum(timeout_s, 1)})
 
     def _cmd_turn(self, p):
@@ -860,11 +1162,18 @@ class TeleopNode(Node):
                          "t0": time.monotonic(), "phase": "driving",
                          "coast_t0": 0.0, "reason": "done"}
             self.mode = "turn"
-        log(f"turn start: {d} {deg}deg at {DOCK_TURN_RADPS} rad/s "
-            f"(cut drive at {deg*TURN_COAST_FACTOR:.1f}deg, coast {TURN_SETTLE_S}s)")
+        # As with nudge: DOCK_TURN_RADPS is under the angular floor and will be
+        # raised on the way out, so report the rate that will actually be used.
+        # The closed loop absorbs the difference by cutting drive sooner.
+        eff_radps = snap_up(DOCK_TURN_RADPS, MIN_CMD_ANG, TURN_MAX_RADPS)
+        log(f"turn start: {d} {deg}deg at {eff_radps} rad/s "
+            f"(requested {DOCK_TURN_RADPS}, raised to clear deadband; "
+            f"cut drive at {deg*TURN_COAST_FACTOR:.1f}deg, coast {TURN_SETTLE_S}s)")
         self._event("events/ack", {"action": "turn", "state": "started",
                                    "dir": d, "deg": jnum(deg, 1),
-                                   "rate_radps": DOCK_TURN_RADPS,
+                                   "rate_radps": jnum(eff_radps, 4),
+                                   "requested_radps": DOCK_TURN_RADPS,
+                                   "deadband_floored": eff_radps != DOCK_TURN_RADPS,
                                    "coast_factor": TURN_COAST_FACTOR,
                                    "timeout_s": TURN_TIMEOUT_S})
 
@@ -959,6 +1268,9 @@ class TeleopNode(Node):
                 last_cmd, last_cmd_at = self.last_cmd, self.last_cmd_at
                 last_error = self.last_error
                 gyro_deg_s = math.degrees(self.gyro_z)
+                snapped = self._deadband_snapped
+                odom_vx = self.odom_vx
+                lurch_trips = self.lurch_trips
 
             payload = {
                 # --- power ---
@@ -987,6 +1299,14 @@ class TeleopNode(Node):
                 "cmd_vel": {"vx": jnum(vx, 4), "wz": jnum(wz, 4)},
                 "deadman_ok": bool(deadman_ok),
                 "ms_since_jog": int(jog_age * 1000) if jog_age is not None else -1,
+                # True while the last published command was raised to the floor,
+                # so the operator can SEE the rover refusing to creep rather than
+                # wondering why "slower" did nothing.
+                "deadband_snapped": bool(snapped),
+                # What odometry says the rover is doing, as opposed to what it
+                # was told to do. The lurch guard compares exactly these two.
+                "odom_vx": jnum(odom_vx, 4),
+                "lurch_trips": int(lurch_trips),
 
                 # --- pose ---
                 "x_mm": jnum(x_mm, 1),
@@ -1001,6 +1321,11 @@ class TeleopNode(Node):
                 "last_error": last_error,
                 "uptime_s": jnum(time.time() - STARTED, 1),
                 "cmd_scale": CMD_SCALE,
+                # The calibration the dashboard should show next to the speeds:
+                # cmd_scale is what divides them, the floors are what they can
+                # never go below. Both are real-world units.
+                "min_cmd_lin": jnum(MIN_CMD_LIN, 4),
+                "min_cmd_ang": jnum(MIN_CMD_ANG, 4),
                 "origin_set": self.origin is not None,
             }
             self.bus.publish("telemetry/drive", payload, qos=0)
