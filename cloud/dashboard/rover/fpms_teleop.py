@@ -337,6 +337,38 @@ BATT_LOW_V = 11.1
 ROS_DEAD_S = 3.0          # no /odom_raw for this long => link considered dead
 BATT_STALE_S = 10.0
 
+# --- wire ownership ---
+# fpms-missions publishes telemetry/mission at TELEM_HZ while it exists. Seeing
+# one that recently means it is running, so teleop stops writing to /cmd_vel and
+# stops answering the `mission` verb.
+#
+# This exists because BOTH nodes publish Twist. fpms_missions.py explains it at
+# length: interleaving teleop's 2 Hz idle zeros into a mission's 20 Hz setpoint
+# reproduces exactly the stall-then-lurch this project spent hours misdiagnosing,
+# so the mission node REFUSES TO START while it hears a foreign writer. Without
+# this constant a mission can never begin — the refusal is correct, and teleop is
+# the one that has to yield.
+#
+# THIS VALUE IS COUPLED TO fpms_missions.py's IDLE_TELEM_S (5.0 s) AND MUST STAY
+# COMFORTABLY LARGER THAN IT. That coupling is not obvious and it is not
+# cosmetic, so it is spelled out here rather than left to be rediscovered:
+#
+# While no mission is running, the executor deliberately slows its telemetry to
+# one message every IDLE_TELEM_S. If this window is shorter than that interval,
+# teleop reclaims the wire between heartbeats and emits an idle zero — and the
+# executor, which refuses to start whenever it hears a foreign writer on
+# /cmd_vel, then refuses EVERY mission. The failure is a permanent deadlock that
+# reads as "the rover ignores the button", with both services healthy and
+# nothing in either log that looks like an error.
+#
+# Set at 12 s: long enough to ride out a dropped idle heartbeat (a 10 s gap),
+# short enough that teleop resumes its own heartbeat promptly if the executor
+# actually dies. The asymmetry is deliberate — being slow to reclaim an idle
+# wire costs nothing, while reclaiming it early puts two writers on a moving
+# rover, which is the stall-then-lurch failure this whole mechanism exists to
+# prevent.
+MISSION_OWNS_WIRE_S = 12.0
+
 
 # ======================================================= RUNTIME TUNING CAPS
 # JOG_MAX_MPS and NUDGE/DOCK_MPS above are DEFAULTS. `set_speed` lets an
@@ -875,6 +907,21 @@ class Bus:
         self.client.on_message = self._on_message
         self.connected = False
         self.on_command = None
+        # Monotonic stamp of the last telemetry/mission seen. This is how teleop
+        # knows fpms-missions is alive and therefore owns the wire. See
+        # mission_active(), the heartbeat suppression in _control_tick, and
+        # _cmd_mission.
+        self._mission_seen = 0.0
+
+    def mission_active(self):
+        """True if fpms-missions published recently enough to own /cmd_vel.
+
+        Deliberately a freshness check rather than a flag: if the mission node
+        dies mid-run its telemetry simply stops, and teleop resumes ownership on
+        its own a few seconds later. A latched boolean would leave the wire
+        orphaned until something thought to clear it.
+        """
+        return (time.monotonic() - self._mission_seen) < MISSION_OWNS_WIRE_S
 
     # -- lifecycle ---------------------------------------------------------
     def start(self):
@@ -904,6 +951,10 @@ class Bus:
             # See the comment on that dict for why.
             for action in TELEOP_ACTIONS:
                 client.subscribe(f"fpms/{THING}/commands/{action}", qos=1)
+            # Not a command — this is how teleop notices fpms-missions running
+            # and yields /cmd_vel to it. qos=0: a dropped sample only delays the
+            # handover by one tick, and MISSION_OWNS_WIRE_S covers that.
+            client.subscribe(f"fpms/{THING}/telemetry/mission", qos=0)
             self.publish("events/online",
                          {"svc": "teleop", "status": "online",
                           "cmd_scale": CMD_SCALE,
@@ -938,6 +989,13 @@ class Bus:
         # raise: an exception here would kill the MQTT loop and with it the
         # only channel a `stop` can arrive on.
         try:
+            # MUST be tested on the full topic, before the action is derived.
+            # `telemetry/mission` and `commands/mission` both end in "mission",
+            # so the rsplit below cannot tell them apart — routing on it would
+            # feed every mission telemetry sample back in as a mission COMMAND.
+            if msg.topic.endswith("/telemetry/mission"):
+                self._mission_seen = time.monotonic()
+                return
             action = msg.topic.rsplit("/", 1)[-1]
             try:
                 payload = json.loads(msg.payload.decode() or "{}")
@@ -1084,6 +1142,7 @@ class TeleopNode(Node):
         self.last_cmd_at = None
         self.last_error = None
         self._last_zero_pub = 0.0
+        self._yielded_wire = False   # log the handover once, not 20x/second
         self._link_warned = False
         self._jog_nack_at = 0.0
         self._deadband_snapped = False
@@ -1292,6 +1351,35 @@ class TeleopNode(Node):
 
                 vx, wz, mode = self.cur_vx, self.cur_wz, self.mode
 
+            idle = (mode == "idle" and abs(vx) < 1e-6 and abs(wz) < 1e-6)
+
+            # ---- wire handover to fpms-missions -----------------------------
+            # While a mission is running and this operator is not actively
+            # driving, teleop says NOTHING on /cmd_vel. Both the idle heartbeat
+            # and the lurch auto-zero are suppressed.
+            #
+            # The lurch suppression is the non-obvious half and it is not a
+            # weakening of the guard. That guard fires on "the rover is moving
+            # and teleop did not command it" — which is the precise description
+            # of a mission in progress. Left armed it would zero the wire
+            # continuously and no mission could ever run.
+            #
+            # Nothing is left unguarded. The mission node carries its own
+            # obstacle, battery and link-loss aborts, and it honours stop/estop
+            # directly. An operator who grabs the joystick takes the wire back
+            # immediately, because `idle` goes false and this branch stops
+            # applying — deliberate override stays possible at any moment.
+            if idle and self.bus.mission_active():
+                if not self._yielded_wire:
+                    self._yielded_wire = True
+                    log("mission telemetry is live — teleop yields /cmd_vel "
+                        "(idle heartbeat and lurch auto-zero suppressed)")
+                return
+            if self._yielded_wire:
+                self._yielded_wire = False
+                log("mission telemetry stale or operator input — teleop has the "
+                    "wire back")
+
             if lurch:
                 # Out of the lock and straight to zero. Not via the ramp, not
                 # via the idle heartbeat's rate limit: the whole point is that
@@ -1299,8 +1387,7 @@ class TeleopNode(Node):
                 self._safe_zero()
                 return
 
-            idle_zero = (mode == "idle" and abs(vx) < 1e-6 and abs(wz) < 1e-6)
-            if idle_zero:
+            if idle:
                 # Parked. Keep a slow zero heartbeat instead of 20 Hz of nothing.
                 if now - self._last_zero_pub < 0.5:
                     return
@@ -2515,16 +2602,29 @@ class TeleopNode(Node):
                      "always the speed the rover uses")})
 
     def _cmd_mission(self, p):
+        # fpms-missions owns this verb when it is running. Staying silent then
+        # is the whole point: two processes acking the same mission is how an
+        # operator ends up reading "accepted, no motion" from this stub while
+        # the rover is in fact driving. Same rule fpms_rover_agent follows for
+        # teleop's verbs, and the same reason.
+        if self.bus.mission_active():
+            return
+
         name = str(p.get("name", ""))
         if name not in ("m1", "m2", "water", "home"):
             self._nack("mission", f"unknown mission {name!r}")
             return
-        # Deliberately does not drive. Navigation is not implemented and
-        # inventing it under a person's feet is not an option.
-        log(f"mission '{name}' received — stub, no motion commanded")
-        self._event("events/ack", {"action": "mission", "name": name,
-                                   "accepted": True, "started": False,
-                                   "note": "stub: logged only, no navigation implemented"})
+        # Reached only when the executor is NOT running. Answering here — rather
+        # than leaving the verb unhandled — is deliberate: a mission button that
+        # produces total silence is indistinguishable from a broken dashboard,
+        # and the actual fault is a service that is not running.
+        log(f"mission '{name}' received but fpms-missions is not publishing "
+            "telemetry — refusing rather than pretending")
+        self._nack("mission",
+                   "the mission executor (fpms-missions) is not running, so "
+                   "nothing can drive this route. teleop has never implemented "
+                   "navigation and will not invent it under a moving rover. "
+                   "Start it with: sudo systemctl start fpms-missions")
 
     def _cmd_set_coordinate(self, p):
         try:

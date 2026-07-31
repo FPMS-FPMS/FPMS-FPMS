@@ -800,7 +800,7 @@ class Bus:
             # Verbs it ACTS on and never ANSWERS — teleop owns the reply. See
             # the module docstring; this is the same discipline fpms_rover_agent
             # applies to teleop's verbs, for the same reason.
-            for verb in ("stop", "estop", "auto_off"):
+            for verb in ("stop", "estop", "auto_off", "set_coordinate"):
                 client.subscribe(f"fpms/{THING}/commands/{verb}", qos=1)
             # The only live LiDAR on this rover. The board's /scan is dead.
             client.subscribe(f"fpms/{THING}/telemetry/lidar", qos=0)
@@ -1510,6 +1510,17 @@ class MissionRunner:
                 # ends up reading the wrong one.
                 self.request_abort(ABORT_STOP)
                 return
+            if action == "set_coordinate":
+                # ACT, DO NOT ANSWER — teleop owns this verb and its ack.
+                #
+                # Without this the anchor is read once at boot and never again,
+                # so an operator who repositions the rover and re-zeros it via
+                # teleop gets a correctly-updated origin file and a mission node
+                # still planning from the OLD origin. Every route would be
+                # silently offset by however far the rover had been moved, and
+                # the preview would draw that wrong route confidently.
+                self._reload_anchor()
+                return
             if action != "mission":
                 return
             self._cmd_mission(payload)
@@ -1531,6 +1542,16 @@ class MissionRunner:
             return
         if backend not in BACKENDS:
             self._nack(f"unknown backend {backend!r}", valid=list(BACKENDS))
+            return
+
+        # PLAN ONLY. Answers "where would you go?" without touching the wire.
+        # Handled before every check below on purpose: a preview commands no
+        # motion, so refusing it for a flat battery, a stale LiDAR or a busy
+        # wire would withhold exactly the information an operator needs while
+        # deciding whether to run the thing at all. It still refuses without a
+        # pose, because a route drawn from a guessed start is a lie on a map.
+        if payload.get("preview"):
+            self._preview(name, backend)
             return
 
         with self.lock:
@@ -1620,6 +1641,91 @@ class MissionRunner:
                           "segments_planned": len(plan),
                           "eta_s": jnum(st.eta_s, 1),
                           "returns_home": name != "home"}, qos=1)
+
+    def _reload_anchor(self):
+        """Re-read teleop's origin file after a set_coordinate.
+
+        Refused while a mission is running. Moving the arena frame under a route
+        that is being driven would leave the executor steering toward a target
+        that has silently jumped, using distances measured against the old
+        frame — the rover would keep driving and every number would be wrong.
+        The operator can stop, re-zero, and start again.
+        """
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                log("set_coordinate ignored: a mission is running and the arena "
+                    "frame must not move under it. Stop the mission first.")
+                return
+        a = self.node._initial_anchor()
+        with self.node.lock:
+            self.node.anchor = a
+        log(f"anchor reloaded after set_coordinate: "
+            f"({a.arena_x_mm:.0f}, {a.arena_y_mm:.0f}) mm")
+
+    def _preview(self, name, backend):
+        """Publish the route this mission WOULD drive. Commands nothing.
+
+        The waypoints are produced by walking the same `plan_route` output
+        through the same `apply_segment` forward kinematics the executor uses,
+        rather than by a second geometry routine written for the map. That is
+        the point: a preview computed a different way would eventually disagree
+        with the drive, and a route drawn on a dashboard that the rover does not
+        actually follow is worse than drawing nothing.
+
+        What it CANNOT show is re-planning. Execution re-measures the bearing
+        after every leg and inserts corrections, so the real path deviates from
+        this one — this is the nominal intent, not a promise. `nominal: true`
+        says so to anyone rendering it.
+        """
+        pose = self.node.pose()
+        if pose is None:
+            self._nack("no pose yet, so there is no route to preview "
+                       "(odometry has not been seen)", preview=True)
+            return
+
+        tx, ty, final_heading = mission_target(name)
+        if not in_arena(tx, ty):
+            self._nack(f"target ({tx:.0f}, {ty:.0f}) mm is outside the arena",
+                       preview=True)
+            return
+
+        plan = plan_route(pose[0], pose[1], pose[2], tx, ty)
+
+        # Cumulative pose after each segment. measured=False because nothing has
+        # executed — these are the TARGETS, which is what a preview means.
+        pts = [{"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
+                "heading_deg": jnum(pose[2], 1), "kind": "start"}]
+        p = pose
+        for seg in plan:
+            p = apply_segment(p, seg, measured=False)
+            pts.append({"x_mm": jnum(p[0], 1), "y_mm": jnum(p[1], 1),
+                        "heading_deg": jnum(p[2], 1),
+                        "kind": seg.kind, "dock": bool(seg.dock)})
+
+        one_way = eta_seconds(plan)
+        self.bus.publish("telemetry/mission_plan", {
+            "mission": name,
+            "backend": backend,
+            "nominal": True,
+            "pose_assumed": bool(self.node.anchor.assumed),
+            "from": {"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
+                     "heading_deg": jnum(pose[2], 1)},
+            "target": {"x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1),
+                       "final_heading_deg": jnum(final_heading, 1)},
+            "segments": [{"kind": s.kind, "target": jnum(s.target, 1),
+                          "dock": bool(s.dock)} for s in plan],
+            "waypoints": pts,
+            "distance_mm": jnum(remaining_distance_mm(plan), 1),
+            "eta_s": jnum(one_way if name == "home" else 2 * one_way + HOLD_S, 1),
+            "returns_home": name != "home",
+        }, qos=1)
+
+        log(f"preview {name!r}: {len(plan)} segments, "
+            f"{remaining_distance_mm(plan):.0f}mm, no motion commanded")
+        self.bus.publish("events/ack",
+                         {"action": "mission", "name": name, "preview": True,
+                          "accepted": True, "started": False,
+                          "segments_planned": len(plan)}, qos=1)
 
     def _wire_is_ours(self):
         """Nobody else is publishing /cmd_vel.
