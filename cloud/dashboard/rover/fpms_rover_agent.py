@@ -75,6 +75,25 @@ OBSTACLE_ALERT_MM = int(CFG.get("FPMS_OBSTACLE_ALERT_MM", "400"))
 RUNNING = threading.Event()
 RUNNING.set()
 
+# Autonomy latch. Starts CLEAR on every boot: a rover that came back from a
+# power cut must not resume driving on its own because it was driving when the
+# power went. Only an explicit auto_on sets it.
+AUTO_MODE = threading.Event()
+# Set by stop/estop to cut a running motor self-test short.
+MOTOR_TEST_ABORT = threading.Event()
+
+# Optional motor driver, set by main() the same way UPLINK is, and normally
+# None — there is no motor driver in this tree. Every command that would move
+# the rover checks this and refuses when it is None rather than reporting a
+# motion that never happened. A driver, when one exists, must provide
+# .stop(), .drive(left, right) and .read_encoders().
+MOTORS = None
+
+# Hard ceilings for the self-test, deliberately not read from CFG: a test
+# triggered by a web button is only safe while it is bounded.
+MOTOR_TEST_MAX_SPEED = 0.4
+MOTOR_TEST_MAX_S = 3.0
+
 COCO_TREE_IDS = {58, 50, 75}   # potted plant / broccoli / vase — stand-ins for foliage
 
 # Full COCO-80 names. The model returns class indices; without this the UI shows
@@ -182,10 +201,15 @@ class Bus:
         self.connected = True
         log(f"MQTT connected to {BROKER}:{PORT} ({reason_code})")
         client.subscribe(f"fpms/{THING}/commands/#", qos=1)
+        # "motors" only when a driver actually opened, so the dashboard offers
+        # motion controls for a rover that can honour them and no other.
+        capabilities = ["camera", "lidar", "yolo"]
+        if MOTORS is not None:
+            capabilities.append("motors")
         self.publish("events/online", {
             "thing": THING, "status": "online",
             "camera": CAMERA_DEV, "lidar": LIDAR_PORT,
-            "capabilities": ["camera", "lidar", "yolo"],
+            "capabilities": capabilities,
         }, qos=1)
 
     def _on_message(self, _c, _u, msg):
@@ -258,8 +282,122 @@ def handle_command(bus, action, payload):
         bus.publish("events/ack", {"action": "restart"}, qos=1)
         time.sleep(0.5)
         RUNNING.clear()
+    elif action in ("stop", "estop"):
+        # Gated on nothing at all. A stop has to work while autonomy is on,
+        # while a self-test is mid-run, and while there is no driver to stop —
+        # in the last case it says so instead of claiming the rover halted.
+        AUTO_MODE.clear()
+        MOTOR_TEST_ABORT.set()
+        stopped, error = _motors_stop()
+        bus.publish("events/ack", {"action": "stop", "estop": True, "auto": False,
+                                   "motors_stopped": stopped, "error": error}, qos=1)
+    elif action == "auto_off":
+        # Leaving autonomy also parks the motors: clearing the flag alone would
+        # leave whatever was last commanded still running.
+        AUTO_MODE.clear()
+        stopped, error = _motors_stop()
+        bus.publish("events/ack", {"action": "auto_off", "auto": False,
+                                   "motors_stopped": stopped, "error": error}, qos=1)
+    elif action == "auto_on":
+        AUTO_MODE.set()
+        bus.publish("events/ack", {"action": "auto_on", "auto": True,
+                                   "motors": MOTORS is not None}, qos=1)
+    elif action == "read_encoders":
+        if MOTORS is None:
+            bus.publish("events/nack", {"action": action,
+                                        "error": "no motor interface on this rover"}, qos=1)
+        else:
+            try:
+                counts = MOTORS.read_encoders()
+            except Exception as e:  # noqa: BLE001
+                bus.publish("events/nack", {"action": action, "error": str(e)[:200]}, qos=1)
+            else:
+                bus.publish("events/encoders", {"counts": counts}, qos=1)
+    elif action == "test_motors":
+        if AUTO_MODE.is_set():
+            bus.publish("events/nack", {"action": action,
+                                        "error": "autonomy is on; send auto_off first"}, qos=1)
+        elif MOTORS is None:
+            bus.publish("events/nack", {"action": action,
+                                        "error": "no motor interface on this rover"}, qos=1)
+        else:
+            # handle_command runs on paho's network thread. Driving the test
+            # inline would block that thread for its whole duration, stalling
+            # MQTT keepalive — and with it the STOP that is meant to abort the
+            # test, the one command that must always get through.
+            MOTOR_TEST_ABORT.clear()
+            threading.Thread(target=_motor_self_test, args=(bus, payload),
+                             daemon=True, name="motor-test").start()
+            bus.publish("events/ack", {"action": "test_motors", "started": True}, qos=1)
     else:
         bus.publish("events/nack", {"action": action, "error": "unknown command"}, qos=1)
+
+
+def _motors_stop():
+    """Cut motor output. Returns (stopped, error) and never raises.
+
+    Reporting stopped=True with no driver would be a lie an operator could act
+    on, so a missing driver comes back as the failure it is.
+    """
+    if MOTORS is None:
+        return False, "no motor interface on this rover"
+    try:
+        MOTORS.stop()
+    except Exception as e:  # noqa: BLE001
+        log(f"motor stop failed: {e}")
+        return False, str(e)[:200]
+    return True, None
+
+
+def _motor_self_test(bus, payload):
+    """Short bounded drive test, on its own thread (see test_motors above).
+
+    Both limits are ceilings rather than defaults: a command carrying
+    speed=5 or duration_s=600 must not be able to send the rover off across a
+    heritage site because the dashboard sent a number nobody checked.
+    """
+    try:
+        speed = min(abs(float(payload.get("speed", 0.2))), MOTOR_TEST_MAX_SPEED)
+        duration = min(abs(float(payload.get("duration_s", 1.0))), MOTOR_TEST_MAX_S)
+    except (AttributeError, TypeError, ValueError):
+        # AttributeError covers a payload that parsed to something other than an
+        # object; this thread must nack rather than die without a word.
+        bus.publish("events/nack", {"action": "test_motors",
+                                    "error": "speed and duration_s must be numbers"}, qos=1)
+        return
+
+    motors = MOTORS
+    if motors is None:
+        bus.publish("events/nack", {"action": "test_motors",
+                                    "error": "no motor interface on this rover"}, qos=1)
+        return
+
+    aborted = False
+    error = None
+    try:
+        motors.drive(speed, speed)
+        deadline = time.time() + duration
+        # Polled rather than one sleep(duration): a stop arriving mid-test has
+        # to take effect within ~100ms, not whenever the test happens to end.
+        while time.time() < deadline and RUNNING.is_set():
+            if MOTOR_TEST_ABORT.is_set():
+                aborted = True
+                break
+            time.sleep(0.05)
+    except Exception as e:  # noqa: BLE001
+        error = str(e)[:200]
+        log(f"motor self-test failed: {e}")
+    finally:
+        stopped, stop_error = _motors_stop()
+
+    bus.publish("events/motor_test", {
+        "action": "test_motors",
+        "speed": speed, "duration_s": duration,
+        "aborted": aborted,
+        "completed": not aborted and error is None,
+        "motors_stopped": stopped,
+        "error": error or stop_error,
+    }, qos=1)
 
 
 STREAM_ENABLED = threading.Event()
@@ -770,6 +908,22 @@ def main():
         # Never fatal. Without it the agent behaves exactly as it did before.
         log(f"cloud uplink unavailable ({e}); continuing on MQTT only")
         UPLINK = None
+
+    # Optional motor driver, same contract as the uplink: a missing module is
+    # not fatal. It has to be resolved before the bus connects, because
+    # _on_connect advertises whether this rover has motors at all.
+    global MOTORS
+    try:
+        import fpms_motors
+        MOTORS = fpms_motors.open_driver()
+        if MOTORS is None:
+            raise RuntimeError("open_driver() returned nothing")
+        log(f"motor driver ready ({type(MOTORS).__name__})")
+    except Exception as e:  # noqa: BLE001
+        # No driver means no motion, and every motion command says so rather
+        # than acknowledging something that cannot have happened.
+        log(f"no motor driver ({e}); motion commands will be refused")
+        MOTORS = None
 
     bus = Bus()
     bus.connect_forever()

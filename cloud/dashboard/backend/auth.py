@@ -127,6 +127,8 @@ _PRIVILEGED_PREFIXES = (
     "/api/network/gateway",         # holds the gateway secret
     "/api/network/tunnel",          # a visitor could otherwise kill the link
     "/api/terminal",
+    "/api/control/",                # motion + actuator commands: HQ only, never
+                                    # the cloud role or a public-tunnel visitor
 )
 
 

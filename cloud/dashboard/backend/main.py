@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -541,6 +542,19 @@ def rover_command(thing: str, action: str) -> dict[str, Any]:
     if action not in {"connect", "disconnect"}:
         raise HTTPException(400, "action must be connect or disconnect")
     topic = f"fpms/{thing}/commands/{action}"
+
+    # Mosquitto first: LocalStack's iot-data accepts the publish and no rover
+    # ever hears it, because the rovers are subscribed to the broker this
+    # bridge is already connected to. The boto3 call stays as the fallback —
+    # it is the real production-AWS shape, and it still works if paho is down.
+    bridge = get_bridge()
+    if bridge is not None:
+        sent = bridge.publish_command(thing, action)
+        if sent.get("ok"):
+            return {"ok": True, "topic": topic, "via": sent["via"]}
+        log.warning("bridge publish of %s failed (%s); trying iot-data",
+                    topic, sent.get("error") or sent.get("rc"))
+
     try:
         client = _iot_data_client()
         client.publish(
@@ -551,6 +565,46 @@ def rover_command(thing: str, action: str) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"IoT Core publish failed: {e}") from e
     return {"ok": True, "topic": topic, "via": "aws-iot-data"}
+
+
+# `thing` is interpolated straight into an MQTT topic, so an unvalidated value
+# ("+", "../", a whole path) could publish anywhere in the fpms tree.
+THING_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# What the rover agent knows how to act on. Anything else is refused here
+# rather than published and left to be nacked on the far end.
+CONTROL_ACTIONS = {
+    "stop", "estop", "auto_on", "auto_off", "test_motors", "read_encoders",
+    "ping", "status", "connect", "disconnect", "restart",
+}
+
+
+class CommandBody(BaseModel):
+    params: dict[str, Any] = {}
+
+
+@app.post("/api/control/{thing}/{action}")
+def control_command(thing: str, action: str,
+                    body: CommandBody = CommandBody()) -> dict[str, Any]:
+    """Rover control plane — motion, autonomy and actuator commands.
+
+    HQ-only: `/api/control/` is in auth._PRIVILEGED_PREFIXES, so the cloud role
+    and public-tunnel visitors are refused before they reach this handler.
+    """
+    if not THING_RE.match(thing):
+        raise HTTPException(400, "invalid thing name")
+    if action not in CONTROL_ACTIONS:
+        raise HTTPException(400, f"action must be one of {sorted(CONTROL_ACTIONS)}")
+
+    bridge = get_bridge()
+    if bridge is None:
+        raise HTTPException(502, "MQTT bridge is not running")
+    sent = bridge.publish_command(thing, action, body.params)
+    if not sent.get("ok"):
+        detail = sent.get("error") or f"broker returned rc={sent.get('rc')}"
+        raise HTTPException(502, f"command publish failed: {detail}")
+    return {"ok": True, "thing": thing, "action": action,
+            "topic": sent["topic"], "via": sent["via"]}
 
 
 # ---- Terminal WebSocket ---------------------------------------------------

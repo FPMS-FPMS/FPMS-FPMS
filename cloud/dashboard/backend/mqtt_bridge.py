@@ -120,6 +120,34 @@ class Bridge:
             "last_message_at": self.last_message_at,
         }
 
+    def publish_command(self, thing: str, action: str,
+                        payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a dashboard→rover command on the bridge's own connection.
+
+        The rovers subscribe on Mosquitto, so a command has to go out over the
+        same connection that already receives their telemetry — a publish to
+        any other broker is accepted and then heard by nobody.
+        """
+        topic = f"fpms/{thing}/commands/{action}"
+        body = dict(payload or {})
+        body.setdefault("source", "dashboard")
+        body.setdefault("ts", time.time())
+
+        # A publish while paho is down is queued, not delivered, and would come
+        # back rc=0 — so report the disconnect instead of a false success.
+        if self.client is None or not self.connected:
+            log.warning("command %s not sent: MQTT bridge is not connected", topic)
+            return {"ok": False, "topic": topic, "via": "mosquitto-bridge",
+                    "error": "MQTT bridge is not connected"}
+        try:
+            info = self.client.publish(topic, json.dumps(body), qos=1)
+        except Exception as e:  # noqa: BLE001
+            log.exception("command publish failed on %s", topic)
+            return {"ok": False, "topic": topic, "via": "mosquitto-bridge",
+                    "error": str(e)}
+        return {"ok": bool(info.rc == 0), "topic": topic,
+                "via": "mosquitto-bridge", "rc": int(info.rc)}
+
     # ---- paho callbacks (run on paho's thread) ---------------------------
     def _on_connect(self, client, _userdata, _flags, reason_code, _props=None) -> None:
         # paho v2 gives a ReasonCode object (not an int); use .is_failure.
