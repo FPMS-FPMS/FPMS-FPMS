@@ -571,14 +571,29 @@ def rover_command(thing: str, action: str) -> dict[str, Any]:
 # ("+", "../", a whole path) could publish anywhere in the fpms tree.
 THING_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-# What the rover agent knows how to act on. Anything else is refused here
-# rather than published and left to be nacked on the far end.
+# ALLOWLIST: the full set of actions the rover fleet supports. `action` is
+# interpolated into an MQTT topic just like `thing` (see THING_RE above), so
+# an action not in this set must 400 here rather than being published and
+# left to be nacked on the far end.
+#
+# On the rover, no single process owns this whole list: sensor/status
+# commands (test_motors, read_encoders, ping, status, beep, servo) are
+# handled by `fpms-rover-agent`, while motion/actuator commands (jog, nudge,
+# turn, mission, set_coordinate, set_speed) are handled by `fpms-teleop` on
+# ROS_DOMAIN_ID=20. A command's arrival here does not imply a single
+# receiver on the far end.
 CONTROL_ACTIONS = {
-    "stop", "estop", "auto_on", "auto_off", "test_motors", "read_encoders",
-    "ping", "status", "connect", "disconnect", "restart",
+    # Lifecycle / connectivity
+    "connect", "disconnect", "restart",
+    # Safety / autonomy toggles
+    "stop", "estop", "auto_on", "auto_off",
     # Manual driving (Drive page): a streamed analog jog, bounded steps, a
     # closed-loop turn, named missions, and a pose correction.
     "jog", "nudge", "turn", "mission", "set_coordinate",
+    # Diagnostics / sensing
+    "test_motors", "read_encoders", "ping", "status",
+    # Actuators / misc
+    "beep", "servo", "set_speed",
 }
 
 

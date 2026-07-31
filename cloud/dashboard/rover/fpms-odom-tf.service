@@ -1,0 +1,38 @@
+[Unit]
+Description=FPMS odometry + TF for Nav2 (/odom_raw + /imu -> /odom, odom->base_footprint)
+# Deliberately NO Requires=/BindsTo=/PartOf=/After= on micro-ros-agent or
+# fpms-rover-agent. Restarting this node must never be able to take either of
+# them down: the micro-ROS serial link costs 90-225s to re-establish, and a
+# dependency edge here would turn a trivial odometry tweak into a multi-minute
+# outage of every topic on the robot.
+#
+# The reverse coupling is avoided too. If micro-ROS is down, /odom_raw simply
+# stops arriving, the node's own watchdog notices within 2s, suspends the
+# odom->base_footprint broadcast and logs it. That is a cleaner and more
+# visible failure than systemd shuffling units around, and it means this
+# service can be started, stopped and restarted at any time in any order.
+#
+# network-online is the only thing worth waiting for (DDS discovery).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_odom_tf.py'
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef } from "react";
 import {
   ARENA_MM,
+  FORWARD_HEADING_DEG,
   GRID_MAJOR_MM,
   GRID_MINOR_MM,
   ROVER_LEN_MM,
@@ -25,16 +26,30 @@ import { useChannelRef } from "../lib/ws";
 /**
  * World-fixed bird's-eye view of the arena.
  *
- * The map does not move. The grid, the border and the three zones are painted
- * once onto a static canvas and never touched again; only the rover glyph,
- * the point cloud and the detected objects move within them. That is the
- * whole point of the rewrite — the old polar view was rover-centric, so a
- * turning rover made the entire world appear to spin, which is unreadable
- * when you are trying to tell where an obstacle actually is.
+ * TWO SEPARATE GUARANTEES, both of which the operator asked for by name:
+ *
+ *   1. THE MAP STARTS FORWARD AND STAYS FORWARD. The world layer is fixed.
+ *      Nothing in this file ever rotates the arena, the grid, the zones, the
+ *      axis ticks or the scale bar by rover heading — there is exactly one
+ *      ctx.rotate() in the whole module, inside drawRover's save()/restore(),
+ *      and it turns the ROVER GLYPH ONLY. The old polar view was
+ *      rover-centric, so a turning rover made the entire world appear to
+ *      spin, which is unreadable when you are trying to tell where an
+ *      obstacle actually is. Cloud points and object boxes arrive in world
+ *      millimetres and go through the same fixed transform as the grid.
+ *
+ *   2. THE ROVER STARTS FACING FORWARD. "Forward" is up the arena
+ *      (world +y, towards the top of the screen) = FORWARD_HEADING_DEG,
+ *      90 deg CCW from +x. The static layer paints a FORWARD arrow at the top
+ *      edge so that convention is on screen, not just in a comment.
+ *
+ * Because the map never rotates, the FORWARD marker is a permanent, honest
+ * reference: it belongs to the static layer precisely so it can never be
+ * mistaken for something that tracks the rover.
  *
  * Two stacked canvases:
- *   static   arena border, grid, zones, axis labels, scale bar. Redrawn only
- *            on mount and on resize.
+ *   static   arena border, grid, zones, axis labels, scale bar, FORWARD
+ *            marker. Redrawn only on mount and on resize.
  *   dynamic  cloud, oriented bounding boxes, labels, rover, HUD. Redrawn per
  *            animation frame.
  *
@@ -52,6 +67,8 @@ const EMBER = "#f97316";
 const GRID_MINOR = "rgba(148,163,184,0.055)";
 const GRID_MAJOR = "rgba(148,163,184,0.14)";
 const TEXT_DIM = "rgba(148,163,184,0.55)";
+/** Orientation marker ink — brighter than the ticks; it is a legend, not chrome. */
+const FORWARD_INK = "rgba(226,232,240,0.72)";
 const MONO = '10px "JetBrains Mono", ui-monospace, monospace';
 const MONO_SM = '9px "JetBrains Mono", ui-monospace, monospace';
 
@@ -316,6 +333,99 @@ function drawStatic(ctx: CanvasRenderingContext2D, size: number): void {
   ctx.fillText(`${Math.round(barMm / 10)} cm`, bx + barPx / 2, by - 4);
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
+
+  // ---- FORWARD marker -----------------------------------------------------
+  drawForwardMarker(ctx, x0, y0, wpx);
+}
+
+/**
+ * Fixed orientation reference: an arrow labelled FORWARD, pinned just inside
+ * the arena's top edge.
+ *
+ * This lives on the STATIC layer deliberately. It is a property of the map,
+ * not of the rover: it says "up the screen is up the arena is world +y is
+ * heading 90 deg" and it must keep saying that no matter where the rover
+ * points. Putting it on the dynamic layer, or inside drawRover's rotated
+ * transform, would turn it into a second heading indicator and destroy the
+ * one thing it is for.
+ *
+ * The direction is DERIVED from FORWARD_HEADING_DEG rather than hardcoded to
+ * screen-up, so the marker and the rover's start heading cannot drift apart:
+ * change the constant and this arrow follows. It is still static — the input
+ * is a compile-time constant, never `pose.heading_rad`.
+ *
+ * Drawn once per mount/resize, so measureText and the trig here are off the
+ * hot path entirely.
+ */
+function drawForwardMarker(
+  ctx: CanvasRenderingContext2D,
+  x0: number,
+  y0: number,
+  wpx: number,
+): void {
+  // Label is deliberately just the word: the numeric convention
+  // (FORWARD_HEADING_DEG = 90 deg = world +y) is reported in the HUD, and a
+  // shorter string keeps the marker inside the gap between the two top zones
+  // even on the narrowest card.
+  const label = "FORWARD";
+
+  ctx.font = MONO_SM;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  const textW = ctx.measureText(label).width;
+  const arrowW = 9;
+  const gap = 5;
+  // Just INSIDE the arena's top edge, horizontally centred between zones A and
+  // B. The top margin is already occupied by the HUD's right-aligned pose
+  // badge, and a marker that collides with a warning is a marker nobody reads.
+  const midY = y0 + 14;
+  const left = x0 + wpx / 2 - (arrowW + gap + textW) / 2;
+  const ax = left + arrowW / 2; // arrow centre, screen x
+  const half = 7; // half-length of the shaft, px
+
+  // World heading -> screen direction. cos/sin give the world unit vector;
+  // the y component is negated because canvas +y points down, which is the
+  // same single flip worldToCanvasY applies. At FORWARD_HEADING_DEG = 90 this
+  // evaluates to (0, -1) — straight up the screen.
+  const rad = (FORWARD_HEADING_DEG * Math.PI) / 180;
+  const dx = Math.cos(rad);
+  const dy = -Math.sin(rad);
+  const perpX = -dy; // unit normal, for the arrowhead base
+  const perpY = dx;
+
+  const tipX = ax + dx * half;
+  const tipY = midY + dy * half;
+  const tailX = ax - dx * half;
+  const tailY = midY - dy * half;
+  // Snap a perfectly vertical or horizontal shaft to a half-pixel so the 1px
+  // stroke lands on one device row; a diagonal gets no benefit from it.
+  const snapX = Math.abs(dx) < 1e-6;
+  const snapY = Math.abs(dy) < 1e-6;
+
+  ctx.strokeStyle = FORWARD_INK;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(snapX ? hair(tailX) : tailX, snapY ? hair(tailY) : tailY);
+  ctx.lineTo(snapX ? hair(tipX) : tipX, snapY ? hair(tipY) : tipY);
+  ctx.stroke();
+
+  // Arrowhead: apex at the tip, base one head-length back along the shaft.
+  const headLen = 7;
+  const baseX = tipX - dx * headLen;
+  const baseY = tipY - dy * headLen;
+  ctx.fillStyle = FORWARD_INK;
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(baseX + perpX * (arrowW / 2), baseY + perpY * (arrowW / 2));
+  ctx.lineTo(baseX - perpX * (arrowW / 2), baseY - perpY * (arrowW / 2));
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillText(label, left + arrowW + gap, midY);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
 }
 
 // =========================================================== dynamic layer ===
@@ -510,11 +620,27 @@ function drawHud(
     }
   }
 
+  // ---- pose provenance ----------------------------------------------------
+  // This fleet publishes no pose: the heartbeat carries uptime/camera/lidar
+  // flags and nothing else. So the rover is drawn at ROVER_START facing
+  // FORWARD_HEADING_DEG, and the operator has to be told that the bearing on
+  // screen is an assumption rather than a measurement — otherwise they will
+  // trust a number the rover never reported. Hence two lines, not one: the
+  // existing SIMULATED badge plus the heading and its provenance.
   if (pose.simulated) {
+    const deg = (pose.heading_rad * 180) / Math.PI;
+    // Every numeric that reaches a formatter is finite-guarded; heading_rad
+    // is already clamped in readPose, but this HUD must never be the thing
+    // that throws on top of a degraded link.
+    const degText = Number.isFinite(deg)
+      ? `${Math.round(((deg % 360) + 360) % 360)}°`
+      : "—";
+
     ctx.font = MONO_SM;
     ctx.fillStyle = "#fbbf24";
     ctx.textAlign = "right";
     ctx.fillText("POSE: SIMULATED", size - 8, 12);
+    ctx.fillText(`HDG ${degText} ASSUMED — NOT MEASURED`, size - 8, 23);
     ctx.textAlign = "left";
   }
 }

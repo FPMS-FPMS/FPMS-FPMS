@@ -75,24 +75,18 @@ OBSTACLE_ALERT_MM = int(CFG.get("FPMS_OBSTACLE_ALERT_MM", "400"))
 RUNNING = threading.Event()
 RUNNING.set()
 
-# Autonomy latch. Starts CLEAR on every boot: a rover that came back from a
-# power cut must not resume driving on its own because it was driving when the
-# power went. Only an explicit auto_on sets it.
-AUTO_MODE = threading.Event()
-# Set by stop/estop to cut a running motor self-test short.
-MOTOR_TEST_ABORT = threading.Event()
-
-# Optional motor driver, set by main() the same way UPLINK is, and normally
-# None — there is no motor driver in this tree. Every command that would move
-# the rover checks this and refuses when it is None rather than reporting a
-# motion that never happened. A driver, when one exists, must provide
-# .stop(), .drive(left, right) and .read_encoders().
-MOTORS = None
-
-# Hard ceilings for the self-test, deliberately not read from CFG: a test
-# triggered by a web button is only safe while it is bounded.
-MOTOR_TEST_MAX_SPEED = 0.4
-MOTOR_TEST_MAX_S = 3.0
+# NO MOTOR STATE LIVES HERE. This agent used to carry MOTORS / AUTO_MODE /
+# MOTOR_TEST_ABORT globals plus a bounded self-test, written against
+# Rosmaster_Lib — an STM32 board protocol. The actual hardware is a Yahboom
+# MicroROS Board V2.0 (ESP32-S3) speaking micro-ROS, which Rosmaster_Lib can
+# never talk to, so open_driver() always failed, MOTORS was permanently None,
+# and every motion command answered "no motor interface on this rover". That
+# reply was honest about this process and badly wrong about the rover: motion
+# works, via fpms_teleop.py. The globals are gone rather than left as dead
+# state, so nothing here can drift back toward pretending to own the wheels.
+#
+# The self-test's safety reasoning is NOT lost — it is recorded in the command
+# section below, because fpms_teleop.py owes the same discipline.
 
 COCO_TREE_IDS = {58, 50, 75}   # potted plant / broccoli / vase — stand-ins for foliage
 
@@ -201,11 +195,13 @@ class Bus:
         self.connected = True
         log(f"MQTT connected to {BROKER}:{PORT} ({reason_code})")
         client.subscribe(f"fpms/{THING}/commands/#", qos=1)
-        # "motors" only when a driver actually opened, so the dashboard offers
-        # motion controls for a rover that can honour them and no other.
+        # Sensors only, and never "motors". This service does not drive the
+        # rover, so it must not advertise that it can — a capability list is a
+        # promise the dashboard enables buttons from. fpms-teleop announces its
+        # own events/online with the real motion envelope (jog_max_mps,
+        # turn_max_radps, deadband floors); that is where "can this rover move"
+        # is answered, and the two announcements must not contradict each other.
         capabilities = ["camera", "lidar", "yolo"]
-        if MOTORS is not None:
-            capabilities.append("motors")
         self.publish("events/online", {
             "thing": THING, "status": "online",
             "camera": CAMERA_DEV, "lidar": LIDAR_PORT,
@@ -260,6 +256,119 @@ class Bus:
             log(f"publish failed on {suffix}: {e}")
 
 
+# ---------------------------------------------------------------- commands --
+#
+# THE SPLIT — read this before adding anything below.
+#
+#   fpms-rover-agent (this file) = SENSORS + STATUS.
+#       camera, LiDAR, YOLO, the fire screen, telemetry, and the plumbing
+#       commands: ping, status, connect, disconnect, restart.
+#       It has NO ROS dependency, on purpose: it must keep streaming a camera
+#       and a scanner even when ROS, micro-ROS or the motor board are broken.
+#       Do not import rclpy here.
+#
+#   fpms-teleop (fpms_teleop.py) = MOTION.
+#       It holds the rclpy node and publishes /cmd_vel on ROS_DOMAIN_ID=20 to a
+#       Yahboom MicroROS Board V2.0 (ESP32-S3). jog, nudge, turn, mission,
+#       set_coordinate, set_speed, the actuators, the board-side test_motors and
+#       read_encoders, and the real stop/estop/auto_off. Its TELEOP_ACTIONS map
+#       is the authority on that list; SILENT_VERBS below mirrors it.
+#
+# DO NOT RE-ADD MOTOR CODE HERE. The handlers that were removed drove an
+# optional Rosmaster_Lib driver — an STM32 protocol that cannot address the
+# ESP32-S3 board this rover actually has. It never opened, so `stop` answered
+# "no motor interface on this rover": true of this process, and dangerously
+# false about the rover, which stops perfectly well through teleop. An
+# operator hitting STOP and reading "no motor interface" would reasonably
+# conclude the rover cannot be halted.
+#
+# HOW THE MOTOR VERBS ARE ANSWERED NOW (approach (a) — name the owner):
+#
+#   The rule is that a refusal must say WHERE motion lives, never imply the
+#   rover is immobile. "unknown command" would have been true but useless.
+#
+#   With one deliberate carve-out, because the two processes overlap. This agent
+#   subscribes commands/# (a wildcard), while teleop subscribes the verbs in its
+#   TELEOP_ACTIONS map BY NAME — so every verb teleop owns ALSO lands here. The
+#   dashboard resolves a command against the FIRST reply it sees for a given
+#   (thing, action) pair — see the pending map and describeNack in the frontend's
+#   Drive.tsx — and nothing guarantees teleop wins that race: this process is the
+#   lighter of the two. A nack published from here could therefore paint a stop
+#   that really happened as "refused", which is the same class of lie the
+#   Rosmaster handlers told, just from the other direction.
+#
+#   So: verbs teleop answers get NO reply from this agent (SILENT_VERBS below,
+#   logged but not published), and only verbs nobody answers get the nack that
+#   names the owner. If teleop is down, the dashboard's own no-reply timeout is
+#   the honest signal — and nothing is driving the rover in that case anyway,
+#   because teleop holds the only /cmd_vel publisher.
+#
+# SELF-TEST SAFETY REASONING, PRESERVED FOR fpms_teleop.py.
+#   The deleted _motor_self_test earned three properties that any motion path
+#   still owes, and teleop is now the only place they can be enforced:
+#     * BOUNDED BY CEILING, NOT DEFAULT. Its limits (<=0.4 speed, <=3.0 s) were
+#       hard-coded rather than read from config, and applied with min(abs(x),
+#       cap) so a payload carrying speed=99 or duration_s=9999 clamped instead
+#       of being honoured. A move triggered by a web button is only safe while
+#       it is bounded by something the button cannot raise. (teleop: clamp() to
+#       JOG_MAX_MPS/TURN_MAX_RADPS as the last step before the wire.)
+#     * ABORT BY POLLING, NOT BY SLEEPING. It slept in 50 ms slices checking an
+#       abort flag, never one sleep(duration), so a STOP arriving mid-move took
+#       effect in ~100 ms instead of whenever the move happened to end.
+#       (teleop: the deadman and stall/wrong-way aborts in its control tick.)
+#     * NEVER ON THE MQTT THREAD. It ran on its own thread because
+#       handle_command executes on paho's network thread; blocking there stalls
+#       keepalive, and with it the STOP that is supposed to abort the move — the
+#       one command that must always get through. (teleop: paho's thread only
+#       sets state; the ROS thread ramps and publishes.)
+#   Anything that moves this rover and lacks all three is a regression.
+
+# Verbs fpms-teleop subscribes by name and answers itself: motion, stopping,
+# actuators, and the encoder read that comes off the micro-ROS board. This agent
+# receives them on its wildcard and must stay quiet — see the carve-out above.
+#
+# Mirror of TELEOP_ACTIONS in fpms_teleop.py. It cannot be imported (that module
+# needs rclpy, which this one deliberately does not depend on), so it is copied,
+# and test_commands.py cross-checks the two so the copy cannot rot silently.
+#
+# Deliberately NOT mirrored: ping, status, connect and disconnect. Teleop's map
+# currently lists those too, but they are this agent's own job — sensors and
+# status — and it must keep answering them. A verb belongs in the silent set
+# only when this agent has nothing of its own to say about it.
+#
+# Erring toward silence is the safe direction. Wrongly silent costs a "no reply"
+# in the UI, which is honest; wrongly talkative can overwrite a real ack for a
+# stop with the word "refused".
+SILENT_VERBS = (
+    # motion
+    "jog", "nudge", "turn", "mission", "set_coordinate", "set_speed",
+    # stopping — never answered from here, however tempting
+    "stop", "estop", "auto_off",
+    # diagnostics/actuators that need the board
+    "test_motors", "read_encoders", "beep", "servo",
+    # teleop's own distinctly-named verbs. They deliberately do NOT shadow this
+    # agent's ping/status/connect/disconnect — those stay here because this
+    # service has no ROS dependency and keeps answering when the micro-ROS link
+    # is down, which is exactly when an operator needs them most. Teleop still
+    # needs its own equivalents, so it uses these names. Without them listed
+    # here this agent races an "unknown command" nack against teleop's real
+    # reply, and the dashboard resolves on whichever lands first.
+    "drive_status", "drive_connect", "drive_disconnect",
+)
+
+# Motion verbs nothing subscribes: teleop declines auto_on on purpose (it would
+# enable an autonomy loop that node does not own). Without this branch it would
+# fall through to a bare "unknown command", which is true but tells the operator
+# nothing about where autonomy actually lives.
+MOTION_VERBS_UNOWNED = ("auto_on",)
+
+# Where the operator should actually go, per verb. Concrete beats generic: the
+# point of the nack is that the rover moves, just not from this process.
+MOTION_HINTS = {
+    "auto_on": "autonomous runs are fpms-teleop's `mission` command (Drive page)",
+}
+
+
 def handle_command(bus, action, payload):
     """Commands arrive on fpms/<thing>/commands/<action>."""
     log(f"command: {action} {payload}")
@@ -282,122 +391,30 @@ def handle_command(bus, action, payload):
         bus.publish("events/ack", {"action": "restart"}, qos=1)
         time.sleep(0.5)
         RUNNING.clear()
-    elif action in ("stop", "estop"):
-        # Gated on nothing at all. A stop has to work while autonomy is on,
-        # while a self-test is mid-run, and while there is no driver to stop —
-        # in the last case it says so instead of claiming the rover halted.
-        AUTO_MODE.clear()
-        MOTOR_TEST_ABORT.set()
-        stopped, error = _motors_stop()
-        bus.publish("events/ack", {"action": "stop", "estop": True, "auto": False,
-                                   "motors_stopped": stopped, "error": error}, qos=1)
-    elif action == "auto_off":
-        # Leaving autonomy also parks the motors: clearing the flag alone would
-        # leave whatever was last commanded still running.
-        AUTO_MODE.clear()
-        stopped, error = _motors_stop()
-        bus.publish("events/ack", {"action": "auto_off", "auto": False,
-                                   "motors_stopped": stopped, "error": error}, qos=1)
-    elif action == "auto_on":
-        AUTO_MODE.set()
-        bus.publish("events/ack", {"action": "auto_on", "auto": True,
-                                   "motors": MOTORS is not None}, qos=1)
-    elif action == "read_encoders":
-        if MOTORS is None:
-            bus.publish("events/nack", {"action": action,
-                                        "error": "no motor interface on this rover"}, qos=1)
-        else:
-            try:
-                counts = MOTORS.read_encoders()
-            except Exception as e:  # noqa: BLE001
-                bus.publish("events/nack", {"action": action, "error": str(e)[:200]}, qos=1)
-            else:
-                bus.publish("events/encoders", {"counts": counts}, qos=1)
-    elif action == "test_motors":
-        if AUTO_MODE.is_set():
-            bus.publish("events/nack", {"action": action,
-                                        "error": "autonomy is on; send auto_off first"}, qos=1)
-        elif MOTORS is None:
-            bus.publish("events/nack", {"action": action,
-                                        "error": "no motor interface on this rover"}, qos=1)
-        else:
-            # handle_command runs on paho's network thread. Driving the test
-            # inline would block that thread for its whole duration, stalling
-            # MQTT keepalive — and with it the STOP that is meant to abort the
-            # test, the one command that must always get through.
-            MOTOR_TEST_ABORT.clear()
-            threading.Thread(target=_motor_self_test, args=(bus, payload),
-                             daemon=True, name="motor-test").start()
-            bus.publish("events/ack", {"action": "test_motors", "started": True}, qos=1)
+    elif action in SILENT_VERBS:
+        # Deliberately no publish. fpms-teleop subscribes these same topics by
+        # name and answers them for real; a reply from here would race its ack
+        # for the same (thing, action) and could show a stop that DID happen as
+        # "refused". Logged so the journal still proves the message arrived —
+        # silence on the wire must not mean silence in the diagnostics.
+        log(f"{action}: handled by fpms-teleop (ROS_DOMAIN_ID=20); "
+            f"this agent does not drive the motors and does not reply")
+    elif action in MOTION_VERBS_UNOWNED:
+        # Nobody subscribes these, so without this branch they would fall to the
+        # generic "unknown command". Naming the owner is far more useful: it
+        # tells the operator the rover moves, just not from this service.
+        bus.publish("events/nack", {
+            "action": action,
+            "error": "motion is handled by fpms-teleop on ROS_DOMAIN_ID=20; "
+                     "this agent does not drive the motors",
+            "handled_by": "fpms-teleop",
+            "this_service": "fpms-rover-agent",
+            # Explicit so no UI has to infer it from prose: the rover CAN move.
+            "rover_can_move": True,
+            "hint": MOTION_HINTS.get(action, "use the Drive page"),
+        }, qos=1)
     else:
         bus.publish("events/nack", {"action": action, "error": "unknown command"}, qos=1)
-
-
-def _motors_stop():
-    """Cut motor output. Returns (stopped, error) and never raises.
-
-    Reporting stopped=True with no driver would be a lie an operator could act
-    on, so a missing driver comes back as the failure it is.
-    """
-    if MOTORS is None:
-        return False, "no motor interface on this rover"
-    try:
-        MOTORS.stop()
-    except Exception as e:  # noqa: BLE001
-        log(f"motor stop failed: {e}")
-        return False, str(e)[:200]
-    return True, None
-
-
-def _motor_self_test(bus, payload):
-    """Short bounded drive test, on its own thread (see test_motors above).
-
-    Both limits are ceilings rather than defaults: a command carrying
-    speed=5 or duration_s=600 must not be able to send the rover off across a
-    heritage site because the dashboard sent a number nobody checked.
-    """
-    try:
-        speed = min(abs(float(payload.get("speed", 0.2))), MOTOR_TEST_MAX_SPEED)
-        duration = min(abs(float(payload.get("duration_s", 1.0))), MOTOR_TEST_MAX_S)
-    except (AttributeError, TypeError, ValueError):
-        # AttributeError covers a payload that parsed to something other than an
-        # object; this thread must nack rather than die without a word.
-        bus.publish("events/nack", {"action": "test_motors",
-                                    "error": "speed and duration_s must be numbers"}, qos=1)
-        return
-
-    motors = MOTORS
-    if motors is None:
-        bus.publish("events/nack", {"action": "test_motors",
-                                    "error": "no motor interface on this rover"}, qos=1)
-        return
-
-    aborted = False
-    error = None
-    try:
-        motors.drive(speed, speed)
-        deadline = time.time() + duration
-        # Polled rather than one sleep(duration): a stop arriving mid-test has
-        # to take effect within ~100ms, not whenever the test happens to end.
-        while time.time() < deadline and RUNNING.is_set():
-            if MOTOR_TEST_ABORT.is_set():
-                aborted = True
-                break
-            time.sleep(0.05)
-    except Exception as e:  # noqa: BLE001
-        error = str(e)[:200]
-        log(f"motor self-test failed: {e}")
-    finally:
-        stopped, stop_error = _motors_stop()
-
-    bus.publish("events/motor_test", {
-        "action": "test_motors",
-        "speed": speed, "duration_s": duration,
-        "aborted": aborted,
-        "completed": not aborted and error is None,
-        "motors_stopped": stopped,
-        "error": error or stop_error,
-    }, qos=1)
 
 
 STREAM_ENABLED = threading.Event()
@@ -909,21 +926,12 @@ def main():
         log(f"cloud uplink unavailable ({e}); continuing on MQTT only")
         UPLINK = None
 
-    # Optional motor driver, same contract as the uplink: a missing module is
-    # not fatal. It has to be resolved before the bus connects, because
-    # _on_connect advertises whether this rover has motors at all.
-    global MOTORS
-    try:
-        import fpms_motors
-        MOTORS = fpms_motors.open_driver()
-        if MOTORS is None:
-            raise RuntimeError("open_driver() returned nothing")
-        log(f"motor driver ready ({type(MOTORS).__name__})")
-    except Exception as e:  # noqa: BLE001
-        # No driver means no motion, and every motion command says so rather
-        # than acknowledging something that cannot have happened.
-        log(f"no motor driver ({e}); motion commands will be refused")
-        MOTORS = None
+    # No motor driver is opened here, by design — see the command section. The
+    # driver this used to probe spoke Rosmaster_Lib's STM32 protocol and could
+    # never reach this rover's ESP32-S3 micro-ROS board, so it only ever
+    # produced a startup line claiming motion was unavailable. Motion belongs to
+    # fpms-teleop; this process stays ROS-free so the camera and LiDAR come up
+    # even when the ROS side is down.
 
     bus = Bus()
     bus.connect_forever()

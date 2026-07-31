@@ -123,12 +123,29 @@ re-derive or re-litigate them.
   - `/beep`, `/servo_s1`, `/servo_s2`
   - Differential drive; `linear.y` is ignored. Firmware clamps `vx` to
     +/-1.0 m/s and `wz` to +/-5.0 rad/s.
-- **Do not lower speeds to make the chassis safer — raise the floor
-  instead.** Below the motor deadband the firmware winds up an integrator
-  while stalled and releases it in a direction that is not reliably the
-  commanded one: commanding 0.0041 m/s made the rover sit still for ~3s
-  then lurch 290mm *backward* with 24 degrees of unintended rotation. The
-  fix for "too fast" is to clear the deadband, never to creep slower.
+- **`/odom_raw` reports `twist.linear.x` with an INVERTED SIGN relative to
+  its own `pose.position`.** Measured directly, wheels off, with nothing
+  else publishing `/cmd_vel`:
+
+  | commanded | reported twist | pose displacement | actual |
+  |---|---|---|---|
+  | +0.012 | −0.842 | **+1.395** | forward |
+  | +0.100 | −1.225 | **+3.505** | forward |
+  | −0.012 | +0.574 | **−1.506** | backward |
+  | 0 | 0 | 0 | agree |
+
+  **Trust `pose`, not `twist`.** Any guard that compares a commanded sign
+  against reported twist will abort every *correct* move — that is exactly
+  what killed the first deadband sweep.
+
+  This one inversion produced a whole cascade of wrong conclusions on
+  2026-07-31, all of them now retracted: that the chassis "cannot creep",
+  that a motor deadband made it stall-then-lurch, that a 290mm *backward*
+  lurch had occurred (it was a 290mm *forward* move), and a
+  do-not-re-litigate rule saying "raise the floor, never creep slower".
+  **The drive is correct and proportional at every magnitude tested.**
+  A real deadband may still exist at some low value, but it has never been
+  measured — the sweep aborted on the inverted sign, not on a deadband.
 
 ## Security
 

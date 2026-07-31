@@ -28,6 +28,21 @@
  *
  * Likewise, canvas rotation is clockwise-positive while psi is CCW-positive,
  * so anything calling ctx.rotate() with a heading must negate it: rotate(-psi).
+ *
+ * ---------------------------------------------------------------------------
+ * THE MAP IS WORLD-FIXED
+ * ---------------------------------------------------------------------------
+ * This is a bird's-eye POSE map, not a rover-centric radar sweep. The arena,
+ * its grid and its zones occupy one fixed orientation on screen and NEVER
+ * rotate — no transform in this frontend takes rover heading and applies it to
+ * the scene. Only the rover glyph rotates, and it does so about its own centre
+ * inside a save()/restore() pair (ArenaMap.drawRover). Point-cloud and object
+ * coordinates arrive already resolved into world millimetres, so they are
+ * drawn with the same fixed transform as the grid.
+ *
+ * The corollary is that "which way is forward" must be stated, not inferred
+ * from a spinning picture: FORWARD_HEADING_DEG below is that statement, and
+ * the static layer paints a matching FORWARD marker at the top edge.
  */
 
 /**
@@ -151,15 +166,34 @@ export const ZONES: readonly Zone[] = [
 ];
 
 /**
+ * "FORWARD" — the heading that points straight UP the arena.
+ *
+ * psi is measured CCW from world +x and world +y is up, so +y (up the arena,
+ * towards the top of the screen after the single Y flip in `worldToCanvasY`)
+ * is exactly 90 degrees. This is a named constant rather than a literal so
+ * that "the rover starts facing forward" is legible at the call site: the
+ * operator's requirement is that the map opens facing forward and stays that
+ * way, and 90 is the only value that satisfies it in this frame.
+ *
+ * The static layer draws a matching FORWARD marker at the top edge of the map
+ * (see ArenaMap.drawStatic) so the convention is visible, not just documented.
+ */
+export const FORWARD_HEADING_DEG = 90;
+
+/**
  * Where the rover is assumed to be when no odometry is published: the
- * bottom-right quadrant, nose pointed at 135 deg — up and to the left, into
- * the open arena — so the scan fans out across the map instead of into a
- * corner.
+ * bottom-right quadrant, nose pointed FORWARD — straight up the arena.
+ *
+ * The position is unchanged (bottom-right start box). Only the heading is
+ * pinned to FORWARD_HEADING_DEG. The previous 135 deg diagonal was a
+ * presentation choice — it fanned the scan across the map — but it made the
+ * map open at a slant, which reads as a bug to an operator who expects the
+ * bird's-eye view to start and stay facing forward.
  */
 export const ROVER_START = {
   x_mm: ARENA_MM - M - Z / 2,
   y_mm: M + Z / 2,
-  heading_deg: 135,
+  heading_deg: FORWARD_HEADING_DEG,
 } as const;
 
 export type Pose = {
@@ -168,7 +202,15 @@ export type Pose = {
   y_mm: number;
   /** radians CCW from world +x */
   heading_rad: number;
-  /** true when any component fell back to ROVER_START */
+  /**
+   * True when any component fell back to ROVER_START — which, for this fleet,
+   * is always, because the heartbeat publishes no x_m/y_m/heading_deg.
+   *
+   * When this is set the heading is the ASSUMED start heading
+   * (FORWARD_HEADING_DEG), never a measured one. The HUD must say so: an
+   * operator who reads a bearing off this map while `simulated` is true is
+   * reading a constant the rover has never reported.
+   */
   simulated: boolean;
 };
 
@@ -213,11 +255,20 @@ export function readPose(envelope: unknown, lidarData?: unknown): Pose {
     y_mm = (y as number) * 1000;
   }
 
-  // Heading only counts once we have a real position. The LiDAR payload
-  // hard-codes heading_deg: 0, so honouring it while the position is
-  // simulated would silently override the deliberate 135 deg start heading
-  // and make the map look broken rather than assumed.
-  let heading_deg: number = ROVER_START.heading_deg;
+  // HEADING IS ONLY READ FROM TELEMETRY WHEN THE POSITION IS REAL.
+  //
+  // While the pose is simulated the heading stays pinned to
+  // FORWARD_HEADING_DEG (90 deg, straight up the arena) and NOTHING may
+  // override it. That guard exists specifically because the LiDAR payload
+  // hard-codes `heading_deg: 0`: honouring a firmware constant while the
+  // position is assumed would swing the glyph round to face +x (right across
+  // the screen) and read as a rendering bug, when in fact the rover never
+  // reported a heading at all.
+  //
+  // The `if (hasXY)` gate is the whole mechanism — the telemetry heading
+  // sources are not even looked at outside it, so there is no path by which a
+  // simulated pose renders at anything other than FORWARD.
+  let heading_deg: number = ROVER_START.heading_deg; // = FORWARD_HEADING_DEG
   if (hasXY) {
     const hPose = pick(d, "heading_deg");
     const hLidar = pick(pick(lidarData, "data") ?? lidarData, "heading_deg");
@@ -227,12 +278,15 @@ export function readPose(envelope: unknown, lidarData?: unknown): Pose {
 
   const heading_rad = (heading_deg * Math.PI) / 180;
 
-  // A NaN slipping through here would poison every downstream coordinate,
-  // so clamp one last time rather than trusting the checks above.
+  // A NaN slipping through here would poison every downstream coordinate, so
+  // clamp one last time rather than trusting the checks above. The fallback is
+  // FORWARD, not 0 — 0 rad is "facing +x", which is a real orientation and
+  // would be indistinguishable from a measured heading pointing right.
+  const FORWARD_RAD = (FORWARD_HEADING_DEG * Math.PI) / 180;
   return {
     x_mm: Number.isFinite(x_mm) ? x_mm : ROVER_START.x_mm,
     y_mm: Number.isFinite(y_mm) ? y_mm : ROVER_START.y_mm,
-    heading_rad: Number.isFinite(heading_rad) ? heading_rad : 0,
+    heading_rad: Number.isFinite(heading_rad) ? heading_rad : FORWARD_RAD,
     simulated: !hasXY,
   };
 }

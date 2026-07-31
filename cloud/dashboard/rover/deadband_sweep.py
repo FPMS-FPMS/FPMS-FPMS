@@ -433,7 +433,10 @@ def run_step_dry(axis, sign, mag, cfg, model, rng):
 
 def run_dry_sweep(cfg, state, store, stop_flag):
     rng = random.Random(DRY_RUN_SEED)
-    for axis_key, axis, sign in AXES:
+    # AXES entries are (axis, sign, axis_key) — unpacking them in any other
+    # order silently binds axis_key to "lin"/"ang" and the model lookup dies
+    # with KeyError. That is exactly what happened on the first run.
+    for axis, sign, axis_key in AXES:
         model = DRY_RUN_MODEL[axis_key]
 
         def step_fn(a, s, m, _model=model):
@@ -628,7 +631,8 @@ def run_live_sweep(cfg, state, store, stop_flag):
     rclpy.init(args=None)
     node = DeadbandNode()
     try:
-        for axis_key, axis, sign in AXES:
+        # Same unpack order as run_dry_sweep: AXES is (axis, sign, axis_key).
+        for axis, sign, axis_key in AXES:
             sweep_axis(axis_key, axis, sign, cfg, state, store, run_step_live,
                       stop_flag)
     except AbortSweep as e:
