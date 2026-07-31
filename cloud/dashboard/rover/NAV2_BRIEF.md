@@ -207,6 +207,36 @@ whited out the entire dashboard.
 
 ---
 
+## 6b. Nav2 is ALREADY INSTALLED — and one landmine
+
+Verified 2026-07-31: **Nav2 1.1.20** is fully installed from apt (arm64, Humble),
+including `nav2_bringup`, `nav2_simple_commander`, `nav2_amcl`, `nav2_costmap_2d`,
+the DWB / MPPI / Regulated-Pure-Pursuit controllers, `slam_toolbox` 2.6.10 and
+`robot_localization`. `import nav2_simple_commander.robot_navigator` works.
+Disk is at 49 % of 29 G with ~15 G free. **Do not reinstall it.**
+
+**LANDMINE: do NOT import `tf_transformations`.** It is installed correctly but
+fails at runtime:
+
+    AttributeError: `np.maximum_sctype` was removed in the NumPy 2.0 release.
+
+A user-local NumPy 2.x in `/home/ubuntu/.local/lib/python3.10/site-packages/`
+shadows the system NumPy and is too new for the system `transforms3d`.
+
+**Do not fix this by changing NumPy on the rover.** The camera/YOLO path in
+`fpms-rover-agent` depends on NumPy and currently works; downgrading it to
+satisfy a convenience library risks breaking the most reliable part of the
+system. Compute quaternions inline instead — for planar motion it is two lines:
+
+```python
+qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)                 # yaw -> quat
+yaw = math.atan2(2.0 * (qw*qz + qx*qy), 1.0 - 2.0*(qy*qy + qz*qz))  # quat -> yaw
+```
+
+`fpms_odom_tf.py` already does this and its pure-math tests pass.
+
+---
+
 ## 7. Nav2 prerequisites — the actual blocking chain
 
 Nav2 cannot localise without a laser scan **in ROS**. Today:
