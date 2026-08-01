@@ -32,6 +32,41 @@ CREATE INDEX IF NOT EXISTS idx_readings_events ON readings (kind, ts DESC);
 -- even though ts appears in both — do not remove it as a "duplicate".
 CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings (ts DESC);
 
+-- Rolling recording of LiDAR scans and camera frames, for replay on the public
+-- page while the rover is offline — which is almost always.
+--
+-- SEPARATE FROM `readings` ON PURPOSE. archivable() in worker.js strips the
+-- base64 `frame` before a camera row is written there, because at stream rate
+-- keeping frames cost ~155 MB/day for data nothing queried. This table is the
+-- opposite trade: it keeps the pixels, and pays for that with a hard cap on how
+-- many rows may exist (RECORD_KEEP in worker.js) plus a sampling gate in the
+-- Durable Object. `readings` is the queryable archive; this is a short film.
+--
+-- WHAT GOES IN `data`
+-- The PUBLIC PROJECTION, not the rover's payload. recordProjection() in
+-- worker.js drops `detections` (it carries the detector's class `label`, which
+-- maps to a real person's first name), `wildlife`, `sectors_mm` and `baud`
+-- BEFORE the INSERT. A bug in the read path therefore cannot leak them: they
+-- were never written. Only a frame count survives from `detections`.
+--
+-- WHY THERE IS NO INDEX HERE, DELIBERATELY
+-- Every index costs an extra billed written row per INSERT (D1 pricing note 6),
+-- and this table is capped at a few hundred rows total. A full scan of ~400 rows
+-- is cheaper than doubling the write cost of the only thing that writes to it.
+-- Do not "fix" this by adding one without re-checking RECORD_KEEP.
+--
+-- NO TIME-BASED RETENTION, also deliberate. A six-month-old run is exactly what
+-- the public page needs to show when the rover has been off for six months.
+-- Retention is by COUNT (pruneRecordings, on the */15 cron), never by age.
+CREATE TABLE IF NOT EXISTS recordings (
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts     REAL    NOT NULL,          -- unix SECONDS, same unit as readings.ts
+  thing  TEXT    NOT NULL,          -- rover1, rover2, ...
+  kind   TEXT    NOT NULL,          -- lidar | camera  (the telemetry SUBTYPE,
+                                    -- not readings.kind's telemetry|events)
+  data   TEXT    NOT NULL           -- already-public-projected JSON
+);
+
 -- Analysis reports produced by the scheduled agents.
 CREATE TABLE IF NOT EXISTS reports (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,

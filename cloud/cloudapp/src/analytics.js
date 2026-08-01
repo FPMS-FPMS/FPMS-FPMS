@@ -1045,6 +1045,9 @@ export const ANALYTICS_STYLE = `
 
   /* ---------- analytics: layout (mobile first) ---------- */
   #fx { margin-top:34px; }
+  #fx > h3 { font-size:clamp(19px,4.6vw,23px); line-height:1.25; margin:0 0 6px;
+             letter-spacing:-0.01em; color:var(--fx-ink); }
+  .fx-lede { margin:0 0 14px; font-size:15px; color:var(--fx-ink-2); max-width:62ch; }
   .fx-sr { position:absolute; width:1px; height:1px; padding:0; margin:-1px;
            overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 
@@ -1116,8 +1119,10 @@ export const ANALYTICS_STYLE = `
   .fx-key-none { width:10px; height:10px; border-radius:3px; flex:none;
                  border:1px solid var(--fx-axis); background:transparent; }
 
+  /* Six tiles: 2 x 3 on a phone, 3 x 2 from a large phone up. Never six across —
+     the page is 760px wide and a 120px tile truncates its own note. */
   .fx-kpis { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:12px; }
-  @media (min-width:620px) { .fx-kpis { grid-template-columns:repeat(4,1fr); } }
+  @media (min-width:620px) { .fx-kpis { grid-template-columns:repeat(3,1fr); } }
   .fx-kpi { background:var(--fx-surface); border:1px solid var(--fx-axis);
             border-radius:8px; padding:12px 13px; }
   .fx-kpi .fx-k-label { font-size:11px; color:var(--fx-muted); text-transform:uppercase;
@@ -1180,7 +1185,12 @@ export const ANALYTICS_STYLE = `
 /** The section markup. Semantic, and empty until the script fills it. */
 export const ANALYTICS_HTML = `
   <section id="fx" data-mode="live" aria-labelledby="fx-h">
-    <h3 id="fx-h">Analytics</h3>
+    <h3 id="fx-h">What FPMS has done so far</h3>
+    <p class="fx-lede">
+      Every number and every chart below is drawn from the archive the system has
+      been keeping since it was switched on &mdash; not from a live connection.
+      They are here whether or not a rover is powered on right now.
+    </p>
 
     <div class="fx-bar" role="group" aria-label="Analytics data source">
       <button type="button" class="fx-btn" id="fx-live" aria-pressed="true">Live archive</button>
@@ -1274,12 +1284,18 @@ export const ANALYTICS_SCRIPT = `<script>
     if (text !== undefined && text !== null) n.textContent = String(text);
     return n;
   }
+  /* Absent is "--", never 0. A missing measurement and a measured zero are
+     different facts and this page must not conflate them: "0 detections" is a
+     claim the archive was read and found nothing, which is not what an
+     unreachable archive means. Every formatter below returns ABSENT for
+     null/undefined/NaN, and every caller passes null rather than a default. */
+  var ABSENT = "\\u2013\\u2013";
   function fmtInt(n) {
-    if (n === null || n === undefined || !isFinite(n)) return "-";
+    if (n === null || n === undefined || !isFinite(n)) return ABSENT;
     return Math.round(n).toLocaleString();
   }
   function fmtDur(s) {
-    if (s === null || s === undefined || !isFinite(s)) return "-";
+    if (s === null || s === undefined || !isFinite(s)) return ABSENT;
     s = Math.max(0, Math.round(s));
     var d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600);
     var mm = Math.floor((s % 3600) / 60), ss = s % 60;
@@ -1294,11 +1310,11 @@ export const ANALYTICS_SCRIPT = `<script>
     return m + ":" + (r < 10 ? "0" : "") + r;
   }
   function fmtDist(mm) {
-    if (mm === null || mm === undefined || !isFinite(mm)) return "-";
+    if (mm === null || mm === undefined || !isFinite(mm)) return ABSENT;
     return mm >= 1000 ? (mm / 1000).toFixed(2) + " m" : Math.round(mm) + " mm";
   }
   function fmtDate(ms) {
-    if (!ms) return "-";
+    if (!ms) return ABSENT;
     try { return new Date(ms).toLocaleString(); } catch (e) { return String(ms); }
   }
   /* Bucket labels. Day buckets are UTC midnights (the SQL bucketed on UTC);
@@ -2197,23 +2213,97 @@ export const ANALYTICS_SCRIPT = `<script>
     return d;
   }
 
+  /**
+   * Was the archive actually read?
+   *
+   * The difference between "the archive holds no detections" and "the archive
+   * could not be reached" is the whole reason ABSENT exists. liveAnalytics
+   * stamps the second case in its notes array, so a count is only printed when
+   * query genuinely ran.
+   */
+  function archiveRead(d) {
+    var n = d.notes || [], i;
+    for (i = 0; i < n.length; i++) {
+      if (n[i] === "archive_unavailable" || n[i] === "archive_query_failed") return false;
+    }
+    return true;
+  }
+
+  /**
+   * Fleet totals across every charted rover.
+   *
+   * Distance starts null and stays null unless some run carried an odometry
+   * reading — shapeRuns is careful never to invent a 0 mm run and neither is
+   * this. Summing null into 0 would publish a distance nothing measured.
+   */
+  function fleetRuns(d) {
+    var rovers = d.rovers || [], runs = 0, dist = null, withDist = 0, longest = null;
+    for (var i = 0; i < rovers.length; i++) {
+      var rs = rovers[i].runs || [];
+      runs += rs.length;
+      for (var j = 0; j < rs.length; j++) {
+        var mm = rs[j].distance_mm;
+        if (mm === null || mm === undefined || !isFinite(mm)) continue;
+        dist = (dist === null ? 0 : dist) + mm;
+        withDist++;
+        if (longest === null || mm > longest) longest = mm;
+      }
+    }
+    return { runs: runs, distance_mm: dist, with_distance: withDist, longest_mm: longest };
+  }
+
+  /**
+   * The record, as six stat tiles.
+   *
+   * This is the first thing a visitor reads, and it is deliberately about what
+   * the project HAS DONE rather than whether it happens to be powered on. Every
+   * value is drawn from stored history; every absent one prints ABSENT.
+   */
   function renderKpis(d) {
     var box = el("fx-kpis");
     box.textContent = "";
 
     var ev = d.events || {};
     var rovers = d.rovers || [];
-    var lidarRover = null, battRover = null, upRover = null, i;
+    var read = archiveRead(d);
+    var span = state.mode === "demo" ? "in the scripted run so far"
+      : (d.window_days ? "in the last " + d.window_days + " days" : "in the window");
+    var lidarRover = null, upRover = null, i;
     for (i = 0; i < rovers.length; i++) {
       if (!lidarRover && rovers[i].lidar && rovers[i].lidar.samples) lidarRover = rovers[i];
-      if (!battRover && rovers[i].battery && rovers[i].battery.samples) battRover = rovers[i];
       if (!upRover && rovers[i].uptime && rovers[i].uptime.samples) upRover = rovers[i];
     }
+    var fleet = fleetRuns(d);
 
     box.appendChild(kpi(
-      "Detections", fmtInt(ev.total || 0),
-      state.mode === "demo" ? "in the scripted run so far"
-        : (d.window_days ? "in the last " + d.window_days + " days" : "in the window")
+      "Detections logged",
+      read && ev && typeof ev.total === "number" ? fmtInt(ev.total) : ABSENT,
+      read ? "fires, obstacles, wildlife and faults " + span
+        : "the archive could not be read just now"
+    ));
+
+    box.appendChild(kpi(
+      "Runs completed",
+      read && rovers.length ? fmtInt(fleet.runs) : ABSENT,
+      rovers.length ? "patrols with mission telemetry " + span
+        : "no rover has reported to the archive"
+    ));
+
+    box.appendChild(kpi(
+      "Distance driven",
+      fmtDist(fleet.distance_mm),
+      fleet.distance_mm === null
+        ? "no run carried an odometry reading"
+        : "measured by the rover's own odometry over " +
+          fleet.with_distance + " run" + (fleet.with_distance === 1 ? "" : "s")
+    ));
+
+    box.appendChild(kpi(
+      "Longest uptime",
+      upRover && upRover.uptime.peak_uptime_s
+        ? fmtDur(upRover.uptime.peak_uptime_s) : ABSENT,
+      upRover ? "without a reboot, from the 5 s health heartbeat"
+        : "no heartbeat reached the archive " + span
     ));
 
     var cov = null;
@@ -2225,23 +2315,18 @@ export const ANALYTICS_SCRIPT = `<script>
     }
     box.appendChild(kpi(
       "LiDAR coverage",
-      cov === null ? "no data" : Math.round(cov * 100) + "%",
-      cov === null ? "no scans in this window"
+      cov === null ? ABSENT : Math.round(cov * 100) + "%",
+      cov === null ? "no laser scan " + span
         : "of " + (lidarRover.lidar.sector_count || 12) + " sectors, latest scan",
       cov
     ));
 
-    box.appendChild(kpi(
-      "Longest uptime",
-      upRover && upRover.uptime.peak_uptime_s ? fmtDur(upRover.uptime.peak_uptime_s) : "no data",
-      upRover ? "without a reboot, " + upRover.thing : "no heartbeat recorded"
-    ));
-
     var hl = d.health || {};
     box.appendChild(kpi(
-      "Analyst checks",
-      hl.checks ? hl.nominal + " / " + hl.checks : "none",
-      hl.checks ? "reported all-nominal" : "no analysis has run in this window",
+      "Self-checks passed",
+      read && hl.checks ? hl.nominal + " / " + hl.checks : ABSENT,
+      hl.checks ? "automatic reviews that reported all-nominal"
+        : "no automatic review ran " + span,
       hl.checks ? hl.nominal / hl.checks : null
     ));
   }

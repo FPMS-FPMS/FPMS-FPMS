@@ -90,6 +90,14 @@
   // Telemetry archive — the S3/DynamoDB equivalent. D1 rather than R2 because
   // R2 requires enabling billing on the dashboard, and D1's free tier does not.
   // 5 GB and 100k writes/day: two rovers at a 5s interval use ~35k/day.
+  //
+  // Two tables share that budget, and they are opposites on purpose (schema.sql):
+  //   `readings`    30-day window, frames STRIPPED — the queryable archive.
+  //   `recordings`  count-capped (~4.4 MB typical, ~19 MB ceiling), frames KEPT,
+  //                 no age limit — the replay the public page shows when the
+  //                 rover is offline. Sampled at 1 frame per 20s per rover and
+  //                 trimmed on the */15 cron, so worst case is ~35k writes/day
+  //                 on top of the above. See the budget arithmetic in worker.js.
   "d1_databases": [
     {
       "binding": "DB",

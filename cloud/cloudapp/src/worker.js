@@ -186,6 +186,79 @@ const PRUNE_BATCH = 2000;
 // without the 96 near-identical rows/day the old unconditional insert wrote.
 const REPORT_HEARTBEAT_RUNS = 24;
 
+/* ------------------------------------------------- rolling recording (replay)
+ *
+ * The rover is offline almost all the time, so the public page has to be worth
+ * visiting with nothing live behind it. `readings` cannot supply that: archivable()
+ * strips the base64 frame before writing, and the Durable Object's `latest:` key
+ * holds exactly ONE frame per channel with no history. This is the missing piece —
+ * a bounded rolling film of past LiDAR scans and camera frames, kept forever by
+ * COUNT rather than by age, so a run from six months ago still plays back.
+ *
+ * SIZE AND COST BUDGET — the arithmetic, so it can be re-checked
+ * --------------------------------------------------------------
+ * A camera item is ~28 KB (27 KB base64 frame + fields; see MAX_INGEST_BYTES).
+ * A LiDAR scan projected down to ranges_m + a few scalars is ~0.8 KB.
+ *
+ *   storage, typical : 150 x 28 KB  = 4.2 MB   camera
+ *                      200 x 0.8 KB = 0.16 MB  lidar        -> ~4.4 MB
+ *   storage, ceiling : 150 x 128 KB = 19.2 MB  camera (RECORD_MAX_FRAME_B64)
+ *                                              -> <0.4% of D1's 5 GB
+ *
+ *   writes, worst case (a rover streaming 24/7, which has never happened):
+ *     86400 s / 20 s = 4320 samples/day/kind/thing
+ *     2 rovers x 2 kinds x 4320 = 17,280 INSERTs/day
+ *     steady state deletes match inserts     = 17,280 more
+ *                                            = ~34.6k of the 100k/day free tier
+ *   `readings` already uses ~35k/day, so the pair fits with headroom. There is
+ *   no index on `recordings` precisely to keep that number at one row per
+ *   INSERT rather than two (D1 bills an extra written row per index).
+ *
+ * DOWNSCALING is not available here: a Worker cannot re-encode a JPEG without
+ * pulling in a codec, and Images is not bound. The levers are therefore
+ * SAMPLING (below), a COUNT cap (RECORD_KEEP) and a per-frame byte cap
+ * (RECORD_MAX_FRAME_B64) — which is why all three exist rather than one.
+ */
+
+// Subtypes worth recording. Anything else is live-only.
+const RECORD_KINDS = new Set(["lidar", "camera"]);
+
+// Minimum gap between recorded samples, per (kind, thing). This is the write-rate
+// lever: it decouples the recording entirely from the 15 fps stream rate. State
+// for it lives in the Durable Object, never in a module variable — Worker
+// isolates are reused across unrelated requests, so a module-level Map would
+// leak one rover's cadence into another's.
+const RECORD_MIN_INTERVAL_MS = 20_000;
+
+// Rows retained per kind, fleet-wide (NOT per thing). Fleet-wide on purpose:
+// MAX_THINGS allows 64 names, and a per-thing cap would let a typo multiply the
+// storage ceiling by 64. At RECORD_MIN_INTERVAL_MS these spans are:
+//   camera 150 x 20 s = 50 minutes of run
+//   lidar  200 x 20 s = 67 minutes of run
+// which is a representative patrol, not an archive.
+const RECORD_KEEP = { camera: 150, lidar: 200 };
+
+// Hard per-frame cap. MAX_INGEST_BYTES lets a single HTTP frame reach ~250 KB
+// and the WebSocket path ~512 KB, so without this one oversized camera could
+// blow the storage budget on its own. 128 KB of base64 is ~96 KB of JPEG —
+// generous for 1280x720, and well inside D1's 2 MB per-value limit.
+const RECORD_MAX_FRAME_B64 = 128 * 1024;
+
+// LiDAR publishes one entry per 5-degree bin, so 72. Capped rather than trusted:
+// the array arrives from the network.
+const RECORD_MAX_BINS = 72;
+
+// How many frames one replay response may carry. Camera is small by default
+// because each frame is ~28 KB: 24 x 28 KB is a ~670 KB response, 60 is ~1.7 MB.
+const RECORD_SERVE = {
+  camera: { def: 24, max: 60 },
+  lidar: { def: 120, max: 240 },
+};
+
+// Public replay endpoint. Under /api/public/ so it inherits that prefix's
+// meaning, but routed in this file — see the note at its registration.
+const RECORDING_PATH = "/api/public/recording";
+
 // NOTE (next step, not done here): row COUNT is still one insert per reading,
 // which at stream rate exceeds the 100k/day D1 row quota (each insert also
 // writes the two index rows from schema.sql, so ~3 billed rows per reading).
@@ -221,6 +294,21 @@ export default {
 
       const analytics = await handleAnalytics(request, env, url, path, hubStub);
       if (analytics) return analytics;
+
+      // Replay of past LiDAR scans and camera frames — the thing that makes the
+      // public page worth opening when the rover is off, which is nearly always.
+      //
+      // Registered ahead of handlePublic because that function OWNS /api/public/*
+      // and answers 404 to every path outside its own dispatch table, so a route
+      // added after it would never be reached.
+      //
+      // Only GET and HEAD are intercepted. Everything else — the CORS preflight,
+      // the 405 for other methods, and public.js's burst guard for them — is left
+      // to handlePublic, so this endpoint does not become a second, laxer door
+      // into the same prefix.
+      if (path === RECORDING_PATH && (request.method === "GET" || request.method === "HEAD")) {
+        return publicRecording(env, url);
+      }
 
       // The public read-only view. Deliberately ahead of the auth gate below,
       // and deliberately a separate module: it serves a whitelisted projection
@@ -310,6 +398,24 @@ export default {
     ctx.waitUntil(
       pruneArchive(env).catch((err) => console.error(JSON.stringify({
         message: "scheduled prune failed",
+        error: err instanceof Error ? err.message : String(err),
+      }))),
+    );
+
+    // The recording is trimmed on EVERY tick, unlike pruneArchive above, which
+    // throttles itself to one pass per 6 hours in the Durable Object.
+    //
+    // Different job, different cadence. pruneArchive enforces a 30-DAY window, so
+    // a few hours of drift is invisible. This enforces a ROW COUNT, and the count
+    // is the only thing bounding how much base64 sits in D1 — six hours of drift
+    // at the worst-case sample rate is ~2,000 extra camera rows, or ~56 MB. Two
+    // bounded DELETEs every 15 minutes is the cheaper mistake.
+    //
+    // Deliberately not on the ingest path: a rover uploading a frame must never
+    // pay for someone else's housekeeping.
+    ctx.waitUntil(
+      pruneRecordings(env).catch((err) => console.error(JSON.stringify({
+        message: "scheduled recording prune failed",
         error: err instanceof Error ? err.message : String(err),
       }))),
     );
@@ -1330,6 +1436,348 @@ async function archive(env, items) {
   }
 }
 
+/* ------------------------------------------------- rolling recording (replay)
+ *
+ * See the constants block at the top of this file for the size/cost budget and
+ * the arithmetic behind it. This section is: the projection (what may be
+ * stored), the write, the count-capped prune, and the public read endpoint.
+ */
+
+/**
+ * Timestamps in, normalised to unix SECONDS.
+ *
+ * `readings.ts`, `recordings.ts`, the hub's envelope `ts` and `last_message_at`
+ * are ALL unix seconds. The rover stamps `data.ts` with time.time(), also
+ * seconds — but it arrives over the network, so it is not trusted to stay that
+ * way. A milliseconds value silently stored as seconds lands in the year 55000;
+ * compared against a seconds clock the other direction it lands in 1970, and
+ * every rover reads as permanently offline. That has happened here before.
+ *
+ * Same 1e12 discriminator public.js's toMs() uses, in the opposite direction:
+ * 1e12 is ~2001 in milliseconds and year 33658 in seconds, so the two units
+ * cannot be confused for real timestamps.
+ */
+function toRecordSeconds(ts, fallbackS) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return fallbackS;
+  return n > 1e12 ? n / 1000 : n;
+}
+
+/**
+ * Unix seconds -> milliseconds for the browser. The mirror of toRecordSeconds,
+ * and byte-identical in behaviour to public.js's toMs() — every timestamp this
+ * file puts in a /api/public/ response goes through it, exactly as everything
+ * public.js emits goes through that one. Duplicated rather than imported
+ * because public.js does not export it and is owned elsewhere.
+ */
+function toPublicMs(ts) {
+  const n = Number(ts);
+  if (!n || !Number.isFinite(n)) return null;
+  return n > 1e12 ? n : n * 1000;
+}
+
+/** Bounded, finite, rounded — or undefined. Mirrors public.js's num(). */
+function recordNum(v, min, max, dp) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min || n > max) return undefined;
+  return Number(n.toFixed(dp));
+}
+
+/**
+ * The ONLY fields a recorded sample may ever contain.
+ *
+ * Applied BEFORE the INSERT, not on the way out. That ordering is the whole
+ * safety argument: a field that is never written cannot be leaked by a later bug
+ * in the read path, by a new consumer of the table, or by someone adding a
+ * `SELECT *` somewhere. It is also applied again on read (see publicRecording)
+ * so a row written by an older or future version of this function is still
+ * filtered by today's rules.
+ *
+ * WHAT IS DROPPED, AND WHY
+ *  - `detections`  each entry carries `label`, the detector's class name. The
+ *                  operator's custom_labels.json maps class 0 to a real
+ *                  person's first name — this exact field has leaked once
+ *                  already (see PUBLIC_EVENT_DATA in public.js). Only the
+ *                  COUNT survives, which is a number and names nobody.
+ *  - `wildlife`    the same class names by another route, after operator label
+ *                  overrides have been applied to them.
+ *  - `sectors_mm`  a coarser copy of ranges_m; doubles the row for no picture.
+ *  - `baud`, `npu` device configuration, of no use to a viewer.
+ *  - `format`      constant "jpeg"; the read endpoint states it once instead.
+ * Anything added to the rover payload later is dropped by default, because this
+ * builds an object from a fixed list rather than deleting from the input.
+ *
+ * Returns null when the sample is not worth recording at all.
+ */
+function recordProjection(kind, data) {
+  if (!data || typeof data !== "object") return null;
+
+  if (kind === "camera") {
+    const frame = data.frame;
+    if (typeof frame !== "string") return null;
+    // Same floor vision() uses: below this it is a black frame, a truncated
+    // write or a camera that failed to expose. Nothing to replay.
+    if (frame.length < VISION_MIN_FRAME_B64) return null;
+    // Above this one frame would dominate the whole storage budget.
+    if (frame.length > RECORD_MAX_FRAME_B64) return null;
+
+    const out = { frame };
+    const w = recordNum(data.width, 1, 8192, 0);
+    const h = recordNum(data.height, 1, 8192, 0);
+    if (w !== undefined) out.w = w;
+    if (h !== undefined) out.h = h;
+    if (typeof data.fire_like === "boolean") out.fire_like = data.fire_like;
+    const ratio = recordNum(data.fire_ratio, 0, 1, 4);
+    if (ratio !== undefined) out.fire_ratio = ratio;
+    // A count, never the detections themselves — see above.
+    out.detections = Array.isArray(data.detections)
+      ? Math.min(data.detections.length, 1000)
+      : 0;
+    return out;
+  }
+
+  if (kind === "lidar") {
+    if (!Array.isArray(data.ranges_m)) return null;
+    // Every entry coerced through recordNum: a null, a string or a NaN in the
+    // array would otherwise reach the page's canvas, which walks it by index.
+    const ranges = data.ranges_m
+      .slice(0, RECORD_MAX_BINS)
+      .map((v) => recordNum(v, 0, 1000, 2) ?? 0);
+    if (!ranges.length) return null;
+    // An all-zero scan is a LiDAR that returned nothing — not a picture of
+    // open ground, and it replays as a blank frame either way.
+    if (!ranges.some((v) => v > 0)) return null;
+
+    const out = { ranges_m: ranges };
+    const max = recordNum(data.range_max_m, 0, 1000, 2);
+    const heading = recordNum(data.heading_deg, -360, 360, 1);
+    const points = recordNum(data.points, 0, 100_000, 0);
+    const minMm = recordNum(data.min_mm, 0, 100_000, 0);
+    const minBearing = recordNum(data.min_bearing_deg, -360, 360, 0);
+    if (max !== undefined) out.range_max_m = max;
+    if (heading !== undefined) out.heading_deg = heading;
+    if (points !== undefined) out.points = points;
+    if (minMm !== undefined) out.min_mm = minMm;
+    if (minBearing !== undefined) out.min_bearing_deg = minBearing;
+    return out;
+  }
+
+  return null;
+}
+
+/**
+ * Append sampled frames to the recording. Best-effort by design, exactly like
+ * archive(): a failed recording write must never be the reason a rover thinks
+ * its telemetry was rejected and re-sends it.
+ *
+ * One batch, so a batch of samples is one round trip rather than N.
+ */
+async function recordSamples(env, samples) {
+  if (!env.DB || !samples.length) return;
+  try {
+    const stmt = env.DB.prepare(
+      "INSERT INTO recordings (ts, thing, kind, data) VALUES (?, ?, ?, ?)",
+    );
+    await env.DB.batch(
+      samples.map((s) => stmt.bind(s.ts, s.thing, s.kind, JSON.stringify(s.data))),
+    );
+  } catch (err) {
+    console.error(JSON.stringify({
+      message: "recording write failed",
+      error: err instanceof Error ? err.message : String(err),
+      samples: samples.length,
+    }));
+  }
+}
+
+/**
+ * Trim the recording back to RECORD_KEEP rows per kind. Called from the cron,
+ * never from ingest.
+ *
+ * Retention is by COUNT, not by age, and that is the point of the whole feature:
+ * a rover that has been off since spring must still have its last run playable
+ * in autumn. A `ts < cutoff` prune — which is what pruneArchive() does to
+ * `readings` — would empty this table for exactly the rovers whose history the
+ * page most needs.
+ *
+ * ORDER BY id DESC ... OFFSET keep is "everything except the newest `keep`".
+ * `id` rather than `ts` because ids are monotonic on arrival and a rover with a
+ * skewed clock must not be able to make its own rows immortal by stamping them
+ * in the future. Bounded by PRUNE_BATCH for the same reason pruneArchive is: an
+ * unbounded DELETE that always times out prunes nothing, forever.
+ */
+async function pruneRecordings(env) {
+  if (!env.DB) return { skipped: "archive not configured" };
+
+  const deleted = {};
+  for (const kind of RECORD_KINDS) {
+    try {
+      // `kind` is bound, and the only values it can take are the literals in
+      // RECORD_KINDS — never caller input.
+      const res = await env.DB
+        .prepare(
+          "DELETE FROM recordings WHERE rowid IN (" +
+          "SELECT rowid FROM recordings WHERE kind = ? ORDER BY id DESC LIMIT ? OFFSET ?)",
+        )
+        .bind(kind, PRUNE_BATCH, RECORD_KEEP[kind])
+        .run();
+      deleted[kind] = res?.meta?.changes ?? 0;
+    } catch (err) {
+      deleted[kind] = null;
+      console.error(JSON.stringify({
+        message: "recording prune failed", kind,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+
+  console.log(JSON.stringify({
+    message: "recording pruned",
+    camera_deleted: deleted.camera,
+    lidar_deleted: deleted.lidar,
+    keep: RECORD_KEEP,
+    sample_interval_s: RECORD_MIN_INTERVAL_MS / 1000,
+  }));
+  return deleted;
+}
+
+/**
+ * Response envelope for the replay endpoint.
+ *
+ * Byte-for-byte the same headers publicJson() sets in public.js — CORS-open,
+ * nosniff, and tagged `fpms-public` so one cache purge by tag clears every
+ * public response at once if a projection anywhere is ever found leaking.
+ *
+ * The TTL is longer than public.js's 15 s because the content is different in
+ * kind: a recording of the past does not go stale the way live fleet status
+ * does, and this is by far the heaviest public response. Caching it is what
+ * keeps a burst of visitors from becoming a burst of multi-megabyte D1 reads —
+ * a cache HIT is served by Cloudflare without invoking this Worker at all.
+ */
+const RECORDING_CACHE_CONTROL =
+  "public, max-age=60, stale-while-revalidate=300, stale-if-error=21600";
+// Errors and refusals are cached too, so a scraper hitting a 400 in a loop does
+// not get a free uncached path to the Worker. Same reasoning as public.js's
+// DENY_CACHE_CONTROL.
+const RECORDING_DENY_CACHE = "public, max-age=3600, stale-while-revalidate=3600";
+
+function recordingJson(obj, status = 200, cacheControl = RECORDING_CACHE_CONTROL) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": cacheControl,
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Tag": "fpms-public",
+    },
+  });
+}
+
+/**
+ * GET /api/public/recording?kind=lidar|camera&thing=&limit=
+ *
+ * Ordered OLDEST FIRST — playback order, so a client can walk the array with a
+ * timer and needs no sort. Every timestamp is MILLISECONDS, matching everything
+ * else under /api/public/.
+ *
+ * This is the anonymous surface, so it repeats every gate the rest of the public
+ * API applies: the camera opt-in, the field whitelist (re-applied on read), and
+ * no raw model text, internal ids, paths or addresses anywhere in the shape.
+ */
+async function publicRecording(env, url) {
+  if (!env.DB) {
+    return recordingJson(
+      { error: "recording not available" }, 503, RECORDING_DENY_CACHE,
+    );
+  }
+
+  const kind = String(url.searchParams.get("kind") || "lidar").toLowerCase();
+  if (!RECORD_KINDS.has(kind)) {
+    return recordingJson(
+      { error: "kind must be lidar or camera" }, 400, RECORDING_DENY_CACHE,
+    );
+  }
+
+  // THE SAME OPT-IN publicCamera() enforces, for the same reason: the operator's
+  // detector labels map class 0 to a real person, so camera pixels are off by
+  // default. A recording is not a lesser exposure than a live frame — it is a
+  // larger one, because it persists.
+  if (kind === "camera" && env.FPMS_PUBLIC_CAMERA !== "on") {
+    return recordingJson({
+      error: "camera recording is not public",
+      hint: "operator must set FPMS_PUBLIC_CAMERA=on",
+    }, 403, RECORDING_DENY_CACHE);
+  }
+
+  const thing = url.searchParams.get("thing");
+  if (thing && !THING_RE.test(thing)) {
+    return recordingJson({ error: "invalid thing" }, 400, RECORDING_DENY_CACHE);
+  }
+
+  const serve = RECORD_SERVE[kind];
+  const limit = Math.min(
+    Math.max(Number(url.searchParams.get("limit") || serve.def) || serve.def, 1),
+    serve.max,
+  );
+
+  // Bound parameters throughout, never concatenation. Newest-first from the
+  // database (that is the half of the table worth reading), reversed below.
+  const binds = [kind];
+  let sql = "SELECT ts, thing, kind, data FROM recordings WHERE kind = ?";
+  if (thing) { sql += " AND thing = ?"; binds.push(thing); }
+  sql += " ORDER BY id DESC LIMIT ?";
+  binds.push(limit);
+
+  let results;
+  try {
+    ({ results } = await env.DB.prepare(sql).bind(...binds).all());
+  } catch (err) {
+    // Logged, never returned: raw D1 error text discloses the schema.
+    console.error(JSON.stringify({
+      message: "recording query failed",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return recordingJson({ error: "query failed" }, 500, RECORDING_DENY_CACHE);
+  }
+
+  const frames = [];
+  for (const row of results || []) {
+    // Plain JSON.parse, not safeParseJson: that helper exists to salvage model
+    // output and runs two regex passes over the string first, which on a
+    // 128 KB base64 frame is pure waste. This column was written by
+    // JSON.stringify in this file, so it either parses or the row is corrupt.
+    let parsed = null;
+    try { parsed = JSON.parse(row.data); } catch { continue; }
+    // Re-projected on the way out as well as on the way in. Defence in depth:
+    // rows written by an older build, or by a future one, are still filtered by
+    // the rules in force today.
+    const data = recordProjection(kind, parsed);
+    if (!data) continue;
+    frames.push({ ts: toPublicMs(row.ts), thing: row.thing, ...data });
+  }
+  // Oldest first — see the doc comment.
+  frames.reverse();
+
+  return recordingJson({
+    kind,
+    // Echoed back so a client that asked for one rover can label its player.
+    // `thing` is already published by /api/public/summary as rovers[].thing.
+    thing: thing || null,
+    format: kind === "camera" ? "jpeg-base64" : "ranges-m",
+    count: frames.length,
+    // Both in milliseconds, like every other public timestamp. The page uses
+    // these to say "recorded 3 months ago" rather than implying it is live.
+    first_at: frames.length ? frames[0].ts : null,
+    last_at: frames.length ? frames[frames.length - 1].ts : null,
+    // Published so the client can pace playback and explain the gaps instead of
+    // guessing at them.
+    sample_interval_s: RECORD_MIN_INTERVAL_MS / 1000,
+    retained: RECORD_KEEP[kind],
+    frames,
+  });
+}
+
 /**
  * Send email via Resend. Returns {ok, id|error} — never throws, because a mail
  * failure must not take down ingest.
@@ -1942,6 +2390,14 @@ export class TelemetryHub extends DurableObject {
   // without the full-table scan it used to run per page poll.
   memLastSeen = new Map();
   pubSeenAt = new Map();           // thing -> Date.now() of last direct publish
+  // "<kind>:<thing>" -> Date.now() of the last frame written to `recordings`.
+  // The sampling gate for the rolling replay. It lives HERE, not in a module
+  // variable in the Worker, for the reason stated at the top of this file: a
+  // Durable Object is one addressable instance, whereas Worker isolates are
+  // reused across unrelated requests and would leak one rover's cadence into
+  // another's. Losing it to hibernation is harmless — the worst case is one
+  // extra recorded frame after a cold start.
+  lastRecord = new Map();
 
   async fetch(request) {
     const url = new URL(request.url);
@@ -2015,6 +2471,7 @@ export class TelemetryHub extends DurableObject {
     const things = this.memThings;
     const subtypes = this.memSubtypes;
     const toArchive = [];
+    const toRecord = [];
     let notified = 0;
     let allSockets = 0;
     let dropped = 0;
@@ -2094,6 +2551,39 @@ export class TelemetryHub extends DurableObject {
         if (!viaRelay) toArchive.push(item);
       }
 
+      // ROLLING RECORDING. Sampled far below the stream rate and, unlike the
+      // `latest:` key above, it keeps a HISTORY — which is the only reason the
+      // public page has anything to show while the rover is off.
+      //
+      // Both ingest paths pass through here, so this is the single gate: the
+      // HTTP relay (already filtered for publisher ownership above) and the
+      // rover's own publisher socket. Nothing is recorded twice.
+      //
+      // The projection runs BEFORE the row is queued, so the base64 frame is the
+      // only large thing that ever reaches D1 and the detector's class labels
+      // never do. See recordProjection().
+      if (item.kind === "telemetry" && RECORD_KINDS.has(item.subtype)) {
+        const recKey = `${item.subtype}:${item.thing}`;
+        if (nowMs - (this.lastRecord.get(recKey) || 0) >= RECORD_MIN_INTERVAL_MS) {
+          const projected = recordProjection(item.subtype, item.data);
+          if (projected) {
+            // Only advance the gate on a sample actually taken: a run of
+            // unusable frames (all-black, oversized) must not silently consume
+            // the interval and leave the recording empty.
+            this.lastRecord.set(recKey, nowMs);
+            toRecord.push({
+              // Unix SECONDS. The rover's own capture time when it sent one,
+              // the hub's receive time otherwise — normalised either way, so a
+              // rover that starts sending milliseconds cannot poison the column.
+              ts: toRecordSeconds(item.data?.ts, now),
+              thing: item.thing,
+              kind: item.subtype,
+              data: projected,
+            });
+          }
+        }
+      }
+
       seen += 1;
       things.add(item.thing);
       subtypes.add(item.subtype);
@@ -2115,6 +2605,18 @@ export class TelemetryHub extends DurableObject {
         }));
       }
     }
+
+    // NOT awaited, unlike toArchive above — this one carries the base64 frames
+    // and is the largest write in the system.
+    //
+    // The relay path blocks the rover's HTTP response on publishItems()
+    // returning, so awaiting here would put a multi-kilobyte D1 INSERT directly
+    // in a cellular uplink's latency path. waitUntil takes it off that path
+    // while keeping it a tracked promise rather than a floating one: a Durable
+    // Object stays active while it has pending I/O, so nothing is cancelled, and
+    // recordSamples() swallows its own errors so a failed recording can never
+    // make a rover believe its telemetry was rejected.
+    if (toRecord.length) this.ctx.waitUntil(recordSamples(this.env, toRecord));
 
     // One throttled multi-key write instead of three puts per publish call.
     // `last_message_at` is also held in memory so liveness stays accurate

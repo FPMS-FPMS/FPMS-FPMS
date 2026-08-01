@@ -933,13 +933,13 @@ const PUBLIC_PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Is anything on fire? — FPMS live rover status</title>
-<meta name="description" content="Live public status for FPMS, a student-built autonomous wildfire-watch rover. Shows whether the rover is online right now and what it last detected.">
+<title>FPMS — a student-built wildfire-watch rover, and everything it has found</title>
+<meta name="description" content="FPMS is a self-driving wildfire-watch rover built by two Grade 8 students in Canada. See what it has detected, how far it has driven, recordings of its laser scans and camera, and ask its AI assistant anything — no login, and it all works while the rover is switched off.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#0b0f14" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta property="og:title" content="FPMS — live wildfire rover status">
-<meta property="og:description" content="A student-built rover watches for wildfires. This page shows what it last saw, live and public.">
+<meta property="og:title" content="FPMS — a student-built wildfire-watch rover">
+<meta property="og:description" content="What the rover has detected, how far it has driven, recordings of its laser scans and camera, and an AI assistant that answers questions about it.">
 <meta property="og:type" content="website">
 <style>
   /* Dark first, because the page is read outdoors at night as often as not,
@@ -1104,6 +1104,134 @@ const PUBLIC_PAGE = `<!doctype html>
     position:absolute; width:1px; height:1px; overflow:hidden;
     clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;
   }
+
+  /* ==================================================================
+     The compact status strip.
+
+     WHY THE BANNER IS SMALL BY DEFAULT
+     ----------------------------------
+     The rover is off almost always, so the honest answer to the page's
+     own question is almost always "not right now". Rendered as a full
+     alarm-sized banner, that answer was the first and largest thing a
+     first-time visitor saw, and it made a working project read as a
+     broken one. The status is still the first thing on the page and it
+     is still completely honest — it is just sized like a fact rather
+     than like an emergency.
+
+     It escalates back to full size for exactly one state: an active
+     fire signal (.b-loud, set by the script). Nothing else is allowed
+     to claim that much of the screen.
+     ================================================================== */
+  .banner.b-compact { padding:12px 14px; margin:16px 0 22px; border-left-width:5px; }
+  .banner.b-compact h2 { font-size:clamp(16px,4vw,18px); margin:2px 0 4px; }
+  .banner.b-compact p { font-size:15px; }
+  .banner.b-compact .stamp { font-size:13px; }
+  .banner.b-loud { padding:16px 18px; border-left-width:6px; }
+  .banner.b-loud h2 { font-size:clamp(20px,5.5vw,26px); }
+  .jump {
+    display:inline-flex; align-items:center; gap:6px; margin-top:8px;
+    font-size:14px; font-weight:600;
+  }
+
+  /* ---------------- the assistant ---------------- */
+  #ai { margin-top:34px; }
+  .ai-card {
+    border:1px solid var(--line); border-radius:12px; background:var(--panel);
+    box-shadow:var(--shadow); padding:16px; margin-top:10px;
+  }
+  .ai-lede { margin:0 0 12px; font-size:16px; }
+  .ai-chips { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 14px; padding:0; list-style:none; }
+  .ai-chip {
+    font:inherit; font-size:14px; font-weight:600; text-align:left;
+    min-height:44px; padding:8px 14px; border-radius:999px;
+    background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    cursor:pointer;
+  }
+  .ai-chip:hover { border-color:var(--accent); }
+  .ai-log { display:grid; gap:10px; margin:0 0 12px; }
+  .ai-turn { border-radius:10px; padding:11px 13px; font-size:16px; }
+  .ai-you {
+    background:var(--panel2); border:1px solid var(--line);
+    justify-self:end; max-width:88%;
+  }
+  .ai-bot { background:transparent; border:1px solid var(--line); border-left:4px solid var(--accent); }
+  .ai-who {
+    display:block; font-size:12px; font-weight:700; letter-spacing:.06em;
+    text-transform:uppercase; color:var(--dim); margin-bottom:4px;
+  }
+  /* Model output is inserted with textContent and never as markup. Newlines are
+     the only formatting it is allowed to carry. */
+  .ai-text { margin:0; white-space:pre-wrap; overflow-wrap:break-word; }
+  .ai-form { display:flex; flex-wrap:wrap; gap:8px; align-items:flex-start; }
+  .ai-form label { flex:1 1 220px; min-width:0; }
+  .ai-input {
+    font:inherit; font-size:16px; width:100%; min-height:48px; resize:vertical;
+    padding:12px; border-radius:10px; background:var(--bg); color:var(--fg);
+    border:1px solid var(--line);
+  }
+  .ai-input:focus-visible { outline:3px solid var(--accent); outline-offset:1px; }
+  .ai-send { flex:0 0 auto; }
+  .ai-foot { margin:10px 0 0; color:var(--dim); font-size:13px; }
+  .ai-busy { color:var(--dim); font-size:14px; }
+
+  /* ---------------- recordings ----------------
+     "Recorded" is a third provenance, distinct from live (green, pulsing)
+     and from the analytics section's simulated amber. It gets its own hue,
+     its own rail, its own hatch and a badge burnt into the media itself, so
+     a cropped screenshot of one frame still says what it is. */
+  :root { --rec:#b3a6ff; --rec-wash:rgba(179,166,255,.12); --rec-ink:#0b0f14; }
+  @media (prefers-color-scheme: light) {
+    :root { --rec:#4a3aa7; --rec-wash:rgba(74,58,167,.10); --rec-ink:#ffffff; }
+  }
+  #rec { margin-top:34px; }
+  .rec-note { margin:0 0 14px; color:var(--dim); font-size:15px; }
+  .rec-grid { display:grid; grid-template-columns:1fr; gap:12px; }
+  @media (min-width:760px) { .rec-grid { grid-template-columns:1fr 1fr; } }
+  .rec-card {
+    border:1px solid var(--rec); border-left:5px solid var(--rec);
+    border-radius:10px; padding:14px; min-width:0;
+    background-color:var(--panel);
+    background-image:repeating-linear-gradient(45deg,
+      var(--rec-wash) 0 6px, transparent 6px 16px);
+  }
+  .rec-card h3 { margin:0 0 2px; font-size:16px; }
+  .rec-card .rec-sub { margin:0 0 10px; font-size:13px; color:var(--dim); }
+  .rec-badge {
+    display:inline-block; font-size:11px; font-weight:800; letter-spacing:.09em;
+    text-transform:uppercase; padding:3px 8px; border-radius:4px;
+    background:var(--rec); color:var(--rec-ink); margin-right:8px;
+    vertical-align:2px; white-space:nowrap;
+  }
+  .rec-badge.is-sim { background:var(--warn); color:var(--on-tone); }
+  .rec-stage { position:relative; background:var(--panel2); border-radius:8px;
+               overflow:hidden; min-height:180px; display:flex;
+               align-items:center; justify-content:center; }
+  .rec-stage img { display:block; max-width:100%; height:auto; }
+  .rec-stage svg { display:block; max-width:100%; height:auto; }
+  /* Burnt into the frame, not beside it. */
+  .rec-stamp {
+    position:absolute; left:8px; top:8px; z-index:2;
+    font-size:11px; font-weight:800; letter-spacing:.09em; text-transform:uppercase;
+    background:var(--rec); color:var(--rec-ink); padding:3px 8px; border-radius:4px;
+    pointer-events:none;
+  }
+  .rec-stamp.is-sim { background:var(--warn); color:var(--on-tone); }
+  .rec-when {
+    position:absolute; right:8px; bottom:8px; z-index:2;
+    font-size:12px; background:var(--bg); color:var(--fg);
+    border:1px solid var(--line); padding:2px 7px; border-radius:4px;
+    pointer-events:none; font-variant-numeric:tabular-nums;
+  }
+  .rec-scroll { overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; }
+  .rec-controls { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px; }
+  .rec-controls input[type=range] { flex:1 1 140px; min-width:120px; height:24px; accent-color:var(--rec); }
+  .rec-controls button { min-height:44px; padding:0 16px; font-size:14px; }
+  .rec-clock { font-size:13px; color:var(--dim); font-variant-numeric:tabular-nums; min-width:78px; }
+  .rec-meta { margin:8px 0 0; font-size:13px; color:var(--dim); }
+  .rec-empty { border:1px dashed var(--line); border-radius:8px; padding:18px 14px;
+               text-align:center; color:var(--dim); font-size:14px; }
+  .rec-empty b { display:block; color:var(--fg); font-size:15px; margin-bottom:4px; }
+  @media (prefers-reduced-motion: reduce) { .rec-stage img { transition:none; } }
 ${ANALYTICS_STYLE}
 </style>
 </head>
@@ -1111,19 +1239,22 @@ ${ANALYTICS_STYLE}
 <a class="skip" href="#status">Skip to the status</a>
 <div class="wrap">
   <header>
-    <p class="eyebrow">Live public status &middot; no login needed</p>
-    <h1>Is anything on fire?</h1>
+    <p class="eyebrow">A student wildfire-watch robot &middot; public, no login needed</p>
+    <h1>FPMS: a rover that watches for wildfires</h1>
     <p class="lede">
-      FPMS is a self-driving rover that patrols for wildfires. Its camera watches
-      for flame colours, its laser scanner watches for obstacles, and everything
-      it sees is reported here automatically. Built by two Grade&nbsp;8 students
-      in Canada.
+      FPMS drives itself on patrol. Its camera looks for flame colours, its
+      spinning laser scanner measures what is in front of it, and it files a
+      report to this website every few seconds over a mobile network. Built by
+      two Grade&nbsp;8 students in Canada for World Robot Olympiad.
+      <strong>The rover only runs during tests and demonstrations</strong> &mdash;
+      so everything below is drawn from the record it has already built up, and
+      it is all here whether or not the robot is switched on right now.
     </p>
   </header>
 
-  <section id="status" class="banner b-idle" aria-labelledby="b-title">
+  <section id="status" class="banner b-idle b-compact" aria-labelledby="b-title">
     <p class="kicker"><span class="dot" id="b-dot" aria-hidden="true"></span><span id="b-kicker">Checking</span></p>
-    <h2 id="b-title">Loading the rover&rsquo;s status&hellip;</h2>
+    <h2 id="b-title">Checking whether the rover is powered on&hellip;</h2>
     <p id="b-note">Fetching the most recent report.</p>
     <p class="stamp" id="b-stamp"></p>
   </section>
@@ -1147,39 +1278,73 @@ ${ANALYTICS_STYLE}
     </div>
   </noscript>
 
-  <section aria-labelledby="h-what">
-    <h2 class="sec" id="h-what">What am I looking at?</h2>
-    <ul class="facts">
-      <li><strong>The rover</strong> A small autonomous robot that drives itself
-      around and keeps watch. It runs its own camera and its own obstacle
-      detection on board, then sends short reports to this website over a
-      mobile network.</li>
-      <li><strong>What it looks for</strong> Flame colours in the camera picture,
-      things blocking its path, and animals in the frame. Anything it finds is
-      listed below in the order it happened.</li>
-      <li><strong>This page</strong> A read-only public window on the system. It
-      is not a live video feed, and it is not a fire service alert. The rover is
-      switched on for demonstrations and tests, so most of the time you are
-      seeing the last thing it recorded rather than something happening now.</li>
-    </ul>
+${ANALYTICS_HTML}
 
-    <details>
-      <summary>How to read the words on this page</summary>
-      <div class="inner">
-        <dl>
-          <dt>Online</dt>
-          <dd>The rover reported within the last 90 seconds. What you see is happening now.</dd>
-          <dt>Recently offline</dt>
-          <dd>Nothing in the last 90 seconds, but something within the last hour.</dd>
-          <dt>Offline</dt>
-          <dd>Nothing for over an hour. This is normal &mdash; the rover is usually switched off. The website itself is still working.</dd>
-          <dt>Fire signal</dt>
-          <dd>The camera saw flame-like colours. It is a camera detecting colour, not a certified fire alarm.</dd>
-          <dt>Automatic check</dt>
-          <dd>Every 15 minutes the system reviews its own data and records how healthy it looks. The wording of those lines is fixed; the detailed findings stay private.</dd>
-        </dl>
-      </div>
-    </details>
+  <!--
+    THE ASSISTANT.
+
+    Placed high on purpose. It is the part of this system that works best when
+    the rover is dark: it answers from the same stored facts and history the
+    charts above are drawn from, so a judge who arrives at midnight can still
+    interrogate the project. The suggested questions are the ones people
+    actually ask, pre-loaded so nobody has to guess what it knows.
+  -->
+  <section id="ai" aria-labelledby="h-ai">
+    <h2 class="sec" id="h-ai">Ask the FPMS assistant</h2>
+    <div class="ai-card">
+      <p class="ai-lede">
+        An AI assistant that answers questions about this project from its stored
+        facts and its recorded history. It works while the rover is switched off.
+        It will say &ldquo;I don&rsquo;t know&rdquo; rather than guess, and it
+        cannot drive or contact anything.
+      </p>
+
+      <p class="ai-lede" style="font-size:14px;color:var(--dim);margin-bottom:8px">
+        Try one of these:
+      </p>
+      <ul class="ai-chips" id="ai-chips"></ul>
+
+      <div class="ai-log" id="ai-log"></div>
+
+      <form class="ai-form" id="ai-form">
+        <label for="ai-input">
+          <span class="vh">Your question about FPMS</span>
+          <textarea id="ai-input" class="ai-input" rows="2" maxlength="400"
+                    placeholder="Ask anything about the rover, what it found, or how it works"></textarea>
+        </label>
+        <button type="submit" class="ai-send" id="ai-send">Ask</button>
+      </form>
+      <p class="ai-foot" id="ai-foot">
+        Answers are generated by a language model from a fixed set of public
+        project facts and the rover&rsquo;s own recorded events. Nothing you type
+        here is stored, and no private telemetry is available to it.
+      </p>
+      <p class="vh" id="ai-live" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!--
+    RECORDINGS.
+
+    Saved material, and the page must never let it read as live. Three
+    independent channels carry that, none of which can be styled away on its
+    own: the RECORDED badge is burnt into the media frame itself (so a cropped
+    screenshot still carries it), every card wears the recorded rail and hatch,
+    and every frame is captioned with the date it was captured rather than a
+    relative "just now". The alt text and the SVG <title> say it too, which is
+    what a screen reader reads out.
+
+    If the recordings API is not deployed yet, this degrades to the scripted
+    demonstration run — which is labelled SIMULATED, in the analytics section's
+    amber, and never as "recorded". Simulated and recorded are different claims
+    and this page keeps them apart.
+  -->
+  <section id="rec" aria-labelledby="h-rec">
+    <h2 class="sec" id="h-rec">Recordings from previous runs</h2>
+    <p class="rec-note" id="rec-note">
+      Saved material from patrols that have already finished. None of it is live.
+    </p>
+    <div class="rec-grid" id="rec-grid"></div>
   </section>
 
   <section aria-labelledby="h-rovers">
@@ -1206,12 +1371,51 @@ ${ANALYTICS_STYLE}
     <ul id="reports" class="feed"><li class="empty">Loading&hellip;</li></ul>
   </section>
 
+  <section aria-labelledby="h-what">
+    <h2 class="sec" id="h-what">What am I looking at?</h2>
+    <ul class="facts">
+      <li><strong>The rover</strong> A small autonomous robot that drives itself
+      around and keeps watch. It runs its own camera and its own obstacle
+      detection on board, then sends short reports to this website over a
+      mobile network.</li>
+      <li><strong>What it looks for</strong> Flame colours in the camera picture,
+      things blocking its path, and animals in the frame. Anything it finds is
+      listed above in the order it happened.</li>
+      <li><strong>This page</strong> A read-only public window on the system. It
+      is not a live video feed, and it is not a fire service alert. The rover is
+      switched on for demonstrations and tests, so most of the time you are
+      reading its record rather than watching something happen.</li>
+    </ul>
+
+    <details>
+      <summary>How to read the words on this page</summary>
+      <div class="inner">
+        <dl>
+          <dt>Online</dt>
+          <dd>The rover reported within the last 90 seconds. What you see is happening now.</dd>
+          <dt>Recently offline</dt>
+          <dd>Nothing in the last 90 seconds, but something within the last hour.</dd>
+          <dt>Offline</dt>
+          <dd>Nothing for over an hour. This is normal &mdash; the rover is usually switched off. The website itself is still working.</dd>
+          <dt>Recorded</dt>
+          <dd>Material saved during a run that has already finished. It is stamped on the picture itself and dated. It is never live.</dd>
+          <dt>Simulated</dt>
+          <dd>A scripted demonstration built from the system&rsquo;s own settings, so the page can still show how the system behaves when nothing has been recorded. No measurement in it is real.</dd>
+          <dt>Fire signal</dt>
+          <dd>The camera saw flame-like colours. It is a camera detecting colour, not a certified fire alarm.</dd>
+          <dt>Automatic check</dt>
+          <dd>Every 15 minutes the system reviews its own data and records how healthy it looks. The wording of those lines is fixed; the detailed findings stay private.</dd>
+          <dt>&ndash;&ndash;</dt>
+          <dd>Nothing was recorded for that number. It is deliberately not shown as zero, because &ldquo;we did not measure it&rdquo; and &ldquo;we measured none&rdquo; are different facts.</dd>
+        </dl>
+      </div>
+    </details>
+  </section>
+
   <p class="controls">
     <button id="refresh" type="button">Refresh now</button>
     <span class="stamp" id="poll-note">This page updates by itself every 30 seconds.</span>
   </p>
-
-${ANALYTICS_HTML}
 
   <footer>
     <p>FPMS &mdash; Fire Prevention &amp; Monitoring System. A student project
@@ -1221,7 +1425,11 @@ ${ANALYTICS_HTML}
     <p>Prefer the raw data? It is open and needs no key:
     <a href="/api/public/all"><code>/api/public/all</code></a>,
     <a href="/api/public/summary"><code>/api/public/summary</code></a>,
-    <a href="/api/public/events"><code>/api/public/events</code></a>.</p>
+    <a href="/api/public/events"><code>/api/public/events</code></a>,
+    <a href="/api/public/analytics"><code>/api/public/analytics</code></a>,
+    <a href="/api/public/chat"><code>/api/public/chat</code></a>.
+    Anything marked <em>simulated</em> in those responses is scripted, and says
+    so in its own payload.</p>
   </footer>
 </div>
 
@@ -1300,8 +1508,11 @@ ${ANALYTICS_HTML}
 
   var announced = "";
 
-  function setBanner(tone, dot, kicker, title, note) {
-    $("status").className = "banner b-" + tone;
+  // The "loud" flag promotes the strip back to a full-size banner. Exactly one
+  // state uses it — an active fire signal. Everything else is a fact, not an
+  // emergency, and is sized accordingly: see .b-compact in the stylesheet.
+  function setBanner(tone, dot, kicker, title, note, loud) {
+    $("status").className = "banner b-" + tone + (loud ? " b-loud" : " b-compact");
     $("b-dot").className = "dot" + (dot ? " d-" + dot : "");
     $("b-kicker").textContent = kicker;
     $("b-title").textContent = title;
@@ -1328,31 +1539,35 @@ ${ANALYTICS_HTML}
       setBanner("bad", "bad", "Alert",
         "A fire signal was detected",
         "The rover's camera saw flame-coloured light. Detected " +
-          (ago(d.fire && d.fire.since) || "recently") + ".");
+          (ago(d.fire && d.fire.since) || "recently") + ".",
+        true);
     } else if (state === "live") {
       // Deliberately "right now" and not "in the last 24 hours": a fire that
       // was detected and then cleared this morning is reported on the stamp
       // line below, and the two lines must not contradict each other.
       setBanner("ok", "ok", "Live now",
-        "All clear",
+        "The rover is on patrol right now",
         online + " of " + total + " rover" + (total === 1 ? "" : "s") +
-          " reporting right now, and no fire signal is being detected.");
+          " reporting live, and no fire signal is being detected.");
     } else if (state === "recently_offline") {
+      // Every offline wording below says the same two things in the same order:
+      // the honest status, then where the substance is. A visitor who reads only
+      // this strip should still know the page is worth scrolling.
       setBanner("warn", "warn", "Not live",
-        "The rover is offline right now",
-        "It last reported " + (seen || "recently") + ". Everything below is the " +
-          "last thing it recorded, not something happening now. This page itself " +
-          "is working normally.");
+        "The rover is not reporting at the moment",
+        "It last reported " + (seen || "recently") + ". Its full record, the " +
+          "charts, the recordings and the assistant below all keep working.");
     } else if (state === "offline") {
       setBanner("idle", "", "Not live",
-        "The rover is switched off",
-        "This is normal: it runs during tests and demonstrations. It was last " +
-          "heard from " + (seen || "some time ago") + ", and what it recorded then " +
-          "is shown below.");
+        "The rover is switched off, which is normal",
+        "It runs during tests and demonstrations, and was last heard from " +
+          (seen || "some time ago") + ". Everything below is its stored record: " +
+          "what it has found, how far it has driven, recordings of past runs, " +
+          "and an assistant that can answer questions about all of it.");
     } else if (state === "no_data") {
       setBanner("idle", "", "Not live",
-        "Waiting for the first report",
-        "The website is running and ready, but no rover has ever reported to it yet.");
+        "Waiting for the rover's first report",
+        "The website is running and ready, but no rover has reported to it yet.");
     } else {
       setBanner("idle", "", "Unknown",
         "Status unavailable",
@@ -1537,6 +1752,837 @@ ${ANALYTICS_HTML}
   }, 60000);
 
   refresh().then(schedule);
+})();
+</script>
+
+<!--
+  The assistant and the recordings player.
+
+  A separate IIFE from the status poll above: it touches only #ai and #rec, it
+  shares no state with the poll, and if either endpoint it depends on is missing
+  the rest of the page is unaffected. Nothing here is on the critical path for
+  answering "is anything on fire?".
+-->
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  /**
+   * Seconds-or-milliseconds normaliser, the browser-side twin of toMs() in
+   * public.js — same 1e12 split, same reasoning.
+   *
+   * It exists here because the recordings API is a separate handler and this
+   * page must not assume which unit it chose. A seconds value treated as
+   * milliseconds dates every recorded frame to January 1970; a milliseconds
+   * value treated as seconds dates it to the year 33658. Either one turns an
+   * honest capture date into nonsense, and the capture date is the main thing
+   * stopping recorded material from reading as live.
+   */
+  function toMs(ts) {
+    var n = Number(ts);
+    if (!n || !isFinite(n)) return null;
+    return n > 1e12 ? n : n * 1000;
+  }
+
+  /** Absolute, local, unambiguous. Recorded material never gets "just now". */
+  function stampText(ms) {
+    if (!ms) return null;
+    try {
+      return new Date(ms).toLocaleString(undefined, {
+        year: "numeric", month: "short", day: "numeric",
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+    } catch (e) { return null; }
+  }
+
+  function getJSON(path) {
+    return fetch(path, { headers: { Accept: "application/json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+
+  function elem(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+
+  /* ====================================================================
+     THE ASSISTANT
+     ====================================================================
+     The one part of this system that is at its most useful when the rover
+     is dark: it answers from stored project facts and recorded history, so
+     it does not need anything to be powered on.
+
+     Model output is written with textContent, never innerHTML. The server
+     already constrains what the model may say; this side guarantees that
+     whatever comes back is displayed as text and can never become markup,
+     a link or a script in this page.
+     ==================================================================== */
+
+  (function assistant() {
+    var form = $("ai-form");
+    if (!form) return;
+
+    /* Questions a judge, a teacher or a visitor actually asks. Loaded as
+       buttons because a blank box with a cursor in it gets used by nobody. */
+    var SUGGESTIONS = [
+      "What is FPMS and what does it do?",
+      "What has the rover detected so far?",
+      "How does it spot a fire?",
+      "How does the rover avoid obstacles?",
+      "Why is the rover offline right now?",
+      "What competition was this built for?"
+    ];
+
+    var MAX_CHARS = 400;      /* mirrors MAX_MESSAGE_CHARS on the server */
+    var HISTORY_MSGS = 6;     /* three exchanges; the server trims further */
+    var HISTORY_CHARS = 280;  /* mirrors MAX_HISTORY_CHARS, keeps the body small */
+
+    var history = [];
+    var busy = false;
+    var probed = false;
+    var disabled = false;
+
+    function setDisabled(reason) {
+      disabled = true;
+      $("ai-input").disabled = true;
+      $("ai-send").disabled = true;
+      var chips = $("ai-chips").getElementsByTagName("button");
+      for (var i = 0; i < chips.length; i++) chips[i].disabled = true;
+      $("ai-foot").textContent = reason;
+    }
+
+    /* One cacheable GET, on first interaction rather than on load, so a visitor
+       who never opens the assistant never costs a request for it. */
+    function probe() {
+      if (probed) return;
+      probed = true;
+      getJSON("/api/public/chat").then(function (doc) {
+        if (doc && doc.available === false) {
+          setDisabled(
+            "The assistant is switched off for this deployment. The record, the " +
+            "charts and the recordings on this page all still work."
+          );
+        }
+      });
+    }
+
+    function addTurn(who, cls) {
+      var box = elem("div", "ai-turn " + cls);
+      box.appendChild(elem("span", "ai-who", who));
+      var p = elem("p", "ai-text", "");
+      box.appendChild(p);
+      $("ai-log").appendChild(box);
+      return p;
+    }
+
+    /* SSE reader. Each event is one JSON object: {"t":"..."} for a chunk of
+       text, {"done":true} at the end. Anything else is ignored rather than
+       displayed — an unrecognised frame is not something to show a visitor. */
+    function readStream(body, out) {
+      var reader = body.getReader();
+      var decoder = new TextDecoder();
+      var buf = "";
+      var text = "";
+
+      function handleLine(line) {
+        if (line.indexOf("data:") !== 0) return;
+        var payload = line.slice(5).replace(/^\\s+/, "");
+        if (!payload) return;
+        var obj = null;
+        try { obj = JSON.parse(payload); } catch (e) { return; }
+        if (obj && typeof obj.t === "string") {
+          text += obj.t;
+          out.textContent = text;
+        }
+      }
+      function drain() {
+        var i;
+        while ((i = buf.indexOf("\\n")) >= 0) {
+          handleLine(buf.slice(0, i).replace(/\\r$/, ""));
+          buf = buf.slice(i + 1);
+        }
+      }
+      function pump() {
+        return reader.read().then(function (res) {
+          if (res.done) {
+            if (buf) { handleLine(buf.replace(/\\r$/, "")); buf = ""; }
+            return text;
+          }
+          buf += decoder.decode(res.value, { stream: true });
+          drain();
+          return pump();
+        });
+      }
+      return pump().catch(function () { return text; });
+    }
+
+    function finish(question, out, text) {
+      busy = false;
+      if (!disabled) $("ai-send").disabled = false;
+      var answer = String(text || "").trim();
+      if (!answer) {
+        /* Never a status code, never an exception string. A visitor is told
+           what happened and what still works. */
+        answer =
+          "I could not answer that one just now. The record, the charts and the " +
+          "recordings on this page are all still available \\u2014 please try again " +
+          "in a moment.";
+      }
+      out.textContent = answer;
+      history.push({ role: "user", content: question.slice(0, HISTORY_CHARS) });
+      history.push({ role: "assistant", content: answer.slice(0, HISTORY_CHARS) });
+      if (history.length > HISTORY_MSGS) history = history.slice(-HISTORY_MSGS);
+      $("ai-live").textContent = "The assistant answered.";
+    }
+
+    function ask(raw) {
+      if (busy || disabled) return;
+      var question = String(raw || "").trim();
+      if (!question) return;
+      if (question.length > MAX_CHARS) question = question.slice(0, MAX_CHARS);
+
+      probe();
+      busy = true;
+      $("ai-send").disabled = true;
+      $("ai-input").value = "";
+      addTurn("You asked", "ai-you").textContent = question;
+      var out = addTurn("FPMS assistant", "ai-bot");
+      out.textContent = "Thinking\\u2026";
+      $("ai-live").textContent = "Asking the assistant.";
+
+      fetch("/api/public/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+        body: JSON.stringify({ message: question, history: history })
+      }).then(function (r) {
+        var ct = r.headers.get("Content-Type") || "";
+        /* Streaming is the documented default. Fall back to reading the whole
+           body as JSON for any deployment or intermediary that does not stream
+           — the endpoint answers both shapes and every failure path of it
+           carries an honest sentence rather than an error code. */
+        if (ct.indexOf("text/event-stream") >= 0 && r.body && r.body.getReader) {
+          return readStream(r.body, out);
+        }
+        return r.json().then(function (j) {
+          return j && typeof j.reply === "string" ? j.reply : "";
+        }).catch(function () { return ""; });
+      }).then(function (text) {
+        finish(question, out, text);
+      }).catch(function () {
+        finish(question, out, "");
+      });
+    }
+
+    /* chips */
+    var ul = $("ai-chips");
+    for (var i = 0; i < SUGGESTIONS.length; i++) {
+      (function (q) {
+        var li = document.createElement("li");
+        var b = elem("button", "ai-chip", q);
+        b.type = "button";
+        b.addEventListener("click", function () { ask(q); });
+        li.appendChild(b);
+        ul.appendChild(li);
+      })(SUGGESTIONS[i]);
+    }
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      ask($("ai-input").value);
+    });
+    $("ai-input").addEventListener("focus", probe);
+    /* Enter sends, Shift+Enter makes a new line — what everyone expects. */
+    $("ai-input").addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        ask($("ai-input").value);
+      }
+    });
+  })();
+
+  /* ====================================================================
+     RECORDINGS
+     ====================================================================
+     Saved material from runs that have already finished.
+
+     THE ONE RULE: recorded must never read as live.
+       - a RECORDED badge is drawn INSIDE the media frame, so a cropped
+         screenshot of a single frame still carries it;
+       - every frame is captioned with the absolute date it was captured,
+         never with a relative "just now";
+       - the card wears a coloured rail and a 45 degree hatch that belongs
+         to nothing else on the page;
+       - the alt text and the SVG <title> both start with "Recorded", which
+         is what a screen reader reads out;
+       - playback starts PAUSED. An animation that begins on its own is the
+         one thing that most looks like a live feed.
+
+     SIMULATED IS A DIFFERENT CLAIM AND KEEPS A DIFFERENT LABEL. If the
+     recordings API is not deployed, this falls back to /api/public/demo,
+     which is a scripted dataset — it is labelled Simulated in the analytics
+     section's amber and is never called a recording.
+     ==================================================================== */
+
+  (function recordings() {
+    var grid = $("rec-grid");
+    if (!grid) return;
+
+    var SVGNS = "http://www.w3.org/2000/svg";
+    var STEP_MS = 700;
+    var MAX_FRAMES = 240;
+
+    /* Only these two shapes are ever placed in an <img src>. A recording feed
+       is data this page did not author, and "data:" URLs can carry markup. */
+    var B64 = /^[A-Za-z0-9+/=]+$/;
+    var DATA_URL = /^data:image\\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
+
+    function imageSrc(v) {
+      if (typeof v !== "string" || !v.length) return null;
+      var s = v.replace(/\\s+/g, "");
+      if (DATA_URL.test(s)) return s;
+      if (B64.test(s) && s.length > 64) return "data:image/jpeg;base64," + s;
+      return null;
+    }
+
+    /**
+     * A sweep, normalised to an array of millimetres with null for "nothing
+     * came back in that direction".
+     *
+     * TWO UNITS ARRIVE HERE AND THEY MUST NOT BE CONFUSED.
+     *   - the recordings API publishes 'ranges_m' — METRES, one entry per five
+     *     degree bin, with 0 meaning no return (it fills gaps with 0 and drops
+     *     any scan that is all-zero);
+     *   - the analytics demo publishes 'sectors_mm' — MILLIMETRES, twelve
+     *     thirty degree sectors, with null meaning no return.
+     * A metres array read as millimetres draws every wall 1000x too close,
+     * which is the LiDAR equivalent of the seconds/milliseconds bug: it looks
+     * like data rather than like an error. So the unit is decided by the FIELD
+     * NAME, never guessed from the magnitude.
+     */
+    function sweep(raw) {
+      if (!raw || typeof raw !== "object") return null;
+      var src = null, toMm = null;
+      if (Array.isArray(raw.ranges_m)) {
+        src = raw.ranges_m;
+        toMm = function (n) { return n * 1000; };
+      } else if (Array.isArray(raw.sectors_mm) || Array.isArray(raw.sectors) ||
+                 Array.isArray(raw.ranges_mm)) {
+        src = raw.sectors_mm || raw.sectors || raw.ranges_mm;
+        toMm = function (n) { return n; };
+      }
+      if (!src || !src.length || src.length > 1440) return null;
+
+      var out = [], any = false;
+      for (var i = 0; i < src.length; i++) {
+        var n = Number(src[i]);
+        /* 0 and null both mean "no return". Neither is a measured distance and
+           neither may be drawn as one. */
+        if (src[i] === null || src[i] === undefined || !isFinite(n) || n <= 0) {
+          out.push(null);
+        } else {
+          var mm = toMm(n);
+          if (mm > 100000) { out.push(null); continue; }
+          out.push(mm);
+          any = true;
+        }
+      }
+      return any ? out : null;
+    }
+
+    /* The recordings API is written by a different module, so read it
+       tolerantly: take the first array-shaped field that carries frames, and
+       accept either name for a timestamp. Anything unrecognised is dropped,
+       never guessed at. */
+    function frameArray(doc) {
+      var keys = ["frames", "scans", "samples", "items", "records", "points"];
+      for (var i = 0; i < keys.length; i++) {
+        var v = doc && doc[keys[i]];
+        if (Array.isArray(v) && v.length) return v.slice(0, MAX_FRAMES);
+      }
+      return null;
+    }
+
+    function normalise(doc, kind) {
+      var rows = frameArray(doc);
+      if (!rows) return null;
+      var frames = [];
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (!r || typeof r !== "object") continue;
+        var t = toMs(r.ts !== undefined ? r.ts
+          : (r.t !== undefined ? r.t : r.captured_at));
+        if (kind === "camera") {
+          var src = imageSrc(r.frame !== undefined ? r.frame
+            : (r.image !== undefined ? r.image : r.jpeg));
+          if (src) frames.push({ t: t, src: src });
+        } else {
+          var sec = sweep(r);
+          if (sec) frames.push({ t: t, sectors: sec });
+        }
+      }
+      if (!frames.length) return null;
+      /* A response that calls itself simulated is labelled simulated, whatever
+         endpoint it came from. The claim travels with the data. */
+      var sim = doc.simulated === true || doc.source === "simulated";
+      return { kind: kind, frames: frames, simulated: sim };
+    }
+
+    /* ---------------------------------------------------- the polar plot */
+
+    function polarSvg(sectors, scaleMm, size, simulated) {
+      var cx = size / 2, cy = size / 2, R = size / 2 - 26;
+      var svg = document.createElementNS(SVGNS, "svg");
+      svg.setAttribute("viewBox", "0 0 " + size + " " + size);
+      svg.setAttribute("width", String(size));
+      svg.setAttribute("height", String(size));
+      svg.setAttribute("role", "img");
+
+      var hit = 0, nearest = null, i;
+      for (i = 0; i < sectors.length; i++) {
+        if (sectors[i] === null) continue;
+        hit++;
+        if (nearest === null || sectors[i] < nearest) nearest = sectors[i];
+      }
+      var word = simulated ? "Simulated" : "Recorded";
+      var title = document.createElementNS(SVGNS, "title");
+      title.textContent = word + " laser sweep: " + hit + " of " + sectors.length +
+        " sectors returned a range" +
+        (nearest === null ? "." : ", nearest " + Math.round(nearest) + " millimetres.");
+      svg.appendChild(title);
+      svg.setAttribute("aria-label", title.textContent);
+
+      var line = function (attrs) {
+        var n = document.createElementNS(SVGNS, "circle");
+        for (var k in attrs) n.setAttribute(k, String(attrs[k]));
+        return n;
+      };
+      var ink = getComputedStyle(document.body).getPropertyValue("--dim").trim() || "#888";
+      var gridC = getComputedStyle(document.body).getPropertyValue("--line").trim() || "#444";
+      var hue = getComputedStyle(document.body).getPropertyValue("--rec").trim() || "#4a3aa7";
+      if (simulated) hue = getComputedStyle(document.body).getPropertyValue("--warn").trim() || "#8a5a00";
+
+      for (var ring = 1; ring <= 3; ring++) {
+        svg.appendChild(line({
+          cx: cx, cy: cy, r: (R * ring) / 3, fill: "none", stroke: gridC, "stroke-width": 1
+        }));
+        var lab = document.createElementNS(SVGNS, "text");
+        lab.setAttribute("x", String(cx + 4));
+        lab.setAttribute("y", String(cy - (R * ring) / 3 - 3));
+        lab.setAttribute("font-size", "10");
+        lab.setAttribute("fill", ink);
+        lab.textContent = Math.round((scaleMm * ring) / 3) + " mm";
+        svg.appendChild(lab);
+      }
+
+      var step = (Math.PI * 2) / sectors.length;
+      /* The 2px surface gap between adjacent fills, in radians — but never more
+         than a fraction of the wedge itself. The recordings API publishes 72
+         five degree bins, where a fixed 0.024 rad gap on each side would eat
+         more than half of every wedge and the plot would read as a dotted ring
+         rather than as a sweep. */
+      var gap = Math.min(0.024, step * 0.12);
+
+      if (sectors.length > 24) {
+        /* Many narrow bins: draw the sweep as one silhouette. Individual
+           wedges at this width are thinner than their own outline. A gap in
+           the scan breaks the outline rather than being filled across, so a
+           direction that returned nothing still reads as nothing. */
+        var run = null;
+        var flushRun = function () {
+          if (!run || run.length < 2) { run = null; return; }
+          var d = "M" + cx + "," + cy;
+          for (var q = 0; q < run.length; q++) d += " L" + run[q][0] + "," + run[q][1];
+          d += " Z";
+          var poly = document.createElementNS(SVGNS, "path");
+          poly.setAttribute("d", d);
+          poly.setAttribute("fill", hue);
+          poly.setAttribute("fill-opacity", "0.30");
+          poly.setAttribute("stroke", hue);
+          poly.setAttribute("stroke-width", "2");
+          poly.setAttribute("stroke-linejoin", "round");
+          svg.appendChild(poly);
+          run = null;
+        };
+        for (i = 0; i < sectors.length; i++) {
+          if (sectors[i] === null) { flushRun(); continue; }
+          var rr = Math.max(4, Math.min(R, (sectors[i] / scaleMm) * R));
+          var aa = -Math.PI / 2 + step * (i + 0.5);
+          if (!run) run = [];
+          run.push([cx + Math.cos(aa) * rr, cy + Math.sin(aa) * rr]);
+        }
+        flushRun();
+      } else {
+        for (i = 0; i < sectors.length; i++) {
+          var a0 = -Math.PI / 2 + step * i + gap;
+          var a1 = -Math.PI / 2 + step * (i + 1) - gap;
+          var v = sectors[i];
+          var rOut = v === null ? R : Math.max(6, Math.min(R, (v / scaleMm) * R));
+          var p = document.createElementNS(SVGNS, "path");
+          p.setAttribute("d",
+            "M" + cx + "," + cy +
+            " L" + (cx + Math.cos(a0) * rOut) + "," + (cy + Math.sin(a0) * rOut) +
+            " A" + rOut + "," + rOut + " 0 0 1 " +
+            (cx + Math.cos(a1) * rOut) + "," + (cy + Math.sin(a1) * rOut) + " Z");
+          p.setAttribute("fill", v === null ? "transparent" : hue);
+          p.setAttribute("fill-opacity", v === null ? "0" : "0.30");
+          p.setAttribute("stroke", v === null ? gridC : hue);
+          p.setAttribute("stroke-width", v === null ? "1" : "2");
+          svg.appendChild(p);
+        }
+      }
+
+      svg.appendChild(line({ cx: cx, cy: cy, r: 4, fill: ink }));
+      var front = document.createElementNS(SVGNS, "text");
+      front.setAttribute("x", String(cx));
+      front.setAttribute("y", "13");
+      front.setAttribute("text-anchor", "middle");
+      front.setAttribute("font-size", "11");
+      front.setAttribute("fill", ink);
+      front.textContent = "0\\u00b0 (front)";
+      svg.appendChild(front);
+
+      /* The label is part of the picture, not part of the page around it. */
+      var mark = document.createElementNS(SVGNS, "text");
+      mark.setAttribute("x", String(cx));
+      mark.setAttribute("y", String(cy + 6));
+      mark.setAttribute("text-anchor", "middle");
+      mark.setAttribute("font-size", "22");
+      mark.setAttribute("font-weight", "800");
+      mark.setAttribute("letter-spacing", "3");
+      mark.setAttribute("fill", hue);
+      mark.setAttribute("fill-opacity", "0.22");
+      mark.setAttribute("transform", "rotate(-24 " + cx + " " + (cy + 6) + ")");
+      mark.textContent = simulated ? "SIMULATED" : "RECORDED";
+      svg.appendChild(mark);
+
+      return svg;
+    }
+
+    /* ------------------------------------------------------- the player */
+
+    function player(spec, clip, footnote) {
+      var sim = clip.simulated;
+      var word = sim ? "Simulated" : "Recorded";
+      var card = elem("article", "rec-card");
+
+      var head = elem("h3", null);
+      head.appendChild(elem("span", "rec-badge" + (sim ? " is-sim" : ""), word));
+      head.appendChild(document.createTextNode(spec.title));
+      card.appendChild(head);
+      card.appendChild(elem("p", "rec-sub", spec.sub));
+
+      var scroll = elem("div", "rec-scroll");
+      var stage = elem("div", "rec-stage");
+      scroll.appendChild(stage);
+      card.appendChild(scroll);
+
+      var badge = elem("span", "rec-stamp" + (sim ? " is-sim" : ""), word + " \\u2014 not live");
+      var when = elem("span", "rec-when", "");
+      stage.appendChild(badge);
+      stage.appendChild(when);
+
+      var media = elem("div", null);
+      media.style.width = "100%";
+      media.style.display = "flex";
+      media.style.justifyContent = "center";
+      stage.appendChild(media);
+
+      /* One scale for every frame, so a wedge growing means the world changed
+         and not that the axis did. */
+      var scaleMm = 900;
+      if (spec.kind === "lidar") {
+        var top = 0;
+        for (var f = 0; f < clip.frames.length; f++) {
+          var s = clip.frames[f].sectors;
+          for (var k = 0; k < s.length; k++) if (s[k] !== null && s[k] > top) top = s[k];
+        }
+        scaleMm = Math.max(300, Math.min(Math.round(top * 1.1) || 900, 6000));
+      }
+
+      var idx = 0;
+      var timer = null;
+
+      var table = null, tbody = null;
+      if (spec.kind === "lidar") {
+        var det = document.createElement("details");
+        det.className = "fx-table";
+        var sum = document.createElement("summary");
+        sum.textContent = "This sweep as a table";
+        det.appendChild(sum);
+        table = document.createElement("table");
+        var thead = document.createElement("thead");
+        var hr = document.createElement("tr");
+        var bins = clip.frames[0].sectors.length;
+        hr.appendChild(elem("th", null, "Direction"));
+        hr.appendChild(elem("th", null,
+          bins > 24 ? "Nearest return in sector" : "Nearest return"));
+        thead.appendChild(hr);
+        table.appendChild(thead);
+        tbody = document.createElement("tbody");
+        table.appendChild(tbody);
+        det.appendChild(table);
+        card.appendChild(det);
+      }
+
+      function paint() {
+        var fr = clip.frames[idx];
+        media.textContent = "";
+        if (spec.kind === "camera") {
+          var img = document.createElement("img");
+          img.decoding = "async";
+          img.loading = "lazy";
+          img.src = fr.src;
+          img.alt = word + " still picture from the rover's forward-facing camera" +
+            (stampText(fr.t) ? ", captured " + stampText(fr.t) : "") +
+            ". This is saved material, not a live view.";
+          media.appendChild(img);
+        } else {
+          var size = Math.max(220, Math.min(340, (stage.clientWidth || 300) - 8));
+          media.appendChild(polarSvg(fr.sectors, scaleMm, size, sim));
+          if (tbody) {
+            /* The table is the non-visual route to the same sweep. Seventy-two
+               five degree rows is a wall of numbers nobody reads, so anything
+               finer than fifteen degrees is grouped into twelve thirty degree
+               sectors reporting the NEAREST return in each — which is the
+               number a reader of this plot actually wants. The column heading
+               says so, so the table never implies a resolution it lacks. */
+            tbody.textContent = "";
+            var n = fr.sectors.length;
+            var groups = n > 24 ? 12 : n;
+            var per = n / groups;
+            var wide = 360 / groups;
+            for (var g = 0; g < groups; g++) {
+              var near = null;
+              for (var k2 = Math.floor(g * per); k2 < Math.floor((g + 1) * per); k2++) {
+                var val = fr.sectors[k2];
+                if (val === null) continue;
+                if (near === null || val < near) near = val;
+              }
+              var tr = document.createElement("tr");
+              tr.appendChild(elem("td", null,
+                Math.round(g * wide) + "\\u00b0\\u2013" + Math.round((g + 1) * wide) + "\\u00b0"));
+              tr.appendChild(elem("td", null,
+                near === null ? "no return" : Math.round(near) + " mm"));
+              tbody.appendChild(tr);
+            }
+          }
+        }
+        var st = stampText(fr.t);
+        when.textContent = st ? st : "capture time not recorded";
+        clock.textContent = "Frame " + (idx + 1) + " of " + clip.frames.length;
+        scrub.value = String(idx);
+      }
+
+      var controls = elem("div", "rec-controls");
+      var play = elem("button", null, "Play");
+      play.type = "button";
+      play.setAttribute("aria-label", "Play the " + word.toLowerCase() + " " + spec.title.toLowerCase());
+      var scrub = document.createElement("input");
+      scrub.type = "range";
+      scrub.min = "0";
+      scrub.max = String(clip.frames.length - 1);
+      scrub.value = "0";
+      scrub.step = "1";
+      scrub.setAttribute("aria-label", "Position in the " + word.toLowerCase() + " sequence");
+      var clock = elem("span", "rec-clock", "");
+      controls.appendChild(play);
+      controls.appendChild(scrub);
+      controls.appendChild(clock);
+      if (clip.frames.length < 2) {
+        play.disabled = true;
+        scrub.disabled = true;
+      }
+      card.appendChild(controls);
+
+      function stop() {
+        if (timer) { clearInterval(timer); timer = null; }
+        play.textContent = "Play";
+        play.setAttribute("aria-label", "Play the " + word.toLowerCase() + " sequence");
+      }
+      function start() {
+        if (timer || clip.frames.length < 2) return;
+        play.textContent = "Pause";
+        play.setAttribute("aria-label", "Pause the " + word.toLowerCase() + " sequence");
+        timer = setInterval(function () {
+          idx = (idx + 1) % clip.frames.length;
+          paint();
+        }, STEP_MS);
+      }
+      play.addEventListener("click", function () { timer ? stop() : start(); });
+      scrub.addEventListener("input", function () {
+        stop();
+        idx = Math.max(0, Math.min(clip.frames.length - 1, Number(scrub.value) || 0));
+        paint();
+      });
+      document.addEventListener("visibilitychange", function () {
+        if (document.hidden) stop();
+      });
+
+      var first = stampText(clip.frames[0].t);
+      var last = stampText(clip.frames[clip.frames.length - 1].t);
+      var meta = clip.frames.length + " frame" + (clip.frames.length === 1 ? "" : "s");
+      if (first) meta += ", captured " + first + (last && last !== first ? " to " + last : "");
+      meta += ". " + (sim
+        ? "Scripted demonstration data. No measurement in it is real."
+        : "Saved during a run that has already finished. This is not a live feed.");
+      if (footnote) meta += " " + footnote;
+      card.appendChild(elem("p", "rec-meta", meta));
+
+      paint();
+      /* The polar plot is sized in pixels against its container, and the
+         container has no width until the card is in the document. Repaint once
+         it is, and again when the viewport changes. */
+      card.repaintChart = paint;
+      return card;
+    }
+
+    var repaintTimer = null;
+    function repaintAll() {
+      var cards = grid.children;
+      for (var i = 0; i < cards.length; i++) {
+        if (typeof cards[i].repaintChart === "function") cards[i].repaintChart();
+      }
+    }
+    window.addEventListener("resize", function () {
+      if (repaintTimer) clearTimeout(repaintTimer);
+      repaintTimer = setTimeout(repaintAll, 200);
+    });
+
+    function emptyCard(spec, headline, why) {
+      var card = elem("article", "rec-card");
+      var head = elem("h3", null, spec.title);
+      card.appendChild(head);
+      var box = elem("div", "rec-empty");
+      box.appendChild(elem("b", null, headline));
+      box.appendChild(document.createTextNode(why));
+      card.appendChild(box);
+      return card;
+    }
+
+    var SPECS = [
+      {
+        kind: "lidar",
+        title: "Laser scans",
+        sub: "One frame is one full sweep of the spinning laser scanner. " +
+             "Straight up is the direction the rover was facing, and how far " +
+             "the shape reaches in any direction is how far away the nearest " +
+             "thing was. A notch means nothing came back that way."
+      },
+      {
+        kind: "camera",
+        title: "Camera frames",
+        sub: "Still pictures the rover saved while it was out on patrol."
+      }
+    ];
+
+    /* Ask for the real thing first. The endpoint is added by a separate module
+       and may not be deployed yet, so its absence is a normal outcome here and
+       not an error: getJSON returns null for a 404 and the fallback runs. */
+    function load() {
+      return Promise.all([
+        getJSON("/api/public/recording?kind=lidar"),
+        getJSON("/api/public/recording?kind=camera")
+      ]).then(function (res) {
+        return {
+          lidar: normalise(res[0] || {}, "lidar"),
+          camera: normalise(res[1] || {}, "camera")
+        };
+      });
+    }
+
+    /* Fallback. The scripted run is NOT a recording and is never presented as
+       one — it comes back flagged simulated, so player() gives it the amber
+       treatment and the word "Simulated" everywhere the word "Recorded" would
+       otherwise appear. */
+    function demoClip() {
+      return getJSON("/api/public/demo").then(function (d) {
+        if (!d || d.simulated !== true || d.source !== "simulated") return null;
+        var rover = (d.rovers || [])[0];
+        var lid = rover && rover.lidar;
+        var sec = lid && sweep({ sectors_mm: lid.latest_sectors_mm });
+        if (!sec) return null;
+        var pts = (lid.points || []);
+        var t = pts.length ? toMs(pts[pts.length - 1].t) : toMs(d.scenario && d.scenario.anchor);
+        return { kind: "lidar", simulated: true, frames: [{ t: t, sectors: sec }] };
+      });
+    }
+
+    function render(clips) {
+      grid.textContent = "";
+      var haveReal = !!(clips.lidar || clips.camera);
+
+      if (clips.lidar) {
+        grid.appendChild(player(SPECS[0], clips.lidar, ""));
+      }
+      if (clips.camera) {
+        grid.appendChild(player(SPECS[1], clips.camera, ""));
+      } else {
+        grid.appendChild(emptyCard(SPECS[1],
+          "No camera frames are published yet",
+          "The rover's camera also points at a home, so saved pictures are only " +
+          "published when the operator switches that on. Nothing is shown here " +
+          "rather than something stood in for it."));
+      }
+
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(repaintAll);
+      else repaintAll();
+
+      if (haveReal) {
+        /* One of the two cards can come back flagged simulated while the other
+           is genuinely recorded. The section note must not claim more than the
+           cards below it do, so it names both when both are present. */
+        var anySim = (clips.lidar && clips.lidar.simulated) ||
+                     (clips.camera && clips.camera.simulated);
+        var allSim = (!clips.lidar || clips.lidar.simulated) &&
+                     (!clips.camera || clips.camera.simulated);
+        $("rec-note").textContent = allSim
+          ? "Everything below is scripted demonstration data, labelled as such on " +
+            "every frame. No measurement in it is real, and none of it is live."
+          : (anySim
+            ? "Saved material from patrols that have already finished, plus one " +
+              "scripted demonstration. Each panel says which it is, on the frame " +
+              "itself. None of it is live, and playback starts paused."
+            : "Saved material from patrols that have already finished. Every frame " +
+              "is stamped and dated on the picture itself. None of it is live, and " +
+              "playback starts paused.");
+        return;
+      }
+
+      /* Nothing recorded is published. Offer the scripted run instead, clearly
+         labelled, rather than an empty panel. */
+      return demoClip().then(function (clip) {
+        $("rec-note").textContent =
+          "No recorded runs have been published yet. Shown below instead is the " +
+          "system's scripted demonstration \\u2014 it is simulated, not measured, " +
+          "and it is labelled that way wherever it appears.";
+        if (!clip) {
+          grid.insertBefore(emptyCard(SPECS[0],
+            "No saved scans yet",
+            "Recorded sweeps appear here once a run has been archived. Until then " +
+            "the charts above show the laser scanner's coverage over time."), grid.firstChild);
+          return;
+        }
+        grid.insertBefore(
+          player(SPECS[0], clip,
+            "Recorded sweeps will replace this automatically once a run is archived."),
+          grid.firstChild
+        );
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(repaintAll);
+        else repaintAll();
+      });
+    }
+
+    load().then(render).catch(function () {
+      grid.textContent = "";
+      grid.appendChild(emptyCard(SPECS[0], "Recordings could not be loaded",
+        "This page could not reach the recordings service. Everything else on " +
+        "the page is unaffected."));
+    });
+  })();
 })();
 </script>
 ${ANALYTICS_SCRIPT}
