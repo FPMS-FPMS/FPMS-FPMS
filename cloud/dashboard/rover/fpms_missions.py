@@ -1,9 +1,30 @@
 #!/usr/bin/env python3
 """FPMS mission executor — "go to a zone on command, and come back perfectly".
 
-Owns exactly one MQTT verb, `mission`, and one job: drive to a named arena zone,
-dock, hold, and return to the start pose facing the start heading. It publishes
-/cmd_vel while a mission runs and nothing at all when one does not.
+Owns exactly one MQTT verb, `mission`, and one job: drive to one or more named
+arena targets in order, dock and hold at each, and return to the start pose
+facing the start heading. It publishes /cmd_vel while a mission runs and nothing
+at all when one does not.
+
+TERMINOLOGY, because two things were both called a "leg"
+========================================================
+    LEG      one stage of a route: the drive from wherever the rover is to ONE
+             target. A single-target mission is a one-leg route. `MAX_SEGMENTS`
+             and the hold are per LEG.
+    SEGMENT  one commanded motion — a turn, or one bounded straight run.
+             `split_legs` cuts a leg's straight-line distance into these.
+
+MULTI-LEG ROUTES
+================
+`ROUTES` chains single-target missions into one run: `patrol` visits the
+top-RIGHT zone, then the top-LEFT zone, then the water station, and retraces the
+WHOLE path home. Legs are named by their single-target mission id, so a route
+and the missions it is built from can never disagree about where a target is.
+
+The route is not three missions in a row. Three missions would each retrace home
+and set off again — four crossings of the arena instead of two, and three
+separate chances for the re-face to be wrong. One route accumulates every
+measured motion into a single list and unwinds it once.
 
 WHY dead reckoning IS THE DEFAULT BACKEND
 =========================================
@@ -30,7 +51,8 @@ against a pose nobody has verified. See NAV2_BRIEF.md section 7.
 
 WHY THE RETRACE IS THE VALUABLE PART
 ====================================
-The return does not re-plan. It replays the MEASURED outbound motions in reverse
+The return does not re-plan — and this holds for a three-leg route exactly as it
+does for a one-leg one. It replays the MEASURED outbound motions in reverse
 order with their signs flipped:
 
     outbound   turn +44.7 deg (asked 45), drive +302 mm (asked 300), drive ...
@@ -48,6 +70,14 @@ outbound turns in reverse leaves the rover already facing the start heading when
 it arrives — the re-face is a small correction, not the plan. The LiDAR is 360
 degrees, so the obstacle guard simply watches the rear cone instead of the front
 one while reversing (see `front_clearance_mm(..., reverse=True)`).
+
+Say the consequence out loud, because it is the one thing about a multi-leg
+route that surprises people: a `patrol` reverses along ALL THREE legs on the way
+back — roughly 2.2 m of reversing, past both zones, without stopping at them.
+That is not a bug to be optimised away with a short fresh plan from the last
+target. A fresh plan carries every millimetre of accumulated drift home with it;
+the retrace cancels it. The retrace is the longer route and the accurate one,
+and accuracy is what the operator asked for when they said "come back".
 
 THE SPEED CONSTRAINT — READ THIS BEFORE "FIXING" THE DOCK SPEED
 ===============================================================
@@ -281,13 +311,13 @@ def zone_center(zone_id):
     return (z["x_mm"] + z["w_mm"] / 2.0, z["y_mm"] + z["h_mm"] / 2.0)
 
 
-# The four commandable missions. `home` is the start pose, not a zone rect, and
-# is the only one with a heading requirement of its own.
+# The four single-target missions. `home` is the start pose, not a zone rect,
+# and is the only one with a heading requirement of its own.
 MISSIONS = ("m1", "m2", "water", "home")
 
 
 def mission_target(name):
-    """(x_mm, y_mm, final_heading_deg or None) for a mission name."""
+    """(x_mm, y_mm, final_heading_deg or None) for a single-target mission."""
     if name == "m1":
         x, y = zone_center("zone-a")
         return x, y, None
@@ -300,6 +330,89 @@ def mission_target(name):
     if name == "home":
         return ROVER_START["x_mm"], ROVER_START["y_mm"], ROVER_START["heading_deg"]
     raise KeyError(name)
+
+
+# WHICH PHYSICAL CORNER EACH NAME MEANS — READ BEFORE WRITING ANY LABEL
+# =====================================================================
+# The mission ids are historical and they do NOT line up with what an operator
+# says out loud. Standing behind the rover at the start box:
+#
+#     the zone STRAIGHT AHEAD (top-right, `zone-b`) is mission `m2`
+#     the FAR zone (top-left, `zone-a`)             is mission `m1`
+#
+# so the operator's spoken "Zone 1" — meaning the one in front of them — is the
+# code's `m2`. Nothing is renumbered here: renaming ids to match one operator's
+# vocabulary would silently change what every stored command, log line and
+# dashboard button means. Instead every operator-facing string names the CORNER,
+# because a corner is the one description that cannot be read two ways.
+TARGET_LABEL = {
+    "m1": "top-LEFT zone (zone-a, the far zone from the start box)",
+    "m2": "top-RIGHT zone (zone-b, straight ahead of the start box)",
+    "water": "bottom-LEFT water station",
+    "home": "start box, bottom-RIGHT, facing up the arena",
+}
+
+
+# ====================================================================== ROUTES
+# A ROUTE is an ordered list of single-target missions driven back to back
+# without returning between them, finished by ONE retrace of the whole thing.
+#
+# Legs are named by their single-target mission id rather than by coordinates so
+# there stays exactly one definition of where each target is (`mission_target`).
+# A route therefore cannot drift away from the single-target mission it is built
+# from — they are the same numbers by construction.
+#
+# WHY THIS ORDER (m2 -> m1 -> water) AND NOT ANOTHER
+# --------------------------------------------------
+# Two orders tie for shortest at 2232 mm of outbound travel: m2->m1->water and
+# water->m1->m2. Both walk three sides of the arena perimeter with two 90 deg
+# turns; every other permutation needs a diagonal and costs 300-600 mm more.
+# The tie is broken by the FIRST leg: the rover starts at the bottom-right
+# facing 90 deg, which points exactly at m2, so leg 1 needs NO turn at all. Each
+# turn is worth +/-1-4 deg of heading error that every later leg inherits, so
+# the order that spends zero turns before the first drive is the one to take.
+# It also happens to match the order an operator reads out ("zone in front,
+# then the far zone, then water"), which is a nice accident and not the reason.
+ROUTES = {
+    "patrol": {
+        "label": "ALL TARGETS",
+        "legs": ("m2", "m1", "water"),
+        # Operator-facing, corner-named. Never "zone 1 then zone 2".
+        "describe": ("top-RIGHT zone, then top-LEFT zone, then the bottom-LEFT "
+                     "water station, then RETRACE the whole path back to the "
+                     "start box"),
+    },
+}
+
+# Everything the `mission` verb will accept. Single-target missions keep their
+# own tuple because `mission_target` is defined for exactly those and several
+# payloads iterate it.
+COMMANDABLE = MISSIONS + tuple(ROUTES)
+
+
+def is_route(name):
+    return name in ROUTES
+
+
+def route_legs(name):
+    """Ordered [(leg_name, x_mm, y_mm, final_heading_deg or None), ...].
+
+    A single-target mission is returned as a ONE-LEG route on purpose. The
+    executor then has exactly one shape to run, so there is no second code path
+    that could drift away from the one the single-target missions have already
+    been proven on — the multi-leg case is the single case with the loop running
+    more than once, and nothing else.
+    """
+    if name in ROUTES:
+        return [(leg,) + tuple(mission_target(leg)) for leg in ROUTES[name]["legs"]]
+    return [(name,) + tuple(mission_target(name))]
+
+
+def route_description(name):
+    """One operator-facing sentence naming the physical corners, never numbers."""
+    if name in ROUTES:
+        return ROUTES[name]["describe"]
+    return TARGET_LABEL.get(name, name)
 
 
 def in_arena(x_mm, y_mm, pad_mm=0.0):
@@ -374,7 +487,29 @@ BEARING_TOL_DEG = 4.0    # heading error under this is not worth a turn segment
 HEADING_TOL_DEG = 3.0    # re-face tolerance at the end of a mission
 MAX_REFACE_DEG = 30.0    # a bigger error means the retrace failed; report it,
                          # do not spin the rover round trying to hide it
-MAX_SEGMENTS = 40        # adaptive re-planning must terminate, always
+
+# THE SEGMENT BUDGET IS PER LEG, NOT PER ROUTE. This is a deliberate choice and
+# it is worth the two constants.
+#
+# What the budget exists to catch is ADAPTIVE RE-PLANNING THAT WILL NOT
+# CONVERGE: `_drive_to` loops "measure bearing -> turn or drive" until the
+# target is inside ARRIVE_TOL_MM, and a rover that is oscillating instead of
+# closing must be stopped rather than left to churn. Convergence is a property
+# of ONE target. A route that converges perfectly on every leg would trip a
+# per-route counter purely for having more legs, and — worse — the counter would
+# mean something different on leg 3 than on leg 1, so the same misbehaviour
+# would abort early in the route and be tolerated late in it. That is a guard
+# whose meaning drifts, which is no guard at all.
+#
+# So MAX_SEGMENTS keeps its value and its meaning, applied per leg (a
+# single-target mission is a one-leg route, so it is unchanged), and a separate
+# absolute ceiling keeps the whole route bounded — because "every leg terminates"
+# does not by itself prove "the route terminates" if legs could ever be added
+# dynamically. Nominal `patrol` is ~20 outbound + ~20 retrace + 1 re-face; with
+# a correction turn after most legs a real run lands near 60-70. 200 is room to
+# be wrong without being unbounded, and MISSION_TIMEOUT_S bounds it in time too.
+MAX_SEGMENTS = 40        # PER LEG: adaptive re-planning must terminate, always
+MAX_ROUTE_SEGMENTS = 200  # PER ROUTE: absolute backstop across all legs + retrace
 
 CONTROL_HZ = 20.0        # phase6's loop rate, carried over
 CONTROL_DT = 1.0 / CONTROL_HZ
@@ -509,7 +644,10 @@ class Segment:
 
 
 def split_legs(dist_mm):
-    """Break a straight run into bounded legs: cruise legs, then dock bursts.
+    """Break ONE LEG's straight run into bounded segments: cruise, then dock.
+
+    (Historical name. What comes out are SEGMENTS of a single leg — see the
+    module docstring's terminology note — not legs of a route.)
 
     Two different bounds for two different reasons. The cruise legs are bounded
     at MAX_LEG_MM so heading is re-measured often enough that dead reckoning
@@ -561,6 +699,44 @@ def plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm):
         for mm, dock in split_legs(dist):
             segs.append(Segment("drive", mm, dock=dock))
     return segs
+
+
+def plan_multi_route(x_mm, y_mm, heading_deg, targets):
+    """Chain `plan_route` across an ordered list of (x_mm, y_mm) waypoints.
+
+    Returns [((tx_mm, ty_mm), [Segment, ...]), ...] — grouped by leg, because
+    the segment budget, the telemetry phase and the hold at each target are all
+    per-leg ideas and flattening them here would only mean regrouping later.
+    `route_segments` flattens when a flat list is what is wanted.
+
+    THERE IS NO SECOND GEOMETRY ROUTINE HERE, AND THERE MUST NEVER BE ONE.
+    Each leg is `plan_route` called again, and the pose it is planned from is the
+    pose the previous leg ENDS at, obtained by walking that leg's own segments
+    through `apply_segment` — the same function the executor's forward
+    kinematics and the preview both use. Anything else (chaining bearings
+    analytically, say) would be a parallel implementation of the same geometry,
+    and the two would eventually disagree. A drawn route that disagrees with the
+    driven one is worse than no route at all.
+
+    `measured=False` because nothing has executed: a plan is made of targets.
+    The executor still re-measures after every leg and inserts corrections, so
+    this is the nominal intent, never a promise.
+    """
+    pose = (float(x_mm), float(y_mm), float(heading_deg))
+    legs = []
+    for tx, ty in targets:
+        segs = plan_route(pose[0], pose[1], pose[2], tx, ty)
+        pose = apply_segments(pose, segs, measured=False)
+        legs.append(((tx, ty), segs))
+    return legs
+
+
+def route_segments(legs):
+    """Flatten `plan_multi_route` output into one segment list, in drive order."""
+    out = []
+    for _target, segs in legs:
+        out.extend(segs)
+    return out
 
 
 def invert_segments(segs):
@@ -627,6 +803,20 @@ def eta_seconds(segs):
         else:
             total += math.radians(abs(s.target)) / max(TURN_RADPS, 1e-6) + TURN_SETTLE_S
     return total
+
+
+def route_eta_seconds(legs, returns_home):
+    """Nominal wall time for a whole route, from `plan_multi_route` output.
+
+    The retrace is counted as a SECOND OUTBOUND rather than estimated on its
+    own: it replays the same motions with the same magnitudes, so by
+    construction it costs what the outbound cost. Every target gets a HOLD_S,
+    including the last one — the worker settles at every target it reaches,
+    which the old single-target estimate for `home` quietly left out.
+    """
+    outbound = eta_seconds(route_segments(legs))
+    total = outbound + len(legs) * HOLD_S
+    return total + outbound if returns_home else total
 
 
 def remaining_distance_mm(segs):
@@ -807,14 +997,26 @@ class Bus:
             self.publish("events/online",
                          {"svc": "missions", "status": "online",
                           "actions": ["mission"],
-                          "missions": list(MISSIONS),
+                          "missions": list(COMMANDABLE),
+                          "single_targets": list(MISSIONS),
                           "backends": list(BACKENDS),
                           "default_backend": DEFAULT_BACKEND,
                           "acts_silently_on": ["stop", "estop", "auto_off"],
                           "arena_mm": ARENA_MM,
                           "targets": {m: {"x_mm": jnum(mission_target(m)[0], 1),
-                                          "y_mm": jnum(mission_target(m)[1], 1)}
+                                          "y_mm": jnum(mission_target(m)[1], 1),
+                                          "label": TARGET_LABEL.get(m)}
                                       for m in MISSIONS},
+                          # Multi-leg routes, advertised with their leg order and
+                          # a corner-naming description — a consumer that builds
+                          # a button from `label` alone would otherwise have to
+                          # guess which physical zone "zone 1" meant.
+                          "routes": {r: {"legs": list(ROUTES[r]["legs"]),
+                                         "label": ROUTES[r]["label"],
+                                         "describe": ROUTES[r]["describe"],
+                                         "leg_labels": [TARGET_LABEL.get(leg)
+                                                        for leg in ROUTES[r]["legs"]]}
+                                     for r in ROUTES},
                           "limits": {"cruise_mps": CRUISE_MPS,
                                      "dock_mps": DOCK_MPS,
                                      "turn_radps": TURN_RADPS,
@@ -822,6 +1024,8 @@ class Bus:
                                      "dock_step_mm": DOCK_STEP_MM,
                                      "front_stop_mm": FRONT_STOP_MM,
                                      "mission_timeout_s": MISSION_TIMEOUT_S,
+                                     "max_segments_per_leg": MAX_SEGMENTS,
+                                     "max_segments_per_route": MAX_ROUTE_SEGMENTS,
                                      "batt_low_v": BATT_LOW_V}}, qos=1)
         except Exception as e:
             log(f"MQTT: on_connect error {e}")
@@ -1165,6 +1369,13 @@ class MissionNode(Node):
             "segment_i": st.segment_i,
             "segments_n": st.segments_n,
             "segment_kind": st.segment_kind,
+            # Route progress. `leg_label` names the CORNER rather than a number
+            # so an operator reading the card cannot mistake which zone the
+            # rover is at (see TARGET_LABEL).
+            "leg_i": st.leg_i,
+            "legs_n": st.legs_n,
+            "leg": st.leg_name,
+            "leg_label": TARGET_LABEL.get(st.leg_name) if st.leg_name else None,
             "distance_remaining_mm": jnum(st.distance_remaining_mm, 1),
             "distance_travelled_mm": jnum(st.distance_travelled_mm, 1),
             "eta_s": jnum(st.eta_s, 1),
@@ -1196,6 +1407,13 @@ class MissionState:
     segment_i: int = 0
     segments_n: int = 0
     segment_kind: str = None
+    # Which leg of a multi-leg route is being driven. A single-target mission is
+    # leg 1 of 1, so these are always meaningful and never need a None check.
+    leg_i: int = 0
+    legs_n: int = 0
+    leg_name: str = None
+    leg_segment_i: int = 0       # reset per leg; the budget is measured on it
+    leg_budget: int = MAX_SEGMENTS
     distance_remaining_mm: float = 0.0
     distance_travelled_mm: float = 0.0
     eta_s: float = 0.0
@@ -1537,8 +1755,8 @@ class MissionRunner:
         name = str(payload.get("name", "") or "")
         backend = str(payload.get("backend", "") or DEFAULT_BACKEND)
 
-        if name not in MISSIONS:
-            self._nack(f"unknown mission {name!r}", valid=list(MISSIONS))
+        if name not in COMMANDABLE:
+            self._nack(f"unknown mission {name!r}", valid=list(COMMANDABLE))
             return
         if backend not in BACKENDS:
             self._nack(f"unknown backend {backend!r}", valid=list(BACKENDS))
@@ -1580,10 +1798,12 @@ class MissionRunner:
             if pose is None:
                 self._nack("no pose: odometry has not been seen yet")
                 return
-            tx, ty, final_heading = mission_target(name)
-            if not in_arena(tx, ty):
-                self._nack(f"target ({tx:.0f}, {ty:.0f}) mm is outside the arena")
-                return
+            legs = route_legs(name)
+            for leg_name, tx, ty, _lh in legs:
+                if not in_arena(tx, ty):
+                    self._nack(f"leg {leg_name!r} target ({tx:.0f}, {ty:.0f}) mm "
+                               "is outside the arena")
+                    return
 
             b = self.backends[backend]
             ok, why = b.available()
@@ -1601,6 +1821,25 @@ class MissionRunner:
                     "see fpms_missions.py, COEXISTENCE.")
                 return
 
+            # The plan is built BEFORE acceptance so the ETA below is a real
+            # number rather than a guess, and so a route that cannot fit inside
+            # the mission timeout is refused now instead of aborting halfway
+            # round with the rover parked at the far corner.
+            plan_legs = plan_multi_route(pose[0], pose[1], pose[2],
+                                         [(t[1], t[2]) for t in legs])
+            plan = route_segments(plan_legs)
+            returns_home = name != "home"
+            eta = route_eta_seconds(plan_legs, returns_home)
+            if eta > MISSION_TIMEOUT_S:
+                self._nack(
+                    f"route {name!r} needs ~{eta:.0f}s nominal but "
+                    f"MISSION_TIMEOUT_S is {MISSION_TIMEOUT_S:.0f}s, so it would "
+                    "abort part-way and leave the rover away from the start box. "
+                    "Raise FPMS_MISSION_TIMEOUT_S in /etc/fpms/config.env, or "
+                    "run the legs as separate missions.",
+                    eta_s=jnum(eta, 1), timeout_s=MISSION_TIMEOUT_S)
+                return
+
             # ---- accepted ----
             self.node.halt.clear()
             self.abort_reason = None
@@ -1612,35 +1851,49 @@ class MissionRunner:
             st.segments_n = 0
             st.segment_kind = None
             st.distance_travelled_mm = 0.0
-            st.target = (tx, ty)
+            st.leg_i = 0
+            st.legs_n = len(legs)
+            st.leg_name = None
+            st.leg_segment_i = 0
+            # The FINAL target of the route, so a consumer that draws one marker
+            # draws the last place the rover is going rather than the first.
+            st.target = (legs[-1][1], legs[-1][2])
             st.started = time.monotonic()
 
-            plan = plan_route(pose[0], pose[1], pose[2], tx, ty)
             st.segments_n = len(plan)
             st.distance_remaining_mm = remaining_distance_mm(plan)
-            # A round trip is roughly twice the outbound, plus the hold. `home`
-            # is one way, so it is not doubled.
-            one_way = eta_seconds(plan)
-            st.eta_s = one_way if name == "home" else (2 * one_way + HOLD_S)
+            st.eta_s = eta
 
             self.thread = threading.Thread(
                 target=self._run, name="mission",
-                args=(name, backend, (tx, ty, final_heading), pose), daemon=True)
+                args=(name, backend, legs, pose), daemon=True)
             self.thread.start()
 
+        route_str = " -> ".join(f"({t[1]:.0f},{t[2]:.0f})" for t in legs)
         log(f"mission {name!r} accepted on backend {backend!r}: "
-            f"({pose[0]:.0f},{pose[1]:.0f})mm h={pose[2]:.0f}deg -> "
-            f"({tx:.0f},{ty:.0f})mm, {len(plan)} planned segments")
+            f"({pose[0]:.0f},{pose[1]:.0f})mm h={pose[2]:.0f}deg -> {route_str}mm, "
+            f"{len(legs)} leg(s), {len(plan)} planned segments, "
+            f"{'retrace home' if returns_home else 'one way'}")
         self.bus.publish("events/ack",
                          {"action": "mission", "name": name, "accepted": True,
                           "started": True, "backend": backend,
-                          "target": {"x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1)},
+                          "route": route_description(name),
+                          "legs": [{"name": t[0], "label": TARGET_LABEL.get(t[0]),
+                                    "x_mm": jnum(t[1], 1), "y_mm": jnum(t[2], 1)}
+                                   for t in legs],
+                          "legs_n": len(legs),
+                          # Kept for consumers written against the single-target
+                          # payload: the route's LAST target, which for a
+                          # one-leg mission is the same field it always was.
+                          "target": {"x_mm": jnum(legs[-1][1], 1),
+                                     "y_mm": jnum(legs[-1][2], 1)},
                           "from": {"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
                                    "heading_deg": jnum(pose[2], 1)},
                           "pose_assumed": bool(self.node.anchor.assumed),
                           "segments_planned": len(plan),
                           "eta_s": jnum(st.eta_s, 1),
-                          "returns_home": name != "home"}, qos=1)
+                          "return_strategy": "retrace" if returns_home else "none",
+                          "returns_home": returns_home}, qos=1)
 
     def _reload_anchor(self):
         """Re-read teleop's origin file after a set_coordinate.
@@ -1665,17 +1918,24 @@ class MissionRunner:
     def _preview(self, name, backend):
         """Publish the route this mission WOULD drive. Commands nothing.
 
-        The waypoints are produced by walking the same `plan_route` output
-        through the same `apply_segment` forward kinematics the executor uses,
-        rather than by a second geometry routine written for the map. That is
-        the point: a preview computed a different way would eventually disagree
-        with the drive, and a route drawn on a dashboard that the rover does not
-        actually follow is worse than drawing nothing.
+        The waypoints are produced by walking `plan_multi_route` — which is
+        `plan_route` called once per leg — through the same `apply_segment`
+        forward kinematics the executor uses, rather than by a second geometry
+        routine written for the map. That is the point: a preview computed a
+        different way would eventually disagree with the drive, and a route
+        drawn on a dashboard that the rover does not actually follow is worse
+        than drawing nothing. A multi-leg route changes NOTHING about that rule;
+        it just runs the same loop more than once.
 
         What it CANNOT show is re-planning. Execution re-measures the bearing
         after every leg and inserts corrections, so the real path deviates from
         this one — this is the nominal intent, not a promise. `nominal: true`
         says so to anyone rendering it.
+
+        The RETURN is not drawn. It is a retrace, so its line is this line
+        walked backwards: drawing it would put a second stroke exactly on top of
+        the first and tell the operator nothing they cannot already see.
+        `return_strategy: "retrace"` says what happens instead.
         """
         pose = self.node.pose()
         if pose is None:
@@ -1683,48 +1943,79 @@ class MissionRunner:
                        "(odometry has not been seen)", preview=True)
             return
 
-        tx, ty, final_heading = mission_target(name)
-        if not in_arena(tx, ty):
-            self._nack(f"target ({tx:.0f}, {ty:.0f}) mm is outside the arena",
-                       preview=True)
-            return
+        legs = route_legs(name)
+        for leg_name, tx, ty, _lh in legs:
+            if not in_arena(tx, ty):
+                self._nack(f"leg {leg_name!r} target ({tx:.0f}, {ty:.0f}) mm is "
+                           "outside the arena", preview=True)
+                return
 
-        plan = plan_route(pose[0], pose[1], pose[2], tx, ty)
+        plan_legs = plan_multi_route(pose[0], pose[1], pose[2],
+                                     [(t[1], t[2]) for t in legs])
+        plan = route_segments(plan_legs)
 
         # Cumulative pose after each segment. measured=False because nothing has
         # executed — these are the TARGETS, which is what a preview means.
+        #
+        # One flat waypoint list, because that is what the arena map draws: a
+        # polyline. Each point carries the leg it belongs to so a renderer that
+        # wants to colour or label the legs can, without needing a second,
+        # differently-shaped payload.
         pts = [{"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
-                "heading_deg": jnum(pose[2], 1), "kind": "start"}]
+                "heading_deg": jnum(pose[2], 1), "kind": "start",
+                "leg_i": 0, "leg": None}]
         p = pose
-        for seg in plan:
-            p = apply_segment(p, seg, measured=False)
-            pts.append({"x_mm": jnum(p[0], 1), "y_mm": jnum(p[1], 1),
-                        "heading_deg": jnum(p[2], 1),
-                        "kind": seg.kind, "dock": bool(seg.dock)})
+        leg_meta = []
+        for i, ((tx, ty), segs) in enumerate(plan_legs, 1):
+            leg_name = legs[i - 1][0]
+            for seg in segs:
+                p = apply_segment(p, seg, measured=False)
+                pts.append({"x_mm": jnum(p[0], 1), "y_mm": jnum(p[1], 1),
+                            "heading_deg": jnum(p[2], 1),
+                            "kind": seg.kind, "dock": bool(seg.dock),
+                            "leg_i": i, "leg": leg_name})
+            # The last point of a leg is a target the rover holds at. Marked so
+            # the map can put a pin there rather than treating it as one more
+            # anonymous vertex in a long polyline.
+            if segs:
+                pts[-1]["waypoint"] = leg_name
+            leg_meta.append({"i": i, "name": leg_name,
+                             "label": TARGET_LABEL.get(leg_name),
+                             "x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1),
+                             "final_heading_deg": jnum(legs[i - 1][3], 1),
+                             "segments": len(segs),
+                             "distance_mm": jnum(remaining_distance_mm(segs), 1)})
 
-        one_way = eta_seconds(plan)
+        returns_home = name != "home"
         self.bus.publish("telemetry/mission_plan", {
             "mission": name,
             "backend": backend,
             "nominal": True,
+            "route": route_description(name),
             "pose_assumed": bool(self.node.anchor.assumed),
             "from": {"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
                      "heading_deg": jnum(pose[2], 1)},
-            "target": {"x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1),
-                       "final_heading_deg": jnum(final_heading, 1)},
+            # Unchanged meaning for a one-leg mission; for a route it is the
+            # LAST target, which is where the outbound line ends.
+            "target": {"x_mm": jnum(legs[-1][1], 1), "y_mm": jnum(legs[-1][2], 1),
+                       "final_heading_deg": jnum(legs[-1][3], 1)},
+            "legs": leg_meta,
+            "legs_n": len(legs),
             "segments": [{"kind": s.kind, "target": jnum(s.target, 1),
                           "dock": bool(s.dock)} for s in plan],
             "waypoints": pts,
             "distance_mm": jnum(remaining_distance_mm(plan), 1),
-            "eta_s": jnum(one_way if name == "home" else 2 * one_way + HOLD_S, 1),
-            "returns_home": name != "home",
+            "eta_s": jnum(route_eta_seconds(plan_legs, returns_home), 1),
+            "return_strategy": "retrace" if returns_home else "none",
+            "returns_home": returns_home,
         }, qos=1)
 
-        log(f"preview {name!r}: {len(plan)} segments, "
-            f"{remaining_distance_mm(plan):.0f}mm, no motion commanded")
+        log(f"preview {name!r}: {len(legs)} leg(s), {len(plan)} segments, "
+            f"{remaining_distance_mm(plan):.0f}mm outbound, no motion commanded")
         self.bus.publish("events/ack",
                          {"action": "mission", "name": name, "preview": True,
                           "accepted": True, "started": False,
+                          "legs_n": len(legs),
                           "segments_planned": len(plan)}, qos=1)
 
     def _wire_is_ours(self):
@@ -1797,8 +2088,27 @@ class MissionRunner:
             time.sleep(0.05)
 
     # --------------------------------------------------------------- worker
-    def _run(self, name, backend_name, target, start_pose):
-        tx, ty, final_heading = target
+    def _run(self, name, backend_name, legs, start_pose):
+        """Drive every leg in order, hold at each, then ONE retrace of the lot.
+
+        THE RETRACE IS OF THE WHOLE ROUTE, NOT OF EACH LEG. That is the entire
+        reason a multi-leg route is worth having rather than three missions run
+        back to back: `executed` accumulates across every leg, so
+        `invert_segments` unwinds the complete outbound path in one pass and
+        each individual motion is still cancelled by the amount it was MEASURED
+        at. Retracing leg by leg would send the rover home between targets and
+        drive the arena four times over; re-planning a short hop home from the
+        last target instead would be the one thing the module docstring says not
+        to do, because a fresh plan carries the accumulated drift home with it
+        rather than cancelling it.
+
+        The consequence to be honest about: the return reverses along all three
+        legs, so a `patrol` reverses for the full outbound distance. That is
+        safe here only because the LiDAR is 360 deg and the guard watches the
+        REAR cone while reversing (`front_clearance_mm(..., reverse=True)`), and
+        it is why the arena being obstacle-free is a stated precondition and not
+        an assumption buried in the geometry.
+        """
         st = self.state
         backend = self.backends[backend_name]
         executed = []
@@ -1806,30 +2116,49 @@ class MissionRunner:
         reason = "done"
         start_yaw = self.node.yaw()
         t0 = time.monotonic()
+        final_heading = legs[-1][3]
 
         try:
-            if backend_name == "nav2":
-                sx, sy = standoff_point(start_pose[0], start_pose[1], tx, ty)
+            for leg_i, (leg_name, tx, ty, _leg_heading) in enumerate(legs, 1):
+                # Fresh convergence budget per leg — see MAX_SEGMENTS.
+                self._begin_leg(leg_name, leg_i)
+                st.target = (tx, ty)
                 st.phase = "outbound"
-                approach = bearing_deg(tx - start_pose[0], ty - start_pose[1])
-                backend.goto(sx, sy, approach)
-                # Nav2 got us close; the dock is always ours.
-                st.phase = "docking"
-                executed += self._drive_to(tx, ty, dock_only=True)
-            else:
-                executed += self._drive_to(tx, ty)
+                if backend_name == "nav2":
+                    # Standoff from the LIVE pose, not from start_pose: on leg 2
+                    # and beyond the rover is nowhere near where the mission was
+                    # accepted, and a standoff measured from the start box would
+                    # aim at a point on the wrong side of the target.
+                    here = self.node.pose()
+                    if here is None:
+                        raise MissionAbort(ABORT_LINK)
+                    sx, sy = standoff_point(here[0], here[1], tx, ty)
+                    approach = bearing_deg(tx - here[0], ty - here[1])
+                    backend.goto(sx, sy, approach)
+                    # Nav2 got us close; the dock is always ours.
+                    st.phase = "docking"
+                    executed += self._drive_to(tx, ty, dock_only=True)
+                else:
+                    executed += self._drive_to(tx, ty)
 
-            st.phase = "hold"
-            self.settle(HOLD_S)
+                # A full stop at every target. On this firmware a stop IS the
+                # speed control (see the docstring), so the hold is doing double
+                # duty: it is the operator-visible dwell AND the settle that
+                # makes the next leg's first measurement trustworthy.
+                st.phase = "hold"
+                self.settle(HOLD_S)
 
             if name == "home":
                 # `home` IS the return. Retracing it would drive the rover back
                 # to wherever it happened to be when the button was pressed,
                 # which is the opposite of what the operator asked for.
+                self._begin_leg("reface", len(legs) + 1)
                 st.phase = "reface"
                 executed += self._reface(final_heading)
             else:
+                self._begin_leg("home", len(legs) + 1)
                 st.phase = "return"
+                st.target = (ROVER_START["x_mm"], ROVER_START["y_mm"])
                 if backend_name == "nav2":
                     hx, hy, hh = mission_target("home")
                     here = self.node.pose()
@@ -1841,12 +2170,23 @@ class MissionRunner:
                 else:
                     # THE RETRACE. Not a fresh plan: the measured outbound
                     # motions, reversed and negated, so their errors cancel.
+                    # After a multi-leg route this unwinds EVERY leg in one
+                    # pass — see this method's docstring for why that is the
+                    # point rather than an accident.
                     retrace = invert_segments(executed)
                     st.segments_n = len(executed) + len(retrace)
                     st.distance_remaining_mm = remaining_distance_mm(retrace)
                     st.eta_s = eta_seconds(retrace)
+                    # A retrace is a FIXED list, not an adaptive search, so the
+                    # convergence budget is the wrong shape for it: on a long
+                    # route the replay legitimately runs more segments than
+                    # MAX_SEGMENTS while behaving perfectly. Its own length is
+                    # the exact right bound — running one more segment than the
+                    # list holds would be a bug, not slow progress.
+                    self._begin_leg("home", len(legs) + 1, budget=len(retrace))
                     for seg in retrace:
                         executed.append(self._run_one(backend, seg))
+                self._begin_leg("reface", len(legs) + 2)
                 st.phase = "reface"
                 executed += self._reface(ROVER_START["heading_deg"], start_yaw=start_yaw)
 
@@ -1865,21 +2205,47 @@ class MissionRunner:
             st.driving = False
             st.reversing = False
 
-        self._report(name, backend_name, target, start_pose, executed,
+        self._report(name, backend_name, legs, start_pose, executed,
                      outcome, reason, time.monotonic() - t0, start_yaw)
         st.phase = "idle"
         st.name = None
         st.segment_kind = None
         st.distance_remaining_mm = 0.0
         st.eta_s = 0.0
+        st.leg_i = 0
+        st.legs_n = 0
+        st.leg_name = None
+
+    def _begin_leg(self, leg_name, leg_i, budget=MAX_SEGMENTS):
+        """Start a leg: name it, and give it a FRESH segment budget.
+
+        The single place a leg's budget is reset, so a leg cannot be started
+        without one. `budget` is per-leg by default (see MAX_SEGMENTS); the
+        retrace overrides it because a fixed replay is bounded by its own
+        length, not by a convergence allowance.
+        """
+        st = self.state
+        st.leg_name = leg_name
+        st.leg_i = leg_i
+        st.leg_segment_i = 0
+        st.leg_budget = int(budget)
 
     def _run_one(self, backend, seg):
         st = self.state
         st.segment_i += 1
+        st.leg_segment_i += 1
         st.segment_kind = seg.kind
-        if st.segment_i > MAX_SEGMENTS:
-            raise MissionAbort(f"segment budget exhausted ({MAX_SEGMENTS}); "
-                               "the rover is not converging on the target")
+        # PER-LEG first, because it is the guard that carries meaning: it says
+        # "this leg is not converging on its target". The route ceiling below is
+        # the backstop that keeps the whole thing finite regardless.
+        if st.leg_segment_i > st.leg_budget:
+            raise MissionAbort(
+                f"segment budget exhausted ({st.leg_budget} for leg "
+                f"{st.leg_i}/{st.legs_n} {st.leg_name!r}); the rover is not "
+                "converging on that target")
+        if st.segment_i > MAX_ROUTE_SEGMENTS:
+            raise MissionAbort(f"route segment ceiling exhausted "
+                               f"({MAX_ROUTE_SEGMENTS} across all legs)")
         out = backend.run_segment(seg)
         if out.kind == "drive":
             st.distance_travelled_mm += abs(out.measured)
@@ -1958,10 +2324,11 @@ class MissionRunner:
         return executed
 
     # --------------------------------------------------------------- report
-    def _report(self, name, backend_name, target, start_pose, executed,
+    def _report(self, name, backend_name, legs, start_pose, executed,
                 outcome, reason, elapsed, start_yaw):
         """events/mission_done — MEASURED outcome, never the requested one."""
         pose = self.node.pose()
+        st = self.state
         drives = [s for s in executed if s.kind == "drive" and s.executed]
         turns = [s for s in executed if s.kind == "turn" and s.executed]
         travelled = sum(abs(s.measured) for s in drives)
@@ -1988,7 +2355,21 @@ class MissionRunner:
             "distance_travelled_mm": jnum(travelled, 1),
             "segments_executed": len(executed),
             "turns": len(turns), "drives": len(drives),
-            "target": {"x_mm": jnum(target[0], 1), "y_mm": jnum(target[1], 1)},
+            "retraced": len([s for s in executed if s.retrace]),
+            # The route's FINAL target. Same field, same meaning, for a one-leg
+            # mission; `legs` below carries the rest.
+            "target": {"x_mm": jnum(legs[-1][1], 1), "y_mm": jnum(legs[-1][2], 1)},
+            "route": route_description(name),
+            "legs": [{"name": t[0], "label": TARGET_LABEL.get(t[0]),
+                      "x_mm": jnum(t[1], 1), "y_mm": jnum(t[2], 1)} for t in legs],
+            "legs_n": len(legs),
+            # The leg it was WORKING ON when it finished or aborted — not a
+            # count of legs completed, because a run that aborts halfway down
+            # leg 2 was on leg 2 and had completed one. On an abort this is the
+            # difference between "never left the start box" and "stopped at the
+            # far corner", which is the first thing an operator needs to know.
+            "leg_at_end": max(0, min(st.leg_i, len(legs))),
+            "leg_at_end_label": TARGET_LABEL.get(st.leg_name),
             "start_pose": {"x_mm": jnum(start_pose[0], 1),
                            "y_mm": jnum(start_pose[1], 1),
                            "heading_deg": jnum(start_pose[2], 1)},
@@ -2009,7 +2390,8 @@ class MissionRunner:
                                      "y_mm": jnum(pose[1], 1),
                                      "heading_deg": jnum(pose[2], 1)}
         log(f"mission {name!r} {outcome}: {reason}; {travelled:.0f}mm travelled, "
-            f"{len(executed)} segments, {elapsed:.1f}s")
+            f"{len(executed)} segments over {len(legs)} leg(s) "
+            f"(last: {st.leg_name!r}), {elapsed:.1f}s")
         self.bus.publish("events/mission_done", payload, qos=1)
         self.bus.publish("telemetry/mission", self.node.snapshot())
 

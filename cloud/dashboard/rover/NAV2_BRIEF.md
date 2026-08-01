@@ -99,6 +99,24 @@ Measured wheels-off, nothing else publishing `/cmd_vel`:
 point twist is read. Any guard comparing a commanded sign against reported twist
 will fire on correct motion and stay silent on real reversal.
 
+**"Trust pose" has to include the SIGN, not just the magnitude.** Taking a
+distance from `hypot(dx, dy)` and its direction from the twist is still a twist
+read in front of a direction decision. Get the sign from the pose too, by
+projecting the delta onto the board's own reported yaw *from the same message*:
+
+    along = dx*cos(board_yaw) + dy*sin(board_yaw)
+
+`fpms_teleop.py` `_on_odom` / `summarize_leg` and `fpms_odom_tf.py`
+`travel_sign()` all do this. If `/odom_raw`'s orientation is identity, this
+degenerates to `dx` — which is exactly the signed quantity the table above was
+read from, so the identity case is the measured case. Twist is a last resort for
+a genuinely ambiguous projection, and `fpms_odom_tf.py` counts how often that
+happens rather than letting it be invisible.
+
+Note also that `hypot()` is unsigned, so "no directional evidence → assume
+forward" turns a parked rover's position noise into a monotonic forward creep.
+With no evidence the honest displacement is **zero**.
+
 ### 3b. The firmware cannot express slow motion — this is the big one
 
 From the firmware source:
@@ -168,10 +186,24 @@ In the repo at `cloud/dashboard/rover/`:
 - `fpms_teleop.py` — the bridge. 0.6 s jog deadman, closed-loop nudge/turn,
   lurch guard that differentiates **pose** (not twist), full command set.
 - `fpms_odom_tf.py` + `fpms-odom-tf.service` — **authored, NOT yet installed.**
-  Position from `/odom_raw` pose deltas, heading from integrated gyro Z with
-  stationary bias estimation. Publishes `/odom` and `odom`→`base_footprint` TF.
-  Stamps with the **Pi's** ROS clock, not the board's (board time falls outside
-  tf2's buffer and Nav2 rejects it with a confusing extrapolation error).
+  Position from `/odom_raw` pose deltas (magnitude *and* sign, see §3a), heading
+  from integrated gyro Z with stationary bias estimation. Publishes `/odom` and
+  `odom`→`base_footprint` TF. Stamps with the **Pi's** ROS clock, not the
+  board's (board time falls outside tf2's buffer and Nav2 rejects it with a
+  confusing extrapolation error). `python3 fpms_odom_tf.py --selftest` runs the
+  pure-math checks off-robot and prints why the LiDAR correction is disabled.
+  **Heading is GYRO ONLY and that is a deliberate, documented choice** — this is
+  a skid-steer chassis, so an encoder-derived yaw carries an unmeasured
+  effective-track slip factor; the complementary filter is written but its time
+  constant is `None` until two named measurements exist. The encoder yaw is
+  accumulated as a cross-check and reported every 30 s.
+
+  **Open contradiction in this repo, nobody has checked:** is `/odom_raw`'s
+  `pose.pose.orientation` a real encoder yaw or the identity quaternion?
+  `fpms_teleop.py` `_on_odom` says "the board publishes an identity
+  orientation"; its `summarize_leg` says "odom yaw is dead-reckoned from the
+  wheels". One `ros2 topic echo /odom_raw --once` after a turn settles it.
+  `fpms_odom_tf.py` logs which it observed at startup.
 - `deadband_sweep.py` — **BROKEN**: reads the inverted twist, so its wrong-way
   detector is backwards. Fix to use pose before re-running.
 - `deploy_rover.py` — backup + on-Pi syntax check + rollback. **Refuses to

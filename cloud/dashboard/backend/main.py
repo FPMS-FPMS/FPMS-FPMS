@@ -576,23 +576,52 @@ THING_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # an action not in this set must 400 here rather than being published and
 # left to be nacked on the far end.
 #
-# On the rover, no single process owns this whole list: sensor/status
-# commands (test_motors, read_encoders, ping, status, beep, servo) are
-# handled by `fpms-rover-agent`, while motion/actuator commands (jog, nudge,
-# turn, mission, set_coordinate, set_speed) are handled by `fpms-teleop` on
-# ROS_DOMAIN_ID=20. A command's arrival here does not imply a single
-# receiver on the far end.
+# On the rover, no single process owns this whole list. The authoritative
+# source for each half is on the rover itself:
+#
+#   fpms_teleop.py    TELEOP_ACTIONS  — motion, actuators, the board-side
+#                     diagnostics, and its own drive_* verbs. It publishes this
+#                     dict verbatim on events/online and in every drive_status
+#                     reply, precisely so the dashboard does not have to guess.
+#   fpms_missions.py  "mission"       — the mission executor, which also ACTS
+#                     on stop/estop/auto_off/set_coordinate without answering.
+#   fpms_rover_agent  ping, status, connect, disconnect, restart.
+#
+# A command's arrival here does not imply a single receiver on the far end, and
+# an action being in this set is NOT a claim that anything answers it — see
+# `auto_on` below.
+#
+# THIS SET MUST BE A SUPERSET OF THE ROVER'S. It is only a topic-injection
+# guard: a verb the rover supports but this set omits is refused with a 400
+# before it is ever published, which looks to the operator exactly like a
+# dashboard bug and cannot be diagnosed from the rover side at all. That is what
+# happened to the three drive_* verbs below — fpms-teleop subscribed and
+# advertised them, and every attempt to send one 400'd here.
 CONTROL_ACTIONS = {
-    # Lifecycle / connectivity
+    # Lifecycle / connectivity — fpms-rover-agent.
     "connect", "disconnect", "restart",
-    # Safety / autonomy toggles
+    # Safety / autonomy toggles.
+    #
+    # `auto_on` is deliberately kept even though NOTHING on the rover subscribes
+    # it: fpms-rover-agent answers it with a nack that names where autonomy
+    # actually lives (the mission executor). Dropping it from this set would
+    # replace that useful refusal with a 400 that says nothing.
     "stop", "estop", "auto_on", "auto_off",
     # Manual driving (Drive page): a streamed analog jog, bounded steps, a
     # closed-loop turn, named missions, and a pose correction.
     "jog", "nudge", "turn", "mission", "set_coordinate",
-    # Diagnostics / sensing
+    # Diagnostics / sensing.
     "test_motors", "read_encoders", "ping", "status",
-    # Actuators / misc
+    # fpms-teleop's OWN status and stream verbs. Distinctly named so they do not
+    # shadow fpms-rover-agent's ping/status/connect/disconnect — the two
+    # services answer different questions and both must stay reachable, which is
+    # the whole reason teleop chose separate names.
+    #
+    # `drive_status` is the richest read on the rover (motion envelope, deadband
+    # floors, micro-ROS link, and the live TELEOP_ACTIONS list itself) and it
+    # commands no motion, so it is also the dashboard's capability-refresh path.
+    "drive_status", "drive_connect", "drive_disconnect",
+    # Actuators / misc.
     "beep", "servo", "set_speed",
 }
 

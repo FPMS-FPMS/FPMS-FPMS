@@ -3,10 +3,21 @@ import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import ErrorBoundary from "../components/ErrorBoundary";
 import Joystick, { type StickValue } from "../components/Joystick";
-import { ArenaMap, type RoutePoint } from "../components/ArenaMap";
+import { ArenaMap } from "../components/ArenaMap";
 import { useChannel } from "../lib/ws";
 import { apiPostJson } from "../lib/api";
 import { useThings } from "../lib/things";
+// Mission normalisation lives in lib/mission so that Control and LiDAR inherit
+// the same three rules — missing is not zero, an unknown phase is RUNNING, and
+// stale-while-running is loud — rather than each reimplementing them.
+import {
+  MISSION_STALE_MS,
+  poseEnvelopeFromMm,
+  readMission,
+  readPlan,
+  type MissionPlan,
+  type MissionState,
+} from "../lib/mission";
 
 /**
  * Manual driving. Control.tsx is the command console — discrete actions and
@@ -78,15 +89,6 @@ const ACK_TIMEOUT_MS = 3000;
 const LOG_LIMIT = 40;
 
 /**
- * Mission telemetry older than this stops being the rover's state and starts
- * being history. Shorter than TELEMETRY_STALE_MS on purpose: a mission is a
- * machine driving itself across a room, and "the progress bar is six seconds
- * out of date" is a materially different situation from a health panel being
- * six seconds out of date.
- */
-const MISSION_STALE_MS = 6000;
-
-/**
  * Which executor drives a mission.
  *
  * deadreckon is the default because it is the only one that has ever worked:
@@ -117,82 +119,32 @@ type MissionBackend = (typeof MISSION_BACKENDS)[number]["id"];
 
 const DEFAULT_MISSION_BACKEND: MissionBackend = "deadreckon";
 
-/** The four routes offered. Kept as data so the buttons and the wiring agree. */
-const MISSIONS: { name: string; label: string; primary?: boolean }[] = [
-  { name: "home", label: "RETURN HOME", primary: true },
-  { name: "m1", label: "MISSION 1" },
-  { name: "m2", label: "MISSION 2" },
-  { name: "water", label: "WATER REFILL" },
+/**
+ * The routes offered. Kept as data so the buttons and the wiring agree.
+ *
+ * `where` names the physical CORNER, because the ids do not line up with what
+ * an operator says out loud: standing at the start box, the zone straight ahead
+ * is `m2` and the far one is `m1`, so a spoken "zone 1" is the code's m2. The
+ * ids are not renumbered — fpms_missions.py explains why — so the tooltip is
+ * what stops an operator sending the rover to the opposite corner.
+ */
+const MISSIONS: {
+  name: string;
+  label: string;
+  where: string;
+  primary?: boolean;
+}[] = [
+  { name: "home", label: "RETURN HOME", where: "start box, bottom-right", primary: true },
+  { name: "m1", label: "MISSION 1", where: "top-LEFT zone (zone A, the far one)" },
+  { name: "m2", label: "MISSION 2", where: "top-RIGHT zone (zone B, straight ahead of the start box)" },
+  { name: "water", label: "WATER REFILL", where: "bottom-LEFT water station" },
+  {
+    name: "patrol",
+    label: "ALL TARGETS",
+    where:
+      "top-RIGHT zone, then top-LEFT zone, then the water station, then retraces the whole path back to the start box",
+  },
 ];
-
-/**
- * Phases that mean "not driving". A phase outside this set — including one we
- * have never seen — counts as running, because the failure that matters is
- * showing "idle" while the rover is moving, not the reverse.
- */
-const MISSION_IDLE_PHASES = new Set([
-  "idle", "ready", "none", "done", "complete", "completed", "finished",
-  "aborted", "cancelled", "canceled", "failed", "error", "stopped",
-]);
-
-/**
- * Normalised mission state. Every field is optional because every field can be
- * genuinely absent: the executor may not be running, may have no pose, and may
- * have no LiDAR. A missing field is NOT zero — rendering `undefined` as 0 once
- * blanked this dashboard, and a mission card that says "0 mm remaining" when it
- * means "I have no idea" is the same class of lie.
- */
-type MissionState = {
-  mission: string | null;
-  backend: string | null;
-  phase: string | null;
-  segmentI: number | null;
-  segmentsN: number | null;
-  segmentKind: string | null;
-  remainingMm: number | null;
-  travelledMm: number | null;
-  etaS: number | null;
-  elapsedS: number | null;
-  targetX: number | null;
-  targetY: number | null;
-  poseAssumed: boolean;
-  odomSource: string | null;
-  linkOk: boolean | null;
-  battV: number | null;
-  frontMm: number | null;
-  lidarOk: boolean | null;
-  running: boolean;
-};
-
-function readMission(raw: unknown): MissionState | null {
-  if (!raw || typeof raw !== "object") return null;
-  const d = raw as any;
-  const phase = typeof d.phase === "string" ? d.phase : null;
-  const tgt = d.target && typeof d.target === "object" ? d.target : {};
-  return {
-    mission: typeof d.mission === "string" ? d.mission : null,
-    backend: typeof d.backend === "string" ? d.backend : null,
-    phase,
-    segmentI: num(d.segment_i),
-    segmentsN: num(d.segments_n),
-    segmentKind: typeof d.segment_kind === "string" ? d.segment_kind : null,
-    remainingMm: num(d.distance_remaining_mm),
-    travelledMm: num(d.distance_travelled_mm),
-    etaS: num(d.eta_s),
-    elapsedS: num(d.elapsed_s),
-    targetX: num(tgt.x_mm),
-    targetY: num(tgt.y_mm),
-    poseAssumed: !!d.pose_assumed,
-    odomSource: typeof d.odom_source === "string" ? d.odom_source : null,
-    linkOk: typeof d.link_ok === "boolean" ? d.link_ok : null,
-    battV: num(d.batt_v),
-    frontMm: num(d.front_mm),
-    lidarOk: typeof d.lidar_ok === "boolean" ? d.lidar_ok : null,
-    // Unknown phases count as RUNNING. Showing "idle" while the rover is
-    // driving is the dangerous error; the reverse is only untidy.
-    running: phase !== null && !MISSION_IDLE_PHASES.has(phase),
-  };
-}
 
 type Action = "stop" | "jog" | "nudge" | "turn" | "mission" | "set_coordinate";
 
@@ -246,30 +198,52 @@ export default function Drive() {
   const poseCh = useChannel<any>(thing ? `pose:${thing}` : null);
 
   const planCh = useChannel<any>(thing ? `mission_plan:${thing}` : null);
-  const planRaw = readTelemetry(planCh.data) as any;
+  const planRaw = readPlan(planCh.data);
 
   // useChannel has no clear(), so dismissal is local: remember which plan was
   // dismissed by its timestamp. Keyed on the plan itself rather than a boolean
   // so the NEXT preview reappears automatically instead of staying hidden
   // behind a flag the operator has forgotten they set.
   const [dismissedPlanTs, setDismissedPlanTs] = useState<number | null>(null);
-  const planTs = Number.isFinite(planRaw?.ts) ? planRaw.ts : null;
-  const plan = planTs !== null && planTs === dismissedPlanTs ? null : planRaw;
+  const planTs = planRaw?.ts ?? null;
+  const plan: MissionPlan | null =
+    planTs !== null && planTs === dismissedPlanTs ? null : planRaw;
+  const planRoute = plan?.waypoints ?? null;
 
-  const planRoute: RoutePoint[] | null = Array.isArray(plan?.waypoints)
-    ? plan.waypoints
-        .filter(
-          (w: any) => Number.isFinite(w?.x_mm) && Number.isFinite(w?.y_mm),
-        )
-        .map((w: any) => ({
-          x_mm: w.x_mm,
-          y_mm: w.y_mm,
-          kind: w.kind,
-          dock: !!w.dock,
-        }))
-    : null;
   const mission = readMission(readTelemetry(missionCh.data));
   const [backend, setBackend] = useState<MissionBackend>(DEFAULT_MISSION_BACKEND);
+
+  /**
+   * Where the arena map draws the rover.
+   *
+   * This page was passing the rover-agent heartbeat straight through, and that
+   * heartbeat carries no position at all — so the map on the DRIVE tab, the one
+   * an operator uses to decide whether a mission is going the right way, drew
+   * the rover parked in the start corner no matter where it actually was. Both
+   * the mission executor and the teleop bridge publish a real dead-reckoned
+   * pose in millimetres; the executor wins when it has one, because it is the
+   * process doing the driving and a map that disagreed with the mission card
+   * would leave two positions on screen and no way to tell which the rover was
+   * steering by.
+   *
+   * When nothing has a position we fall back to the heartbeat envelope, exactly
+   * as before, so `readPose` raises its own SIMULATED badge. That fallback is
+   * the point: this must never manufacture a coordinate, or the badge saying
+   * the position is assumed would disappear while it still was.
+   */
+  const mapPose =
+    poseEnvelopeFromMm(
+      mission?.poseX ?? null,
+      mission?.poseY ?? null,
+      mission?.poseHeadingDeg ?? null,
+    ) ??
+    poseEnvelopeFromMm(num(tele?.x_mm), num(tele?.y_mm), num(tele?.heading_deg));
+  const mapPoseSource =
+    mapPose === null
+      ? null
+      : mission?.poseX !== null && mission?.poseX !== undefined
+        ? "mission executor"
+        : "teleop bridge";
 
   // Staleness is a function of wall time, not of arriving data — without a tick
   // a feed that simply stops would keep rendering its last value as current
@@ -688,22 +662,39 @@ export default function Drive() {
                 title="Arena"
                 subtitle="Fixed birdseye · the rover moves, the map does not"
                 right={
-                  planRoute ? (
-                    <span className="chip font-mono" title="A planned route is shown">
-                      route · {planRoute.length} pts
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={mapPoseSource ? "chip font-mono" : "chip-warn font-mono"}
+                      title={
+                        mapPoseSource
+                          ? `Rover drawn from the ${mapPoseSource}'s dead-reckoned pose`
+                          : "Nothing is publishing a position — the rover is drawn at the assumed start corner"
+                      }
+                    >
+                      pose · {mapPoseSource ?? "assumed"}
                     </span>
-                  ) : (
-                    <span className="chip font-mono text-slate-500">no plan</span>
-                  )
+                    {planRoute ? (
+                      <span className="chip font-mono" title="A planned route is shown">
+                        route · {planRoute.length} pts
+                      </span>
+                    ) : (
+                      <span className="chip font-mono text-slate-500">no plan</span>
+                    )}
+                  </div>
                 }
               />
               <div className="mx-auto w-full max-w-[560px]">
                 <ArenaMap
                   thing={thing}
-                  poseEnvelope={poseCh.data}
+                  poseEnvelope={mapPose ?? poseCh.data}
                   route={planRoute}
                 />
               </div>
+              <p className="mt-3 text-xs text-slate-500">
+                {mapPoseSource
+                  ? `The rover glyph is the ${mapPoseSource}'s own position, dead-reckoned in arena millimetres — nothing on this rover localises against the map, so it drifts and only a set coordinate resets it.`
+                  : "Nothing is publishing a position, so the rover is drawn at the assumed start corner and the map says SIMULATED. Neither the mission executor nor the teleop bridge has reported x/y."}
+              </p>
             </Card>
           </ErrorBoundary>
         ) : null}
@@ -873,15 +864,21 @@ export default function Drive() {
                 Plan first · shows the route, drives nothing
               </div>
               <div className="flex flex-wrap gap-2">
-                {MISSIONS.filter((m) => m.name !== "home").map((m) => (
+                {/* RETURN HOME is previewable too, and used to be the one route
+                    you could not look at before committing to it. The executor
+                    plans it through the identical code path as the others —
+                    fpms_missions._preview accepts any name in MISSIONS — and
+                    "get the rover back" is exactly the moment an operator wants
+                    to see the line before pressing the button. */}
+                {MISSIONS.map((m) => (
                   <button
                     key={m.name}
                     className="chip"
                     onClick={() => planMission(m.name)}
                     disabled={!thing}
-                    title={`Preview the route to ${m.name} without moving`}
+                    title={`Preview the route to ${m.name} — ${m.where} — without moving`}
                   >
-                    PLAN {m.label.replace(/^MISSION /, "")}
+                    PLAN {m.label.replace(/^MISSION /, "").replace(/^RETURN /, "")}
                   </button>
                 ))}
                 {planRoute ? (
@@ -896,16 +893,21 @@ export default function Drive() {
               </div>
               {plan ? (
                 <div className="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
-                  <span className="font-mono">{plan.mission}</span> ·{" "}
-                  {Math.round(plan.distance_mm)} mm ·{" "}
-                  {plan.segments?.length ?? 0} segments · ETA ~
-                  {Math.round(plan.eta_s)} s
-                  {plan.returns_home ? " · returns home" : ""}
+                  {/* Every number here can be genuinely absent, and an absent
+                      distance rendered as "0 mm" would read as "already
+                      there" — which is the most misleading thing a route
+                      summary could possibly say. */}
+                  <span className="font-mono">{plan.mission ?? "--"}</span> ·{" "}
+                  {plan.distanceMm === null ? "--" : `${Math.round(plan.distanceMm)} mm`} ·{" "}
+                  {plan.segments === null ? "--" : plan.segments} segments · ETA{" "}
+                  {plan.etaS === null ? "--" : `~${Math.round(plan.etaS)} s`}
+                  {plan.returnsHome ? " · returns home" : ""}
+                  {plan.backend ? ` · via ${plan.backend}` : ""}
                   <div className="mt-1 text-[11px] text-sky-200/70">
                     Nominal route. The executor re-measures its bearing after
                     every leg and inserts corrections, so the driven path will
                     differ from this line.
-                    {plan.pose_assumed
+                    {plan.poseAssumed
                       ? " Start pose is ASSUMED — nothing localises this rover, so the whole route is only as right as that assumption."
                       : ""}
                   </div>
@@ -924,15 +926,18 @@ export default function Drive() {
                   hint={
                     motionDisabled
                       ? disabledHint
-                      : `Run ${m.name} using the ${backend} backend`
+                      : `Run ${m.name} (${m.where}) using the ${backend} backend`
                   }
                 />
               ))}
             </div>
             <p className="mt-3 text-xs text-slate-500">
-              All four are confirm-gated: each one drives the rover somewhere on
-              its own, and from here a rover on blocks and a rover on the floor
-              look identical. Each is sent as{" "}
+              All {MISSIONS.length} are confirm-gated: each one drives the rover
+              somewhere on its own, and from here a rover on blocks and a rover
+              on the floor look identical. The PLAN row above is not gated at
+              all — a preview commands no motion, and the moment you most want
+              to see the intended route is while you are deciding whether it is
+              safe to run. Each is sent as{" "}
               <span className="font-mono">{`{name, backend}`}</span> — progress
               comes back in the Mission card above. Take the stick or hit STOP ALL
               to cut a mission short; STOP ALL aborts the mission as well as
@@ -1965,6 +1970,26 @@ function MissionCard({
         <>
           <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-4">
             <Stat label="Phase" value={mission?.phase ?? "--"} />
+            {/*
+              LEG vs SEGMENT are different questions and the card answers both.
+              A leg is one target on a multi-corner route; a segment is one
+              turn-or-drive within it. `leg_label` is the rover's own
+              plain-English corner name — the mission ids do not match what an
+              operator says out loud, so the label is what prevents a run being
+              read as going to the opposite zone.
+            */}
+            <Stat
+              label="Leg"
+              value={
+                mission?.legLabel || mission?.leg
+                  ? `${mission.legLabel ?? mission.leg}${
+                      mission?.legI !== null && mission?.legI !== undefined && mission?.legsN
+                        ? ` · ${mission.legI}/${mission.legsN}`
+                        : ""
+                    }`
+                  : "--"
+              }
+            />
             <Stat label="Segment" value={seg} />
             <Stat
               label="Remaining"
@@ -2007,12 +2032,27 @@ function MissionCard({
                 ? `(${Math.round(mission.targetX)}, ${Math.round(mission.targetY ?? 0)}) mm`
                 : "--"}
             </span>
+            {/*
+              The executor's OWN pose, with the teleop bridge as the fallback.
+              Both are omitted rather than zero-filled when there is no
+              odometry, so the pair is checked together — an x without a y is
+              not a position, and rendering the missing half as 0 would place
+              the rover on an arena edge it has never been near.
+            */}
             <span className="font-mono">
               pose{" "}
-              {fallbackPose.x_mm !== null
-                ? `(${Math.round(fallbackPose.x_mm)}, ${Math.round(fallbackPose.y_mm ?? 0)}) mm`
-                : "--"}
+              {mission?.poseX !== null && mission?.poseX !== undefined &&
+              mission?.poseY !== null && mission?.poseY !== undefined
+                ? `(${Math.round(mission.poseX)}, ${Math.round(mission.poseY)}) mm · executor`
+                : fallbackPose.x_mm !== null && fallbackPose.y_mm !== null
+                  ? `(${Math.round(fallbackPose.x_mm)}, ${Math.round(fallbackPose.y_mm)}) mm · bridge`
+                  : "--"}
             </span>
+            {mission?.poseHeadingDeg !== null && mission?.poseHeadingDeg !== undefined ? (
+              <span className="font-mono">
+                heading {Math.round(mission.poseHeadingDeg)}°
+              </span>
+            ) : null}
             {mission?.odomSource ? (
               <span className="chip font-mono">odom · {mission.odomSource}</span>
             ) : null}
