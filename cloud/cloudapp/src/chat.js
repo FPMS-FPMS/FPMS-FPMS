@@ -243,19 +243,31 @@ const PROJECT_FACTS = {
     "infrared heat directly and is good at embers under leaves and hot ground before flames " +
     "appear. Cross-validation between them is what keeps shadows and sun-warmed rocks from " +
     "triggering false alarms.",
+  // WHAT IS ACTUALLY RUNNING, not what is planned. These answers previously
+  // described Nav2, SLAM Toolbox and an EKF as though they were live; none of
+  // them are running on the rover today. A public assistant that overstates a
+  // student project's architecture is worse than one that says "not yet" —
+  // a judge can ask a follow-up, and the honest answer is the impressive one
+  // because it shows the team knows the difference.
   how_it_navigates:
-    "ROS2 Humble with Nav2 for path planning and obstacle avoidance. An LDROBOT D500 2D LiDAR " +
-    "feeds SLAM Toolbox, which builds and updates the map while the rover drives through it — " +
-    "the rover is not given a map in advance.",
+    "Today the rover drives dead reckoning: it turns to a bearing, drives a measured distance in " +
+    "short segments with full stops between them, and returns by replaying those measured moves " +
+    "in reverse so the errors cancel instead of adding up. That retrace is why the return is " +
+    "accurate. ROS 2 Humble is running and the LiDAR publishes into it, but Nav2 and SLAM are " +
+    "configured and NOT yet in the driving loop — the team has deliberately kept the proven " +
+    "method in charge until the navigation stack is verified end to end.",
   how_it_knows_where_it_is:
-    "Odometry comes from wheel encoders on the four motors plus an IMU, fused by an Extended " +
-    "Kalman Filter (robot_localization). Encoders alone drift when wheels slip on carpet; the " +
-    "IMU alone drifts over time; the EKF combines them into a better position estimate than " +
-    "either gives on its own. LiDAR SLAM then corrects the remaining drift against the map.",
+    "By dead reckoning from a known start position: wheel encoders measure distance travelled and " +
+    "the IMU gyro measures turns. Nothing corrects that estimate against the outside world yet, so " +
+    "the position slowly drifts, and the dashboard deliberately marks the rover's pose as ASSUMED " +
+    "rather than measured whenever that is the case. An EKF and LiDAR-based correction are the " +
+    "planned next step, not something running now.",
   what_the_lidar_does:
     "The D500 spins and measures distance to whatever it hits, producing a 2D slice of the room " +
-    "many times a second. That slice is used for two separate jobs: building the map (SLAM) and " +
-    "stopping before obstacles (Nav2 costmaps).",
+    "about ten times a second. Today that slice does two jobs: it is drawn on the dashboard's " +
+    "bird's-eye map, and it acts as the obstacle guard that refuses to let a mission start or " +
+    "continue if the view ahead is blocked or the scan goes stale. Using it to build a map and " +
+    "correct position is the next step.",
   compute:
     "Main compute is a Radxa ROCK 5B+ (RK3588) running Ubuntu 22.04. YOLO26 runs on its 6 TOPS " +
     "NPU via the Rockchip RKNN toolkit at FP16, measured at 15+ FPS. A Yahboom V3.0 board " +
