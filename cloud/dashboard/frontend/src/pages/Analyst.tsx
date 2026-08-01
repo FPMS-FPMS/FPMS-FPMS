@@ -155,15 +155,31 @@ export default function Analyst() {
                   </ul>
                 </div>
               )}
+              {/* "live" and "silent" hide how live: a stream last heard 4s ago
+                  and one last heard 40s ago both rendered as "live", and the
+                  age is the number that says whether the report above is about
+                  the rover now or the rover earlier. */}
               <div className="mt-5 grid grid-cols-4 gap-2">
-                {Object.entries(rep.snapshot.streams_live).map(([k, v]) => (
-                  <div key={k} className="rounded-md border border-white/5 bg-black/30 px-2 py-1.5 text-center">
-                    <div className="lbl text-[9px]">{k}</div>
-                    <div className={`mt-0.5 text-xs font-semibold ${v ? "text-emerald-300" : "text-slate-500"}`}>
-                      {v ? "live" : "silent"}
+                {Object.entries(rep.snapshot.streams_live).map(([k, v]) => {
+                  const age = rep.snapshot.ages_s?.[k];
+                  const ageText =
+                    typeof age === "number" && Number.isFinite(age)
+                      ? age < 90 ? `${age.toFixed(0)}s ago` : `${(age / 60).toFixed(0)}m ago`
+                      : "never";
+                  return (
+                    <div
+                      key={k}
+                      className="rounded-md border border-white/5 bg-black/30 px-2 py-1.5 text-center"
+                      title={`${k}: last packet ${ageText}`}
+                    >
+                      <div className="lbl text-[9px]">{k}</div>
+                      <div className={`mt-0.5 text-xs font-semibold ${v ? "text-emerald-300" : "text-slate-500"}`}>
+                        {v ? "live" : "silent"}
+                      </div>
+                      <div className="font-mono text-[9px] text-slate-500">{ageText}</div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </>
           )}

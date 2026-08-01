@@ -75,6 +75,14 @@ export default function Terminal({ isLan }: { isLan: boolean }) {
     ws.send(msg);
   };
 
+  const quickConnect = useMemo(
+    () =>
+      things
+        .map((t) => ({ name: t.name, ip: t.attributes?.ip }))
+        .filter((t): t is { name: string; ip: string } => typeof t.ip === "string" && t.ip !== ""),
+    [things],
+  );
+
   const canConnect = useMemo(() => {
     if (connected) return false;
     if (mode === "local") return isLan;
@@ -190,24 +198,28 @@ export default function Terminal({ isLan }: { isLan: boolean }) {
           </div>
         )}
 
-        {things.length > 0 && mode === "ssh" && (
+        {/* Only Things that carry an `ip` attribute can be quick-connected. The
+            section used to render on `things.length` alone, so a registry full
+            of Things provisioned without an address produced an empty
+            "Quick connect" heading and nothing under it — which reads as a
+            broken panel rather than as missing data. */}
+        {mode === "ssh" && quickConnect.length > 0 && (
           <div className="mt-3">
             <div className="lbl mb-1">Quick connect · from Devices</div>
             <div className="flex flex-wrap gap-1.5">
-              {things.map((t) => {
-                const ip = t.attributes?.ip;
-                if (!ip) return null;
-                return (
-                  <button
-                    key={t.name}
-                    className="chip"
-                    onClick={() => setHost(ip)}
-                  >
-                    {t.name} · {ip}
-                  </button>
-                );
-              })}
+              {quickConnect.map(({ name, ip }) => (
+                <button key={name} className="chip" onClick={() => setHost(ip)}>
+                  {name} · {ip}
+                </button>
+              ))}
             </div>
+          </div>
+        )}
+        {mode === "ssh" && things.length > 0 && quickConnect.length === 0 && (
+          <div className="mt-3 text-xs text-slate-500">
+            {things.length} Thing{things.length > 1 ? "s" : ""} registered, none
+            carrying an <span className="font-mono">ip</span> attribute — nothing
+            to quick-connect to. Enter the address above.
           </div>
         )}
       </Card>

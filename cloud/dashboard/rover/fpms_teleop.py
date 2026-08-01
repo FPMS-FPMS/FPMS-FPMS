@@ -186,6 +186,26 @@ DOCK_TURN_RADPS = 0.2     # closed-loop `turn` command
 # evidence of a stall-then-release. Every claim of the form "this chassis cannot
 # creep" is withdrawn. It creeps.
 #
+# ---- 2026-08-01: THE ABOVE IS TRUE BUT INCOMPLETE, AND LOAD IS WHY -----------
+# Those readings were taken under one load condition that was never written
+# down, and that omission made them look more general than they are. Measured
+# since, on this rover:
+#
+#     ON THE FLOOR, wheels loaded:  0.00295 on the wire -> NO motion at all
+#     WHEELS OFF, free spinning:    0.0010  on the wire -> fast rotation
+#
+# A smaller command produced motion where a larger one produced none, because
+# the two runs differed in load, not in amplitude. So the response is not
+# proportional in any way a caller can rely on, and the honest summary is:
+#
+#     amplitude alone does not predict motion; load has to be stated with it.
+#
+# Practical consequence for anything wanting SLOW: short bounded pulses with
+# full stops between them (~0.35 s was the shortest that moved anything, free
+# spinning) rather than a smaller setpoint. That number is ALSO free-spinning
+# and must be re-measured under load before any distance is computed from it.
+# See SESSION_HANDOFF.md, 2026-08-01.
+#
 # ---- WHY THE MECHANISM STAYS ANYWAY ----------------------------------------
 # The floor is kept, and it is kept DISABLED (default 0.0). Deleting it outright
 # would be overcorrecting in the other direction: no test has yet gone below
@@ -2392,11 +2412,16 @@ class TeleopNode(Node):
                            "note": ("UNMEASURED — defaults are 0.0 (floor off). "
                                     "The 'deadband lurch' this mechanism was "
                                     "built for was an odom twist sign "
-                                    "inversion, not a real deadband; motion is "
-                                    "smooth and proportional at every speed "
-                                    "tested. Kept, disabled, pending a clean "
-                                    "pose-based sweep. Nothing may command "
-                                    "below these when non-zero.")},
+                                    "inversion, not a real deadband. Kept, "
+                                    "disabled, pending a clean pose-based "
+                                    "sweep under load. Nothing may command "
+                                    "below these when non-zero. "
+                                    "2026-08-01: response is NOT proportional "
+                                    "and LOAD IS THE HIDDEN VARIABLE — on the "
+                                    "floor 0.00295 produced no motion at all, "
+                                    "while free-spinning 0.0010 ran fast. Do "
+                                    "not read any speed claim here without "
+                                    "knowing whether the wheels were loaded.")},
                 "limits": {"jog_max_mps": jnum(self.jog_max_mps, 4),
                            "nudge_mps": jnum(self.nudge_mps, 4),
                            "turn_max_radps": jnum(TURN_MAX_RADPS, 4),

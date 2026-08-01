@@ -71,15 +71,25 @@ function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
     finally { setBusy(false); }
   };
 
+  const frame: string | null =
+    typeof stream.data?.data?.frame === "string" ? stream.data.data.frame : null;
+  const format: string =
+    typeof stream.data?.data?.format === "string" ? stream.data.data.format : "jpeg";
+
+  // Reading `.data.data.format` off an envelope that arrived without a payload
+  // threw and took the page down. A frame we do not have simply disables the
+  // button instead.
   const snapshot = () => {
-    if (!stream.data) return;
+    if (!frame) return;
     const a = document.createElement("a");
-    a.href = `data:image/${stream.data.data.format};base64,${stream.data.data.frame}`;
-    a.download = `${thing}-${Date.now()}.jpg`;
+    a.href = `data:image/${format};base64,${frame}`;
+    a.download = `${thing}-${Date.now()}.${format === "png" ? "png" : "jpg"}`;
     a.click();
   };
 
-  const detections: any[] = stream.data?.data?.detections ?? [];
+  const detections: any[] = Array.isArray(stream.data?.data?.detections)
+    ? stream.data.data.detections
+    : [];
   const npu = stream.data?.data?.npu;
 
   return (
@@ -126,7 +136,12 @@ function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
       </div>
 
       <div className="mt-4 flex flex-wrap justify-end gap-2">
-        <button className="btn" onClick={snapshot} disabled={!stream.data}>
+        <button
+          className="btn"
+          onClick={snapshot}
+          disabled={!frame}
+          title={frame ? "Download this frame" : "No frame has arrived to save"}
+        >
           📸 Snapshot
         </button>
         <button className="btn-primary" disabled={busy} onClick={() => cmd("connect")}>

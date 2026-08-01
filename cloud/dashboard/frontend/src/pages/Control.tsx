@@ -6,7 +6,7 @@ import { MissionStrip } from "../components/MissionStrip";
 import { useChannel } from "../lib/ws";
 import { apiPostJson } from "../lib/api";
 import { useThings } from "../lib/things";
-import { useMission } from "../lib/mission";
+import { MISSION_ABORT_ACTION, MISSION_ABORT_NOTE, useMission } from "../lib/mission";
 import {
   emptyCapabilities,
   mergeCapabilities,
@@ -180,12 +180,25 @@ const LIM = {
   /** Closed-loop on the integrated gyro; a full turn is the cap. */
   turnDeg: { min: 1, max: 360, def: 15, step: 5, digits: 0 },
   /**
-   * Real m/s, both ends of the envelope load-bearing. Below the 0.035 m/s
-   * deadband the firmware stalls, winds up its integrator and then lurches in a
-   * direction that is not reliably the commanded one; 0.12 m/s is the hard cap
-   * the drive code was reviewed against and is not tunable from anywhere.
+   * Real m/s. Both ends are the ROVER's, not this file's opinion.
+   *
+   * The lower bound used to be 0.035, justified by "below this the firmware
+   * stalls, winds up its integrator and then lurches". That justification has
+   * been WITHDRAWN on the rover: the lurch it described was `/odom_raw`'s
+   * sign-inverted twist being read as motion, fpms_teleop.py now says in as
+   * many words that the chassis creeps, and both deadband floors ship at 0.0
+   * (OFF). Meanwhile the rover's real refusal threshold for `set_speed` is
+   * SET_SPEED_MIN_MPS = 0.005 — a usability bound, not a deadband — so this
+   * box was rejecting a two-thirds of the range the rover would have accepted,
+   * on the strength of a fault that did not exist.
+   *
+   * 0.12 is HARD_MAX_LIN_MPS, which genuinely is not tunable from anywhere.
+   *
+   * Neither end should be read as "the rover will go this slowly": the board
+   * applies a large fixed duty to any non-zero setpoint, so amplitude buys
+   * very little. See the Drive tab's Speed floor card.
    */
-  speedMps: { min: 0.035, max: 0.12, def: 0.05, step: 0.005, digits: 3 },
+  speedMps: { min: 0.005, max: 0.12, def: 0.05, step: 0.005, digits: 3 },
   /** Per-leg self-test duration. */
   testS: { min: 0.3, max: 3.0, def: 1.0, step: 0.1, digits: 1 },
   /** 0 means silence; see clampBeepMs for the 1..9 firmware quirk. */
@@ -428,12 +441,16 @@ export default function Control() {
   /**
    * Abort the running mission on the rover the strip is showing.
    *
-   * Goes out as `mission {name: "abort"}` — the same shape the Drive tab uses —
-   * and is never gated on anything. A stop alone is not enough against the
-   * executor: a mission driving a segment republishes cmd_vel continuously, so
-   * a single halt is overwritten by the next tick.
+   * Goes out as `stop`, and never gated on anything. It used to go out as
+   * `mission {name: "abort"}`, which neither publisher accepts — `abort` is not
+   * in fpms_missions.COMMANDABLE, so the button that exists for a machine
+   * driving somewhere wrong produced `unknown mission 'abort'` and aborted
+   * nothing. fpms-missions subscribes stop/estop/auto_off and calls
+   * request_abort on them, publishing no reply of its own because teleop owns
+   * the ack for those verbs; the rover advertises exactly this as
+   * `acts_silently_on`. See MISSION_ABORT_NOTE.
    */
-  const abortMission = (to: string[]) => fire("mission", to, { name: "abort" });
+  const abortMission = (to: string[]) => fire(MISSION_ABORT_ACTION, to);
 
   // Inbound rover traffic. useChannel only keeps the latest envelope, so the
   // message counter is what tells us a new one landed.
@@ -515,7 +532,7 @@ export default function Control() {
         <button
           onClick={stopAll}
           className="flex w-full items-center justify-center gap-3 rounded-xl border border-rose-500/50 bg-rose-600/25 px-4 py-5 text-lg font-semibold tracking-wide text-rose-50 shadow-lg shadow-black/50 backdrop-blur transition hover:bg-rose-600/40 active:scale-[0.995]"
-          title="Emergency stop — halts every rover. Shortcut: Esc"
+          title="Emergency stop — halts every rover AND aborts any running mission (fpms-missions subscribes `stop` and aborts on it). Shortcut: Esc"
         >
           <span className="inline-block h-3 w-3 rounded-full bg-rose-400 pulse-dot text-rose-400" />
           EMERGENCY STOP — ALL ROVERS
@@ -618,11 +635,22 @@ export default function Control() {
         <Card>
           <CardHeader title="Motion" subtitle="These move the rover" />
           <div className="space-y-3">
+            {/*
+              THERE IS ONE HALT, AND IT IS ALSO THE ABORT.
+              `stop` is subscribed by BOTH services: teleop zeroes the wire, and
+              fpms-missions calls request_abort on the same verb (it publishes
+              no reply — teleop owns the ack, and the rover advertises this as
+              `acts_silently_on`). A separate "abort mission" button beside it
+              would now send the identical command, so it is not offered; the
+              MISSION strip above keeps its own abort because that one is
+              reachable without scrolling past a page of motion controls.
+            */}
             <Row label="Halt">
               <CommandButton
                 className="btn-danger"
-                label="Stop selected"
-                onFire={() => fire("stop", targets)}
+                label="Stop + abort"
+                title={`Publishes stop to the selected rover(s). ${MISSION_ABORT_NOTE}`}
+                onFire={() => abortMission(targets)}
               />
               {/*
                 `estop` is a separate verb in fpms-teleop's TELEOP_ACTIONS, and
@@ -636,13 +664,8 @@ export default function Control() {
               <CommandButton
                 className="btn-danger"
                 label="E-stop verb"
-                title="Publishes `estop`. fpms-teleop handles stop/estop/auto_off through one ungated path — same halt, different name."
+                title="Publishes `estop`. fpms-teleop handles stop/estop/auto_off through one ungated path — same halt, different name. fpms-missions aborts on this one too."
                 onFire={() => fire("estop", targets)}
-              />
-              <CommandButton
-                label="Abort mission"
-                title="mission {name: abort} — stops the executor. A plain stop is not enough: a driving mission republishes cmd_vel every tick."
-                onFire={() => abortMission(targets)}
               />
             </Row>
 
@@ -716,10 +739,13 @@ export default function Control() {
           <p className="mt-3 text-xs text-slate-500">
             Nudge is closed-loop on odometry ({LIM.nudgeMm.min}–{LIM.nudgeMm.max} mm),
             turn is closed-loop on the integrated gyro ({LIM.turnDeg.min}–{LIM.turnDeg.max}°).
-            Speeds are clamped to {LIM.speedMps.min}–{LIM.speedMps.max} m/s: under
-            the low end the firmware stalls and then lurches instead of creeping,
-            and the high end is the reviewed envelope. Test motors is the only
-            one here that is confirm-gated — a rover on blocks and a rover on the
+            Speeds are clamped to {LIM.speedMps.min}–{LIM.speedMps.max} m/s: the
+            low end is the rover's own <span className="font-mono">set_speed</span>{" "}
+            sanity bound and the high end is its hard cap. A lower number does
+            not reliably buy a slower rover — the board applies a large fixed
+            duty to any non-zero setpoint — so short steps, not small speeds,
+            are how this chassis is driven gently. Test motors is the only one
+            here that is confirm-gated: a rover on blocks and a rover on the
             ground look identical from this page.
           </p>
         </Card>
@@ -924,9 +950,11 @@ export default function Control() {
             {LIM.speedMps.min}–{LIM.speedMps.max} m/s and the nudge speed is held
             at or below jog max (jog max is the hard clamp, so a higher nudge
             would only be clipped back to it). Values below {LIM.speedMps.min} m/s
-            are refused by the rover rather than quietly raised: that gap between
-            what was set and what ran is where the lurch came from. This changes
-            the running service only — it does not survive a restart.
+            are refused by the rover with a reason rather than quietly raised —
+            at that speed a 100 mm nudge takes over twenty seconds, so it is
+            almost always a units mistake. This changes the running service only:
+            it does not survive a restart, and the Drive tab reads the values
+            actually in force off the rover rather than off this page.
           </p>
         </Card>
       </div>
@@ -1396,17 +1424,17 @@ function describeDriveStatus(data: Record<string, any>): Outcome {
     fields.push({ k: "nudge", v: fmt(limits.nudge_mps, 3, " m/s") });
   }
 
-  // The deadband floors are the reason "just go slower" is not available, and
-  // the rover states whether they are even switched on. Reporting a floor of
-  // 0.000 as though it were measured would be the same lie in the other
-  // direction, so `enabled` is shown alongside it.
+  // The floors ship DISABLED (0.0) and the rover says so with its own
+  // `enabled` flag. Rendering 0.000 as a measured minimum would keep the
+  // withdrawn "this chassis cannot creep" story alive on screen, so the two
+  // cases are never collapsed: a floor that is off says off.
   const floors = obj(data.floors);
   if (floors) {
     fields.push({
       k: "floors",
       v: floors.enabled === true
         ? `${fmt(floors.min_cmd_lin_mps, 4, " m/s")} / ${fmt(floors.min_cmd_ang_radps, 4, " rad/s")}`
-        : "off (unmeasured)",
+        : "off — no floor, not a measured zero",
     });
   }
 
@@ -1473,7 +1501,9 @@ function describeAck(data: Record<string, any>): Outcome {
     if (key in data) fields.push({ k: label, v: fmt(data[key], digits, unit) });
   }
   if (typeof data.deadband_floored === "boolean" && data.deadband_floored) {
-    fields.push({ k: "note", v: "raised to clear the motor deadband" });
+    // Only possible when someone has configured FPMS_MIN_CMD_* non-zero; the
+    // shipped default is 0.0 and this never fires.
+    fields.push({ k: "note", v: "raised to the configured floor — ran FASTER than asked" });
   }
   if (notes.length) fields.push({ k: "clamped", v: notes.join(" · ") });
 

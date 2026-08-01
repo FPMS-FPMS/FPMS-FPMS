@@ -1,5 +1,6 @@
 import { ReactNode, useEffect, useState } from "react";
 import NavBar from "./NavBar";
+import { FleetMissionBar } from "./MissionStrip";
 import { apiGet } from "../lib/api";
 
 type Health = {
@@ -45,6 +46,15 @@ export default function Layout(
           </div>
         </div>
       )}
+      {/*
+        MISSION STATE, ON EVERY TAB.
+        A mission is the one thing on this dashboard that makes a machine drive
+        itself across a room, and it used to be visible only on Drive. The
+        roster comes from the health poll already running above rather than
+        from a second one; the bar renders nothing until a rover has actually
+        published mission telemetry, and is quiet until one is moving.
+      */}
+      <FleetMissionBar things={health?.mqtt.things_seen ?? []} />
       <main className="mx-auto max-w-7xl px-4 pb-16 pt-6 sm:px-6 lg:px-8">
         {children}
       </main>

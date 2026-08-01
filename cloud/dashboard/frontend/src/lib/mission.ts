@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useChannel } from "./ws";
+import { apiPostJson } from "./api";
 
 /**
  * Mission state, in ONE place.
@@ -45,6 +46,55 @@ import { useChannel } from "./ws";
  * only ever escalated in combination with `running` — see `blind`.
  */
 export const MISSION_STALE_MS = 6000;
+
+/**
+ * HOW A MISSION IS ACTUALLY ABORTED — and why it is not `mission {name:"abort"}`.
+ *
+ * Every ABORT button on this dashboard used to publish
+ * `mission {name: "abort"}`. Neither publisher accepts that:
+ *
+ *   fpms_missions._cmd_mission  refuses any name outside COMMANDABLE
+ *                               ("m1","m2","water","home","patrol") with
+ *                               `unknown mission 'abort'`.
+ *   fpms_teleop._cmd_mission    (the stub that answers only while the executor
+ *                               is NOT publishing) refuses anything outside
+ *                               ("m1","m2","water","home") the same way.
+ *
+ * So the button that exists for the moment a machine is driving somewhere wrong
+ * produced a nack and no abort. What the executor DOES act on is
+ * `stop`/`estop`/`auto_off`: `fpms_missions.handle_command` maps all three to
+ * `request_abort(ABORT_STOP)` and deliberately publishes no reply, because
+ * teleop owns the ack for those verbs. The rover announces this itself — it is
+ * the `acts_silently_on` list in the missions service's `events/online`, which
+ * lib/capabilities already records.
+ *
+ * `stop` is therefore the abort, and it is the right one for a second reason:
+ * it halts the motors AND ends the executor in one publish. A `mission` verb
+ * that only ended the executor would leave whatever teleop had on the wire.
+ */
+export const MISSION_ABORT_ACTION = "stop";
+
+/** Tooltip/explanation shared by every abort control, so they cannot drift. */
+export const MISSION_ABORT_NOTE =
+  "Publishes `stop`. fpms-missions subscribes stop/estop/auto_off and aborts " +
+  "the run instantly (it answers nothing — teleop owns the ack for those " +
+  "verbs). The mission verb does not accept an `abort` name and would be " +
+  "refused.";
+
+/**
+ * Send the abort. Never gated on anything: an abort has to work precisely when
+ * every other check has decided things are wrong.
+ *
+ * Errors are swallowed by design for the callers that have no log of their own
+ * — the acknowledgement lands in the Control and Drive command logs either way,
+ * and a toast here would be one more thing between the operator and a second
+ * press.
+ */
+export function postMissionAbort(thing: string): Promise<unknown> {
+  return apiPostJson<unknown>(`/api/control/${thing}/${MISSION_ABORT_ACTION}`, {
+    params: {},
+  }).catch(() => undefined);
+}
 
 /**
  * Phases that mean "not driving".

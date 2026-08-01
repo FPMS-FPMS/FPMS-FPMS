@@ -1,5 +1,11 @@
+import { useCallback, useEffect, useState } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { useMission, type MissionFeed } from "../lib/mission";
+import {
+  MISSION_ABORT_NOTE,
+  postMissionAbort,
+  useMission,
+  type MissionFeed,
+} from "../lib/mission";
 
 /**
  * "IS THE ROVER DRIVING ITSELF RIGHT NOW?" — answered on every tab.
@@ -166,8 +172,26 @@ function MissionStripInner({
           </span>
         ) : null}
 
+        {/* Clearance and battery ride along because this strip is what a tab
+            other than Drive gets, and "how close is the obstacle guard" is the
+            other question an operator has while watching a machine move. Both
+            are absent-able, so both are `--` rather than 0 — "0 mm clear" reads
+            as something touching the bumper. */}
+        {m?.frontMm !== null && m?.frontMm !== undefined ? (
+          <span className="font-mono text-xs text-slate-400" title="Clearance ahead, from the executor's obstacle guard">
+            clear {Math.round(m.frontMm)} mm
+          </span>
+        ) : null}
+        {m?.battV !== null && m?.battV !== undefined ? (
+          <span className="font-mono text-xs text-slate-400">batt {m.battV.toFixed(1)} V</span>
+        ) : null}
+
         {onAbort && (running || f.blind) ? (
-          <button className="btn-hot ml-auto" onClick={onAbort} title="Abort the running mission">
+          <button
+            className="btn-hot ml-auto"
+            onClick={onAbort}
+            title={`Abort the running mission. ${MISSION_ABORT_NOTE}`}
+          >
             ABORT MISSION
           </button>
         ) : null}
@@ -180,6 +204,150 @@ function MissionStripInner({
         </p>
       ) : null}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ fleet */
+
+/**
+ * "IS ANY ROVER DRIVING ITSELF?" — on EVERY tab, including the ones that have
+ * nothing to do with driving.
+ *
+ * MissionStrip answers that for one rover on the three tabs that opted in.
+ * This is the version that lives in the Layout, so Camera, Thermal, Analyst,
+ * Devices, Terminal, AWS and the overview page answer it too. The failure it
+ * exists for is concrete: someone watching the camera feed, or scanning a
+ * subnet on the Devices tab, had no indication whatsoever that the machine
+ * across the room was under its own power.
+ *
+ * QUIET WHEN IDLE, LOUD WHEN NOT. An idle fleet gets one thin slate line — a
+ * banner that looks like a warning while nothing is happening is a banner
+ * people learn to scroll past. A rover that is RUNNING or BLIND turns the bar
+ * amber or rose, pins it under the nav, and grows an abort button, because at
+ * that point the operator's next action might be to stop it and they should
+ * not have to find the Drive tab first.
+ *
+ * Nothing is rendered at all until at least one rover has produced mission
+ * telemetry. That is not the same claim as "idle" — the per-rover strips on
+ * Drive/Control/LiDAR make the distinction explicitly, and repeating "no
+ * telemetry" across every page of a deployment that never runs the executor
+ * would be noise rather than information.
+ */
+type FleetKind = "none" | "idle" | "running" | "blind";
+
+export function FleetMissionBar({ things }: { things: readonly string[] }) {
+  const [kinds, setKinds] = useState<Record<string, FleetKind>>({});
+
+  const report = useCallback((thing: string, kind: FleetKind) => {
+    setKinds((prev) => (prev[thing] === kind ? prev : { ...prev, [thing]: kind }));
+  }, []);
+
+  const heard = things.filter((t) => (kinds[t] ?? "none") !== "none");
+  const anyBlind = heard.some((t) => kinds[t] === "blind");
+  const anyRunning = heard.some((t) => kinds[t] === "running");
+  const tone = anyBlind
+    ? "border-rose-500/50 bg-rose-950/70"
+    : anyRunning
+      ? "border-ember-500/40 bg-ember-950/70"
+      : "border-white/5 bg-ink-950/80";
+
+  /*
+   * ONE TREE, ALWAYS. The empty case is hidden with a class rather than by
+   * returning a different element tree — returning a different tree unmounts
+   * the watchers below, which closes their websockets, which resets their
+   * message counters to zero, which makes every rover look unheard again, which
+   * re-renders the empty tree. That is an oscillation, not a render.
+   */
+  return (
+    <ErrorBoundary label="fleet mission">
+      {/*
+        Deliberately NOT sticky. Control and Drive already pin their own
+        EMERGENCY STOP bar at exactly the offset a second sticky element would
+        want, and two things fighting for that slot ends with one of them
+        covering the stop button. This sits in normal flow directly under the
+        nav, where it is the first thing on every page.
+      */}
+      <div className={`border-b backdrop-blur ${tone} ${heard.length ? "" : "hidden"}`}>
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-1 px-4 py-1.5 sm:px-6 lg:px-8">
+          <span className="lbl shrink-0">mission</span>
+          {things.map((t) => (
+            <FleetRover key={t} thing={t} onReport={report} />
+          ))}
+        </div>
+      </div>
+    </ErrorBoundary>
+  );
+}
+
+function FleetRover({
+  thing,
+  onReport,
+}: {
+  thing: string;
+  onReport: (thing: string, kind: FleetKind) => void;
+}) {
+  const f = useMission(thing);
+  const m = f.mission;
+  // Unknown phases count as running — see MISSION_IDLE_PHASES. Erring towards
+  // "it is moving" is the direction that is safe to be wrong in.
+  const kind: FleetKind = !f.messages
+    ? "none"
+    : f.blind
+      ? "blind"
+      : m?.running
+        ? "running"
+        : "idle";
+
+  useEffect(() => {
+    onReport(thing, kind);
+  }, [thing, kind, onReport]);
+
+  if (kind === "none") return null;
+
+  if (kind === "idle") {
+    return (
+      <span className="font-mono text-[11px] text-slate-500">
+        {thing} idle
+      </span>
+    );
+  }
+
+  return (
+    <span className="flex items-center gap-2">
+      <span
+        className={`inline-block h-2 w-2 shrink-0 rounded-full pulse-dot ${
+          kind === "blind" ? "bg-rose-400 text-rose-400" : "bg-ember-400 text-ember-400"
+        }`}
+      />
+      <span
+        className={`font-mono text-xs font-semibold ${
+          kind === "blind" ? "text-rose-100" : "text-ember-200"
+        }`}
+      >
+        {thing} {kind === "blind" ? "DRIVING — TELEMETRY LOST" : "DRIVING"}
+      </span>
+      <span className="font-mono text-[11px] text-slate-300">
+        {m?.mission ?? "--"} · {m?.phase ?? "--"}
+        {m?.legLabel || m?.leg ? ` · → ${m.legLabel ?? m.leg}` : ""}
+      </span>
+      <span className="font-mono text-[11px] text-slate-400">
+        {m?.remainingMm !== null && m?.remainingMm !== undefined
+          ? `${Math.round(m.remainingMm)} mm left`
+          : "-- mm left"}
+      </span>
+      {kind === "blind" ? (
+        <span className="chip-hot" title="Last known state was DRIVING and telemetry has since stopped">
+          stale {Math.round((f.ageMs ?? 0) / 1000)}s
+        </span>
+      ) : null}
+      <button
+        className="btn-hot py-0.5 text-[11px]"
+        onClick={() => postMissionAbort(thing)}
+        title={`Abort ${thing}'s mission from any tab. ${MISSION_ABORT_NOTE}`}
+      >
+        ABORT
+      </button>
+    </span>
   );
 }
 

@@ -128,8 +128,10 @@ export type Zone = {
 };
 
 /** Zone side and margin, as fractions of the arena so a rescale is free. */
-const Z = 0.3 * ARENA_MM;
-const M = 0.04 * ARENA_MM;
+export const ZONE_SIDE_MM = 0.3 * ARENA_MM;
+export const ZONE_MARGIN_MM = 0.04 * ARENA_MM;
+const Z = ZONE_SIDE_MM;
+const M = ZONE_MARGIN_MM;
 
 export const ZONES: readonly Zone[] = [
   {
@@ -181,8 +183,26 @@ export const ZONES: readonly Zone[] = [
 export const FORWARD_HEADING_DEG = 90;
 
 /**
- * Where the rover is assumed to be when no odometry is published: the
- * bottom-right quadrant, nose pointed FORWARD — straight up the arena.
+ * The START BOX: bottom-right, mirroring the three named zones in size and
+ * inset so the four corners of the arena read as one family of regions.
+ *
+ * It is deliberately NOT a member of ZONES. Zones are mission destinations the
+ * rover drives to; this is the one region whose position is an ASSUMPTION —
+ * where the operator is asked to place the rover before a run, and where the
+ * map draws it when nothing publishes a position. The static layer paints it
+ * in its own dashed style for exactly that reason, and `ROVER_START` below is
+ * derived from it so the box and the glyph can never disagree.
+ */
+export const START_BOX = {
+  x_mm: ARENA_MM - M - Z,
+  y_mm: M,
+  w_mm: Z,
+  h_mm: Z,
+} as const;
+
+/**
+ * Where the rover is assumed to be when no odometry is published: the centre
+ * of the start box, nose pointed FORWARD — straight up the arena.
  *
  * The position is unchanged (bottom-right start box). Only the heading is
  * pinned to FORWARD_HEADING_DEG. The previous 135 deg diagonal was a
@@ -191,10 +211,31 @@ export const FORWARD_HEADING_DEG = 90;
  * bird's-eye view to start and stay facing forward.
  */
 export const ROVER_START = {
-  x_mm: ARENA_MM - M - Z / 2,
-  y_mm: M + Z / 2,
+  x_mm: START_BOX.x_mm + START_BOX.w_mm / 2,
+  y_mm: START_BOX.y_mm + START_BOX.h_mm / 2,
   heading_deg: FORWARD_HEADING_DEG,
 } as const;
+
+/** Wrap any angle into [0, 360). Returns null for anything non-finite. */
+export function normDeg(deg: number): number | null {
+  if (!Number.isFinite(deg)) return null;
+  return ((deg % 360) + 360) % 360;
+}
+
+/**
+ * Provenance of one pose component.
+ *
+ *   measured  the rover reported this number. It is dead-reckoned and it
+ *             drifts, but it came off the robot.
+ *   assumed   NOBODY reported it. The value is a constant from ROVER_START
+ *             and means "we put it here", not "it is here".
+ *
+ * The renderer draws these two differently on purpose. Nothing localises this
+ * rover, so the difference between "the odometry says 840 mm" and "we assumed
+ * 1020 mm because there is no odometry" is the single most important thing on
+ * the map, and it must be visible without reading any text.
+ */
+export type PoseSource = "measured" | "assumed";
 
 export type Pose = {
   /** world mm */
@@ -212,6 +253,18 @@ export type Pose = {
    * reading a constant the rover has never reported.
    */
   simulated: boolean;
+  /** Provenance of x_mm/y_mm. `simulated` is exactly `position === "assumed"`. */
+  position: PoseSource;
+  /**
+   * Provenance of heading_rad, tracked SEPARATELY from the position because
+   * the two really do arrive apart: `poseEnvelopeFromMm` omits heading_deg
+   * when the bridge has a position but no yaw. That case draws a rover whose
+   * dot is measured and whose nose is a guess, and the only way to say so is
+   * to keep the two flags distinct.
+   */
+  heading: PoseSource;
+  /** Drawn heading in degrees, wrapped to [0,360). Never null — see below. */
+  heading_deg: number;
 };
 
 function isNum(v: unknown): v is number {
@@ -269,11 +322,26 @@ export function readPose(envelope: unknown, lidarData?: unknown): Pose {
   // sources are not even looked at outside it, so there is no path by which a
   // simulated pose renders at anything other than FORWARD.
   let heading_deg: number = ROVER_START.heading_deg; // = FORWARD_HEADING_DEG
+  let headingMeasured = false;
   if (hasXY) {
     const hPose = pick(d, "heading_deg");
     const hLidar = pick(pick(lidarData, "data") ?? lidarData, "heading_deg");
-    if (isNum(hPose)) heading_deg = hPose;
-    else if (isNum(hLidar)) heading_deg = hLidar;
+    if (isNum(hPose)) {
+      heading_deg = hPose;
+      headingMeasured = true;
+    } else if (isNum(hLidar)) {
+      // Read, but NOT promoted to "measured".
+      //
+      // The LiDAR payload hard-codes `heading_deg: 0`. That zero is a struct
+      // field the firmware fills in, not a bearing anything on this rover
+      // observed — nothing here has a compass and the yaw that does exist is
+      // integrated gyro, which arrives on the pose envelope above, not this
+      // one. Drawing it is harmless because the value is kept and the glyph
+      // renders in the ASSUMED style; labelling it MEASURED would put a
+      // firmware constant on screen as an observation, which is the same
+      // mistake as inventing a coordinate.
+      heading_deg = hLidar;
+    }
   }
 
   const heading_rad = (heading_deg * Math.PI) / 180;
@@ -283,10 +351,123 @@ export function readPose(envelope: unknown, lidarData?: unknown): Pose {
   // FORWARD, not 0 — 0 rad is "facing +x", which is a real orientation and
   // would be indistinguishable from a measured heading pointing right.
   const FORWARD_RAD = (FORWARD_HEADING_DEG * Math.PI) / 180;
+  const okHdg = Number.isFinite(heading_rad);
+  const drawnDeg = normDeg(okHdg ? heading_deg : FORWARD_HEADING_DEG);
+
   return {
     x_mm: Number.isFinite(x_mm) ? x_mm : ROVER_START.x_mm,
     y_mm: Number.isFinite(y_mm) ? y_mm : ROVER_START.y_mm,
-    heading_rad: Number.isFinite(heading_rad) ? heading_rad : FORWARD_RAD,
+    heading_rad: okHdg ? heading_rad : FORWARD_RAD,
+    // `simulated` stays derived from hasXY ALONE. It is the flag the badge
+    // hangs off, and the only way to clear it is for real x_m/y_m to arrive —
+    // there is deliberately no argument, option or fallback that can set it
+    // false while the position is still a constant from ROVER_START.
     simulated: !hasXY,
+    position: hasXY ? "measured" : "assumed",
+    // A heading that failed the finite check is an assumption whatever the
+    // position did: we drew FORWARD, and FORWARD is our choice, not the
+    // rover's.
+    heading: headingMeasured && okHdg ? "measured" : "assumed",
+    heading_deg: drawnDeg === null ? FORWARD_HEADING_DEG : drawnDeg,
   };
+}
+
+// ------------------------------------------------------------------ trail ---
+
+/** Ring capacity. At the 2 Hz telemetry rate this is ~4 minutes of history. */
+const TRAIL_CAP = 480;
+
+/**
+ * Minimum movement before a new trail sample is kept, millimetres.
+ *
+ * Dead-reckoned position jitters by a few mm while parked. Without this gate a
+ * stationary rover would fill the whole ring with a fuzzy dot and evict the
+ * route it actually drove — the history would be destroyed by standing still.
+ */
+const TRAIL_MIN_STEP_MM = 8;
+
+/**
+ * A position change larger than this is a TELEPORT, not a drive.
+ *
+ * `set_coordinate` re-zeros the origin, and an origin re-zero moved this rover
+ * from (-9182,-11926) to a sane pose in one message. Joining those two samples
+ * with a line would draw a metre-long path the rover never took — a fabricated
+ * history, which is the same sin as a fabricated position. The sample is kept
+ * (it is where the rover is now) but flagged as a BREAK so the renderer lifts
+ * the pen.
+ */
+const TRAIL_JUMP_MM = 250;
+
+export const TRAIL_MEASURED = 1;
+export const TRAIL_BREAK = 2;
+
+/**
+ * Bounded history of where the rover has been.
+ *
+ * Fixed-capacity ring over two Float32Arrays and a flag byte, all allocated
+ * once. `push` does no allocation and takes no closures, so the rAF loop above
+ * can call it every time a pose arrives without producing GC sawtooth.
+ *
+ * Samples carry their own provenance. A trail drawn from assumed poses is not
+ * a record of travel — it is a record of the map's guess — so the renderer
+ * needs the flag per point, not per trail.
+ */
+export class PoseTrail {
+  readonly cap: number;
+  readonly xs: Float32Array;
+  readonly ys: Float32Array;
+  /** bit 0 = TRAIL_MEASURED, bit 1 = TRAIL_BREAK (do not join to previous). */
+  readonly flags: Uint8Array;
+  count = 0;
+  private head = 0;
+
+  constructor(cap: number = TRAIL_CAP) {
+    this.cap = cap > 1 ? cap | 0 : 2;
+    this.xs = new Float32Array(this.cap);
+    this.ys = new Float32Array(this.cap);
+    this.flags = new Uint8Array(this.cap);
+  }
+
+  /** Oldest-first ordering: `at(0)` is the eldest surviving sample. */
+  at(i: number): number {
+    return (this.head - this.count + i + this.cap * 2) % this.cap;
+  }
+
+  clear(): void {
+    this.count = 0;
+    this.head = 0;
+  }
+
+  /**
+   * Record a pose. Returns true when the sample opened a new stroke — a jump,
+   * a provenance flip, or the first point — which is the caller's cue that the
+   * world it had been tracking is no longer the world it is looking at.
+   */
+  push(x: number, y: number, measured: boolean): boolean {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+
+    let brk = true;
+    if (this.count > 0) {
+      const last = (this.head - 1 + this.cap) % this.cap;
+      const wasMeasured = (this.flags[last] & TRAIL_MEASURED) !== 0;
+      const dx = x - this.xs[last];
+      const dy = y - this.ys[last];
+      const d2 = dx * dx + dy * dy;
+      const flipped = wasMeasured !== measured;
+      if (!flipped && d2 < TRAIL_MIN_STEP_MM * TRAIL_MIN_STEP_MM) return false;
+      brk = flipped || d2 > TRAIL_JUMP_MM * TRAIL_JUMP_MM;
+    }
+
+    const h = this.head;
+    this.xs[h] = x;
+    this.ys[h] = y;
+    this.flags[h] = (measured ? TRAIL_MEASURED : 0) | (brk ? TRAIL_BREAK : 0);
+    this.head = (h + 1) % this.cap;
+    if (this.count < this.cap) this.count++;
+    return brk;
+  }
+}
+
+export function createPoseTrail(cap?: number): PoseTrail {
+  return new PoseTrail(cap);
 }

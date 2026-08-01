@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { apiGet } from "../lib/api";
+import { useThings } from "../lib/things";
 
 type Iface = { name: string; ip: string; netmask: string; cidr: string; is_up: boolean; is_loopback: boolean };
 type Host = { ip: string; hostname: string | null; open_ports: number[]; ssh_banner: string | null; guess: string };
@@ -25,6 +26,11 @@ export default function Devices() {
   const [things, setThings] = useState<Thing[]>([]);
   const [activeHost, setActiveHost] = useState<Host | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  // Registration and reporting are different facts, and this page only ever
+  // showed the first. A Thing that exists in the registry but has never
+  // published looks identical here to a healthy rover — which is the state
+  // after a provision that half-worked, and the one worth seeing.
+  const reporting = useThings();
 
   const loadInterfaces = () => apiGet<{ interfaces: Iface[] }>("/api/discovery/interfaces")
     .then((r) => {
@@ -178,7 +184,13 @@ export default function Devices() {
           right={
             <div className="flex items-center gap-2">
               <button className="btn" onClick={loadThings}>Refresh</button>
-              <span className="chip">{things.length}</span>
+              <span className="chip" title="Things in the registry">{things.length} registered</span>
+              <span
+                className={reporting.length ? "chip-ok" : "chip-warn"}
+                title="Things the broker has actually heard from"
+              >
+                {reporting.length} reporting
+              </span>
             </div>
           }
         />
@@ -190,7 +202,19 @@ export default function Devices() {
           <ul className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {things.map((t) => (
               <li key={t.arn} className="rounded-lg border border-white/5 bg-black/30 p-3">
-                <div className="font-semibold text-slate-100">{t.name}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-slate-100">{t.name}</span>
+                  <span
+                    className={reporting.includes(t.name) ? "chip-ok text-[10px]" : "chip-warn text-[10px]"}
+                    title={
+                      reporting.includes(t.name)
+                        ? "Publishing telemetry the broker has seen"
+                        : "Registered, but nothing has been heard from it — the publisher may not be running"
+                    }
+                  >
+                    {reporting.includes(t.name) ? "reporting" : "silent"}
+                  </span>
+                </div>
                 <div className="mt-1 truncate font-mono text-[10px] text-slate-500" title={t.arn}>{t.arn}</div>
                 {Object.entries(t.attributes).length > 0 && (
                   <div className="mt-2 flex flex-wrap gap-1">
@@ -202,6 +226,24 @@ export default function Devices() {
               </li>
             ))}
           </ul>
+        )}
+        {/* Publishing without being registered is the other half of the same
+            check, and it is how a hand-installed rover stays invisible to every
+            page that iterates the registry. */}
+        {reporting.filter((r) => !things.some((t) => t.name === r)).length > 0 && (
+          <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-100/90">
+            <b>Publishing but not registered:</b>{" "}
+            {reporting
+              .filter((r) => !things.some((t) => t.name === r))
+              .map((r) => (
+                <span key={r} className="mr-1.5 font-mono">{r}</span>
+              ))}
+            <div className="mt-1 text-amber-200/70">
+              The broker is receiving telemetry from these, but they have no
+              Thing in the registry — provisioned by hand, or registered against
+              a different endpoint.
+            </div>
+          </div>
         )}
       </Card>
 

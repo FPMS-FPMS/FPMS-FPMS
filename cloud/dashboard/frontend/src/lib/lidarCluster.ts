@@ -46,7 +46,19 @@ export type ClassId = 0 | 1 | 2 | 3;
 export const CLASS_NAMES: readonly string[] = ["NOISE", "WALL", "TREE", "OBSTACLE"];
 
 /** slate / slate-light / green / amber — deliberately low-chroma except hits. */
-export const CLASS_COLORS: readonly string[] = ["#475569", "#94a3b8", "#4ade80", "#fbbf24"];
+export const CLASS_COLORS_DARK: readonly string[] = ["#475569", "#94a3b8", "#4ade80", "#fbbf24"];
+
+/**
+ * The same four meanings at light-background contrast.
+ *
+ * Not a tint of the dark set — #4ade80 on white is barely legible, so the
+ * green and amber are dropped several steps while the two greys are pushed
+ * darker. Hue is preserved because the hue is what carries the class.
+ */
+export const CLASS_COLORS_LIGHT: readonly string[] = ["#94a3b8", "#475569", "#15803d", "#b45309"];
+
+/** Back-compatible default. The renderer picks a set from the resolved theme. */
+export const CLASS_COLORS: readonly string[] = CLASS_COLORS_DARK;
 
 // -------------------------------------------------------------- tunables ---
 
@@ -203,6 +215,19 @@ export type ArenaFrame = {
   /** interleaved world-mm xy pairs, valid for [0, 2*ptCount) */
   pts: Float32Array;
   ptCount: number;
+  /**
+   * Class of the cluster each point ended up in, parallel to `pts`, valid for
+   * [0, ptCount). CLS_NOISE covers both "in a rejected cluster" and "in no
+   * cluster at all".
+   *
+   * This is THIS FRAME's raw classification, not the voted `Track.cls` — the
+   * cloud is raw measurement and colouring it from a temporal filter would
+   * make points look more certain than they are. It exists so the renderer can
+   * tint the cloud by what the point is part of; a monochrome cloud makes the
+   * wall returns and the obstacle returns indistinguishable, which is most of
+   * what an operator is trying to read off a scan.
+   */
+  ptCls: Uint8Array;
   /** points outside [0,ARENA_MM]^2 — early warning that ARENA_MM is wrong */
   outOfBounds: number;
   /** pool of length POOL; iterate and skip !active */
@@ -212,6 +237,8 @@ export type ArenaFrame = {
   /** nearest valid return this frame, mm; -1 when the scan is empty */
   nearestMm: number;
   nearestBearingDeg: number;
+  /** index into `pts` of that nearest return; -1 when the scan is empty */
+  nearestIdx: number;
   clusterCount: number;
   /** clustering wall-clock, milliseconds */
   ms: number;
@@ -313,11 +340,13 @@ class ClusterEngine {
     this.out = {
       pts: new Float32Array(N_BINS * 2),
       ptCount: 0,
+      ptCls: new Uint8Array(N_BINS),
       outOfBounds: 0,
       tracks: this.tracks,
       counts: new Int32Array(4),
       nearestMm: -1,
       nearestBearingDeg: 0,
+      nearestIdx: -1,
       clusterCount: 0,
       ms: 0,
       frame: 0,
@@ -336,6 +365,7 @@ class ClusterEngine {
     out.outOfBounds = 0;
     out.nearestMm = -1;
     out.nearestBearingDeg = 0;
+    out.nearestIdx = -1;
     this.clusterCount = 0;
 
     const m = this.project(ranges, rangeMaxM, pose);
@@ -392,12 +422,14 @@ class ClusterEngine {
     const pr = this.pr;
     const pb = this.pb;
     const pts = this.out.pts;
+    const ptCls = this.out.ptCls;
 
     const lim = nIn < N_BINS ? nIn : N_BINS;
     let m = 0;
     let oob = 0;
     let best = Infinity;
     let bestBin = 0;
+    let bestIdx = -1;
 
     for (let i = 0; i < lim; i++) {
       const rm = ranges[i];
@@ -417,11 +449,15 @@ class ClusterEngine {
       pb[m] = i;
       pts[m * 2] = xw;
       pts[m * 2 + 1] = yw;
+      // Cleared here rather than in a separate wipe: the segmenter only ever
+      // raises this, so every point starts life unclassified.
+      ptCls[m] = CLS_NOISE;
       m++;
 
       if (r < best) {
         best = r;
         bestBin = i;
+        bestIdx = m - 1;
       }
       if (
         xw < -OOB_TOL_MM ||
@@ -434,9 +470,10 @@ class ClusterEngine {
     }
 
     this.out.outOfBounds = oob;
-    if (m > 0) {
+    if (m > 0 && bestIdx >= 0) {
       this.out.nearestMm = best;
       this.out.nearestBearingDeg = bestBin;
+      this.out.nearestIdx = bestIdx;
     }
     return m;
   }
@@ -672,8 +709,19 @@ class ClusterEngine {
     c.rmsResid = rmsResid;
     c.minR = minR === Infinity ? 0 : minR;
     c.bearingDeg = minBin;
-    c.cls = classify(runN, c.len, c.wid, linearity, rmsResid);
+    const cls = classify(runN, c.len, c.wid, linearity, rmsResid);
+    c.cls = cls;
     this.clusterCount++;
+
+    // Stamp the verdict back onto the member points so the cloud can be tinted
+    // by class. A third pass rather than a merge into the loop above, because
+    // the class is not known until the extents from that loop have been
+    // classified; it is O(runN) over the same run and the whole scan is 360
+    // points.
+    if (cls !== CLS_NOISE) {
+      const ptCls = this.out.ptCls;
+      for (let t = runStart; t < end; t++) ptCls[this.ord[t]] = cls;
+    }
   }
 
   // ------------------------------------------------------------ stage 4 ---

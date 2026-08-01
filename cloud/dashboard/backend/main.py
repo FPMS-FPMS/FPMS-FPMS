@@ -125,9 +125,19 @@ def logout(response: Response) -> dict[str, Any]:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     bridge = get_bridge()
+    mqtt = bridge.status() if bridge else {
+        "connected": False,
+        "problem": "MQTT bridge never started — check launch.log for an import "
+                   "error during startup.",
+    }
+    # "ok" used to be a hardcoded True, which made it useless: the dashboard
+    # reported ok:true while the broker was refusing every connection and no
+    # rover data could possibly arrive.
     return {
-        "ok": True,
-        "mqtt": bridge.status() if bridge else {"connected": False},
+        "ok": bool(mqtt.get("connected")),
+        "problems": [p for p in (mqtt.get("problem"),) if p],
+        "mqtt": mqtt,
+        "frontend": _frontend_status(),
         "channels": hub.channels(),
         "aws": {
             # effective_mode reflects real credentials when they exist, so the
@@ -736,11 +746,47 @@ _dist_override = os.environ.get("FPMS_FRONTEND_DIST")
 _bundled_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 if _dist_override and Path(_dist_override).is_dir():
     FRONTEND_DIST = Path(_dist_override)
+    FRONTEND_DIST_SOURCE = "FPMS_FRONTEND_DIST override"
 else:
     if _dist_override:
-        print(f"FPMS_FRONTEND_DIST={_dist_override!r} is not a directory; "
-              f"falling back to the bundled UI", flush=True)
+        log.error("FPMS_FRONTEND_DIST=%r is not a directory; falling back to the "
+                  "bundled UI. Fix or clear that variable — the UI you are "
+                  "looking at is NOT the one you pointed at.", _dist_override)
+        FRONTEND_DIST_SOURCE = "bundled (override path does not exist)"
+    else:
+        FRONTEND_DIST_SOURCE = "bundled"
     FRONTEND_DIST = _bundled_dist
+
+log.info("serving frontend from %s (%s)", FRONTEND_DIST, FRONTEND_DIST_SOURCE)
+if not FRONTEND_DIST.is_dir():
+    log.error("No frontend build at %s — the API works but every page will be "
+              "missing. Run `npm run build` in cloud/dashboard/frontend.",
+              FRONTEND_DIST)
+
+
+def _frontend_status() -> dict[str, Any]:
+    """Which UI this process is actually serving.
+
+    Serving a stale or missing dist is invisible from the browser — the app just
+    looks old or blank — so /api/health has to name the exact directory and where
+    that choice came from.
+    """
+    index = FRONTEND_DIST / "index.html"
+    st: dict[str, Any] = {
+        "dist": str(FRONTEND_DIST),
+        "source": FRONTEND_DIST_SOURCE,
+        "override_env": _dist_override or None,
+        "override_honoured": FRONTEND_DIST_SOURCE.startswith("FPMS_FRONTEND_DIST"),
+        "exists": FRONTEND_DIST.is_dir(),
+        "index_html": index.is_file(),
+        "built_at": None,
+    }
+    try:
+        if index.is_file():
+            st["built_at"] = index.stat().st_mtime
+    except OSError:
+        pass
+    return st
 
 if FRONTEND_DIST.is_dir():
     app.mount(

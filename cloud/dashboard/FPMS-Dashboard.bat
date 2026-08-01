@@ -35,10 +35,24 @@ if not exist "%DOCKER_EXE%" (
 if errorlevel 1 (
     echo [~] Starting Docker Desktop, please wait...
     start "" "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    REM  Bounded wait. This used to be an unconditional `goto` loop, so a Docker
+    REM  Desktop that never came up left the launcher spinning forever with no
+    REM  message and no way to tell it apart from a slow start.
+    set /a DOCKER_WAIT=0
     :waitdocker
     timeout /t 3 /nobreak >nul
+    set /a DOCKER_WAIT+=3
     "%DOCKER_EXE%" info >nul 2>&1
-    if errorlevel 1 goto waitdocker
+    if not errorlevel 1 goto dockerup
+    if !DOCKER_WAIT! GEQ 180 (
+        echo [!] Docker Desktop did not come up within 3 minutes.
+        echo     Start it by hand, or set FPMS_AWS_MODE=cloud to skip LocalStack.
+        pause
+        exit /b 1
+    )
+    echo     ... still waiting for Docker ^(!DOCKER_WAIT!s^)
+    goto waitdocker
+    :dockerup
     echo [+] Docker Desktop is up.
 ) else (
     echo [+] Docker Desktop is already running.
@@ -71,6 +85,41 @@ if not exist ".venv\Scripts\python.exe" (
     .venv\Scripts\python.exe -m pip install -q -r backend\requirements.txt
 )
 
+REM ---- 3b. MQTT credentials ----------------------------------
+REM  A backend started without broker credentials against a broker with
+REM  allow_anonymous false connects, is told "Not authorized", and retries in a
+REM  loop. Nothing in the UI says so - every rover panel just waits forever.
+REM  Check it here, before anything else has a chance to look healthy.
+if not defined FPMS_MQTT_USERNAME (
+    for /f "usebackq tokens=*" %%p in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('FPMS_MQTT_USERNAME','User')"`) do set "FPMS_MQTT_USERNAME=%%p"
+)
+if not defined FPMS_MQTT_PASSWORD (
+    for /f "usebackq tokens=*" %%p in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('FPMS_MQTT_PASSWORD','User')"`) do set "FPMS_MQTT_PASSWORD=%%p"
+)
+if not defined FPMS_MQTT_USERNAME goto nocreds
+if not defined FPMS_MQTT_PASSWORD goto nocreds
+echo [+] MQTT credentials found for user "%FPMS_MQTT_USERNAME%".
+goto creds_done
+:nocreds
+echo.
+echo [!] ============================================================
+echo [!]  NO MQTT BROKER CREDENTIALS ARE SET.
+echo [!]
+echo [!]  If the broker runs with allow_anonymous false, this backend
+echo [!]  will be refused with "Not authorized", retry forever, and
+echo [!]  EVERY rover panel will sit at "waiting" with no error shown.
+echo [!]
+echo [!]  Set them once (User scope), then re-run this file:
+echo [!]    [Environment]::SetEnvironmentVariable('FPMS_MQTT_USERNAME','fpms','User')
+echo [!]    [Environment]::SetEnvironmentVariable('FPMS_MQTT_PASSWORD','^<password^>','User')
+echo [!]
+echo [!]  Or create the account: scripts\Setup-Mosquitto.ps1 -Password '^<password^>'
+echo [!] ============================================================
+echo.
+echo     Continuing anyway in 10s - correct only if your broker is anonymous.
+timeout /t 10 >nul
+:creds_done
+
 REM ---- 4. Frontend build (if missing) -------------------------
 if not exist "frontend\dist\index.html" (
     echo [~] Building frontend (one-time)...
@@ -92,11 +141,14 @@ if not defined FPMS_AWS_MODE set FPMS_AWS_MODE=local
 if not defined FPMS_BIND_PORT set FPMS_BIND_PORT=8000
 if not defined AWS_DEFAULT_REGION set AWS_DEFAULT_REGION=us-east-1
 if /I "%FPMS_AWS_MODE%"=="local" (
-    set FPMS_AWS_ENDPOINT=http://localhost:4566
-    set AWS_ACCESS_KEY_ID=test
-    set AWS_SECRET_ACCESS_KEY=test
-    set FPMS_MQTT_HOST=localhost
-    set FPMS_MQTT_PORT=1883
+    REM  Defaults only. These used to be unconditional, so an operator who had
+    REM  pointed the app at a broker on another machine had it silently reset to
+    REM  localhost every launch.
+    if not defined FPMS_AWS_ENDPOINT set FPMS_AWS_ENDPOINT=http://localhost:4566
+    if not defined AWS_ACCESS_KEY_ID set AWS_ACCESS_KEY_ID=test
+    if not defined AWS_SECRET_ACCESS_KEY set AWS_SECRET_ACCESS_KEY=test
+    if not defined FPMS_MQTT_HOST set FPMS_MQTT_HOST=localhost
+    if not defined FPMS_MQTT_PORT set FPMS_MQTT_PORT=1883
 ) else (
     if not defined FPMS_MQTT_HOST (
         echo [!] For CLOUD mode set FPMS_MQTT_HOST to your AWS IoT Core endpoint,
@@ -107,13 +159,39 @@ if /I "%FPMS_AWS_MODE%"=="local" (
     )
 )
 
+REM  Which UI will be served. main.py honours FPMS_FRONTEND_DIST only when it is
+REM  a real directory, so say out loud which one wins - a stale override is
+REM  otherwise indistinguishable from "the rebuild didn't work".
+if defined FPMS_FRONTEND_DIST (
+    if exist "%FPMS_FRONTEND_DIST%\index.html" (
+        echo [i] UI override: %FPMS_FRONTEND_DIST%
+    ) else (
+        echo [!] FPMS_FRONTEND_DIST=%FPMS_FRONTEND_DIST% has no index.html - it will be
+        echo     IGNORED and frontend\dist served instead.
+    )
+) else (
+    echo [i] UI: %CD%\frontend\dist
+)
+
 echo.
 echo ============================================================
 echo   Launching native window...
 echo   AWS mode: %FPMS_AWS_MODE%
+echo   MQTT    : %FPMS_MQTT_HOST%:%FPMS_MQTT_PORT%  user=%FPMS_MQTT_USERNAME%
+echo   Health  : http://localhost:%FPMS_BIND_PORT%/api/health
 echo ============================================================
 echo.
 
 .venv\Scripts\python.exe -m backend.desktop
+set "RC=%ERRORLEVEL%"
+
+REM  A non-zero exit here is the "app flashed and vanished" failure. Show it
+REM  and hold the window open so the reason is readable.
+if not "%RC%"=="0" (
+    echo.
+    echo [!] FPMS exited with code %RC%.
+    echo     Full log: %LOCALAPPDATA%\FPMS\launch.log
+    pause
+)
 
 endlocal

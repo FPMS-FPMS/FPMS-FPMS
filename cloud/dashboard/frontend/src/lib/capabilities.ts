@@ -58,6 +58,21 @@ export type ServiceAnnouncement = {
   at: number;
 };
 
+/** One commandable mission, described by the rover rather than by this file. */
+export type MissionInfo = {
+  name: string;
+  /** The rover's own operator-facing name for the target or route. */
+  label: string | null;
+  /** Longer description; routes carry one naming every corner in order. */
+  describe: string | null;
+  /** Ordered leg names for a route; null for a single target. */
+  legs: string[] | null;
+  /** Corner names for those legs, in the same order. */
+  legLabels: string[] | null;
+  x_mm: number | null;
+  y_mm: number | null;
+};
+
 export type RoverCapabilities = {
   /** True once ANY service on this rover has announced a verb list. */
   announced: boolean;
@@ -76,6 +91,24 @@ export type RoverCapabilities = {
   services: readonly ServiceAnnouncement[];
   /** Mission names the executor offers, if it has announced. */
   missions: string[] | null;
+  /**
+   * Single-target missions, as opposed to multi-leg routes. The executor sends
+   * both lists so a consumer can tell "drive to one corner" apart from "visit
+   * three and retrace", which is a materially different commitment.
+   */
+  singleTargets: string[] | null;
+  /**
+   * mission name -> the rover's OWN plain-English corner name and coordinates.
+   * From the `targets` and `routes` maps in fpms_missions' events/online.
+   *
+   * This exists because the mission ids do not match what an operator says out
+   * loud — `m2` is the zone straight ahead and `m1` is the far one — so a
+   * button labelled from the id alone is how a rover gets sent to the opposite
+   * corner. The rover is the only authority on that mapping and it publishes
+   * it; taking the label from here rather than from a copy in the frontend is
+   * the whole point.
+   */
+  missionInfo: Readonly<Record<string, MissionInfo>>;
   backends: string[] | null;
   defaultBackend: string | null;
   /** Numeric envelope, merged across announcements. Display only. */
@@ -91,6 +124,8 @@ const EMPTY: RoverCapabilities = {
   notOwned: {},
   services: [],
   missions: null,
+  singleTargets: null,
+  missionInfo: {},
   backends: null,
   defaultBackend: null,
   limits: {},
@@ -103,6 +138,60 @@ export function emptyCapabilities(): RoverCapabilities {
 
 function strList(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+function numOrNull(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Fold the executor's `targets` and `routes` maps into one description per
+ * commandable mission.
+ *
+ * Both are optional and both are read defensively: a rover build that predates
+ * either simply contributes nothing, and the caller falls back to its own
+ * labels. What must never happen is a coordinate or a label being invented
+ * here — a button that names the wrong corner is worse than a button that
+ * names none.
+ */
+function readMissionInfo(data: Record<string, any>): Record<string, MissionInfo> {
+  const out: Record<string, MissionInfo> = {};
+
+  const targets = data.targets;
+  if (targets && typeof targets === "object" && !Array.isArray(targets)) {
+    for (const [name, raw] of Object.entries(targets as Record<string, any>)) {
+      if (!raw || typeof raw !== "object") continue;
+      out[name] = {
+        name,
+        label: typeof raw.label === "string" ? raw.label : null,
+        describe: null,
+        legs: null,
+        legLabels: null,
+        x_mm: numOrNull(raw.x_mm),
+        y_mm: numOrNull(raw.y_mm),
+      };
+    }
+  }
+
+  const routes = data.routes;
+  if (routes && typeof routes === "object" && !Array.isArray(routes)) {
+    for (const [name, raw] of Object.entries(routes as Record<string, any>)) {
+      if (!raw || typeof raw !== "object") continue;
+      out[name] = {
+        name,
+        label: typeof raw.label === "string" ? raw.label : null,
+        describe: typeof raw.describe === "string" ? raw.describe : null,
+        legs: strList(raw.legs).length ? strList(raw.legs) : null,
+        legLabels: strList(raw.leg_labels).length ? strList(raw.leg_labels) : null,
+        // A route has no single coordinate, and rendering one would place a
+        // multi-corner patrol at whichever corner happened to sort first.
+        x_mm: null,
+        y_mm: null,
+      };
+    }
+  }
+
+  return out;
 }
 
 function strMap(v: unknown): Record<string, string> {
@@ -151,6 +240,8 @@ function fold(prev: RoverCapabilities, ann: ServiceAnnouncement): RoverCapabilit
     notOwned: prev.notOwned,
     services,
     missions: prev.missions,
+    singleTargets: prev.singleTargets,
+    missionInfo: prev.missionInfo,
     backends: prev.backends,
     defaultBackend: prev.defaultBackend,
     limits: prev.limits,
@@ -208,6 +299,8 @@ export function useRoverCapabilities(): Record<string, RoverCapabilities> {
 
     const notOwned = strMap(data.not_owned_here);
     const missions = strList(data.missions);
+    const singleTargets = strList(data.single_targets);
+    const missionInfo = readMissionInfo(data);
     const backends = strList(data.backends);
     const defaultBackend =
       typeof data.default_backend === "string" ? data.default_backend : null;
@@ -236,6 +329,10 @@ export function useRoverCapabilities(): Record<string, RoverCapabilities> {
           ...next,
           notOwned: Object.keys(notOwned).length ? { ...next.notOwned, ...notOwned } : next.notOwned,
           missions: missions.length ? missions : next.missions,
+          singleTargets: singleTargets.length ? singleTargets : next.singleTargets,
+          missionInfo: Object.keys(missionInfo).length
+            ? { ...next.missionInfo, ...missionInfo }
+            : next.missionInfo,
           backends: backends.length ? backends : next.backends,
           defaultBackend: defaultBackend ?? next.defaultBackend,
           limits: limits ? { ...next.limits, ...limits } : next.limits,
@@ -269,9 +366,11 @@ export function mergeCapabilities(
   const replyTopics: Record<string, string> = {};
   const notOwned: Record<string, string> = {};
   const limits: Record<string, unknown> = {};
+  const missionInfo: Record<string, MissionInfo> = {};
   const services: ServiceAnnouncement[] = [];
   let announced = false;
   let missions: string[] | null = null;
+  let singleTargets: string[] | null = null;
   let backends: string[] | null = null;
   let defaultBackend: string | null = null;
   let lastAt: number | null = null;
@@ -283,12 +382,42 @@ export function mergeCapabilities(
     Object.assign(replyTopics, c.replyTopics);
     Object.assign(notOwned, c.notOwned);
     Object.assign(limits, c.limits);
+    Object.assign(missionInfo, c.missionInfo);
     services.push(...c.services);
     missions = missions ?? c.missions;
+    singleTargets = singleTargets ?? c.singleTargets;
     backends = backends ?? c.backends;
     defaultBackend = defaultBackend ?? c.defaultBackend;
     if (c.lastAt !== null) lastAt = lastAt === null ? c.lastAt : Math.max(lastAt, c.lastAt);
   }
 
-  return { announced, actions, owners, replyTopics, notOwned, services, missions, backends, defaultBackend, limits, lastAt };
+  return {
+    announced, actions, owners, replyTopics, notOwned, services,
+    missions, singleTargets, missionInfo, backends, defaultBackend, limits, lastAt,
+  };
+}
+
+/**
+ * The mission buttons to offer, built from what the rover announced when it
+ * has announced and from `fallback` when it has not.
+ *
+ * UNKNOWN IS NOT UNSUPPORTED, again. `events/online` is published once and not
+ * retained, so a dashboard opened after the executor started has heard nothing
+ * — and rendering "this rover has no missions" then would remove the controls
+ * on the strength of a message that was never sent. The fallback list is used
+ * whole in that case, and `fromRover` says which situation the caller is in so
+ * it can label the difference instead of hiding it.
+ *
+ * When the rover HAS spoken, its list wins outright: a mission the executor
+ * dropped must lose its button, and one it gained must get one.
+ */
+export function missionCatalog(
+  caps: RoverCapabilities,
+  fallback: readonly string[],
+): { names: string[]; fromRover: boolean; info: Readonly<Record<string, MissionInfo>> } {
+  const advertised = caps.missions;
+  if (advertised && advertised.length) {
+    return { names: [...advertised], fromRover: true, info: caps.missionInfo };
+  }
+  return { names: [...fallback], fromRover: false, info: caps.missionInfo };
 }

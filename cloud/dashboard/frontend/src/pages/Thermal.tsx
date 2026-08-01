@@ -8,7 +8,12 @@ import { useActiveThing } from "../lib/things";
 import { apiPost } from "../lib/api";
 
 export default function Thermal() {
-  const { thing } = useActiveThing(null);
+  // The page used to be titled "rover 1" while the feed underneath it was
+  // whichever rover happened to be reporting — so a critical hotspot could be
+  // labelled with the wrong machine's name. The rover is now picked explicitly
+  // and its name is printed wherever the reading is.
+  const [picked, setPicked] = useState<string | null>(null);
+  const { thing, things } = useActiveThing(picked);
   const stream = useChannel<any>(thing ? `thermal:${thing}` : null);
   const analysis = useChannel<any>(thing ? `thermal-analysis:${thing}` : null);
   const [busy, setBusy] = useState(false);
@@ -20,20 +25,37 @@ export default function Thermal() {
     finally { setBusy(false); }
   };
 
-  const severity = analysis.data?.data.severity ?? "nominal";
+  // `?.data.severity` threw the moment an envelope arrived without a payload,
+  // and a thrown render on this page takes the fire warning down with it.
+  const severity: string =
+    (analysis.data?.data?.severity as string | undefined) ?? "unknown";
 
   return (
     <div className="space-y-6">
-      <div className="flex items-end justify-between">
+      <div className="flex items-end justify-between gap-4">
         <div>
           <div className="lbl">Page 4</div>
-          <h1 className="h-page mt-1">Thermal — rover 1 · with mini analyst</h1>
+          <h1 className="h-page mt-1">
+            Thermal — {thing ?? "no rover reporting"} · with mini analyst
+          </h1>
         </div>
         <div className="flex items-center gap-2">
           {severity === "critical" && (
             <span className="chip-hot animate-pulse">
-              ⚠ CRITICAL — potential fire
+              ⚠ CRITICAL — potential fire on {thing ?? "this rover"}
             </span>
+          )}
+          {things.length > 1 && (
+            <select
+              value={thing ?? ""}
+              onChange={(e) => setPicked(e.target.value)}
+              className="rounded-lg border border-white/10 bg-black/40 px-3 py-1.5 text-sm text-slate-100 outline-none"
+              title="Which rover's thermal feed to show"
+            >
+              {things.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
           )}
         </div>
       </div>
@@ -42,7 +64,7 @@ export default function Thermal() {
         <Card>
           <CardHeader
             title="Live thermal grid"
-            subtitle="LWIR · 32 × 24 · ironbow"
+            subtitle={thing ? `LWIR · 32 × 24 · ironbow · ${thing}` : "LWIR · 32 × 24 · ironbow"}
             right={
               <StatusPill
                 connected={stream.connected}

@@ -11,6 +11,8 @@ import { useThings } from "../lib/things";
 // the same three rules — missing is not zero, an unknown phase is RUNNING, and
 // stale-while-running is loud — rather than each reimplementing them.
 import {
+  MISSION_ABORT_ACTION,
+  MISSION_ABORT_NOTE,
   MISSION_STALE_MS,
   poseEnvelopeFromMm,
   readMission,
@@ -18,6 +20,14 @@ import {
   type MissionPlan,
   type MissionState,
 } from "../lib/mission";
+// The mission names, their corner labels and the backends all come from what
+// the executor announced, not from a copy kept here that can drift away from it.
+import {
+  emptyCapabilities,
+  missionCatalog,
+  useRoverCapabilities,
+  type MissionInfo,
+} from "../lib/capabilities";
 
 /**
  * Manual driving. Control.tsx is the command console — discrete actions and
@@ -51,13 +61,90 @@ const NUDGE_MM = 100;
 /** Closed-loop turn magnitudes offered, smallest first. */
 const TURN_DEGS = [15, 45, 90] as const;
 
-/** Speed limits enforced on the rover. Printed so the operator is not guessing. */
-const CAPS: { what: string; limit: string }[] = [
-  { what: "jog (stick)", limit: "0.05 m/s" },
-  { what: "nudge", limit: "0.04 m/s" },
-  { what: "dock", limit: "0.025 m/s" },
-  { what: "turn", limit: "0.4 rad/s" },
-];
+/**
+ * Speed limits, printed so the operator is not guessing.
+ *
+ * These are DEFAULTS, and they are labelled as such when that is all we have.
+ * `set_speed` on the Control tab retunes jog and nudge at runtime, and the
+ * rover then reports the values it is actually using on every telemetry tick
+ * (`jog_max_mps`, `nudge_mps`) — so a card that printed these constants
+ * unconditionally would go on claiming 0.05 m/s after an operator had changed
+ * it, which is precisely the drift this dashboard is supposed to catch rather
+ * than commit.
+ */
+const CAP_DEFAULTS = {
+  jogMaxMps: 0.05,
+  nudgeMps: 0.04,
+  dockMps: 0.025,
+  turnRadps: 0.4,
+} as const;
+
+/**
+ * Fallback mission ids, used ONLY until the executor announces its own.
+ *
+ * fpms_missions publishes `missions`, `single_targets`, `targets` (each with
+ * the rover's own corner label) and `routes` on events/online. Those win
+ * outright once heard. This list exists because that message is published once
+ * and not retained, so a dashboard opened after the rover booted has heard
+ * nothing — and offering no missions at all then would be reading silence as
+ * "this rover cannot drive anywhere".
+ */
+const FALLBACK_MISSIONS = ["home", "m1", "m2", "water", "patrol"] as const;
+
+/**
+ * Labels of last resort, for the same window before the rover has spoken.
+ *
+ * `where` names the physical CORNER, because the ids do not line up with what
+ * an operator says out loud: standing at the start box, the zone straight
+ * ahead is `m2` and the far one is `m1`. When the rover's own label arrives it
+ * replaces this — fpms_missions.TARGET_LABEL is the single authority and this
+ * is a stale copy of it by construction.
+ */
+const FALLBACK_LABELS: Record<string, { label: string; where: string; primary?: boolean }> = {
+  home: { label: "RETURN HOME", where: "start box, bottom-RIGHT", primary: true },
+  m1: { label: "MISSION 1", where: "top-LEFT zone (zone-a, the far one)" },
+  m2: { label: "MISSION 2", where: "top-RIGHT zone (zone-b, straight ahead of the start box)" },
+  water: { label: "WATER REFILL", where: "bottom-LEFT water station" },
+  patrol: {
+    label: "ALL TARGETS",
+    where:
+      "top-RIGHT zone, then top-LEFT zone, then the water station, then retraces the whole path back to the start box",
+  },
+};
+
+/** One mission button, however we came to know about it. */
+type MissionOption = {
+  name: string;
+  label: string;
+  where: string;
+  primary: boolean;
+  /** True when the label came from the rover rather than from FALLBACK_LABELS. */
+  fromRover: boolean;
+};
+
+function buildMissionOptions(
+  names: readonly string[],
+  info: Readonly<Record<string, MissionInfo>>,
+): MissionOption[] {
+  return names.map((name) => {
+    const ann = info[name];
+    const fb = FALLBACK_LABELS[name];
+    // A route's `describe` names every corner in order and is the better
+    // tooltip; a single target has only its corner label.
+    const where = ann?.describe ?? ann?.label ?? fb?.where ?? "target not described by the rover";
+    return {
+      name,
+      // The rover's route label ("ALL TARGETS") is operator-facing already.
+      // Single targets announce a corner description rather than a button
+      // caption, so the local caption is kept for those and the corner goes in
+      // the tooltip where it belongs.
+      label: fb?.label ?? (ann?.legs ? ann.label ?? name.toUpperCase() : name.toUpperCase()),
+      where,
+      primary: fb?.primary === true || name === "home",
+      fromRover: !!ann,
+    };
+  });
+}
 
 /** Telemetry older than this means we no longer know what the rover is doing. */
 const TELEMETRY_STALE_MS = 5000;
@@ -99,52 +186,23 @@ const LOG_LIMIT = 40;
  * publishes to MQTT only. Selecting it before that chain is up sends a
  * mission to a planner that cannot localise.
  */
-const MISSION_BACKENDS = [
-  {
-    id: "deadreckon",
+const BACKEND_NOTES: Record<string, { label: string; note: string; warn: string | null }> = {
+  deadreckon: {
     label: "dead reckoning",
     note: "proven — 0.6% distance error, ±1–4° turns",
-    warn: null as string | null,
+    warn: null,
   },
-  {
-    id: "nav2",
+  nav2: {
     label: "Nav2",
     note: "requires the navigation stack to be up",
     warn:
       "Nav2 needs a live LaserScan in ROS, a complete TF tree and a map before it can localise. Those are not up on this rover yet — the board's /scan publishes all zeros and the working LiDAR goes to MQTT, not ROS. A mission sent on this backend will not plan.",
   },
-] as const;
+};
 
-type MissionBackend = (typeof MISSION_BACKENDS)[number]["id"];
-
-const DEFAULT_MISSION_BACKEND: MissionBackend = "deadreckon";
-
-/**
- * The routes offered. Kept as data so the buttons and the wiring agree.
- *
- * `where` names the physical CORNER, because the ids do not line up with what
- * an operator says out loud: standing at the start box, the zone straight ahead
- * is `m2` and the far one is `m1`, so a spoken "zone 1" is the code's m2. The
- * ids are not renumbered — fpms_missions.py explains why — so the tooltip is
- * what stops an operator sending the rover to the opposite corner.
- */
-const MISSIONS: {
-  name: string;
-  label: string;
-  where: string;
-  primary?: boolean;
-}[] = [
-  { name: "home", label: "RETURN HOME", where: "start box, bottom-right", primary: true },
-  { name: "m1", label: "MISSION 1", where: "top-LEFT zone (zone A, the far one)" },
-  { name: "m2", label: "MISSION 2", where: "top-RIGHT zone (zone B, straight ahead of the start box)" },
-  { name: "water", label: "WATER REFILL", where: "bottom-LEFT water station" },
-  {
-    name: "patrol",
-    label: "ALL TARGETS",
-    where:
-      "top-RIGHT zone, then top-LEFT zone, then the water station, then retraces the whole path back to the start box",
-  },
-];
+/** Used until the executor announces `backends` / `default_backend`. */
+const FALLBACK_BACKENDS = ["deadreckon", "nav2"] as const;
+const FALLBACK_DEFAULT_BACKEND = "deadreckon";
 
 type Action = "stop" | "jog" | "nudge" | "turn" | "mission" | "set_coordinate";
 
@@ -211,7 +269,42 @@ export default function Drive() {
   const planRoute = plan?.waypoints ?? null;
 
   const mission = readMission(readTelemetry(missionCh.data));
-  const [backend, setBackend] = useState<MissionBackend>(DEFAULT_MISSION_BACKEND);
+
+  /**
+   * What THIS rover says it can drive.
+   *
+   * The mission buttons, their corner labels and the backend chips are all
+   * built from this. Before it arrives the fallbacks above are used whole and
+   * the card says so — an unheard announcement must never be rendered as "this
+   * rover has no missions", because `events/online` is published once and is
+   * not retained, so a dashboard opened after the executor started has heard
+   * nothing at all.
+   */
+  const capsByThing = useRoverCapabilities();
+  const caps = thing ? capsByThing[thing] ?? emptyCapabilities() : emptyCapabilities();
+  const catalog = useMemo(
+    () => missionCatalog(caps, FALLBACK_MISSIONS),
+    [caps],
+  );
+  const missionOptions = useMemo(
+    () => buildMissionOptions(catalog.names, catalog.info),
+    [catalog],
+  );
+
+  const backends: readonly string[] =
+    caps.backends && caps.backends.length ? caps.backends : FALLBACK_BACKENDS;
+  const [pickedBackend, setPickedBackend] = useState<string | null>(null);
+  // The rover's own default wins over ours until the operator chooses. It is
+  // configurable on the rover (FPMS_MISSION_BACKEND), so hardcoding
+  // "deadreckon" here would silently send missions on a backend the rover was
+  // deliberately configured away from.
+  const backend =
+    pickedBackend && backends.includes(pickedBackend)
+      ? pickedBackend
+      : caps.defaultBackend && backends.includes(caps.defaultBackend)
+        ? caps.defaultBackend
+        : backends[0] ?? FALLBACK_DEFAULT_BACKEND;
+  const setBackend = setPickedBackend;
 
   /**
    * Where the arena map draws the rover.
@@ -398,9 +491,16 @@ export default function Drive() {
    * Abort whatever mission is running on `targets`, without touching the
    * motion lockout — an abort has to work precisely when the link check has
    * decided things are wrong, so it goes through `fire` and never `move`.
+   *
+   * This used to publish `mission {name:"abort"}`, which BOTH publishers
+   * refuse: `abort` is not in fpms_missions.COMMANDABLE and not in teleop's
+   * stub list either, so the one control that exists for a machine driving
+   * somewhere wrong answered with a nack and aborted nothing. `stop` is the
+   * verb the executor actually subscribes and acts on (see MISSION_ABORT_NOTE
+   * and the rover's own `acts_silently_on` announcement), and it halts the
+   * motors in the same publish.
    */
-  const abortMission = (targets: string[]) =>
-    fire("mission", targets, { name: "abort" });
+  const abortMission = (targets: string[]) => fire(MISSION_ABORT_ACTION, targets);
 
   /**
    * Fleet emergency stop. Ignores the rover selector on purpose: an e-stop that
@@ -408,16 +508,13 @@ export default function Drive() {
    * and never confirm-gated — a dialog on an e-stop costs a click during an
    * emergency, and an accidental stop is the safe outcome.
    *
-   * The stop goes first because it is the command that has always existed and
-   * halts the motors. The mission abort goes with it because a stop alone is
-   * not enough against an executor: a mission driving segments republishes
-   * cmd_vel continuously, so a single halt would be overwritten by the next
-   * tick and the rover would carry on as if nothing had been pressed.
+   * One publish per rover does both jobs. `stop` halts the motors in teleop
+   * AND aborts the run in fpms-missions, which subscribes the same verb and
+   * calls request_abort on it. The earlier version sent a second
+   * `mission {name:"abort"}` alongside — that name is not commandable, so all
+   * it ever added was a refusal in the log at the worst possible moment.
    */
-  const stopAll = () => {
-    fire("stop", bays);
-    abortMission(bays);
-  };
+  const stopAll = () => fire(MISSION_ABORT_ACTION, bays);
   const stopRef = useRef(stopAll);
   stopRef.current = stopAll;
   useEffect(() => {
@@ -510,7 +607,7 @@ export default function Drive() {
           <button
             onClick={stopAll}
             className="flex w-full items-center justify-center gap-3 rounded-xl border border-rose-500/50 bg-rose-600/25 px-4 py-5 text-lg font-semibold tracking-wide text-rose-50 shadow-lg shadow-black/50 backdrop-blur transition hover:bg-rose-600/40 active:scale-[0.995]"
-            title="Emergency stop — halts every rover. Always enabled. Shortcut: Esc"
+            title="Emergency stop — halts every rover AND aborts any running mission (fpms-missions subscribes `stop` and aborts on it). Always enabled. Shortcut: Esc"
           >
             <span className="inline-block h-3 w-3 rounded-full bg-rose-400 pulse-dot text-rose-400" />
             STOP ALL — EVERY ROVER
@@ -605,28 +702,20 @@ export default function Drive() {
           />
         </ErrorBoundary>
 
-        <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 text-sm text-amber-100/90">
-          <b>Everything here is capped slow, on purpose.</b> The rover enforces
-          these limits — full stick deflection asks for the jog cap, not for
-          whatever the motors can do:
-          <div className="mt-2 flex flex-wrap gap-2">
-            {CAPS.map((c) => (
-              <span key={c.what} className="chip font-mono">
-                {c.what} ≤ {c.limit}
-              </span>
-            ))}
-          </div>
-          <div className="mt-2 text-xs text-amber-200/70">
-            Nudges are fixed {NUDGE_MM} mm steps and turns are closed-loop to the
-            requested angle.
-          </div>
-        </div>
+        {/* The envelope, read off the rover where the rover reports it. jog and
+            nudge are retunable at runtime from the Control tab, so printing the
+            compiled-in defaults would go on claiming a cap the operator had
+            already changed. */}
+        <ErrorBoundary label="Drive limits">
+          <SpeedEnvelope tele={tele} limits={caps.limits} />
+        </ErrorBoundary>
 
-        {/* The caps above say how fast the rover may go. This says how slow it
-            can go — the other end of the same argument, and the one that looks
-            like the dashboard ignoring the request unless it is spelled out. */}
-        <ErrorBoundary label="Drive deadband">
-          <DeadbandCard tele={tele} />
+        {/* The caps above say how fast the rover may go. This says what happens
+            at the bottom of the range — which on this firmware is not what
+            anybody assumed, and the assumption cost two multi-hour debugging
+            sessions. */}
+        <ErrorBoundary label="Drive speed floor">
+          <SpeedFloorCard tele={tele} />
         </ErrorBoundary>
 
         {/* What the rover is doing to itself, as opposed to what the stick is
@@ -729,8 +818,11 @@ export default function Drive() {
             </div>
             <p className="mt-3 text-xs text-slate-500">
               Push up to go forward, right to turn right; output is normalised
-              −1…1 and the rover maps full deflection to its {CAPS[0].limit} jog
-              cap. The centre <span className="font-mono">8%</span> is a dead
+              −1…1 and the rover maps full deflection to its jog cap —{" "}
+              {num(tele?.jog_max_mps) !== null
+                ? `${num(tele?.jog_max_mps)!.toFixed(3)} m/s, as the rover reported it on its last packet`
+                : `${CAP_DEFAULTS.jogMaxMps.toFixed(3)} m/s by default; the rover has not reported the value in force`}
+              . The centre <span className="font-mono">8%</span> is a dead
               zone so a resting thumb cannot creep the rover. While the stick is
               held, jog is sent continuously — even when it is held still —
               because the rover halts on its own if nothing arrives for{" "}
@@ -813,46 +905,72 @@ export default function Drive() {
               title="Missions"
               subtitle="Hands the route to the rover"
               right={
-                <span className="chip font-mono" title="Backend the next mission will be sent with">
-                  via {backend}
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={catalog.fromRover ? "chip-ok" : "chip-warn"}
+                    title={
+                      catalog.fromRover
+                        ? "Buttons built from the mission list this rover announced"
+                        : "The executor has not announced its mission list — events/online is published once and not retained. These are the dashboard's fallbacks, which may be out of date."
+                    }
+                  >
+                    {catalog.fromRover ? "from rover" : "not yet announced"}
+                  </span>
+                  <span className="chip font-mono" title="Backend the next mission will be sent with">
+                    via {backend}
+                  </span>
+                </div>
               }
             />
 
             {/* The selector sits above the buttons it changes. A backend
                 picked in another card is a setting nobody reads before
-                clicking. */}
+                clicking. The list itself is the rover's — fpms_missions
+                announces `backends` and `default_backend`, and the default is
+                configurable on the rover, so hardcoding it here would send
+                missions on a backend the rover was deliberately configured
+                away from. */}
             <div className="mb-4">
               <div className="lbl mb-2">Driven by</div>
               <div className="flex flex-wrap gap-2">
-                {MISSION_BACKENDS.map((b) => (
-                  <button
-                    key={b.id}
-                    onClick={() => setBackend(b.id)}
-                    className={`chip ${
-                      backend === b.id
-                        ? "border-ember-500/40 bg-ember-500/10 text-ember-200"
-                        : ""
-                    }`}
-                    title={b.warn ?? b.note}
-                  >
-                    <span className="font-mono">{b.id}</span>
-                    <span className="ml-1.5 text-[10px] text-slate-500">· {b.note}</span>
-                  </button>
-                ))}
+                {backends.map((id) => {
+                  const b = BACKEND_NOTES[id];
+                  return (
+                    <button
+                      key={id}
+                      onClick={() => setBackend(id)}
+                      className={`chip ${
+                        backend === id
+                          ? "border-ember-500/40 bg-ember-500/10 text-ember-200"
+                          : ""
+                      }`}
+                      title={b?.warn ?? b?.note ?? "Backend advertised by the rover"}
+                    >
+                      <span className="font-mono">{id}</span>
+                      {b ? (
+                        <span className="ml-1.5 text-[10px] text-slate-500">· {b.note}</span>
+                      ) : (
+                        <span className="ml-1.5 text-[10px] text-amber-300">
+                          · advertised by the rover, unknown to this dashboard
+                        </span>
+                      )}
+                      {caps.defaultBackend === id && (
+                        <span className="ml-1.5 text-[10px] text-slate-500">· rover default</span>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
-              {MISSION_BACKENDS.map((b) =>
-                b.id === backend && b.warn ? (
-                  <div
-                    key={b.id}
-                    className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90"
-                  >
-                    <b>{b.label} is not ready on this rover.</b> {b.warn} Switch back
-                    to <span className="font-mono">deadreckon</span> unless you are
-                    deliberately testing the stack.
-                  </div>
-                ) : null,
-              )}
+              {BACKEND_NOTES[backend]?.warn ? (
+                <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+                  <b>{BACKEND_NOTES[backend].label} is not ready on this rover.</b>{" "}
+                  {BACKEND_NOTES[backend].warn} Switch back to{" "}
+                  <span className="font-mono">
+                    {caps.defaultBackend ?? FALLBACK_DEFAULT_BACKEND}
+                  </span>{" "}
+                  unless you are deliberately testing the stack.
+                </div>
+              ) : null}
             </div>
 
             {/* PLAN FIRST. Separate row, above the buttons that actually drive,
@@ -867,16 +985,18 @@ export default function Drive() {
                 {/* RETURN HOME is previewable too, and used to be the one route
                     you could not look at before committing to it. The executor
                     plans it through the identical code path as the others —
-                    fpms_missions._preview accepts any name in MISSIONS — and
+                    fpms_missions._preview accepts any commandable name — and
                     "get the rover back" is exactly the moment an operator wants
                     to see the line before pressing the button. */}
-                {MISSIONS.map((m) => (
+                {missionOptions.map((m) => (
                   <button
                     key={m.name}
                     className="chip"
                     onClick={() => planMission(m.name)}
                     disabled={!thing}
-                    title={`Preview the route to ${m.name} — ${m.where} — without moving`}
+                    title={`Preview the route to ${m.name} — ${m.where} — without moving${
+                      m.fromRover ? "" : " (corner description is the dashboard's, not the rover's)"
+                    }`}
                   >
                     PLAN {m.label.replace(/^MISSION /, "").replace(/^RETURN /, "")}
                   </button>
@@ -916,7 +1036,7 @@ export default function Drive() {
             </div>
 
             <div className="flex flex-wrap gap-2">
-              {MISSIONS.map((m) => (
+              {missionOptions.map((m) => (
                 <ConfirmButton
                   key={m.name}
                   className={m.primary ? "btn-primary" : "btn"}
@@ -932,21 +1052,56 @@ export default function Drive() {
               ))}
             </div>
             <p className="mt-3 text-xs text-slate-500">
-              All {MISSIONS.length} are confirm-gated: each one drives the rover
-              somewhere on its own, and from here a rover on blocks and a rover
-              on the floor look identical. The PLAN row above is not gated at
-              all — a preview commands no motion, and the moment you most want
+              All {missionOptions.length} are confirm-gated: each one drives the
+              rover somewhere on its own, and from here a rover on blocks and a
+              rover on the floor look identical. The PLAN row above is not gated
+              at all — a preview commands no motion, and the moment you most want
               to see the intended route is while you are deciding whether it is
               safe to run. Each is sent as{" "}
               <span className="font-mono">{`{name, backend}`}</span> — progress
               comes back in the Mission card above. Take the stick or hit STOP ALL
-              to cut a mission short; STOP ALL aborts the mission as well as
-              halting the motors.
+              to cut a mission short; STOP ALL is also the abort — fpms-missions
+              subscribes <span className="font-mono">stop</span> and ends the run
+              on it, which is why there is no separate abort verb.
+            </p>
+            <p className="mt-2 text-xs text-slate-500">
+              {catalog.fromRover ? (
+                <>
+                  This list is <b>the rover's</b>: fpms-missions announced{" "}
+                  {catalog.names.length} commandable name
+                  {catalog.names.length === 1 ? "" : "s"}, and a mission it drops
+                  loses its button here on the next announcement.
+                </>
+              ) : (
+                <>
+                  <b>The executor has not announced its mission list.</b>{" "}
+                  <span className="font-mono">events/online</span> is published
+                  once and not retained, so a dashboard opened after the rover
+                  booted never saw it — these are the dashboard's fallback names
+                  and they may be out of date. Sending an unknown one is refused
+                  by the rover with the valid list attached, which lands in the
+                  log below.
+                </>
+              )}
             </p>
           </Card>
 
           <Card>
             <CardHeader title="Set coordinate" subtitle="Tells the rover where it is" />
+            {/* The rover says whether it has an origin at all, and the answer
+                changes what this control is for: with no origin the pose is
+                measured from wherever the bridge happened to start, so this is
+                not a correction, it is the thing that makes the arena frame
+                exist. */}
+            {tele?.origin_set === false && (
+              <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+                <b>No origin is set on this rover.</b> x/y are being measured
+                from wherever the teleop bridge started, not in the arena frame
+                the map draws in, so every coordinate on this page and every
+                mission planned from it is offset by an unknown amount. Set it
+                before running anything.
+              </div>
+            )}
             <SetCoordinate
               disabled={noRover}
               onFire={(x, y) => thing && fire("set_coordinate", [thing], { x_mm: x, y_mm: y })}
@@ -955,7 +1110,11 @@ export default function Drive() {
               Writes the rover's believed position in arena millimetres. It moves
               nothing, so there is nothing to confirm and it stays available when
               the motion controls are locked — but the number has to be right, or
-              every mission afterwards is wrong by the same amount.
+              every mission afterwards is wrong by the same amount.{" "}
+              <b>Re-set it after every boot.</b> The origin file survives a
+              reboot while the board's odometry restarts at zero, so a stale
+              reference is not a small error — it has already placed a rover
+              nine metres outside a 1.2 m arena, and the planner believed it.
             </p>
           </Card>
         </div>
@@ -1279,124 +1438,242 @@ const PHASE_LABEL: Record<LinkPhase, string> = {
   never: "NEVER SEEN",
 };
 
-/* ---- deadband ------------------------------------------------------------ */
+/* ---- speed envelope ------------------------------------------------------ */
 
 /**
- * Why the floor exists, next to the numbers that make it up. The operator asked
- * for very slow and got a minimum instead; without this block that reads as the
- * request having been ignored rather than answered.
+ * What the rover is CURRENTLY enforcing, not what it was compiled with.
+ *
+ * `set_speed` on the Control tab retunes jog and nudge on the running service,
+ * and every telemetry tick reports the values in force (`jog_max_mps`,
+ * `nudge_mps`). A panel that printed the defaults would keep claiming 0.05 m/s
+ * after an operator had halved it — a small lie of exactly the kind that is
+ * only discovered by driving into something.
+ *
+ * Where the rover has not told us, the default is shown and labelled as a
+ * default rather than passed off as a reading.
  */
-function DeadbandCard({ tele }: { tele: Record<string, unknown> | null }) {
+function SpeedEnvelope({
+  tele,
+  limits,
+}: {
+  tele: Record<string, unknown> | null;
+  limits: Readonly<Record<string, unknown>>;
+}) {
+  const jog = num(tele?.jog_max_mps) ?? num(limits.jog_max_mps);
+  const jogLive = num(tele?.jog_max_mps) !== null;
+  const nudge = num(tele?.nudge_mps) ?? num(limits.nudge_mps);
+  const nudgeLive = num(tele?.nudge_mps) !== null;
+  const dock = num(limits.dock_mps);
+  const turn = num(limits.turn_max_radps) ?? num(limits.turn_radps);
+  const hardLin = num(limits.hard_max_lin_mps);
+
+  const rows: { what: string; value: number | null; unit: string; live: boolean; fallback: number }[] = [
+    { what: "jog (stick)", value: jog, unit: "m/s", live: jogLive, fallback: CAP_DEFAULTS.jogMaxMps },
+    { what: "nudge", value: nudge, unit: "m/s", live: nudgeLive, fallback: CAP_DEFAULTS.nudgeMps },
+    { what: "dock", value: dock, unit: "m/s", live: false, fallback: CAP_DEFAULTS.dockMps },
+    { what: "turn", value: turn, unit: "rad/s", live: false, fallback: CAP_DEFAULTS.turnRadps },
+  ];
+
+  return (
+    <div className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-4 text-sm text-amber-100/90">
+      <b>Everything here is capped slow, on purpose.</b> The rover enforces these
+      limits — full stick deflection asks for the jog cap, not for whatever the
+      motors can do:
+      <div className="mt-2 flex flex-wrap gap-2">
+        {rows.map((r) => (
+          <span
+            key={r.what}
+            className={r.live ? "chip-ok font-mono" : "chip font-mono"}
+            title={
+              r.live
+                ? "Reported by the rover on this telemetry tick — this is the value in force"
+                : r.value !== null
+                  ? "From the rover's announced limits"
+                  : "The rover has not reported this; showing the compiled-in default"
+            }
+          >
+            {r.what} ≤ {(r.value ?? r.fallback).toFixed(3)} {r.unit}
+            {r.value === null && <span className="ml-1 text-[10px] text-slate-400">· default</span>}
+          </span>
+        ))}
+        {hardLin !== null && (
+          <span className="chip font-mono" title="Not tunable from anywhere at runtime">
+            hard cap ≤ {hardLin.toFixed(3)} m/s
+          </span>
+        )}
+      </div>
+      <div className="mt-2 text-xs text-amber-200/70">
+        Nudges are fixed {NUDGE_MM} mm steps and turns are closed-loop to the
+        requested angle. Green chips are values the rover reported on its last
+        packet; plain chips are announced or compiled-in defaults it has not
+        confirmed — jog and nudge are retunable at runtime from the Control tab,
+        so those two are the ones worth reading off the rover rather than off
+        this page.
+      </div>
+    </div>
+  );
+}
+
+/* ---- speed floor --------------------------------------------------------- */
+
+/**
+ * WHAT HAPPENS AT THE BOTTOM OF THE RANGE — and the retraction that belongs
+ * with it.
+ *
+ * This card used to be headed "Motor deadband floor · why very slow is not
+ * available" and asserted, with a measurement, that a 100 mm forward command
+ * came out as a 290 mm BACKWARD lurch with 24° of unrequested rotation.
+ *
+ * That measurement was an artefact. `/odom_raw`'s `twist.linear.x` is
+ * sign-inverted relative to its own `pose.position` on this firmware; the rover
+ * had moved forward, as commanded, the whole time. fpms_teleop.py carries the
+ * retraction in full ("Every claim of the form 'this chassis cannot creep' is
+ * withdrawn. It creeps.") and set both floors back to 0.0 — OFF. Repeating the
+ * withdrawn claim on the operator's screen is how a corrected fault gets
+ * re-learned by the next person.
+ *
+ * TWO THINGS ARE TRUE INSTEAD, AND THEY ARE NOT THE SAME THING:
+ *
+ *   1. The configurable floor is OFF and UNMEASURED. The rover publishes
+ *      min_cmd_lin/min_cmd_ang as 0.0 by default. 0.0 means "no floor", NOT
+ *      "measured at zero", and rendering it as a measured minimum was the
+ *      remaining piece of the old story.
+ *   2. Amplitude does not buy slowness on this firmware anyway. The velocity
+ *      loop regulates integer encoder counts per 10 ms and the board applies a
+ *      large fixed duty to any non-zero setpoint, so a smaller number is not a
+ *      slower rover — it is a rover that either moves at the speed it always
+ *      moves at, or does not move. Slow is bought with TIME: short bounded
+ *      segments with full stops between them.
+ */
+function SpeedFloorCard({ tele }: { tele: Record<string, unknown> | null }) {
   const lin = num(tele?.min_cmd_lin);
   const ang = num(tele?.min_cmd_ang);
-  const measured = lin !== null || ang !== null;
-  const snapped = tele?.deadband_snapped;
-  const isSnapped = snapped === true;
+  const reported = lin !== null || ang !== null;
+  // 0.0 is the rover's way of saying the mechanism is switched off. It is a
+  // real reading and it is not a floor, so it is never rendered as one.
+  const floorOn = (lin ?? 0) > 0 || (ang ?? 0) > 0;
+  const snapped = tele?.deadband_snapped === true;
 
   return (
     <Card>
       <CardHeader
-        title="Motor deadband floor"
-        subtitle="Why very slow is not available"
+        title="Speed floor"
+        subtitle="What the bottom of the range actually does"
         right={
           <div className="flex flex-wrap items-center gap-2">
-            <span className={measured ? "chip-ok" : "chip-warn"}>
-              {measured ? "measured" : "not yet measured"}
-            </span>
             <span
-              className={isSnapped ? "chip-hot" : snapped === false ? "chip" : "chip-warn"}
+              className={floorOn ? "chip-warn" : reported ? "chip" : "chip-warn"}
               title={
-                snapped === undefined
-                  ? "The rover is not reporting deadband_snapped yet"
-                  : isSnapped
-                    ? "The last command was below the floor and was raised to it"
-                    : "The last command was already at or above the floor"
+                !reported
+                  ? "The rover has not reported min_cmd_lin/min_cmd_ang yet"
+                  : floorOn
+                    ? "A floor is configured on the rover; commands below it are raised to it"
+                    : "Both floors are 0.0 — the mechanism is switched off, not measured at zero"
               }
             >
-              {snapped === undefined
-                ? "snap · not reported"
-                : isSnapped
-                  ? "FLOOR APPLIED"
-                  : "no floor applied"}
+              {!reported ? "not reported" : floorOn ? "FLOOR ON" : "floor off"}
             </span>
+            {snapped && (
+              <span className="chip-hot" title="The last command was below the configured floor and was raised to it">
+                FLOOR APPLIED
+              </span>
+            )}
           </div>
         }
       />
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <div
-          className={`rounded-lg border px-3 py-2 ${
-            lin === null ? "border-amber-500/25 bg-amber-500/5" : "border-white/5 bg-black/20"
-          }`}
-        >
-          <div className="lbl">min linear · min_cmd_lin</div>
-          <div
-            className={`mt-0.5 font-mono text-2xl tabular-nums ${
-              lin === null ? "text-amber-300/80" : "text-slate-200"
-            }`}
-          >
-            {lin === null ? (
-              <span className="text-base">not yet measured</span>
-            ) : (
-              <>
-                {lin.toFixed(3)}
-                <span className="ml-1 text-sm text-slate-500">m/s</span>
-              </>
-            )}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Slowest forward/back command the chassis will actually execute.
-          </div>
-        </div>
-
-        <div
-          className={`rounded-lg border px-3 py-2 ${
-            ang === null ? "border-amber-500/25 bg-amber-500/5" : "border-white/5 bg-black/20"
-          }`}
-        >
-          <div className="lbl">min angular · min_cmd_ang</div>
-          <div
-            className={`mt-0.5 font-mono text-2xl tabular-nums ${
-              ang === null ? "text-amber-300/80" : "text-slate-200"
-            }`}
-          >
-            {ang === null ? (
-              <span className="text-base">not yet measured</span>
-            ) : (
-              <>
-                {ang.toFixed(3)}
-                <span className="ml-1 text-sm text-slate-500">rad/s</span>
-              </>
-            )}
-          </div>
-          <div className="mt-1 text-[11px] text-slate-500">
-            Slowest turn command the chassis will actually execute.
-          </div>
-        </div>
+        <FloorReadout
+          label="min linear · min_cmd_lin"
+          value={lin}
+          unit="m/s"
+          digits={4}
+        />
+        <FloorReadout
+          label="min angular · min_cmd_ang"
+          value={ang}
+          unit="rad/s"
+          digits={4}
+        />
       </div>
 
-      {isSnapped && (
+      {snapped && (
         <div className="mt-3 rounded-lg border border-ember-500/40 bg-ember-500/10 px-3 py-2 text-sm text-ember-100">
-          <b>Floor applied to the last command.</b> You asked for less than the
-          deadband, so the rover raised it to the minimum above rather than sending
-          a value it would stall on. The rover is moving faster than requested — it
-          is not moving slower, and it is not ignoring you.
+          <b>Floor applied to the last command.</b> Someone has configured a
+          non-zero <span className="font-mono">FPMS_MIN_CMD_*</span> on this
+          rover, and the last command was below it and was raised. The rover is
+          moving <b>faster</b> than asked — not slower, and not ignoring you.
         </div>
       )}
 
       <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-sm text-amber-100/90">
-        <b>Why speeds are floored.</b> Below the motor deadband the chassis does
-        not creep — it stalls, the drivers wind up against a load that will not
-        move, and then it lurches when something finally breaks free. Measured on
-        this chassis: a <span className="font-mono">100 mm</span> forward command
-        came out as a <span className="font-mono">290 mm</span>{" "}
-        <b>backward</b> lurch with <span className="font-mono">24°</span> of
-        unrequested rotation. A command that is floored to a slow-but-real speed is
-        both slower and far more predictable than one that is honoured literally
-        and then discharged all at once. The caps above still apply on top: the
-        floor is a minimum, not a licence to go fast.
+        <b>Do not try to make this rover slow by lowering the setpoint.</b> The
+        board's velocity loop regulates integer encoder counts per 10 ms and
+        applies a large fixed duty to any non-zero setpoint, so amplitude buys
+        almost nothing: measured on this chassis, one small setpoint moved it at
+        cruise while another, larger, produced no motion at all. The only lever
+        that works is <b>time</b> — short bounded segments with a full stop
+        between them, run at a speed the loop can actually hold. That is what
+        the mission executor's dead-reckoning backend does.
+      </div>
+
+      <div className="mt-3 rounded-lg border border-white/5 bg-black/30 p-3 text-xs text-slate-400">
+        <b className="text-slate-300">Retraction, kept on purpose.</b> This card
+        previously reported a measured “100 mm forward became a 290 mm backward
+        lurch”. That reading came from{" "}
+        <span className="font-mono">/odom_raw twist.linear.x</span>, which is
+        sign-inverted relative to its own{" "}
+        <span className="font-mono">pose.position</span> on this firmware — the
+        rover had gone forward the whole time. Both floors were switched back off
+        and have never been measured on corrected data. A floor of{" "}
+        <span className="font-mono">0.0000</span> above means the mechanism is{" "}
+        <b>off</b>, not that the minimum was measured at zero.
       </div>
     </Card>
+  );
+}
+
+function FloorReadout({
+  label,
+  value,
+  unit,
+  digits,
+}: {
+  label: string;
+  value: number | null;
+  unit: string;
+  digits: number;
+}) {
+  const off = value !== null && value <= 0;
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 ${
+        value === null ? "border-amber-500/25 bg-amber-500/5" : "border-white/5 bg-black/20"
+      }`}
+    >
+      <div className="lbl">{label}</div>
+      <div
+        className={`mt-0.5 font-mono text-2xl tabular-nums ${
+          value === null ? "text-amber-300/80" : off ? "text-slate-400" : "text-slate-200"
+        }`}
+      >
+        {value === null ? (
+          <span className="text-base">not reported</span>
+        ) : (
+          <>
+            {value.toFixed(digits)}
+            <span className="ml-1 text-sm text-slate-500">{unit}</span>
+          </>
+        )}
+      </div>
+      <div className="mt-1 text-[11px] text-slate-500">
+        {value === null
+          ? "The rover has not published this field."
+          : off
+            ? "Zero means the floor is OFF — no command is raised. It is not a measured minimum."
+            : "Commands below this are raised to it before they reach the wire."}
+      </div>
+    </div>
   );
 }
 
@@ -1507,6 +1784,30 @@ function HealthCard({
           <Readout label="X" value={`${fmt(tele?.x_mm, 0)} mm`} />
           <Readout label="Y" value={`${fmt(tele?.y_mm, 0)} mm`} />
           <Readout label="Heading" value={`${fmt(tele?.heading_deg, 1)}°`} />
+          {/*
+            ORIGIN. The rover publishes this and nothing on this page used to
+            show it. The origin FILE survives a reboot while the board's
+            odometry restarts at zero, so a stale reference has already put a
+            rover at (-9182, -11926) mm inside a 1200 mm arena — and it planned
+            from there, confidently. Whether an origin exists at all is the
+            cheapest possible check against that.
+          */}
+          <Readout
+            label="Origin"
+            value={
+              tele?.origin_set === true
+                ? "set"
+                : tele?.origin_set === false
+                  ? "NOT SET"
+                  : "—"
+            }
+            tone={tele?.origin_set === false ? "text-amber-300" : undefined}
+            hint={
+              tele?.origin_set === false
+                ? "No origin — x/y are measured from wherever the bridge started, not in the arena frame the map draws in. Use Set coordinate."
+                : "Whether the teleop bridge has an arena origin for its pose"
+            }
+          />
           <Readout
             label="cmd_vel vx / wz"
             value={`${fmt(cmdVel(tele, "vx"), 2)} / ${fmt(cmdVel(tele, "wz"), 2)}`}
@@ -1947,8 +2248,22 @@ function MissionCard({
                 stale {Math.round((ageMs ?? 0) / 1000)}s
               </span>
             ) : null}
-            <span className="chip font-mono">
-              {running ? (mission?.phase ?? "running") : "idle"}
+            {/*
+              The phase chip is coloured by what it means. An idle-looking chip
+              on a driving rover is the failure this whole card exists to
+              prevent, and an unrecognised phase counts as RUNNING (see
+              MISSION_IDLE_PHASES) so a new or truncated phase name errs towards
+              the safe direction rather than reading as parked.
+            */}
+            <span
+              className={running ? "chip-hot font-mono" : "chip font-mono"}
+              title={
+                running
+                  ? "The executor is driving, or reported a phase this dashboard does not recognise — either way, treat it as moving"
+                  : "The executor reported a phase that positively means not-driving"
+              }
+            >
+              {mission?.phase ?? (mission ? "phase not reported" : "no mission state")}
             </span>
             <StatusPill
               connected={channel.connected}
@@ -2003,13 +2318,19 @@ function MissionCard({
                 ? `${Math.round(mission.travelledMm)} mm`
                 : "--"}
             />
+            {/* Null-checked, not truthiness-checked: `0 s elapsed` is a real
+                reading a second into a run, and `?` would have hidden it. */}
             <Stat
               label="Elapsed"
-              value={mission?.elapsedS ? `${Math.round(mission.elapsedS)} s` : "--"}
+              value={mission?.elapsedS !== null && mission?.elapsedS !== undefined
+                ? `${Math.round(mission.elapsedS)} s`
+                : "--"}
             />
             <Stat
               label="ETA"
-              value={mission?.etaS ? `~${Math.round(mission.etaS)} s` : "--"}
+              value={mission?.etaS !== null && mission?.etaS !== undefined
+                ? `~${Math.round(mission.etaS)} s`
+                : "--"}
             />
             <Stat
               label="Battery"
@@ -2026,10 +2347,15 @@ function MissionCard({
           </div>
 
           <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+            {/* BOTH halves are required. `targetY ?? 0` used to fill a missing
+                y with the origin, which drew the destination on an arena edge
+                the rover was never sent to — a fabricated coordinate is worse
+                than an absent one. */}
             <span className="font-mono">
               target{" "}
-              {mission?.targetX !== null && mission?.targetX !== undefined
-                ? `(${Math.round(mission.targetX)}, ${Math.round(mission.targetY ?? 0)}) mm`
+              {mission?.targetX !== null && mission?.targetX !== undefined &&
+              mission?.targetY !== null && mission?.targetY !== undefined
+                ? `(${Math.round(mission.targetX)}, ${Math.round(mission.targetY)}) mm`
                 : "--"}
             </span>
             {/*
@@ -2085,10 +2411,19 @@ function MissionCard({
       )}
 
       {onAbort ? (
-        <div className="mt-4">
-          <button className="btn-hot" onClick={onAbort} disabled={!thing}>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <button
+            className="btn-hot"
+            onClick={onAbort}
+            disabled={!thing}
+            title={MISSION_ABORT_NOTE}
+          >
             ABORT MISSION
           </button>
+          <span className="text-[11px] text-slate-500">
+            Ungated by the link check — an abort has to work exactly when
+            everything else has decided things are wrong.
+          </span>
         </div>
       ) : null}
     </Card>

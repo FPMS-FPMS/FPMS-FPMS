@@ -54,6 +54,53 @@ TOPIC_FILTERS = [
     ("fpms/+/events/#", 1),
 ]
 
+# Every WebSocket channel the frontend opens is produced by one of the filters
+# above (channel name = <subtype>:<thing>, or "events"). Keep this list in step
+# with frontend/src — a channel with no matching filter is not an error anywhere,
+# it is a panel that says "waiting…" forever:
+#
+#   lidar:<thing>            <- fpms/+/telemetry/lidar
+#   camera:<thing>           <- fpms/+/telemetry/camera
+#   thermal:<thing>          <- fpms/+/telemetry/thermal
+#   thermal-analysis:<thing> <- derived locally from thermal frames
+#   pose:<thing>             <- fpms/+/telemetry/pose
+#   drive:<thing>            <- fpms/+/telemetry/drive
+#   mission:<thing>          <- fpms/+/telemetry/mission
+#   mission_plan:<thing>     <- fpms/+/telemetry/mission_plan
+#   events                   <- fpms/+/events/#
+
+# Broker reason codes that mean "your credentials were refused", as opposed to
+# "the broker is down". The distinction matters because the remedies are
+# completely different and the symptom — a dashboard where every panel waits
+# forever — is identical.
+_AUTH_FAILURE_CODES = {
+    4,    # MQTT 3.1.1 CONNACK: bad user name or password
+    5,    # MQTT 3.1.1 CONNACK: not authorized
+    134,  # MQTT 5 : bad user name or password
+    135,  # MQTT 5 : not authorised
+}
+
+_AUTH_HELP = (
+    "The broker REFUSED our credentials. The dashboard will keep retrying and "
+    "every rover panel will sit at 'waiting' with no other error. Fix it with "
+    "one of:\n"
+    "  1. Set credentials for this user, then restart the app:\n"
+    "       [Environment]::SetEnvironmentVariable('FPMS_MQTT_USERNAME','fpms','User')\n"
+    "       [Environment]::SetEnvironmentVariable('FPMS_MQTT_PASSWORD','<broker password>','User')\n"
+    "  2. Or re-run the broker setup to (re)create that account:\n"
+    "       powershell -ExecutionPolicy Bypass -File scripts\\Setup-Mosquitto.ps1 -Password '<broker password>'\n"
+    # Deliberately ASCII-only: this text is redirected to service.log through a
+    # cmd pipe, and a non-ASCII dash comes out as mojibake there.
+    "Never commit the password - it belongs in the User environment only."
+)
+
+_NO_CREDS_HELP = (
+    "No MQTT credentials are configured (FPMS_MQTT_USERNAME / FPMS_MQTT_PASSWORD "
+    "are empty). That is fine ONLY if the broker runs with allow_anonymous true. "
+    "If it does not, the connection will be refused with 'Not authorized' and "
+    "every rover panel will wait forever with no visible error."
+)
+
 
 class Bridge:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -62,6 +109,15 @@ class Bridge:
         self.last_message_at: float | None = None
         self.messages_seen = 0
         self.things_seen: set[str] = set()
+        # Why we are not connected, in words the operator can act on. Surfaced
+        # through /api/health so a broken broker link is diagnosable without
+        # reading launch.log.
+        self.last_error: str | None = None
+        self.last_error_at: float | None = None
+        self.auth_failed = False
+        self.connect_attempts = 0
+        self.subscribed: list[str] = []
+        self._last_auth_log_at = 0.0
 
         self.client = mqtt.Client(
             client_id=settings.mqtt_client_id,
@@ -77,6 +133,17 @@ class Bridge:
             self.client.username_pw_set(settings.mqtt_username,
                                         settings.mqtt_password or None)
             log.info("MQTT auth enabled for user %r", settings.mqtt_username)
+            if not settings.mqtt_password:
+                log.warning(
+                    "FPMS_MQTT_USERNAME is set to %r but FPMS_MQTT_PASSWORD is "
+                    "EMPTY — a password-protected broker will refuse this.",
+                    settings.mqtt_username,
+                )
+        else:
+            # Starting with no credentials at all is the failure that has bitten
+            # this project before: the app looks healthy, the broker answers
+            # "Not authorized", and paho retries in a loop nobody reads.
+            log.warning("MQTT: %s", _NO_CREDS_HELP)
 
         # TLS + X.509 for real AWS IoT Core, if configured.
         if settings.mqtt_tls or settings.aws_mode == "cloud":
@@ -106,15 +173,20 @@ class Bridge:
     def start(self) -> None:
         # AWS IoT Core defaults to 8883 (mqtts). If cloud mode is on and
         # the operator forgot to change the port, do the right thing.
-        port = settings.mqtt_port
-        if settings.aws_mode == "cloud" and port == 1883:
-            port = 8883
-        log.info("connecting to MQTT %s:%s (tls=%s)", settings.mqtt_host, port,
-                 settings.mqtt_tls or settings.aws_mode == "cloud")
+        port = self.effective_port()
+        log.info("connecting to MQTT %s:%s (tls=%s, user=%s, password=%s)",
+                 settings.mqtt_host, port,
+                 settings.mqtt_tls or settings.aws_mode == "cloud",
+                 settings.mqtt_username or "<none>",
+                 "set" if settings.mqtt_password else "NOT SET")
         try:
             self.client.connect(settings.mqtt_host, port, keepalive=30)
         except OSError as e:
-            log.warning("initial MQTT connect failed (%s); paho will retry", e)
+            self.last_error = f"could not reach broker {settings.mqtt_host}:{port}: {e}"
+            self.last_error_at = time.time()
+            log.error("initial MQTT connect to %s:%s failed (%s); paho will keep "
+                      "retrying. Until it succeeds every rover panel stays empty.",
+                      settings.mqtt_host, port, e)
         self.client.loop_start()
 
     def stop(self) -> None:
@@ -124,17 +196,63 @@ class Bridge:
         except Exception:  # noqa: BLE001
             pass
 
+    def effective_port(self) -> int:
+        """The port we actually dial — see start(), which promotes 1883→8883
+        in cloud mode. status() used to recompute this inline and the two could
+        disagree."""
+        if settings.aws_mode == "cloud" and settings.mqtt_port == 1883:
+            return 8883
+        return settings.mqtt_port
+
     def status(self) -> dict[str, Any]:
-        return {
+        creds_ok = bool(settings.mqtt_username and settings.mqtt_password)
+        st: dict[str, Any] = {
             "connected": self.connected,
             "host": settings.mqtt_host,
-            "port": settings.mqtt_port if not (settings.aws_mode == "cloud" and settings.mqtt_port == 1883) else 8883,
+            "port": self.effective_port(),
             "tls": settings.mqtt_tls or settings.aws_mode == "cloud",
             "mode": settings.aws_mode,
+            "client_id": settings.mqtt_client_id,
             "messages_seen": self.messages_seen,
             "things_seen": sorted(self.things_seen),
             "last_message_at": self.last_message_at,
+            "connect_attempts": self.connect_attempts,
+            "subscribed": list(self.subscribed),
+            # Presence only — the password itself is never returned. /api/health
+            # is reachable over the public tunnel once logged in.
+            "credentials": {
+                "username": settings.mqtt_username or None,
+                "username_set": bool(settings.mqtt_username),
+                "password_set": bool(settings.mqtt_password),
+            },
+            "auth_failed": self.auth_failed,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
         }
+        # A single field the UI (and a human reading curl output) can act on.
+        if self.connected:
+            st["problem"] = None
+        elif self.auth_failed:
+            st["problem"] = (
+                f"MQTT authentication failed against {settings.mqtt_host}:"
+                f"{self.effective_port()} as "
+                f"{settings.mqtt_username or '<no username configured>'}. "
+                "Set FPMS_MQTT_USERNAME / FPMS_MQTT_PASSWORD (User scope) and "
+                "restart, or re-run scripts\\Setup-Mosquitto.ps1."
+            )
+        elif not creds_ok:
+            st["problem"] = (
+                f"Not connected to {settings.mqtt_host}:{self.effective_port()}, "
+                "and no MQTT credentials are configured. If the broker requires "
+                "auth, set FPMS_MQTT_USERNAME / FPMS_MQTT_PASSWORD and restart."
+            )
+        else:
+            st["problem"] = (
+                f"Not connected to {settings.mqtt_host}:{self.effective_port()}"
+                + (f" — {self.last_error}" if self.last_error else
+                   " — broker unreachable. Is the mosquitto service running?")
+            )
+        return st
 
     def publish_command(self, thing: str, action: str,
                         payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -169,14 +287,55 @@ class Bridge:
         # paho v2 gives a ReasonCode object (not an int); use .is_failure.
         ok = not getattr(reason_code, "is_failure", bool(reason_code))
         self.connected = ok
-        log.info("MQTT connected: %s", reason_code)
+        self.connect_attempts += 1
+
         if ok:
+            self.last_error = None
+            self.auth_failed = False
+            log.info("MQTT connected to %s:%s as %s", settings.mqtt_host,
+                     self.effective_port(), settings.mqtt_username or "<anonymous>")
+            self.subscribed = []
             for topic, qos in TOPIC_FILTERS:
                 client.subscribe(topic, qos=qos)
+                self.subscribed.append(topic)
+            log.info("MQTT subscribed to %d topic filters: %s",
+                     len(self.subscribed), ", ".join(self.subscribed))
+            return
+
+        # --- refused -------------------------------------------------------
+        code = int(getattr(reason_code, "value", reason_code) or 0)
+        self.last_error = f"broker refused the connection: {reason_code}"
+        self.last_error_at = time.time()
+        self.auth_failed = code in _AUTH_FAILURE_CODES
+
+        if self.auth_failed:
+            # paho retries on a timer, so this fires repeatedly. Log the full
+            # remedy the first time and once a minute after that: loud enough to
+            # find, quiet enough that it doesn't bury everything else.
+            now = time.time()
+            if self.connect_attempts == 1 or now - self._last_auth_log_at > 60:
+                self._last_auth_log_at = now
+                log.error(
+                    "MQTT AUTHENTICATION FAILED against %s:%s as user %r "
+                    "(reason: %s, attempt %d).\n%s",
+                    settings.mqtt_host, self.effective_port(),
+                    settings.mqtt_username or "<anonymous — none configured>",
+                    reason_code, self.connect_attempts,
+                    _AUTH_HELP if settings.mqtt_username else
+                    _NO_CREDS_HELP + "\n" + _AUTH_HELP,
+                )
+        else:
+            log.error("MQTT connection refused by %s:%s — %s (attempt %d)",
+                      settings.mqtt_host, self.effective_port(), reason_code,
+                      self.connect_attempts)
 
     def _on_disconnect(self, _client, _userdata, _flags, reason_code, _props=None) -> None:
         self.connected = False
-        log.warning("MQTT disconnected: %s", reason_code)
+        self.subscribed = []
+        if not self.auth_failed:
+            self.last_error = f"disconnected from broker: {reason_code}"
+            self.last_error_at = time.time()
+        log.warning("MQTT disconnected from %s: %s", settings.mqtt_host, reason_code)
 
     def _on_message(self, _client, _userdata, msg: mqtt.MQTTMessage) -> None:
         self.messages_seen += 1

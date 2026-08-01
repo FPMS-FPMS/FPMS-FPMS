@@ -23,8 +23,10 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { runAgents, renderReport, reasonOverFindings } from "./agents.js";
+import { runAgents, renderReport, reasonOverFindings, worstSeverity } from "./agents.js";
 import { handlePublic } from "./public.js";
+import { handleChat, CHAT_PATH } from "./chat.js";
+import { handleAnalytics } from "./analytics.js";
 import FPMS_INFO from "./info.json";
 
 const COOKIE = "fpms_auth";
@@ -81,6 +83,68 @@ const ARCHIVE_FRAMES = false;
 // paged about a months-old scene indefinitely. Refusing early costs nothing and
 // tells the truth: there is no recent frame, not "no hazard".
 const VISION_MAX_FRAME_AGE_S = 300;
+
+// A JPEG small enough to hit this is a black frame, a truncated write or a
+// camera that failed to expose. Base64 inflates by 4/3, so ~4 KB of base64 is
+// ~3 KB of JPEG — below anything a real 640x480 scene produces. Refusing costs
+// nothing and stops the model narrating noise, which is where hallucinated
+// smoke comes from: shown near-black input it fills in plausible detail.
+const VISION_MIN_FRAME_B64 = 4096;
+
+// TWO-STAGE DETECTION — see visionForThing().
+//
+// Stage 1 (triage) is a small fast VLM asked one high-recall question. Stage 2
+// (confirm) is the big model, and runs ONLY when triage flags something. On a
+// fire watch the overwhelming majority of frames are clear, so the expensive
+// model is idle almost always and the alert path still gets its full judgement
+// on the frames that matter.
+//
+// Moondream 3.1: 9B mixture-of-experts, 2B active, ~770 ms for a `query` task
+// against scout's 0.7-1.5 s, and materially cheaper per call. It is deliberately
+// NOT trusted to clear a frame on its own subtlety — it is tuned to over-report
+// (answer YES when unsure) and stage 2 supplies all the precision.
+const VISION_TRIAGE_MODEL = "@cf/moondream/moondream3.1-9B-A2B";
+
+// Confirmation must clear ALL of these, not just `hazard: true`. Each one has
+// caught a different failure: a model that says true with confidence 0.2, one
+// that says true and then writes kind "none", and one that says true with an
+// empty evidence string because it was pattern-matching the prompt rather than
+// the image.
+const VISION_MIN_CONFIDENCE = 0.7;
+const VISION_MIN_EVIDENCE_CHARS = 24;
+const VISION_HAZARD_KINDS = new Set(["smoke", "flame", "embers"]);
+
+// How many consecutive runs may triage flag a frame that confirmation then
+// rejects before the report says "warning" instead of staying silent.
+//
+// Asymmetric on purpose, the same way the rover-side fire detection is: one
+// disagreement is noise (a sunset, a cloud) and must not page anybody, but the
+// same disagreement three cycles running is a scene that keeps looking like
+// smoke to a screening model — worth an operator's eyes, still not a fire
+// alert. The streak resets the moment triage comes back clear.
+const VISION_UNCONFIRMED_STREAK_WARN = 3;
+
+// Cost discipline. Workers AI is billed and the free tier is 10,000 neurons/day
+// with no rollover, so an unbounded /api/vision would be a self-inflicted denial
+// of the alerting path: spend the quota on curiosity and a real fire cannot be
+// analysed. Per-thing minimum interval between billed triage runs; a caller
+// inside the window gets the previous verdict back, labelled `cached`.
+const VISION_MIN_INTERVAL_S = 90;
+
+// Hard daily ceiling on TRIAGE inferences, UTC-day reset. Confirmation passes
+// are deliberately exempt: the budget may never be the reason a flagged frame
+// goes unexamined. Capping the cheap always-on stage bounds routine spend
+// without ever standing between a possible fire and a verdict.
+const VISION_DAILY_TRIAGE_BUDGET = 400;
+
+// Every external call gets a deadline. A model that hangs must not hold the
+// cron invocation open until the platform kills it — that loses the report, the
+// email and the prune pass together. On timeout the caller degrades to "no
+// analysis available", never to a fabricated verdict.
+const AI_TRIAGE_TIMEOUT_MS = 8_000;
+const AI_CONFIRM_TIMEOUT_MS = 15_000;
+const AI_REASON_TIMEOUT_MS = 12_000;
+const HUB_TIMEOUT_MS = 5_000;
 
 // Roster caps.
 //
@@ -145,6 +209,19 @@ export default {
       if (path === "/api/login") return login(request, env);
       if (path === "/api/auth-status") return authStatus(request, env);
 
+      // Chat and analytics MUST be routed BEFORE handlePublic. That function
+      // owns /api/public/* and answers 405 to every non-GET, so a POST /chat
+      // registered after it would be rejected before ever arriving here.
+      //
+      // Both are public by design and sit ahead of the auth gate, but each
+      // enforces its own limits: chat.js reserves a daily budget in D1 before
+      // it will call a model and fails closed if that budget cannot be read,
+      // and both serve only the same whitelisted projection public.js does.
+      if (path === CHAT_PATH) return handleChat(request, env, ctx, hubStub);
+
+      const analytics = await handleAnalytics(request, env, url, path, hubStub);
+      if (analytics) return analytics;
+
       // The public read-only view. Deliberately ahead of the auth gate below,
       // and deliberately a separate module: it serves a whitelisted projection
       // of the data, never the raw telemetry the authenticated API returns.
@@ -171,9 +248,14 @@ export default {
       if (path === "/api/analyze" && request.method === "POST") {
         // Manual trigger — the same code path the cron runs, so testing it
         // proves the scheduled behaviour rather than a parallel one.
-        return json(await analyzeAndReport(env, { force: url.searchParams.get("force") === "1" }));
+        // `ctx` is passed, never destructured: `const { waitUntil } = ctx`
+        // loses the `this` binding and throws "Illegal invocation" at runtime.
+        return json(await analyzeAndReport(env, {
+          force: url.searchParams.get("force") === "1",
+          ctx,
+        }));
       }
-      if (path === "/api/vision") return json(await vision(env, url));
+      if (path === "/api/vision") return json(await vision(env, url, ctx));
       if (path === "/api/info") return json(FPMS_INFO);
       if (path === "/api/events") return events(env, url);
       if (path === "/api/analyst/status") return json(analystStatus());
@@ -207,10 +289,11 @@ export default {
    */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      analyzeAndReport(env)
+      analyzeAndReport(env, { ctx })
         .then((r) => console.log(JSON.stringify({
           message: "scheduled analysis", severity: r.severity,
           emailed: r.emailed, sample_size: r.sample_size,
+          vision: r.vision_stats,
         })))
         .catch((err) => console.error(JSON.stringify({
           message: "scheduled analysis failed",
@@ -298,13 +381,112 @@ const VISION_MODELS = [VISION_MODEL];
  */
 const TEXT_MODEL = VISION_MODEL;
 
-const VISION_PROMPT =
-  "You are a wildfire monitoring analyst reviewing a rover camera frame.\n" +
-  "Set hazard=true ONLY if you can actually see smoke, flame, glowing embers, " +
-  "or active burning. Haze, shadow, sunlight, sunset colours, red or orange " +
-  "objects, and ordinary indoor scenes are hazard=false.\n" +
-  "Set kind to one of: smoke, flame, embers, none.\n" +
-  "Describe the scene in two or three sentences.";
+/**
+ * STAGE 1 — triage. Deliberately biased towards YES.
+ *
+ * This question is not trying to be right; it is trying to never miss. It is
+ * the cheap stage, it runs on every sampled frame, and the only decision it is
+ * trusted to make alone is the NEGATIVE one — "there is plainly nothing here",
+ * which is true of almost every frame a patrolling rover ever takes. Anything
+ * else is handed to stage 2. Tell it to answer YES when unsure, because a
+ * wasted confirmation costs one inference and a missed plume costs a forest.
+ */
+const VISION_TRIAGE_QUESTION =
+  "You are screening a wilderness camera frame for a wildfire watch.\n" +
+  "Is there ANY visible smoke, plume, rising haze column, flame, glowing " +
+  "ember, or actively burning material anywhere in this image?\n" +
+  "Answer YES if there is anything that could plausibly be smoke or fire, " +
+  "even if you are not sure. Answer NO only if the scene is clearly free of " +
+  "smoke and fire.\n" +
+  "Reply with exactly one word: YES or NO.";
+
+/**
+ * STAGE 2 — confirmation. Deliberately biased towards NO.
+ *
+ * Its job is to REJECT, and it is told so. The enumerated non-hazards are not
+ * padding: every one is a false positive a VLM has actually produced on an
+ * outdoor camera. `evidence` exists to make a positive expensive to assert —
+ * a model that cannot name a specific visible feature and say where it is has
+ * not seen a fire, it has agreed with the question, and the code below throws
+ * that answer away.
+ */
+const VISION_CONFIRM_PROMPT =
+  "You are the CONFIRMATION stage of a wildfire detection system. A fast " +
+  "screening model has flagged this rover camera frame as possibly showing " +
+  "smoke or fire. Your job is to reject false alarms.\n\n" +
+  "A false wildfire alert is far more damaging than a missed frame: it sends " +
+  "people to an empty field and it teaches the operator to ignore the next " +
+  "alert, which may be real.\n\n" +
+  "Set hazard=true ONLY if you can point to a specific visible region of THIS " +
+  "image that contains smoke, flame, glowing embers, or actively burning " +
+  "material, and describe that region in `evidence`.\n\n" +
+  "The following are NOT hazards. If this is what you are looking at, " +
+  "hazard=false:\n" +
+  "- sunset, sunrise, orange or red sky, golden hour light, coloured cloud\n" +
+  "- fog, mist, low cloud, overcast sky, rain, dust, sea spray, snow\n" +
+  "- red or orange objects: vehicles, clothing, signs, flowers, autumn foliage\n" +
+  "- lens flare, glare, overexposure, headlights, street lights, screens\n" +
+  "- steam, vehicle exhaust, condensation, and any indoor scene\n" +
+  "- a fire you infer from context or expect to be there but cannot see\n\n" +
+  "If you are not certain, answer hazard=false. Uncertainty is not a hazard.\n\n" +
+  "Fields:\n" +
+  "  hazard: true only under the rule above.\n" +
+  "  kind: one of smoke, flame, embers, none.\n" +
+  "  confidence: 0.0 to 1.0 — how sure you are the hazard is real, not how " +
+  "confident you feel in general.\n" +
+  "  evidence: when hazard is true, the specific visible feature and where in " +
+  "the frame it appears. Empty string when hazard is false.\n" +
+  "  description: two or three factual sentences describing the whole scene.";
+
+/**
+ * Race a promise against a deadline, without leaving anything floating.
+ *
+ * Two details matter. The timer is cleared in `finally`, so a fast success does
+ * not hold the invocation open waiting for a timeout that will never fire. And
+ * a no-op `.catch` is attached to the raced promise itself: when the deadline
+ * wins, the loser is still in flight and its later rejection would otherwise
+ * surface as an unhandled rejection with no context.
+ */
+async function withTimeout(promise, ms, label) {
+  promise.catch(() => {});
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Cheap non-cryptographic fingerprint of a frame, for "have I already paid to
+ * look at exactly this image?".
+ *
+ * FNV-1a over a stride rather than every byte: a 27 KB base64 string is 27,000
+ * iterations of CPU on a path that runs on every poll, and two genuinely
+ * different scenes differ in far more than one byte in seven. Not security —
+ * nothing is authorised on this value, it only decides whether to spend an
+ * inference — so a fast hash is the right one. Length is folded in so a
+ * truncated frame cannot collide with the full one.
+ */
+function frameFingerprint(b64) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < b64.length; i += 7) {
+    h ^= b64.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  h ^= b64.length;
+  return (h >>> 0).toString(36);
+}
+
+/** Ask the hub something, with a deadline. A cold DO must not hang the cron. */
+async function hubFetch(env, path, init) {
+  return withTimeout(hubStub(env).fetch(`https://hub${path}`, init), HUB_TIMEOUT_MS, `hub ${path}`);
+}
 
 /** JSON.parse that never throws — models sometimes wrap output in ``` fences. */
 function safeParseJson(s) {
@@ -320,25 +502,82 @@ function safeParseJson(s) {
   }
 }
 
+/** Rover-side detector labels that mean "look at this frame properly". */
+const ROVER_FIRE_LABEL_RE = /\b(fire|smoke|flame|ember|burn)/i;
+
+/** HTTP entry point for /api/vision. Query params only; the work is below. */
+async function vision(env, url, ctx) {
+  return visionForThing(env, url.searchParams.get("thing") || "rover2", {
+    ctx,
+    // Operator override: skip the sampling gate and the frame cache. Still
+    // counted against the daily budget, so it cannot be used to drain it
+    // faster than the ceiling allows.
+    force: url.searchParams.get("force") === "1",
+    prompt: url.searchParams.get("prompt") || null,
+  });
+}
+
 /**
- * Vision-language description of the newest camera frame.
+ * Two-stage vision analysis of the newest camera frame.
  *
  * The rover's YOLO tells you *what objects* are present; it cannot tell you
  * "smoke rising behind the treeline" or "the ground is scorched". That
  * judgement is what a VLM adds, and it's why this sits alongside detection
  * rather than replacing it — YOLO stays the fast, deterministic trigger.
+ *
+ * THE CASCADE, AND WHY IT IS THIS WAY ROUND
+ * -----------------------------------------
+ * Stage 1 (moondream, high recall, cheap) looks at every sampled frame and is
+ * trusted with exactly one decision: "this is plainly nothing". That is the
+ * true answer for essentially every frame a patrolling rover ever takes, so
+ * the expensive model is idle almost all the time.
+ *
+ * Stage 2 (llama-4-scout, high precision, expensive) runs only on the frames
+ * stage 1 could not clear, and is the ONLY thing that can assert a hazard. It
+ * is prompted to reject, and its answer then has to survive four independent
+ * checks below before `hazard` is true. Two different models with opposite
+ * biases must agree before anyone is woken up.
+ *
+ * ON KEYWORD MATCHING (see CLAUDE.md: severity must come from a structured
+ * field): moondream's `query` task returns prose, with no json_schema option.
+ * The prose is read here — but ONLY to decide whether to spend stage 2, and
+ * biased so that anything other than a clean "NO" escalates. A misread costs
+ * one extra inference; it can never produce a hazard, because severity still
+ * comes exclusively from stage 2's structured fields. The failure this rule
+ * was written about — scoring "there is no visible smoke" as critical — is
+ * structurally impossible here.
+ *
+ * EVERY exit from this function is either a real verdict or an `error` field.
+ * It never throws and never fabricates: "no analysis available" is an honest
+ * answer, "no hazard" from a call that did not happen is a lie.
  */
-async function vision(env, url) {
-  if (!env.AI) return { error: "Workers AI binding not configured" };
+async function visionForThing(env, thing, opts = {}) {
+  const { ctx = null, force = false, prompt = null, escalate = false } = opts;
+  if (!env.AI) return { thing, error: "Workers AI binding not configured" };
 
-  const thing = url.searchParams.get("thing") || "rover2";
-  const latest = await hubStub(env)
-    .fetch(`https://hub/latest?channel=camera:${encodeURIComponent(thing)}`)
-    .then((r) => r.json())
-    .catch(() => null);
+  let latest = null;
+  try {
+    latest = await hubFetch(env, `/latest?channel=camera:${encodeURIComponent(thing)}`)
+      .then((r) => r.json());
+  } catch (err) {
+    console.error(JSON.stringify({
+      message: "vision: could not read the latest frame", thing,
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return { thing, error: "camera frame unavailable" };
+  }
 
   const frame = latest?.data?.frame;
-  if (!frame) return { thing, error: "no camera frame available yet" };
+  if (typeof frame !== "string" || !frame) {
+    return { thing, error: "no camera frame available yet" };
+  }
+
+  // A near-empty frame is a failed exposure or a truncated write, and a model
+  // shown near-black input invents detail to fill it — which is precisely the
+  // hallucinated plume this system must never produce. Refuse before spending.
+  if (frame.length < VISION_MIN_FRAME_B64) {
+    return { thing, error: "camera frame too small to analyse", frame_b64_len: frame.length };
+  }
 
   // FRESHNESS GATE — before any env.AI.run, because the AI call is the billed
   // part and a stale frame cannot produce a useful verdict at any price.
@@ -356,24 +595,171 @@ async function vision(env, url) {
     return { thing, error: "no recent camera frame", frame_age_s: frameAgeS };
   }
 
-  const prompt = url.searchParams.get("prompt") || VISION_PROMPT;
+  const detections = Array.isArray(latest?.data?.detections) ? latest.data.detections : [];
+  const fp = frameFingerprint(frame);
 
-  try {
-    let lastErr = null;
-    for (const model of VISION_MODELS) {
-      try {
-        const started = Date.now();
+  // SAMPLING GATE — the cost control. Refuses a frame byte-identical to the one
+  // already analysed (a frozen camera is the common case, and re-buying the same
+  // verdict is pure waste), enforces a minimum interval per rover, and holds a
+  // hard daily ceiling on stage-1 calls.
+  //
+  // Fails towards LOOKING if the hub is unreachable: detection beats thrift, and
+  // we only got this far because the same object just served us a frame, so this
+  // branch means something is genuinely wrong and should be loud.
+  let gate = { allowed: true, reason: "sampling gate unavailable" };
+  if (!force) {
+    try {
+      gate = await hubFetch(env, `/vision-gate?thing=${encodeURIComponent(thing)}&fp=${fp}`)
+        .then((r) => r.json());
+    } catch (err) {
+      console.error(JSON.stringify({
+        message: "vision sampling gate unavailable — analysing anyway", thing,
+        error: err instanceof Error ? err.message : String(err),
+      }));
+    }
+  }
+  if (!gate.allowed) {
+    // A cached verdict is returned verbatim apart from `detections`, which are
+    // re-attached live: the verdict is about the stored frame, the detections
+    // describe the current one, and the caller wants both current.
+    if (gate.cached) {
+      return {
+        ...gate.cached,
+        thing,
+        cached: true,
+        cache_reason: gate.reason,
+        detections,
+        // The verdict is reused; the freshness is NOT. `frame_ts` is restated
+        // from the frame in hand so a consumer reading "3 s old" is told the
+        // truth about the evidence, not the age it had when it was analysed.
+        frame_ts: frameTs,
+        frame_age_s: frameAgeS,
+        // Carried through so a run served from cache does not silently reset a
+        // streak that has already reached the warning threshold.
+        unconfirmed_streak: Number(gate.unconfirmed_streak) || 0,
+      };
+    }
+    return { thing, error: "no analysis available", reason: gate.reason, frame_age_s: frameAgeS };
+  }
 
-        // Chat-style multimodal input with a real JSON schema. The model
-        // returns an already-parsed object, which is why the old
-        // /HAZARD:\s*(YES|NO)/ regex is gone — there is no prose to parse.
-        // (The prose-parsing branch that used to live here went with the
-        // LLaVA fallback; see the VISION_MODELS comment.)
-        const result = await env.AI.run(model, {
+  /* ------------------------------------------------- stage 1: triage */
+
+  const yoloFlag = detections.some((d) =>
+    ROVER_FIRE_LABEL_RE.test(String(d?.label ?? d?.class ?? d?.name ?? "")));
+
+  const triage = {
+    model: VISION_TRIAGE_MODEL, flagged: null, answer: null, latency_ms: null,
+    error: null, reason: null,
+  };
+  let triageDescription = "";
+
+  if (escalate || yoloFlag) {
+    // The rover's own detector already fired, or the caller demanded the full
+    // pass. Skip straight to confirmation — spending stage 1 to re-ask a
+    // question already answered affirmatively is money for nothing.
+    triage.flagged = true;
+    triage.reason = yoloFlag ? "rover detector flagged fire/smoke" : "escalated by caller";
+  } else {
+    const t0 = Date.now();
+    try {
+      const res = await withTimeout(
+        env.AI.run(VISION_TRIAGE_MODEL, {
+          task: "query",
+          image: `data:image/jpeg;base64,${frame}`,
+          question: VISION_TRIAGE_QUESTION,
+          // The reasoning trace is tokens we pay for and never read.
+          reasoning: false,
+          // `stream` DEFAULTS TO TRUE on this model. Without this the binding
+          // hands back a ReadableStream and every field below reads undefined —
+          // which would silently look like "model said nothing".
+          stream: false,
+          temperature: 0,
+          max_tokens: 64,
+        }),
+        AI_TRIAGE_TIMEOUT_MS,
+        "vision triage",
+      );
+      triage.latency_ms = Date.now() - t0;
+
+      const answer = String(res?.answer ?? res?.response ?? res?.caption ?? "").trim();
+      triage.answer = answer.slice(0, 120);
+      const [verdictPart, ...rest] = answer.split("|");
+      triageDescription = rest.join("|").trim();
+
+      if (!answer) {
+        triage.flagged = true;
+        triage.reason = "triage returned nothing — escalating";
+      } else {
+        // Only a clean leading NO ends the run. Everything else — "yes",
+        // "maybe", a hedge, a refusal, punctuation soup — goes to stage 2.
+        triage.flagged = !/^\s*no\b/i.test(verdictPart);
+        triage.reason = triage.flagged ? "triage flagged" : "triage clear";
+      }
+    } catch (e) {
+      // A broken or slow triage model must never be able to clear a frame.
+      triage.latency_ms = Date.now() - t0;
+      triage.error = String(e).slice(0, 160);
+      triage.flagged = true;
+      triage.reason = "triage failed — escalating to confirmation";
+    }
+  }
+
+  const base = {
+    thing,
+    // Both true on either branch, and both mean the same thing they always did:
+    // a definite verdict was obtained, rather than the code falling back to a
+    // default because nothing parsed. `stage` is what tells a consumer which
+    // model produced it.
+    structured: true,
+    verdict_parsed: true,
+    frame_ts: frameTs,
+    // Reported alongside the verdict so a caller can see how fresh the
+    // evidence was without re-deriving it from frame_ts.
+    frame_age_s: frameAgeS,
+    triage,
+    cached: false,
+  };
+
+  if (!triage.flagged) {
+    // Cleared cheaply. The one-line scene description from the same call is
+    // what the dashboard shows and what analyzeAndReport files as an "ok"
+    // finding, so a clear frame still produces evidence that we looked.
+    const verdict = {
+      ...base,
+      hazard: false,
+      kind: "none",
+      confidence: null,
+      evidence: null,
+      description: triageDescription || "No smoke or fire visible in the current frame.",
+      model: VISION_TRIAGE_MODEL,
+      stage: "triage",
+      confirmed: false,
+      latency_ms: triage.latency_ms,
+    };
+    const rec = await recordVision(env, thing, fp, verdict, { ctx, needStreak: false });
+    return { ...verdict, unconfirmed_streak: rec?.unconfirmed_streak ?? 0, detections };
+  }
+
+  /* -------------------------------------------- stage 2: confirmation */
+
+  const confirmPrompt = prompt || VISION_CONFIRM_PROMPT;
+  let lastErr = null;
+
+  for (const model of VISION_MODELS) {
+    let obj = null;
+    let raw = "";
+    let latencyMs = null;
+    try {
+      const started = Date.now();
+      // Chat-style multimodal input with a real JSON schema. The model returns
+      // an already-parsed object, which is why the old /HAZARD:\s*(YES|NO)/
+      // regex is gone — there is no prose to parse.
+      const result = await withTimeout(
+        env.AI.run(model, {
           messages: [{
             role: "user",
             content: [
-              { type: "text", text: prompt },
+              { type: "text", text: confirmPrompt },
               { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frame}` } },
             ],
           }],
@@ -384,54 +770,133 @@ async function vision(env, url) {
               properties: {
                 hazard: { type: "boolean" },
                 kind: { type: "string" },
+                confidence: { type: "number" },
+                evidence: { type: "string" },
                 description: { type: "string" },
               },
-              required: ["hazard", "description"],
+              required: ["hazard", "confidence", "description"],
             },
           },
-          max_tokens: 256,
-        });
-        const r = result?.response;
-        const obj = typeof r === "string" ? safeParseJson(r) : r;
-        const raw = typeof r === "string" ? r : JSON.stringify(r ?? "");
+          // Same numbers in, same verdict out. A fire watch that answers
+          // differently on a re-run of the identical frame cannot be argued
+          // with, and the whole gating design below assumes stability.
+          temperature: 0,
+          max_tokens: 384,
+        }),
+        AI_CONFIRM_TIMEOUT_MS,
+        `vision confirm ${model}`,
+      );
+      latencyMs = Date.now() - started;
 
-        if (!obj && !raw) { lastErr = `${model} returned nothing`; continue; }
-
-        // json_schema shapes the output but does NOT enforce `required`, so
-        // every field needs a defensive default. Defaulting hazard to false is
-        // deliberate: a false alarm every 15 minutes trains the operator to
-        // ignore the alert entirely, and the deterministic event agents remain
-        // the real trigger.
-        return {
-          thing,
-          hazard: obj?.hazard === true,
-          kind: typeof obj?.kind === "string" ? obj.kind : null,
-          verdict_parsed: Boolean(obj && typeof obj.hazard === "boolean"),
-          description: typeof obj?.description === "string" && obj.description
-            ? obj.description
-            : raw.slice(0, 400),
-          model,
-          // Always true now that the prose fallback is gone. Kept in the
-          // response so existing consumers of this shape do not break.
-          structured: true,
-          latency_ms: Date.now() - started,
-          frame_ts: frameTs,
-          // Reported alongside the verdict so a caller can see how fresh the
-          // evidence was without re-deriving it from frame_ts.
-          frame_age_s: frameAgeS,
-          detections: latest?.data?.detections ?? [],
-        };
-      } catch (e) {
-        lastErr = `${model}: ${String(e).slice(0, 160)}`;
-      }
+      const r = result?.response;
+      obj = typeof r === "string" ? safeParseJson(r) : r;
+      raw = typeof r === "string" ? r : JSON.stringify(r ?? "");
+      if (!obj && !raw) { lastErr = `${model} returned nothing`; continue; }
+    } catch (e) {
+      lastErr = `${model}: ${String(e).slice(0, 160)}`;
+      continue;
     }
-    return { thing, error: lastErr || "no vision model available" };
+
+    // json_schema shapes the output but does NOT enforce `required`, so every
+    // field is defaulted rather than trusted.
+    const kind = typeof obj?.kind === "string" ? obj.kind.trim().toLowerCase() : "";
+    const evidence = typeof obj?.evidence === "string" ? obj.evidence.trim() : "";
+    const confidence = Number(obj?.confidence);
+    const claimed = obj?.hazard === true;
+
+    // FOUR INDEPENDENT CHECKS, ALL REQUIRED.
+    //
+    // Each has caught a different real failure: a model asserting true at
+    // confidence 0.2; asserting true and then naming kind "none"; asserting
+    // true with an empty `evidence` because it was agreeing with the question
+    // rather than reading the image; and asserting true with no confidence
+    // field at all. A missing confidence is treated as a failure on purpose —
+    // if that ever becomes systematic it shows up as the unconfirmed streak
+    // below escalating to a warning, which is visible, rather than as silence.
+    const checks = {
+      model_asserted_hazard: claimed,
+      kind_is_a_hazard: VISION_HAZARD_KINDS.has(kind),
+      confidence_at_least_threshold: Number.isFinite(confidence) && confidence >= VISION_MIN_CONFIDENCE,
+      evidence_is_specific: evidence.length >= VISION_MIN_EVIDENCE_CHARS,
+    };
+    const hazard = Object.values(checks).every(Boolean);
+    const rejected = claimed && !hazard
+      ? Object.entries(checks).filter(([, ok]) => !ok).map(([k]) => k)
+      : [];
+
+    if (rejected.length) {
+      console.log(JSON.stringify({
+        message: "vision: positive rejected by confirmation checks",
+        thing, model, kind, confidence, evidence_len: evidence.length, rejected,
+      }));
+    }
+
+    const verdict = {
+      ...base,
+      hazard,
+      kind: hazard ? kind : (kind || "none"),
+      confidence: Number.isFinite(confidence) ? confidence : null,
+      evidence: hazard ? evidence.slice(0, 300) : null,
+      claimed_hazard: claimed,
+      rejected_because: rejected,
+      description: typeof obj?.description === "string" && obj.description
+        ? obj.description.slice(0, 600)
+        : raw.slice(0, 400),
+      model,
+      stage: "confirm",
+      confirmed: hazard,
+      latency_ms: latencyMs,
+    };
+
+    // Awaited, not deferred: the streak this returns decides whether the
+    // report says "warning", so the answer is needed before returning.
+    const rec = await recordVision(env, thing, fp, verdict, { ctx, needStreak: true });
+    return { ...verdict, unconfirmed_streak: rec?.unconfirmed_streak ?? 0, detections };
+  }
+
+  // Every confirmation model failed. Say so. The one thing never returned here
+  // is a verdict — a frame stage 1 could not clear must not be reported as
+  // clear just because stage 2 was unreachable.
+  console.error(JSON.stringify({ message: "vision confirmation failed", thing, error: lastErr }));
+  return {
+    thing,
+    error: lastErr || "no vision model available",
+    triage,
+    frame_ts: frameTs,
+    frame_age_s: frameAgeS,
+    detections,
+  };
+}
+
+/**
+ * Persist the verdict and get back the unconfirmed-positive streak.
+ *
+ * When the caller does not need the streak (a frame triage cleared, which is
+ * the common and latency-sensitive case) the write rides `ctx.waitUntil` so the
+ * response is not held up by it — handed to the runtime rather than left
+ * floating, and with its own catch so a failed write is logged, not lost.
+ */
+async function recordVision(env, thing, fp, verdict, { ctx = null, needStreak = false } = {}) {
+  const pending = hubFetch(
+    env,
+    `/vision-record?thing=${encodeURIComponent(thing)}&fp=${fp}`,
+    { method: "POST", body: JSON.stringify(verdict) },
+  ).then((r) => r.json());
+
+  const logFailure = (err) => console.error(JSON.stringify({
+    message: "vision verdict not recorded", thing,
+    error: err instanceof Error ? err.message : String(err),
+  }));
+
+  if (!needStreak && ctx) {
+    ctx.waitUntil(pending.catch(logFailure));
+    return null;
+  }
+  try {
+    return await pending;
   } catch (err) {
-    console.error(JSON.stringify({
-      message: "vision failed",
-      error: err instanceof Error ? err.message : String(err),
-    }));
-    return { thing, error: String(err).slice(0, 300) };
+    logFailure(err);
+    return null;
   }
 }
 
@@ -968,13 +1433,12 @@ async function notify(env, alerts) {
  * Run the analysis agents, store the report, and email when it is not "ok".
  * Called by the cron trigger and by POST /api/analyze.
  */
-async function analyzeAndReport(env, { force = false } = {}) {
+async function analyzeAndReport(env, { force = false, ctx = null } = {}) {
   if (!env.DB) return { error: "archive not configured" };
 
   // A cold or unreachable hub must not take the analysis down with it — the
   // agents can still read D1 without knowing the roster.
-  const snap = await hubStub(env)
-    .fetch("https://hub/snapshot")
+  const snap = await hubFetch(env, "/snapshot")
     .then((r) => r.json())
     .catch((err) => {
       console.error(JSON.stringify({
@@ -1026,28 +1490,98 @@ async function analyzeAndReport(env, { force = false } = {}) {
   // Ask the VLM what the newest frame actually shows. Rule-based agents know
   // the numbers; this is the only part that can say "smoke behind the ridge".
   // Best-effort: a slow or unavailable model must not delay an alert.
-  for (const thing of (snap.things_seen || []).slice(0, 2)) {
-    try {
-      const v = await vision(env, new URL(`https://x/?thing=${encodeURIComponent(thing)}`));
-      // A stale-frame refusal comes back with `error` and no `description`, so
-      // it adds no finding and burns no inference — which is why an offline
-      // rover no longer produces a vision verdict about a frozen scene.
-      if (v.description) {
-        report.findings.push({
-          agent: `vision:${thing}`,
-          // Trust the model's declared verdict, not keywords in its prose.
-          severity: v.hazard ? "critical" : "ok",
-          detail: v.description,
-          hazard: v.hazard,
-          verdict_parsed: v.verdict_parsed,
-          model: v.model,
-          latency_ms: v.latency_ms,
-        });
-      }
-    } catch { /* vision is an enrichment, never a gate */ }
+  //
+  // Run in parallel and settle rather than sequentially: one rover whose model
+  // call is crawling used to push the second rover's analysis behind it, so a
+  // fire on rover2 waited on a slow frame from rover1. Every call already
+  // carries its own deadline, so the fan-out is bounded by the slowest timeout,
+  // not by their sum.
+  const visionThings = (snap.things_seen || []).slice(0, 2);
+  const settled = await Promise.allSettled(
+    visionThings.map((thing) => visionForThing(env, thing, { ctx })),
+  );
+
+  const visionStats = { looked: 0, cached: 0, confirmed: 0, unconfirmed: 0, unavailable: 0 };
+  for (let i = 0; i < settled.length; i++) {
+    const thing = visionThings[i];
+    const s = settled[i];
+    if (s.status !== "fulfilled") {
+      // visionForThing does not throw, so this is a bug, not a model failure.
+      visionStats.unavailable++;
+      console.error(JSON.stringify({
+        message: "vision threw — treated as no analysis", thing,
+        error: s.reason instanceof Error ? s.reason.message : String(s.reason),
+      }));
+      continue;
+    }
+    const v = s.value;
+
+    // A refusal (stale frame, budget, no frame, model down) comes back with
+    // `error` and no `description`, so it adds no finding and asserts nothing.
+    // Silence here means "no analysis available", never "no hazard".
+    if (!v || v.error || !v.description) {
+      visionStats.unavailable++;
+      continue;
+    }
+
+    visionStats.looked++;
+    if (v.cached) visionStats.cached++;
+
+    // SEVERITY, AND WHY AN UNCONFIRMED POSITIVE IS NOT ONE.
+    //
+    // `hazard` is already the AND of two models with opposite biases plus four
+    // structural checks — so critical here means confirmed, not suspected. A
+    // frame that triage flagged and confirmation rejected stays "ok": one
+    // disagreement is a sunset, and promoting it would page the operator on
+    // every dusk, which is exactly how an alert channel gets ignored.
+    //
+    // But the same disagreement several cycles running is not noise, so the
+    // streak escalates to "warning" — asymmetric, like the rover-side fire
+    // detection, and it clears the moment triage comes back clean.
+    const streak = Number(v.unconfirmed_streak) || 0;
+    const persistent = !v.hazard && v.triage?.flagged === true
+      && streak >= VISION_UNCONFIRMED_STREAK_WARN;
+
+    if (v.hazard) visionStats.confirmed++;
+    else if (v.triage?.flagged) visionStats.unconfirmed++;
+
+    let detail = v.description;
+    if (v.hazard && v.evidence) {
+      detail = `${v.description} Evidence: ${v.evidence}`;
+    } else if (persistent) {
+      detail =
+        `Screening has flagged possible smoke or fire on ${streak} consecutive runs and the ` +
+        `confirmation pass rejected it each time — NOT a confirmed fire, but worth human eyes. ` +
+        `Scene: ${v.description}`;
+    } else if (v.triage?.flagged) {
+      detail =
+        `Screening flagged this frame; the confirmation pass did not agree, so it is treated ` +
+        `as no hazard. Scene: ${v.description}`;
+    }
+
+    report.findings.push({
+      agent: `vision:${thing}`,
+      // Trust the structured verdict, never keywords in the prose.
+      severity: v.hazard ? "critical" : persistent ? "warning" : "ok",
+      detail,
+      hazard: v.hazard,
+      kind: v.kind ?? null,
+      confidence: v.confidence ?? null,
+      evidence: v.evidence ?? null,
+      // Kept so a rejected positive is auditable from the stored report rather
+      // than only from the logs.
+      claimed_hazard: v.claimed_hazard ?? false,
+      rejected_because: v.rejected_because ?? [],
+      unconfirmed_streak: streak,
+      verdict_parsed: v.verdict_parsed,
+      stage: v.stage ?? null,
+      cached: Boolean(v.cached),
+      model: v.model,
+      triage_model: v.triage?.model ?? null,
+      latency_ms: v.latency_ms ?? null,
+    });
   }
   // Recompute after adding vision findings so a VLM fire sighting can raise it.
-  const { worstSeverity } = await import("./agents.js");
   report.severity = worstSeverity(report.findings);
 
   // Edge LM pass — LAST, and deliberately after severity is final.
@@ -1057,7 +1591,22 @@ async function analyzeAndReport(env, { force = false } = {}) {
   // it out of worstSeverity() and out of the email trigger below. Returning
   // null is normal (no AI binding, over quota, model down) and the report is
   // complete without it.
-  report.reasoning = await reasonOverFindings(env, report, { model: TEXT_MODEL });
+  //
+  // Deadlined like every other model call. reasonOverFindings already swallows
+  // its own errors, but nothing inside it bounds a model that simply never
+  // answers — and this runs on the cron, where a hang costs the report, the
+  // email and the prune pass together.
+  report.reasoning = await withTimeout(
+    reasonOverFindings(env, report, { model: TEXT_MODEL }),
+    AI_REASON_TIMEOUT_MS,
+    "edge LM reasoning",
+  ).catch((err) => {
+    console.error(JSON.stringify({
+      message: "edge LM reasoning skipped",
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    return null;
+  });
 
   const { html, text } = renderReport(report);
 
@@ -1082,8 +1631,9 @@ async function analyzeAndReport(env, { force = false } = {}) {
   // than a duplicate one. But say so loudly: a silently swallowed error here
   // means the flood protection is off and nobody knows.
   try {
-    const gateRes = await hubStub(env).fetch(
-      `https://hub/report-gate?severity=${encodeURIComponent(report.severity)}` +
+    const gateRes = await hubFetch(
+      env,
+      `/report-gate?severity=${encodeURIComponent(report.severity)}` +
       `&sig=${encodeURIComponent(signature)}`,
     );
     if (!gateRes.ok) {
@@ -1126,11 +1676,11 @@ async function analyzeAndReport(env, { force = false } = {}) {
   let stored = false;
   let storeGate = { store: true, reason: "forced" };
   if (!force && !emailed) {
-    storeGate = await hubStub(env)
-      .fetch(
-        `https://hub/report-store-gate?severity=${encodeURIComponent(report.severity)}` +
-        `&sig=${encodeURIComponent(signature)}`,
-      )
+    storeGate = await hubFetch(
+      env,
+      `/report-store-gate?severity=${encodeURIComponent(report.severity)}` +
+      `&sig=${encodeURIComponent(signature)}`,
+    )
       .then((r) => r.json())
       .catch((err) => {
         // Fail towards storing: a missing history row is unrecoverable, a
@@ -1161,7 +1711,12 @@ async function analyzeAndReport(env, { force = false } = {}) {
     }
   }
 
-  return { ...report, emailed, email, gate, stored, store_reason: storeGate.reason };
+  return {
+    ...report, emailed, email, gate, stored, store_reason: storeGate.reason,
+    // How much AI was actually spent this run, so cost is observable from the
+    // response and from the cron log rather than only from the billing page.
+    vision_stats: visionStats,
+  };
 }
 
 /**
@@ -1403,6 +1958,8 @@ export class TelemetryHub extends DurableObject {
       );
     }
     if (url.pathname === "/alert-gate") return this.alertGate(url);
+    if (url.pathname === "/vision-gate") return this.visionGate(url);
+    if (url.pathname === "/vision-record") return this.visionRecord(request, url);
     if (url.pathname === "/report-gate") return this.reportGate(url);
     if (url.pathname === "/report-store-gate") return this.reportStoreGate(url);
     if (url.pathname === "/prune-gate") return this.pruneGate();
@@ -1802,6 +2359,152 @@ export class TelemetryHub extends DurableObject {
   }
 
   /**
+   * Sampling gate for billed vision inference — the cost control.
+   *
+   * WHY IT LIVES HERE
+   * -----------------
+   * The decision needs memory ("when did I last look at this rover, and at
+   * which frame?") and a Worker has none that survives: isolates are reused
+   * across unrelated requests, so module state is both lost and leaky. This
+   * object is already on the vision path — it is where the frame comes from —
+   * so the state costs no new class of round trip.
+   *
+   * Three refusals, in order of how much they save:
+   *  1. The frame is byte-identical to the one already analysed. A stalled
+   *     camera or a parked rover produces this constantly, and re-buying an
+   *     identical verdict is the purest waste there is. The previous verdict
+   *     comes back instead, labelled so nobody mistakes it for fresh.
+   *  2. Less than VISION_MIN_INTERVAL_S since the last billed look at this
+   *     rover. Bounds an authenticated dashboard polling /api/vision.
+   *  3. The daily stage-1 ceiling is spent.
+   *
+   * The ceiling deliberately covers TRIAGE only. Confirmation is never gated:
+   * once a frame has been flagged, budget must not be the reason it goes
+   * unexamined. Capping the cheap always-on stage bounds routine spend without
+   * ever standing between a possible fire and a verdict.
+   */
+  async visionGate(url) {
+    const thing = url.searchParams.get("thing") || "";
+    const fp = url.searchParams.get("fp") || "";
+    const key = `vision:${thing}`;
+    const now = Date.now();
+
+    const st = (await this.ctx.storage.get(key)) || {};
+    // UTC day, matching how Cloudflare resets the Workers AI allowance. Derived
+    // from the clock rather than a timer so there is nothing to schedule and
+    // nothing to miss while the object is hibernating.
+    const day = new Date(now).toISOString().slice(0, 10);
+    const stored = (await this.ctx.storage.get("vision_budget")) || {};
+    const used = stored.day === day ? Number(stored.used) || 0 : 0;
+
+    if (fp && st.fp === fp && st.verdict) {
+      return Response.json({
+        allowed: false,
+        reason: "frame unchanged since last analysis",
+        cached: st.verdict,
+        unconfirmed_streak: Number(st.unconfirmed_streak) || 0,
+        analysed_ago_s: st.at ? Math.round((now - st.at) / 1000) : null,
+      });
+    }
+
+    const sinceS = st.at ? Math.round((now - st.at) / 1000) : null;
+    if (sinceS !== null && sinceS < VISION_MIN_INTERVAL_S) {
+      return Response.json({
+        allowed: false,
+        reason: "sampled recently",
+        next_in_s: VISION_MIN_INTERVAL_S - sinceS,
+        cached: st.verdict || null,
+        unconfirmed_streak: Number(st.unconfirmed_streak) || 0,
+      });
+    }
+
+    if (used >= VISION_DAILY_TRIAGE_BUDGET) {
+      // No cached verdict is offered here on purpose. The cache answers "this
+      // exact frame" and "a moment ago"; a budget refusal can be many hours
+      // stale, and a stale verdict presented as current is the failure this
+      // whole file is written to avoid. "No analysis available" is the truth.
+      console.error(JSON.stringify({
+        message: "vision daily triage budget exhausted",
+        thing, used, budget: VISION_DAILY_TRIAGE_BUDGET, day,
+      }));
+      return Response.json({
+        allowed: false, reason: "daily vision budget exhausted",
+        used, budget: VISION_DAILY_TRIAGE_BUDGET,
+      });
+    }
+
+    // Both claimed BEFORE the inference runs, exactly as pruneGate does. If the
+    // model call then fails or the request is cut short, the next attempt waits
+    // one interval — whereas committing afterwards would let a model that fails
+    // instantly be retried on every single poll, for real money.
+    await this.ctx.storage.put({
+      [key]: { ...st, at: now },
+      vision_budget: { day, used: used + 1 },
+    });
+    return Response.json({
+      allowed: true, reason: "due",
+      used: used + 1, budget: VISION_DAILY_TRIAGE_BUDGET,
+    });
+  }
+
+  /**
+   * Store a vision verdict and return the unconfirmed-positive streak.
+   *
+   * The streak is the asymmetric-hysteresis counter: it increments only when
+   * triage flagged a frame and confirmation rejected it, and resets to zero on
+   * anything else — a clear frame, a confirmed hazard, or a run that produced
+   * no verdict. Slow to raise concern, instant to drop it.
+   */
+  async visionRecord(request, url) {
+    const thing = url.searchParams.get("thing") || "";
+    const fp = url.searchParams.get("fp") || "";
+    const key = `vision:${thing}`;
+
+    let verdict = null;
+    try { verdict = await request.json(); } catch { verdict = null; }
+
+    const st = (await this.ctx.storage.get(key)) || {};
+    const previous = Number(st.unconfirmed_streak) || 0;
+    const flagged = verdict?.triage?.flagged === true;
+    const confirmed = verdict?.hazard === true;
+    const streak = flagged && !confirmed ? previous + 1 : 0;
+
+    await this.ctx.storage.put(key, {
+      at: Date.now(),
+      fp,
+      // Trimmed, not stored whole. A verdict carries the rover's detection list
+      // and the model's prose; a Durable Object storage value is capped and
+      // every byte is a billed write, and none of the dropped fields are ever
+      // read back from the cache.
+      verdict: verdict ? {
+        hazard: verdict.hazard === true,
+        kind: typeof verdict.kind === "string" ? verdict.kind : null,
+        confidence: Number.isFinite(verdict.confidence) ? verdict.confidence : null,
+        evidence: typeof verdict.evidence === "string" ? verdict.evidence.slice(0, 300) : null,
+        claimed_hazard: verdict.claimed_hazard === true,
+        rejected_because: Array.isArray(verdict.rejected_because) ? verdict.rejected_because : [],
+        description: typeof verdict.description === "string" ? verdict.description.slice(0, 600) : "",
+        model: typeof verdict.model === "string" ? verdict.model : null,
+        stage: typeof verdict.stage === "string" ? verdict.stage : null,
+        structured: true,
+        verdict_parsed: verdict.verdict_parsed === true,
+        confirmed: verdict.confirmed === true,
+        frame_ts: Number(verdict.frame_ts) || null,
+        frame_age_s: Number.isFinite(verdict.frame_age_s) ? verdict.frame_age_s : null,
+        triage: verdict.triage ? {
+          model: verdict.triage.model ?? null,
+          flagged: verdict.triage.flagged === true,
+          reason: typeof verdict.triage.reason === "string" ? verdict.triage.reason : null,
+        } : null,
+        latency_ms: Number.isFinite(verdict.latency_ms) ? verdict.latency_ms : null,
+      } : null,
+      unconfirmed_streak: streak,
+    });
+
+    return Response.json({ unconfirmed_streak: streak, previous });
+  }
+
+  /**
    * Gate for scheduled-report emails — the uptime alerting path.
    *
    * WHY THIS EXISTS
@@ -1959,6 +2662,11 @@ export class TelemetryHub extends DurableObject {
       for (const key of list.keys()) {
         if (key.endsWith(`:${t}`)) await this.ctx.storage.delete(key);
       }
+      // And its vision state. Left behind, a rover cleared as a test fixture
+      // and later re-added would inherit a stale cached verdict and a stale
+      // unconfirmed streak — the second of which could produce a "warning"
+      // about a scene that no longer exists.
+      await this.ctx.storage.delete(`vision:${t}`);
     }
     return Response.json({ ok: true, things_seen: [...known] });
   }

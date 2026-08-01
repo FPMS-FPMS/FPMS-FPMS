@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { LidarView } from "../components/LidarView";
@@ -6,8 +6,14 @@ import { ArenaMap } from "../components/ArenaMap";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { MissionStrip } from "../components/MissionStrip";
 import { useChannel } from "../lib/ws";
-import { apiPost, apiPostJson } from "../lib/api";
-import { poseEnvelopeFromMm, readPlan, useMission } from "../lib/mission";
+import { apiPost } from "../lib/api";
+import { useThings } from "../lib/things";
+import {
+  poseEnvelopeFromMm,
+  postMissionAbort,
+  readPlan,
+  useMission,
+} from "../lib/mission";
 
 /**
  * THIS IS THE TAB PEOPLE WATCH WHILE THE ROVER MOVES.
@@ -33,29 +39,48 @@ import { poseEnvelopeFromMm, readPlan, useMission } from "../lib/mission";
  *                   SIMULATED badge exactly as before.
  */
 
+/** Per-bay accents, cycled so a third rover is not drawn in rover1's colour. */
+const ACCENTS = ["#f97316", "#38bdf8", "#a3e635", "#c084fc"];
+
 export default function Lidar() {
+  // The bays were hardcoded to rover1/rover2, so a fleet whose live unit was
+  // named anything else got two permanently empty maps while its scans streamed
+  // past. Both defaults are still shown, so a bay that has not reported is
+  // visibly absent rather than silently missing (same reasoning as Camera).
+  const things = useThings();
+  const bays = Array.from(new Set([...things, "rover1", "rover2"])).sort().slice(0, 4);
+
   return (
     <div className="space-y-6">
       <div className="flex items-end justify-between">
         <div>
           <div className="lbl">Page 2</div>
-          <h1 className="h-page mt-1">Dual LiDAR — both Orange Pi 5B rovers</h1>
+          <h1 className="h-page mt-1">LiDAR — arena maps, one per rover</h1>
+        </div>
+        <div className="text-xs text-slate-500">
+          {things.length
+            ? `${things.length} rover${things.length > 1 ? "s" : ""} reporting: ${things.join(", ")}`
+            : "no rovers reporting"}
         </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        <RoverLidar thing="rover1" accent="#f97316" />
-        <RoverLidar thing="rover2" accent="#38bdf8" />
+        {bays.map((t, i) => (
+          <RoverLidar key={t} thing={t} accent={ACCENTS[i % ACCENTS.length]} />
+        ))}
       </div>
 
       <Card>
         <CardHeader title="How this stream works" subtitle="Behind the scenes" />
         <p className="text-sm leading-relaxed text-slate-300">
-          Each rover publishes 360-range LiDAR frames at 2 Hz on
+          Each rover publishes 360-range LiDAR frames on
           {" "}<code className="rounded bg-black/50 px-1 py-0.5 text-xs">fpms/&lt;rover&gt;/telemetry/lidar</code>{" "}
-          to the local Mosquitto broker (standing in for AWS IoT Core). This dashboard
-          subscribes over WebSocket — no cloud round-trip, no per-frame cost. Data never
-          leaves your LAN.
+          to the local Mosquitto broker (standing in for AWS IoT Core). The publish rate
+          is set on the rover (<span className="font-mono">FPMS_LIDAR_HZ</span>) rather
+          than fixed here, so each card shows the rate it is actually receiving instead
+          of a number this page would go on printing after the rover was retuned. This
+          dashboard subscribes over WebSocket — no cloud round-trip, no per-frame cost.
+          Data never leaves your LAN.
         </p>
         <p className="mt-3 text-sm leading-relaxed text-slate-400">
           The arena map is world-fixed: the 120 cm x 120 cm grid, the zones and the water
@@ -81,6 +106,9 @@ export default function Lidar() {
   );
 }
 
+/** A scan older than this is history, not the world in front of the rover. */
+const SCAN_STALE_MS = 4000;
+
 function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
   const state = useChannel<any>(`lidar:${thing}`);
   const pose = useChannel<any>(`pose:${thing}`);
@@ -88,6 +116,15 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
   const planCh = useChannel<any>(`mission_plan:${thing}`);
   const feed = useMission(thing);
   const [busy, setBusy] = useState(false);
+
+  // Staleness has to be a function of wall time, not of arriving data: without
+  // a tick, a feed that simply STOPS keeps rendering its last frame as current
+  // forever — which on a map is the most convincing lie available.
+  const [now, setNow] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const cmd = async (action: "connect" | "disconnect") => {
     setBusy(true);
@@ -99,17 +136,13 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
    * Abort, from the map.
    *
    * Watching a rover drive somewhere wrong and having to change tabs to stop it
-   * is the exact gap this closes. It goes straight out as
-   * `mission {name: abort}` and is gated on nothing — an abort has to work
-   * precisely when everything else looks broken. Errors are swallowed on
-   * purpose: the acknowledgement lands in the Control and Drive logs, and a
-   * toast here would be one more thing between the operator and a second press.
+   * is the exact gap this closes. It publishes `stop`, which fpms-missions
+   * subscribes and aborts on — it used to publish `mission {name:"abort"}`,
+   * a name neither publisher accepts, so this button answered with a nack and
+   * stopped nothing. Gated on nothing: an abort has to work precisely when
+   * everything else looks broken.
    */
-  const abort = () => {
-    apiPostJson<unknown>(`/api/control/${thing}/mission`, {
-      params: { name: "abort" },
-    }).catch(() => undefined);
-  };
+  const abort = () => { void postMissionAbort(thing); };
 
   const plan = readPlan(planCh.data);
   const m = feed.mission;
@@ -140,13 +173,53 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
 
   const route = plan?.waypoints ?? null;
 
+  /**
+   * SCAN FRESHNESS, AND WHY IT IS SHOUTED ABOUT DURING A RUN.
+   *
+   * The mission executor refuses to start without a fresh scan and aborts if it
+   * loses one, because its obstacle guard is the only thing between the rover
+   * and whatever is in front of it. WiFi on this rover has been measured
+   * swinging to -78 dBm, at which point the LiDAR telemetry stops crossing
+   * entirely while the small drive and mission messages still get through — so
+   * "the map is frozen but everything else looks fine" is a real, observed
+   * state and not a hypothetical.
+   *
+   * A stale map during a mission therefore gets a red banner, not a grey chip.
+   */
+  const scanAgeMs = state.lastAt === null ? null : Math.max(0, now - state.lastAt);
+  const scanStale = scanAgeMs !== null && scanAgeMs > SCAN_STALE_MS;
+  const missionRunning = !!feed.mission?.running || feed.blind;
+  const scanBlind = missionRunning && (scanStale || state.lastAt === null);
+  // Measured, not assumed: the interval between the last two frames is the rate
+  // this dashboard is actually receiving, whatever FPMS_LIDAR_HZ says.
+  const scanHz =
+    scanAgeMs !== null && scanAgeMs > 0 && scanAgeMs < 30000 && state.messages > 1
+      ? 1000 / Math.max(scanAgeMs, 1)
+      : null;
+
   return (
     <Card>
       <CardHeader
         title={thing.toUpperCase()}
-        subtitle="Arena map · world-fixed · 360 ranges · 2 Hz"
+        subtitle="Arena map · world-fixed · 360 ranges"
         right={
           <div className="flex flex-wrap items-center gap-2">
+            <span
+              className={
+                scanBlind ? "chip-hot font-mono" : scanStale ? "chip-warn font-mono" : "chip font-mono"
+              }
+              title={
+                scanAgeMs === null
+                  ? "No scan has arrived on this channel"
+                  : `Newest scan is ${(scanAgeMs / 1000).toFixed(1)}s old`
+              }
+            >
+              {scanAgeMs === null
+                ? "no scan"
+                : scanStale
+                  ? `scan ${Math.round(scanAgeMs / 1000)}s old`
+                  : `scan · ${scanHz === null ? "--" : `${scanHz.toFixed(1)} Hz`}`}
+            </span>
             <span
               className={route ? "chip font-mono" : "chip font-mono text-slate-500"}
               title={
@@ -170,6 +243,33 @@ function RoverLidar({ thing, accent }: { thing: string; accent: string }) {
           standing next to the arena needs "is it driving itself" answered
           before anything else on it. */}
       <MissionStrip thing={thing} feed={feed} onAbort={abort} className="mb-4" />
+
+      {/* A frozen map under a driving rover. Loud, because the executor's
+          obstacle guard reads the same feed and the operator is looking at a
+          picture of where things WERE. */}
+      {scanBlind && (
+        <div className="mb-4 flex items-start gap-3 rounded-xl border-2 border-rose-500/50 bg-rose-950/40 p-3">
+          <span className="mt-1 inline-block h-3 w-3 shrink-0 rounded-full bg-rose-400 pulse-dot text-rose-400" />
+          <div className="text-sm text-rose-100">
+            <b>The map below is not current, and the rover is driving.</b>{" "}
+            {scanAgeMs === null
+              ? "No scan has arrived at all on this channel."
+              : `The newest scan is ${Math.round(scanAgeMs / 1000)}s old.`}{" "}
+            Everything drawn is where obstacles <i>were</i>. On this rover the
+            LiDAR telemetry is the first thing WiFi drops — below about −70 dBm
+            it stops crossing while the smaller drive and mission messages still
+            get through, so a live-looking page with a frozen map is exactly what
+            that looks like. Abort above before trusting any clearance here.
+          </div>
+        </div>
+      )}
+      {!scanBlind && scanStale && state.lastAt !== null && (
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+          Newest scan is {Math.round(scanAgeMs! / 1000)}s old — the map is
+          history, not the world now. No mission is running, so this is a
+          quiet note rather than an alarm.
+        </div>
+      )}
 
       {/* The map is the view that can lie to you: it depends on the arena
           constants, the pose and the body->world transform all being right.
