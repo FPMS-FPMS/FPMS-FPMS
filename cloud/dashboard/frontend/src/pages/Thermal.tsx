@@ -17,13 +17,29 @@ export default function Thermal() {
   const stream = useChannel<any>(thing ? `thermal:${thing}` : null);
   const analysis = useChannel<any>(thing ? `thermal-analysis:${thing}` : null);
   const [busy, setBusy] = useState(false);
+  // A rejected POST was an unhandled rejection and nothing on screen: the
+  // button un-greyed and the operator was left believing the rover had been
+  // told something.
+  const [cmdErr, setCmdErr] = useState<string | null>(null);
 
   const cmd = async (action: "connect" | "disconnect") => {
+    if (!thing) return;
     setBusy(true);
-    try { if (!thing) return;
-      await apiPost(`/api/rover/${thing}/${action}`); }
+    setCmdErr(null);
+    try { await apiPost(`/api/rover/${thing}/${action}`); }
+    catch (e: unknown) { setCmdErr(`${action} was not sent — ${e instanceof Error ? e.message : String(e)}`); }
     finally { setBusy(false); }
   };
+
+  /**
+   * Has a thermal frame ever arrived?
+   *
+   * Everything else on this page is downstream of that one fact. The card was
+   * titled "Live thermal grid" whether or not a single frame had landed, and a
+   * heading that says "live" over an empty canvas is the same defect as a green
+   * pill over a dead feed. No frames, no "live".
+   */
+  const gotFrame = stream.messages > 0 && stream.data != null;
 
   // `?.data.severity` threw the moment an envelope arrived without a payload,
   // and a thrown render on this page takes the fire warning down with it.
@@ -63,7 +79,7 @@ export default function Thermal() {
       <div className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
         <Card>
           <CardHeader
-            title="Live thermal grid"
+            title={gotFrame ? "Live thermal grid" : "Thermal grid — no frames"}
             subtitle={thing ? `LWIR · 32 × 24 · ironbow · ${thing}` : "LWIR · 32 × 24 · ironbow"}
             right={
               <StatusPill
@@ -73,15 +89,51 @@ export default function Thermal() {
               />
             }
           />
+          {!gotFrame && (
+            <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-100/90">
+              <b>
+                No thermal frame has arrived
+                {thing ? (
+                  <>
+                    {" "}on <span className="font-mono">thermal:{thing}</span>
+                  </>
+                ) : (
+                  " — no rover is reporting"
+                )}
+                .
+              </b>{" "}
+              Nothing below describes a scene: the grid is empty, the severity is{" "}
+              <span className="font-mono">unknown</span> rather than nominal, and
+              an absent hotspot here is an absent measurement, not an absent fire.
+            </div>
+          )}
           <ThermalView envelope={stream.data} analysis={analysis.data} height={420} />
 
           <Legend />
 
+          {cmdErr && (
+            <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">
+              {cmdErr}
+            </div>
+          )}
+
+          {/* Both buttons used to be enabled with no rover selected and bailed
+              silently on click — a control that looks armed and does nothing. */}
           <div className="mt-4 flex justify-end gap-2">
-            <button className="btn-primary" disabled={busy} onClick={() => cmd("connect")}>
-              Connect {thing ?? "rover"}
+            <button
+              className="btn-primary"
+              disabled={busy || !thing}
+              title={thing ? `Ask ${thing} to start its thermal stream` : "No rover is reporting — there is nothing to connect"}
+              onClick={() => cmd("connect")}
+            >
+              Connect {thing ?? "— no rover"}
             </button>
-            <button className="btn-danger" disabled={busy} onClick={() => cmd("disconnect")}>
+            <button
+              className="btn-danger"
+              disabled={busy || !thing}
+              title={thing ? `Ask ${thing} to stop its thermal stream` : "No rover is reporting — there is nothing to disconnect"}
+              onClick={() => cmd("disconnect")}
+            >
               Disconnect
             </button>
           </div>

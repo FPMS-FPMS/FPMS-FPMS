@@ -10,7 +10,10 @@ import {
   TRAIL_BREAK,
   TRAIL_MEASURED,
   ZONES,
+  ZONE_AHEAD_OF_START,
   createPoseTrail,
+  shortCorner,
+  type ArenaCorner,
   readPose,
   scaleFor,
   worldToCanvasX,
@@ -74,6 +77,27 @@ import { useChannelRef } from "../lib/ws";
  * made up.
  *
  * ---------------------------------------------------------------------------
+ * THE ARENA MUST BE FINDABLE
+ * ---------------------------------------------------------------------------
+ * An operator opened this dashboard and asked where the two zones and the
+ * water station were. They were being drawn the whole time — a 10 % wash and a
+ * 9 px name on a near-black floor — which is the same outcome as not drawing
+ * them. A region that is technically painted and practically invisible is a
+ * bug, not a style choice.
+ *
+ * So each of the four corner regions is now stated four independent ways
+ * (wash, corner brackets, a label plate, and a shape glyph) — see drawRegion.
+ * Two rules hold across all of them:
+ *
+ *   - EVERY LABEL NAMES ITS PHYSICAL CORNER. The mission code's m1/m2 and the
+ *     operator's "Zone 1" number the same two zones differently (arena.ts,
+ *     THE ZONE NAMING TRAP), so no label on this map is ever a bare number.
+ *     The start box additionally prints the zone it faces.
+ *   - THE WATER STATION IS NOT A TARGET. It is hatched, double-edged and
+ *     marked with a droplet, because it is where the rover refills, and an
+ *     operator who reads it as a third fire zone sends the rover to spray it.
+ *
+ * ---------------------------------------------------------------------------
  * LAYERS AND THE FRAME BUDGET
  * ---------------------------------------------------------------------------
  *   static   arena border, grid, zones, start box, axis labels, scale bar,
@@ -97,6 +121,18 @@ const PAD_PX = 34;
 const EMBER = "#f97316";
 const MONO = '10px "JetBrains Mono", ui-monospace, monospace';
 const MONO_SM = '9px "JetBrains Mono", ui-monospace, monospace';
+
+/**
+ * Region titles, in three fixed sizes rather than one composed per draw.
+ *
+ * A region on this map is between about 50 px (a narrow phone card) and about
+ * 150 px (the full-width panel) across, and 9 px text that is comfortable at
+ * the top of that range is what made the zones unreadable at the bottom of it.
+ * Semi-bold because these names sit on a busy floor and have to win.
+ */
+const ZONE_TITLE_LG = '600 12px "JetBrains Mono", ui-monospace, monospace';
+const ZONE_TITLE_MD = '600 11px "JetBrains Mono", ui-monospace, monospace';
+const ZONE_TITLE_SM = '600 10px "JetBrains Mono", ui-monospace, monospace';
 
 /** Hoisted so the per-frame path setup allocates nothing. */
 const DASH_NONE: number[] = [];
@@ -131,7 +167,10 @@ type ArenaTheme = {
   text: string;
   textDim: string;
   forward: string;
+  /** Dashed outline of the start box. */
   startInk: string;
+  /** Start box label. Brighter than `startInk` — an outline may whisper, a name may not. */
+  startText: string;
   /** HUD panel wash and the outline behind on-map labels. */
   scrim: string;
   halo: string;
@@ -146,6 +185,16 @@ type ArenaTheme = {
   /** Zone strokes are mixed this far toward this colour for legibility. */
   zoneMix: string;
   zoneMixT: number;
+  /**
+   * Alpha of the zone wash.
+   *
+   * This is the number that decides whether the arena has visible zones at
+   * all. It was 0.10 on a #0b0f16 floor, which is a wash of about three RGB
+   * steps — present in the buffer, absent to the eye, and the reason an
+   * operator opened the dashboard and asked where the zones were. The floor is
+   * near-black, so the wash needs enough alpha to lift the region clear of it.
+   */
+  zoneFill: number;
 };
 
 const THEME_DARK: ArenaTheme = {
@@ -158,7 +207,8 @@ const THEME_DARK: ArenaTheme = {
   text: "#e2e8f0",
   textDim: "rgba(148,163,184,0.55)",
   forward: "rgba(226,232,240,0.72)",
-  startInk: "rgba(148,163,184,0.45)",
+  startInk: "rgba(148,163,184,0.65)",
+  startText: "#cbd5e1",
   scrim: "rgba(7,9,13,0.72)",
   halo: "rgba(7,9,13,0.85)",
   trailMeasured: "#38bdf8",
@@ -170,6 +220,7 @@ const THEME_DARK: ArenaTheme = {
   classColors: CLASS_COLORS_DARK,
   zoneMix: "#e2e8f0",
   zoneMixT: 0,
+  zoneFill: 0.17,
 };
 
 const THEME_LIGHT: ArenaTheme = {
@@ -182,7 +233,8 @@ const THEME_LIGHT: ArenaTheme = {
   text: "#0f172a",
   textDim: "rgba(51,65,85,0.7)",
   forward: "rgba(15,23,42,0.75)",
-  startInk: "rgba(71,85,105,0.55)",
+  startInk: "rgba(71,85,105,0.65)",
+  startText: "#334155",
   scrim: "rgba(255,255,255,0.82)",
   halo: "rgba(255,255,255,0.9)",
   trailMeasured: "#0369a1",
@@ -194,6 +246,9 @@ const THEME_LIGHT: ArenaTheme = {
   classColors: CLASS_COLORS_LIGHT,
   zoneMix: "#0f172a",
   zoneMixT: 0.45,
+  // Lower than dark: the same alpha over white is a much larger perceptual
+  // step, and the ink has already been darkened by zoneMixT.
+  zoneFill: 0.14,
 };
 
 /**
@@ -589,75 +644,53 @@ function drawStatic(
   }
   ctx.stroke();
 
-  // ---- zones --------------------------------------------------------------
+  // ---- regions: the three zones and the start box --------------------------
+  // All four corners go through one routine so they read as one family and so
+  // the start box cannot quietly drift into looking like a destination.
   for (const z of ZONES) {
-    const zx = worldToCanvasX(z.x_mm, s, pad);
-    const zy = worldToCanvasY(z.y_mm + z.h_mm, s, pad); // top edge in canvas
-    const zw = z.w_mm * s;
-    const zh = z.h_mm * s;
-    // The zone inks are picked for a dark floor; on white they wash out, so
-    // they are pulled toward the text colour by the theme's mix factor. Hue is
-    // preserved — the hue is how the operator tells the zones apart.
-    const ink = mixHex(z.stroke, theme.zoneMix, theme.zoneMixT);
-
-    ctx.fillStyle = theme.zoneMixT > 0 ? withAlpha(ink, 0.1) : z.fill;
-    ctx.fillRect(zx, zy, zw, zh);
-
-    if (z.hatch) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(zx, zy, zw, zh);
-      ctx.clip();
-      ctx.strokeStyle = ink;
-      ctx.globalAlpha = 0.22;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      for (let d = -zh; d < zw; d += 9) {
-        ctx.moveTo(zx + d, zy + zh);
-        ctx.lineTo(zx + d + zh, zy);
-      }
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    ctx.strokeStyle = ink;
-    ctx.globalAlpha = 0.75;
-    ctx.lineWidth = 1;
-    ctx.strokeRect(hair(zx), hair(zy), Math.round(zw), Math.round(zh));
-    ctx.globalAlpha = 1;
-
-    // Label at the BOTTOM of the zone, not the top. The two upper zones reach
-    // the top edge of the arena, which is where the HUD block and the pose
-    // badge are anchored, and a top-left label put ZONE B directly under the
-    // badge. Anchoring low keeps every zone name clear of both.
-    ctx.fillStyle = ink;
-    ctx.font = MONO_SM;
-    ctx.textAlign = "left";
-    ctx.textBaseline = "bottom";
-    ctx.fillText(z.label, zx + 5, zy + zh - 4);
+    drawRegion(ctx, theme, {
+      x: worldToCanvasX(z.x_mm, s, pad),
+      y: worldToCanvasY(z.y_mm + z.h_mm, s, pad), // top edge in canvas
+      w: z.w_mm * s,
+      h: z.h_mm * s,
+      upper: z.y_mm + z.h_mm / 2 > ARENA_MM / 2,
+      // The zone inks are picked for a dark floor; on white they wash out, so
+      // they are pulled toward the text colour by the theme's mix factor. Hue
+      // is preserved — the hue is how the operator tells the zones apart.
+      ink: mixHex(z.stroke, theme.zoneMix, theme.zoneMixT),
+      fillA: theme.zoneFill,
+      kind: z.kind,
+      dashed: false,
+      title: z.label,
+      corner: z.corner,
+      role: z.role,
+    });
   }
 
-  // ---- start box ----------------------------------------------------------
-  // Dashed, unfilled and unlabelled in a zone colour, because it is not a
-  // destination: it is where the operator is asked to put the rover, and where
-  // the glyph is drawn when nothing reports a position. Making it look like
-  // ZONE A or ZONE B would imply the rover navigates to it.
-  {
-    const bx = worldToCanvasX(START_BOX.x_mm, s, pad);
-    const by = worldToCanvasY(START_BOX.y_mm + START_BOX.h_mm, s, pad);
-    const bw = START_BOX.w_mm * s;
-    const bh = START_BOX.h_mm * s;
-    ctx.strokeStyle = theme.startInk;
-    ctx.lineWidth = 1;
-    ctx.setLineDash(DASH_START);
-    ctx.strokeRect(hair(bx), hair(by), Math.round(bw), Math.round(bh));
-    ctx.setLineDash(DASH_NONE);
-    ctx.fillStyle = theme.startInk;
-    ctx.font = MONO_SM;
-    ctx.textAlign = "right";
-    ctx.textBaseline = "bottom";
-    ctx.fillText("START", bx + bw - 5, by + bh - 4);
-  }
+  // The start box is drawn dashed, unfilled and in neutral ink because it is
+  // not a destination: it is where the operator is asked to put the rover, and
+  // where the glyph is drawn when nothing reports a position. Filling it in a
+  // zone colour would imply the rover navigates to it.
+  //
+  // Its role line is the antidote to THE ZONE NAMING TRAP (see arena.ts): it
+  // names the zone that is physically in front of the rover as it sits here,
+  // derived from the coordinates, so the operator never has to translate
+  // between their "Zone 1" and the mission code's m1/m2.
+  drawRegion(ctx, theme, {
+    x: worldToCanvasX(START_BOX.x_mm, s, pad),
+    y: worldToCanvasY(START_BOX.y_mm + START_BOX.h_mm, s, pad),
+    w: START_BOX.w_mm * s,
+    h: START_BOX.h_mm * s,
+    upper: false,
+    ink: theme.startText,
+    edgeInk: theme.startInk,
+    fillA: 0,
+    kind: "start",
+    dashed: true,
+    title: START_BOX.label,
+    corner: START_BOX.corner,
+    role: ZONE_AHEAD_OF_START ? `AHEAD ${ZONE_AHEAD_OF_START.label}` : "",
+  });
 
   // ---- border -------------------------------------------------------------
   ctx.strokeStyle = theme.id === "dark" ? withAlpha(accent, 0.55) : theme.border;
@@ -731,6 +764,288 @@ function drawStatic(
 
   // ---- FORWARD marker -----------------------------------------------------
   drawForwardMarker(ctx, x0, y0, wpx, theme);
+}
+
+/** One corner region of the arena, as the static layer needs to draw it. */
+type RegionSpec = {
+  /** Canvas rect: top-left corner and size, px. */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /**
+   * True when the region sits in the UPPER half of the arena, which decides
+   * which inside edge the label plate hugs.
+   *
+   * Upper regions are labelled along their BOTTOM edge and lower regions along
+   * their TOP, so every plate ends up facing the middle of the arena. That
+   * keeps all four names off the arena's outer corners, which is where the HUD
+   * block and the pose badge are anchored and where a zone label used to end
+   * up underneath the badge.
+   */
+  upper: boolean;
+  /** Identity hue: wash, edge, brackets, glyph and title all come from this. */
+  ink: string;
+  /** Optional separate edge ink; defaults to `ink`. Used to keep START neutral. */
+  edgeInk?: string;
+  fillA: number;
+  kind: "fire" | "water" | "start";
+  dashed: boolean;
+  title: string;
+  /** The physical corner. Never a number — see THE ZONE NAMING TRAP. */
+  corner: ArenaCorner;
+  role: string;
+};
+
+/**
+ * Paint one corner region: wash, texture, edge, corner brackets, label plate.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS FOUR CUES AND NOT ONE
+ * ---------------------------------------------------------------------------
+ * The previous version drew each zone as a 10 % wash with a 1 px 75 %-alpha
+ * outline and a 9 px unhaloed name in the zone's own colour. Every one of
+ * those is a single point of failure on a near-black floor, and together they
+ * produced a map on which an operator could not find the regions at all. So a
+ * region now states itself four independent ways:
+ *
+ *   wash      lifts the whole rectangle off the floor.
+ *   brackets  2.5 px L-shapes at the four corners, at full strength. These
+ *             survive any wash that gets lost to contrast, brightness or a
+ *             screen in sunlight, and they read at 50 px across.
+ *   plate     a scrim with the NAME and the PHYSICAL CORNER on it, so the
+ *             label never has to compete with the grid or the point cloud.
+ *   glyph     shape, not hue: a target for a fire zone, a droplet for the
+ *             water station, a chevron for the start box. This is the cue that
+ *             still works for an operator who cannot tell violet from lime.
+ *
+ * Static layer only — measureText and the label logic here run on mount,
+ * resize and theme change, never in the rAF loop.
+ */
+function drawRegion(ctx: CanvasRenderingContext2D, theme: ArenaTheme, r: RegionSpec): void {
+  const { x, y, w, h } = r;
+  if (!(w > 8) || !(h > 8)) return;
+  const edge = r.edgeInk ?? r.ink;
+
+  // ---- wash ----------------------------------------------------------------
+  if (r.fillA > 0) {
+    ctx.fillStyle = withAlpha(r.ink, r.fillA);
+    ctx.fillRect(x, y, w, h);
+  }
+
+  // ---- texture -------------------------------------------------------------
+  // Diagonal hatch marks the water station as a DIFFERENT KIND OF THING from
+  // the two fire zones — a place the rover takes water on board, not a place
+  // it discharges. A texture says that at any size and in any palette; a
+  // slightly different blue does not.
+  if (r.kind === "water") {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    ctx.strokeStyle = r.ink;
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let d = -h; d < w; d += 8) {
+      ctx.moveTo(x + d, y + h);
+      ctx.lineTo(x + d + h, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---- edge ----------------------------------------------------------------
+  ctx.strokeStyle = edge;
+  ctx.lineWidth = 1;
+  if (r.dashed) ctx.setLineDash(DASH_START);
+  ctx.strokeRect(hair(x), hair(y), Math.round(w), Math.round(h));
+  ctx.setLineDash(DASH_NONE);
+
+  // A second, inset edge gives the water station a doubled border: one more
+  // difference that does not depend on colour.
+  if (r.kind === "water" && w > 26 && h > 26) {
+    ctx.globalAlpha = 0.45;
+    ctx.strokeRect(hair(x + 4), hair(y + 4), Math.round(w - 8), Math.round(h - 8));
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- corner brackets -----------------------------------------------------
+  const arm = Math.max(6, Math.min(22, w * 0.22));
+  ctx.strokeStyle = edge;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  for (let k = 0; k < 4; k++) {
+    const right = k === 1 || k === 2;
+    const bottom = k >= 2;
+    // Inset by half the stroke width so the bracket sits inside its region.
+    const cx = right ? x + w - 1.25 : x + 1.25;
+    const cy = bottom ? y + h - 1.25 : y + 1.25;
+    const sx = right ? -1 : 1;
+    const sy = bottom ? -1 : 1;
+    ctx.moveTo(cx + sx * arm, cy);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx, cy + sy * arm);
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1;
+
+  // ---- label plate ---------------------------------------------------------
+  // Below this the region is a few dozen pixels across and a plate would cover
+  // it entirely; the wash and the brackets still say a region is there.
+  if (w < 30 || h < 30) return;
+
+  const titleFont = w >= 108 ? ZONE_TITLE_LG : w >= 74 ? ZONE_TITLE_MD : ZONE_TITLE_SM;
+  const titleH = w >= 108 ? 12 : w >= 74 ? 11 : 10;
+
+  // The glyph is the first thing dropped when space runs out: a name and a
+  // corner are worth more than an icon, and the wash and brackets are still
+  // carrying the region's identity.
+  const glyphOn = w >= 84;
+  const glyphR = glyphOn ? Math.round(titleH * 0.46) : 0;
+  const glyphW = glyphOn ? glyphR * 2 + 5 : 0;
+
+  const padX = 5;
+  const padY = 4;
+  const lineH = 10;
+
+  ctx.font = titleFont;
+  const titleW = ctx.measureText(r.title).width;
+  ctx.font = MONO_SM;
+  const roleW = r.role ? ctx.measureText(r.role).width : 0;
+
+  // Lines are included only if they FIT. A clipped "BOTTOM-RIG" is worse than
+  // no sub-line, and this is the check that keeps the small-card rendering
+  // honest instead of merely hopeful.
+  //
+  // The corner gets two chances before it is given up on: the full name, then
+  // the abbreviation. Losing "BOTTOM-LEFT" off the water station on a phone is
+  // exactly the ambiguity this whole change exists to remove, so it degrades
+  // through "BTM-LEFT" first and is only dropped when even that will not fit.
+  const avail = w - 6 - glyphW - padX * 2;
+  let sub = r.corner as string;
+  let subW = ctx.measureText(sub).width;
+  if (subW > avail) {
+    sub = shortCorner(r.corner);
+    subW = ctx.measureText(sub).width;
+  }
+  const subOn = h >= 44 && subW <= avail;
+  const roleOn = roleW > 0 && h >= 72 && roleW <= avail;
+
+  const textW = Math.max(titleW, subOn ? subW : 0, roleOn ? roleW : 0);
+  const plateW = Math.min(w - 4, textW + glyphW + padX * 2);
+  const plateH = padY * 2 + titleH + 1 + (subOn ? lineH : 0) + (roleOn ? lineH : 0);
+  const plateX = x + (w - plateW) / 2;
+  const plateY = r.upper ? y + h - 5 - plateH : y + 5;
+
+  scrim(ctx, plateX, plateY, plateW, plateH, theme);
+
+  if (glyphOn) {
+    const gx = plateX + padX + glyphR;
+    const gy = plateY + padY + titleH / 2;
+    if (r.kind === "water") drawDropGlyph(ctx, gx, gy, glyphR, r.ink);
+    else if (r.kind === "fire") drawTargetGlyph(ctx, gx, gy, glyphR, r.ink);
+    else drawStartGlyph(ctx, gx, gy, glyphR, r.ink);
+  }
+
+  const tx = plateX + padX + glyphW;
+  let ty = plateY + padY;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+
+  ctx.font = titleFont;
+  ctx.fillStyle = r.ink;
+  ctx.fillText(r.title, tx, ty);
+  ty += titleH + 1;
+
+  if (subOn) {
+    // The corner goes in the plain text colour, not the region's hue: it is
+    // the part an operator has to be able to read, and it must not inherit
+    // whatever contrast problem the identity colour has.
+    ctx.font = MONO_SM;
+    ctx.fillStyle = theme.text;
+    ctx.fillText(sub, tx, ty);
+    ty += lineH;
+  }
+  if (roleOn) {
+    ctx.font = MONO_SM;
+    ctx.fillStyle = theme.textDim;
+    ctx.fillText(r.role, tx, ty);
+  }
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+/** Fire zone: a target. Something the rover aims at. */
+function drawTargetGlyph(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  ink: string,
+): void {
+  ctx.strokeStyle = ink;
+  ctx.fillStyle = ink;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.85, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx - r, cy);
+  ctx.lineTo(cx + r, cy);
+  ctx.moveTo(cx, cy - r);
+  ctx.lineTo(cx, cy + r);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.28, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+/** Water station: a droplet. Something the rover takes ON BOARD. */
+function drawDropGlyph(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  ink: string,
+): void {
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - r);
+  ctx.quadraticCurveTo(cx + r, cy + r * 0.15, cx, cy + r * 0.9);
+  ctx.quadraticCurveTo(cx - r, cy + r * 0.15, cx, cy - r);
+  ctx.closePath();
+  ctx.fillStyle = withAlpha(ink, 0.35);
+  ctx.fill();
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+/** Start box: a chevron pointing FORWARD, the way the rover is placed. */
+function drawStartGlyph(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  r: number,
+  ink: string,
+): void {
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(cx - r * 0.8, cy + r * 0.25);
+  ctx.lineTo(cx, cy - r * 0.6);
+  ctx.lineTo(cx + r * 0.8, cy + r * 0.25);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx - r * 0.8, cy + r * 0.9);
+  ctx.lineTo(cx + r * 0.8, cy + r * 0.9);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+  // Put the join back: the corner brackets of any region drawn after this one
+  // would otherwise inherit round corners from a glyph.
+  ctx.lineJoin = "miter";
 }
 
 /**

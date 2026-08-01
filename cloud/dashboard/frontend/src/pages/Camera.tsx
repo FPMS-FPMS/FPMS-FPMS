@@ -47,9 +47,11 @@ export default function Camera() {
             </code>.
           </li>
           <li>
-            YOLO inference runs on the RK3588 NPU (6 TOPS). Measured on this
-            hardware: 20 ms inference, 11 ms decode/NMS, 35 ms end-to-end —
-            about 28 fps of headroom. Only bounding boxes travel with the frame.
+            YOLO inference runs on the RK3588 NPU (6 TOPS). Recorded in a past
+            bench run on this hardware — not a live reading, and not a claim
+            about any feed above: 20 ms inference, 11 ms decode/NMS, 35 ms
+            end-to-end, about 28 fps of headroom. Only bounding boxes travel
+            with the frame.
           </li>
           <li>
             A hotspot only triggers action when the thermal camera <em>also</em>{" "}
@@ -64,10 +66,15 @@ export default function Camera() {
 function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
   const stream = useChannel<any>(`camera:${thing}`);
   const [busy, setBusy] = useState(false);
+  // A rejected POST used to be an unhandled promise rejection and nothing else:
+  // the button un-greyed and the operator was left believing the command went.
+  const [cmdErr, setCmdErr] = useState<string | null>(null);
 
   const cmd = async (action: "connect" | "disconnect") => {
     setBusy(true);
+    setCmdErr(null);
     try { await apiPost(`/api/rover/${thing}/${action}`); }
+    catch (e: unknown) { setCmdErr(`${action} was not sent — ${e instanceof Error ? e.message : String(e)}`); }
     finally { setBusy(false); }
   };
 
@@ -92,6 +99,17 @@ function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
     : [];
   const npu = stream.data?.data?.npu;
 
+  /**
+   * Has a frame ever arrived on this channel?
+   *
+   * This gate exists because the page used to print "Detections 0" and
+   * "Nothing detected in this frame." with zero frames received. On a
+   * fire-detection dashboard that is the worst available sentence: it reads as
+   * a camera that looked and saw no fire, when in fact nothing ever looked.
+   * No frame, no claim — the count goes to "--" and the copy says why.
+   */
+  const gotFrame = stream.messages > 0 && frame !== null;
+
   return (
     <Card>
       <CardHeader
@@ -105,13 +123,27 @@ function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
           />
         }
       />
-      <CameraView envelope={stream.data} />
+      {/* Only ever handed an envelope that actually carries a frame. An
+          envelope with detections but no image made CameraView emit
+          <img src="data:image/undefined;base64,undefined"> and size its overlay
+          canvas to NaN. */}
+      <CameraView envelope={gotFrame ? stream.data : null} />
 
       <div className="mt-3">
         <div className="lbl mb-1.5">
-          Detections <span className="chip ml-1">{detections.length}</span>
+          Detections{" "}
+          <span className={gotFrame ? "chip ml-1" : "chip-warn ml-1"}>
+            {gotFrame ? detections.length : "--"}
+          </span>
         </div>
-        {detections.length === 0 ? (
+        {!gotFrame ? (
+          <div className="text-sm text-amber-200/90">
+            <b>No frame has arrived from {thing}</b> — so there is nothing to
+            report on. This is <i>not</i> "nothing detected": the camera has not
+            been seen looking. Connect the rover, or check the camera publisher
+            on it.
+          </div>
+        ) : detections.length === 0 ? (
           <div className="text-sm text-slate-500">Nothing detected in this frame.</div>
         ) : (
           <ul className="space-y-1.5">
@@ -134,6 +166,12 @@ function RoverCamera({ thing, live }: { thing: string; live: boolean }) {
           </ul>
         )}
       </div>
+
+      {cmdErr && (
+        <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">
+          {cmdErr}
+        </div>
+      )}
 
       <div className="mt-4 flex flex-wrap justify-end gap-2">
         <button

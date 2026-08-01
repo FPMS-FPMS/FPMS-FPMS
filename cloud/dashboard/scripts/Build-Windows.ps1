@@ -47,8 +47,13 @@ $task = Get-ScheduledTask -TaskName 'FPMS HQ' -ErrorAction Ignore
 if ($task) {
     if ($task.State -eq 'Running') {
         Write-Host "[~] Stopping scheduled task 'FPMS HQ'..."
-        Stop-ScheduledTask -TaskName 'FPMS HQ'
-        Start-Sleep -Seconds 2
+        try {
+            Stop-ScheduledTask -TaskName 'FPMS HQ' -ErrorAction Stop
+            Start-Sleep -Seconds 2
+        } catch {
+            Write-Warning "Could not stop 'FPMS HQ': $($_.Exception.Message)"
+            Write-Warning "  It runs under an S4U logon. Re-run this from an ADMINISTRATOR PowerShell if the build fails to overwrite dist\."
+        }
     } else {
         Write-Host "[+] Scheduled task 'FPMS HQ' is not running."
     }
@@ -56,11 +61,24 @@ if ($task) {
     Write-Host "[+] No 'FPMS HQ' scheduled task registered."
 }
 
+# Stop-Process on an instance started by that task fails with Access Denied
+# from an unelevated shell, and -ErrorAction Ignore made that silent - the
+# build then died later on a "permission denied" from PyInstaller that named a
+# file rather than the process holding it. Report which ones survived.
 $running = @(Get-Process -Name 'FPMS-Dashboard' -ErrorAction Ignore)
 if ($running.Count -gt 0) {
     Write-Host ("[~] Stopping {0} running FPMS-Dashboard process(es)..." -f $running.Count)
-    $running | Stop-Process -Force -ErrorAction Ignore
+    foreach ($p in $running) {
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop }
+        catch { Write-Warning ("  PID {0} could not be stopped: {1}" -f $p.Id, $_.Exception.Message) }
+    }
     Start-Sleep -Seconds 2
+    $left = @(Get-Process -Name 'FPMS-Dashboard' -ErrorAction Ignore)
+    if ($left.Count -gt 0) {
+        Write-Warning ("{0} FPMS-Dashboard process(es) are still running: PID {1}" -f
+                       $left.Count, (($left | ForEach-Object { $_.Id }) -join ', '))
+        Write-Warning "  These need an ADMINISTRATOR PowerShell. If PyInstaller now fails with a permission error on dist\, this is why."
+    }
 }
 
 # ---- 2. Frontend ----------------------------------------------------------
@@ -104,16 +122,35 @@ Write-Host '[~] PyInstaller -> dist\FPMS-Dashboard.exe (this takes a few minutes
 & $py -m PyInstaller 'build\fpms.spec' --distpath 'dist' --workpath 'build' --noconfirm
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed ($LASTEXITCODE)" }
 
-$exe = Join-Path $dashboard 'dist\FPMS-Dashboard.exe'
-if (-not (Test-Path $exe)) { throw "PyInstaller reported success but $exe does not exist" }
-Write-Host ("[ok] {0}  ({1:N1} MB, {2})" -f $exe,
-    ((Get-Item $exe).Length / 1MB), (Get-Item $exe).LastWriteTime) -ForegroundColor Green
+# The spec is a ONE-FOLDER build now, so the output moved:
+#     was  dist\FPMS-Dashboard.exe            (one file)
+#     now  dist\FPMS-Dashboard\FPMS-Dashboard.exe  + _internal\
+#
+# This check used to look at the old path. That is not a harmless stale check:
+# dist\FPMS-Dashboard.exe STILL EXISTS as a leftover from the last one-file
+# build, so the check passed, and the script cheerfully reported the size and
+# timestamp of a build it had not just produced. The Desktop shortcut on this
+# machine was pointing at that exact leftover.
+$appDir = Join-Path $dashboard 'dist\FPMS-Dashboard'
+$exe    = Join-Path $appDir 'FPMS-Dashboard.exe'
+if (-not (Test-Path $exe)) {
+    throw "PyInstaller reported success but $exe does not exist. Expected a one-folder build; check build\fpms.spec still ends in a COLLECT()."
+}
+if (-not (Test-Path (Join-Path $appDir '_internal'))) {
+    throw "$exe exists but there is no _internal\ beside it. That is a one-FILE build and it cannot start once installed. build\fpms.spec must use exclude_binaries=True + COLLECT()."
+}
+$appSize = (Get-ChildItem $appDir -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
+Write-Host ("[ok] {0}  ({1:N1} MB total, {2})" -f $appDir, $appSize,
+    (Get-Item $exe).LastWriteTime) -ForegroundColor Green
 
-# dist-new\ only ever existed to dodge the lock handled in step 1. Leaving a
-# stale copy there invites someone to install the wrong one again.
-$distNew = Join-Path $dashboard 'dist-new\FPMS-Dashboard.exe'
-if (Test-Path $distNew) {
-    Write-Warning "dist-new\FPMS-Dashboard.exe is stale now - dist\ is the one that gets packaged. Delete dist-new\ when convenient."
+# Leftovers from the one-file era. Both are exes that look installable and are
+# not - installing either gives an app that exits before it can log why.
+foreach ($stale in @((Join-Path $dashboard 'dist\FPMS-Dashboard.exe'),
+                     (Join-Path $dashboard 'dist-new\FPMS-Dashboard.exe'))) {
+    if (Test-Path $stale) {
+        Write-Warning "Stale one-file build still present: $stale"
+        Write-Warning "  Nothing uses it any more. Delete it - a shortcut pointing at it launches a build that cannot start."
+    }
 }
 
 # ---- 4. Installer ---------------------------------------------------------
@@ -128,8 +165,21 @@ $iscc = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 if (-not $iscc) {
-    Write-Warning 'ISCC.exe (Inno Setup 6) not found - skipping the installer.'
-    Write-Warning "Run dist\FPMS-Dashboard.exe directly, or install Inno Setup from https://jrsoftware.org/isdl.php and re-run."
+    # Not an error, and not a dead end. Install-App.ps1 does the same job -
+    # copies the one-folder build to %LOCALAPPDATA%\Programs, makes both
+    # shortcuts, and registers an uninstaller in Add/Remove Programs - with no
+    # Inno Setup required. It is also the only one of the two that has been
+    # tested on this machine, because ISCC is not installed here.
+    Write-Host ''
+    Write-Host '[--] ISCC.exe (Inno Setup 6) not found - no Setup.exe was built.' -ForegroundColor Yellow
+    Write-Host '     That is fine. Install the app with:' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '         powershell -ExecutionPolicy Bypass -File .\scripts\Install-App.ps1' -ForegroundColor Cyan
+    Write-Host '     or just double-click  Install-FPMS-Dashboard.bat' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '     A Setup.exe is only needed to hand the app to someone else;'
+    Write-Host '     for that, install Inno Setup 6 from https://jrsoftware.org/isdl.php'
+    Write-Host '     and re-run this script.'
     return
 }
 

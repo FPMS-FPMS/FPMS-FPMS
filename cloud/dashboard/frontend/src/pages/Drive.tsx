@@ -45,8 +45,10 @@ import {
  * Everything is slow on purpose. The first test drive was far too fast. The
  * rover's limits are printed on the page rather than left to be guessed at.
  *
- * And when the link is down the rover cannot move, so the motion controls say
- * so instead of accepting clicks that go nowhere. STOP ALL is the exception: it
+ * And when we cannot say what the rover is doing — ROS reported down, telemetry
+ * gone stale, or nothing ever heard from this bay at all — the motion controls
+ * say so, naming which of the three it is, instead of accepting clicks that go
+ * nowhere. STOP ALL is the exception: it
  * stays live no matter what, because the moment everything else is broken is
  * exactly when a stop has to still be reachable.
  */
@@ -236,7 +238,10 @@ export default function Drive() {
   const [seen, setSeen] = useState<Record<string, { lastAt: number; count: number }>>({});
   const [stickActive, setStickActive] = useState(false);
   const [jogFails, setJogFails] = useState(0);
-  const [lastCmd, setLastCmd] = useState<StickValue>({ vx: 0, wz: 0 });
+  // null until the stick has actually sent something. It used to start at
+  // {0,0}, so the readout said "sent · vx 0.00 · wz 0.00" on a page that had
+  // never sent a command in its life — a zero standing in for "nothing".
+  const [lastCmd, setLastCmd] = useState<StickValue | null>(null);
 
   const ev = useChannel<any>("events");
   const drive = useChannel<any>(thing ? `drive:${thing}` : null);
@@ -373,19 +378,52 @@ export default function Drive() {
   const teleAgeMs = drive.lastAt === null ? null : now - drive.lastAt;
   const teleStale = teleAgeMs !== null && teleAgeMs > TELEMETRY_STALE_MS;
   const rosDown = tele?.ros_ok === false;
+  /** Nothing has EVER arrived on this rover's drive channel this session. */
+  const neverSeen = drive.lastAt === null;
   /**
-   * Motion is blocked when we know the link is bad. "Never received anything"
-   * is deliberately not in that set: if the drive telemetry topic is not
-   * plumbed through on this deployment, locking the controls would leave the
-   * operator with a page that cannot drive and no way to tell why. A missing
-   * feed is called out in the health panel instead.
+   * Motion is blocked whenever we cannot say what the rover is doing, and that
+   * includes never having heard from it at all.
+   *
+   * "Never received anything" used to be deliberately excluded, on the argument
+   * that a deployment without the drive telemetry topic plumbed through would
+   * be left with a page that cannot drive. That trade was the wrong way round.
+   * The banner directly above these controls already reads "OFFLINE - never
+   * seen this session" while the joystick, the turns, the nudges, all five
+   * mission buttons and Set coordinate sat enabled underneath it: a page that
+   * contradicts itself, and a joystick that streams jog at 10 Hz into nothing.
+   * A control that looks armed and does nothing teaches an operator that the
+   * rover is broken - or worse, banks a command that lands the moment the link
+   * comes back. An unheard rover is exactly the case where motion must be
+   * refused, with the reason printed.
+   *
+   * All three lockout causes are named separately below. "Locked" alone sends
+   * the operator hunting; "never seen", "ROS down" and "telemetry stale" each
+   * point at a different thing to go and check.
    */
-  const motionLocked = rosDown || teleStale;
-  const lockReason = rosDown
-    ? "The rover reports ROS is down. It cannot act on a motion command."
+  const motionLocked = rosDown || teleStale || neverSeen;
+
+  type LockKind = "ros" | "stale" | "never";
+  const lockKind: LockKind | null = rosDown
+    ? "ros"
     : teleStale
-      ? `No drive telemetry for ${Math.round((teleAgeMs ?? 0) / 1000)}s — the rover's state is unknown.`
-      : null;
+      ? "stale"
+      : neverSeen
+        ? "never"
+        : null;
+
+  const LOCK_TITLE: Record<LockKind, string> = {
+    ros: "ROS DOWN — the rover cannot move",
+    stale: "LINK STALE — rover state unknown",
+    never: "NEVER SEEN — this rover has not reported at all",
+  };
+  const lockReason =
+    lockKind === "ros"
+      ? "The rover reports ROS is down. It cannot act on a motion command."
+      : lockKind === "stale"
+        ? `No drive telemetry for ${Math.round((teleAgeMs ?? 0) / 1000)}s — the rover's state is unknown.`
+        : lockKind === "never"
+          ? `Nothing has ever arrived on ${thing ? `drive:${thing}` : "this channel"} since the page loaded, so this dashboard has no idea whether ${thing ?? "the rover"} is powered, where it is, or whether anything it is sent would be acted on.`
+          : null;
 
   // The hub replays its last broadcast to each new subscriber, so without this
   // an ack from minutes ago would appear on mount as if it had just landed.
@@ -578,11 +616,17 @@ export default function Drive() {
 
   const noRover = !thing;
   const motionDisabled = noRover || motionLocked;
+  // Every disabled control says WHICH of the three states put it there. A
+  // greyed-out button with no reason is indistinguishable from a broken page.
   const disabledHint = noRover
     ? "no rover selected"
-    : rosDown
+    : lockKind === "ros"
       ? "ROS is down on the rover"
-      : "telemetry stale — link unknown";
+      : lockKind === "stale"
+        ? "telemetry stale — link unknown"
+        : lockKind === "never"
+          ? `${thing} has never reported this session — nothing to drive`
+          : "";
 
   return (
     <ErrorBoundary label="Drive">
@@ -635,15 +679,18 @@ export default function Drive() {
         {/* Loud, unmissable, and above the controls it explains. A greyed-out
             button with no reason next to it sends the operator hunting the
             dashboard for a bug that is on the far end of the link. */}
-        {lockReason && (
+        {lockReason && lockKind && (
           <div className="flex items-start gap-3 rounded-xl border-2 border-rose-500/50 bg-rose-950/40 p-4">
             <span className="mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full bg-rose-400 pulse-dot text-rose-400" />
             <div>
               <div className="text-base font-semibold text-rose-100">
-                {rosDown ? "ROS DOWN — the rover cannot move" : "LINK STALE — rover state unknown"}
+                {LOCK_TITLE[lockKind]}
               </div>
               <p className="mt-1 text-sm text-rose-200/85">
-                {lockReason} Motion controls are disabled until it recovers.{" "}
+                {lockReason}{" "}
+                {lockKind === "never"
+                  ? "Motion controls are disabled until it publishes drive telemetry — they will enable themselves the moment it does, with no reload. Check that the teleop bridge is running on the rover, that the rover is powered, and that the right bay is selected above."
+                  : "Motion controls are disabled until it recovers."}{" "}
                 <b>STOP ALL still works</b> and is still worth pressing.
               </p>
             </div>
@@ -813,7 +860,9 @@ export default function Drive() {
                 disabledHint={disabledHint}
               />
               <div className="w-full rounded-lg border border-white/5 bg-black/30 px-3 py-2 text-center font-mono text-xs text-slate-400">
-                sent · vx {lastCmd.vx.toFixed(2)} · wz {lastCmd.wz.toFixed(2)}
+                {lastCmd === null
+                  ? "nothing sent from this stick yet"
+                  : `sent · vx ${lastCmd.vx.toFixed(2)} · wz ${lastCmd.wz.toFixed(2)}`}
               </div>
             </div>
             <p className="mt-3 text-xs text-slate-500">
@@ -1100,6 +1149,18 @@ export default function Drive() {
                 the map draws in, so every coordinate on this page and every
                 mission planned from it is offset by an unknown amount. Set it
                 before running anything.
+              </div>
+            )}
+            {/* This control is left usable while motion is locked — it moves
+                nothing — but an operator has to know it is being sent into a
+                silence. */}
+            {neverSeen && !noRover && (
+              <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+                <b>{thing} has never reported this session.</b> A coordinate set
+                now goes out over MQTT and will not be acknowledged by anything
+                this page can see. The boxes start empty on purpose: there is no
+                default position, and a pre-filled 0/0 would publish "you are at
+                the arena origin" on a single click.
               </div>
             )}
             <SetCoordinate
@@ -1890,8 +1951,12 @@ function SetCoordinate({
   onFire: (x: number, y: number) => void;
   disabled: boolean;
 }) {
-  const [x, setX] = useState("0");
-  const [y, setY] = useState("0");
+  // Empty, not "0". These boxes used to arrive pre-filled with 0/0, so the
+  // control was one click away from publishing "you are at the arena origin"
+  // — a coordinate nobody typed and nothing measured, on a page that may never
+  // have heard from the rover at all. An unfilled box disables the button.
+  const [x, setX] = useState("");
+  const [y, setY] = useState("");
   const nx = Number(x);
   const ny = Number(y);
   const valid =
@@ -1905,6 +1970,7 @@ function SetCoordinate({
           type="number"
           value={x}
           onChange={(e) => setX(e.target.value)}
+          placeholder="--"
           className="w-28 rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-ember-500/40"
         />
       </label>
@@ -1914,6 +1980,7 @@ function SetCoordinate({
           type="number"
           value={y}
           onChange={(e) => setY(e.target.value)}
+          placeholder="--"
           className="w-28 rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-ember-500/40"
         />
       </label>
@@ -1921,7 +1988,11 @@ function SetCoordinate({
         className="btn-primary"
         disabled={disabled || !valid}
         onClick={() => valid && onFire(nx, ny)}
-        title={valid ? "Set the rover's believed position" : "Both values must be numbers"}
+        title={
+          valid
+            ? "Set the rover's believed position"
+            : "Type both coordinates — there is no default, because a default here is a made-up position"
+        }
       >
         Set coordinate
       </button>

@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { Route, Routes } from "react-router-dom";
+import { Link, Route, Routes, useLocation } from "react-router-dom";
 import Layout from "./components/Layout";
 import Intro from "./pages/Intro";
 import Control from "./pages/Control";
 import Drive from "./pages/Drive";
+import Mission from "./pages/Mission";
 import Devices from "./pages/Devices";
 import Aws from "./pages/Aws";
 import Lidar from "./pages/Lidar";
@@ -34,6 +35,34 @@ function NotAvailableRemotely({ what }: { what: string }) {
         This page can act on the HQ laptop, so it's disabled over the public link.
         Open the FPMS app on that laptop to use it. Live rover data stays available here.
       </p>
+    </div>
+  );
+}
+
+/**
+ * Anything that matches no route.
+ *
+ * This exists because its absence was mistaken for the app losing its tabs.
+ * The backend answers 200 for every path so the SPA can own routing, so a typo,
+ * an old bookmark, or a link to a page that has since been renamed used to
+ * render the normal nav and footer wrapped around a COMPLETELY EMPTY main --
+ * which is indistinguishable from "that tab is gone", and was reported as
+ * exactly that.
+ *
+ * It names the path it could not match, so the next person gets a fact instead
+ * of a blank rectangle.
+ */
+function NoSuchPage() {
+  const { pathname } = useLocation();
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/30 p-8 text-center">
+      <div className="text-lg font-semibold text-slate-100">No page at this address</div>
+      <p className="mx-auto mt-2 max-w-md text-sm text-slate-400">
+        Nothing is routed to <span className="font-mono text-slate-300">{pathname}</span>.
+        It may have been renamed, or the link may be out of date. Every page the
+        app has is in the navigation above.
+      </p>
+      <Link to="/" className="btn mt-5 inline-block">Back to Overview</Link>
     </div>
   );
 }
@@ -77,6 +106,8 @@ export default function App() {
           path="/drive"
           element={locked ? <NotAvailableRemotely what="Drive" /> : <Drive />}
         />
+        {/* Mission drives the rover, so it is HQ-only exactly like Drive. */}
+        <Route path="/mission" element={locked ? <NotAvailableRemotely what="Mission" /> : <Mission />} />
         <Route
           path="/devices"
           element={locked ? <NotAvailableRemotely what="Devices" /> : <Devices />}
@@ -91,6 +122,8 @@ export default function App() {
           element={locked ? <NotAvailableRemotely what="Terminal" /> : <Terminal isLan={status.is_lan} />}
         />
         <Route path="/install" element={<Install />} />
+        {/* Must be LAST: react-router takes the first match. */}
+        <Route path="*" element={<NoSuchPage />} />
       </Routes>
     </Layout>
   );

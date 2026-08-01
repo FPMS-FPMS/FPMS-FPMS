@@ -34,6 +34,9 @@ const groups: { name: string; tabs: Tab[] }[] = [
     name: "Operations",
     tabs: [
       { to: "/", label: "Overview", end: true, icon: IconGrid },
+      // Leads the action tabs: running a mission is the primary task. It drives
+      // the rover, so it carries the same hqOnly flag as Control and Drive.
+      { to: "/mission", label: "Mission", hqOnly: true, icon: IconTarget },
       { to: "/control", label: "Control", hqOnly: true, icon: IconSliders },
       { to: "/drive", label: "Drive", hqOnly: true, icon: IconSteering },
     ],
@@ -267,6 +270,19 @@ function IconGrid({ className }: { className?: string }) {
         <rect x="14" y="3" width="7" height="7" rx="1.5" />
         <rect x="3" y="14" width="7" height="7" rx="1.5" />
         <rect x="14" y="14" width="7" height="7" rx="1.5" />
+      </g>
+    </Svg>
+  );
+}
+
+/** Crosshair over a corner target — the Mission tab picks a corner to drive to. */
+function IconTarget({ className }: { className?: string }) {
+  return (
+    <Svg className={className}>
+      <g>
+        <circle cx="12" cy="12" r="8" />
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
       </g>
     </Svg>
   );

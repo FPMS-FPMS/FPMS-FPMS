@@ -43,6 +43,28 @@
  * The corollary is that "which way is forward" must be stated, not inferred
  * from a spinning picture: FORWARD_HEADING_DEG below is that statement, and
  * the static layer paints a matching FORWARD marker at the top edge.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ZONE NAMING TRAP
+ * ---------------------------------------------------------------------------
+ * There are two numbering schemes in play and they DO NOT AGREE.
+ *
+ *   the code    calls the top-LEFT zone `m1` and the top-RIGHT zone `m2`.
+ *   the operator calls the zone DIRECTLY IN FRONT OF THE START BOX "Zone 1".
+ *
+ * The start box is bottom-RIGHT and the rover starts facing 90 deg (up the
+ * arena), so the zone in front of it is the top-RIGHT one — `zone-b`, which
+ * the mission code calls `m2`. The operator's "Zone 1" is therefore the code's
+ * `m2`, not its `m1`.
+ *
+ * Nothing here renumbers anything: renaming one scheme to match the other just
+ * moves the confusion. The fix is that NO LABEL ON THE MAP IS EVER A BARE
+ * NUMBER. Every region carries the physical corner it occupies (`corner`
+ * below), because the corner is the one description the operator standing at
+ * the arena and the code running the mission cannot disagree about. The start
+ * box additionally names the zone it faces (`ZONE_AHEAD_OF_START`), which is
+ * derived from the geometry rather than typed in, so the map cannot claim a
+ * relationship the coordinates do not support.
  */
 
 /**
@@ -113,18 +135,66 @@ export function worldToCanvas(
   return { px: worldToCanvasX(xw, s, pad), py: worldToCanvasY(yw, s, pad) };
 }
 
+/**
+ * The physical corner of the arena a region sits in.
+ *
+ * This is the label the operator reads off the map, and it is deliberately a
+ * direction rather than a number — see THE ZONE NAMING TRAP at the top of this
+ * file. "TOP" means the far side of the arena from the start box, which is the
+ * side the rover faces at FORWARD_HEADING_DEG.
+ */
+export type ArenaCorner = "TOP-LEFT" | "TOP-RIGHT" | "BOTTOM-LEFT" | "BOTTOM-RIGHT";
+
+/**
+ * The same corner, abbreviated, for when the full name will not fit.
+ *
+ * Only BOTTOM is shortened, and only to BTM — the half that carries the
+ * meaning (LEFT / RIGHT) is never touched, and neither name can be confused
+ * with the other three. This exists so that a narrow card DEGRADES the corner
+ * label rather than DROPPING it: on a phone-width map the region name plus
+ * "BTM-LEFT" still fits where "BOTTOM-LEFT" does not, and the corner is the
+ * one piece of text on this map that must not go missing.
+ */
+export function shortCorner(corner: ArenaCorner): string {
+  return corner.startsWith("BOTTOM-") ? `BTM-${corner.slice(7)}` : corner;
+}
+
+/**
+ * What a region is FOR, which is not a cosmetic distinction.
+ *
+ *   fire   a mission destination. The rover drives to it and discharges.
+ *   water  the refill point. The rover drives to it to take water ON BOARD.
+ *
+ * An operator who mistakes the refill point for a target sends the rover to
+ * spray the water station, so the two kinds are drawn as different objects
+ * (hatched fill, droplet glyph, REFILL role text) and not merely in different
+ * hues — hue alone fails for a colour-blind operator and fails again on a
+ * washed-out screen in daylight.
+ */
+export type ZoneKind = "fire" | "water";
+
 /** A named region painted on the static layer. Rect anchored BOTTOM-LEFT. */
 export type Zone = {
   id: string;
+  /** Short name, e.g. "ZONE A". Never a bare number. */
   label: string;
+  /** Physical corner, always drawn directly under `label`. */
+  corner: ArenaCorner;
+  /** One-word purpose, drawn when the region is large enough to take it. */
+  role: string;
+  kind: ZoneKind;
   /** world mm, bottom-left corner */
   x_mm: number;
   y_mm: number;
   w_mm: number;
   h_mm: number;
+  /**
+   * Hue that identifies this region. The renderer derives the wash, the edge,
+   * the corner brackets and the label ink from this ONE value, so a zone can
+   * never end up with an edge in one colour and a fill in another — which is
+   * how a region ends up drawn but invisible.
+   */
   stroke: string;
-  fill: string;
-  hatch?: boolean;
 };
 
 /** Zone side and margin, as fractions of the arena so a rescale is free. */
@@ -133,37 +203,56 @@ export const ZONE_MARGIN_MM = 0.04 * ARENA_MM;
 const Z = ZONE_SIDE_MM;
 const M = ZONE_MARGIN_MM;
 
+/**
+ * The three named regions, in the three corners that are not the start box.
+ *
+ * HUES ARE ALLOCATED, NOT CHOSEN. The map already spends orange on the arena
+ * border and the measured rover, amber on ASSUMED pose and OBSTACLE tracks,
+ * emerald on MEASURED pose, green on TREE tracks, rose on danger, sky on the
+ * measured trail and the planned route, and slate on walls. A zone painted in
+ * any of those reads as one of those. Violet, lime and cyan are what is left,
+ * and they are far enough apart on the wheel to survive a 17 % wash.
+ *
+ * `zone-a` used to be sky #38bdf8 — one hue step from the water station's cyan
+ * and the same hue as the measured trail. Three regions the operator has to
+ * tell apart at a glance had two nearly identical colours between them.
+ */
 export const ZONES: readonly Zone[] = [
   {
     id: "zone-a",
     label: "ZONE A",
+    corner: "TOP-LEFT",
+    role: "FIRE ZONE",
+    kind: "fire",
     x_mm: M,
     y_mm: ARENA_MM - M - Z, // top-left
     w_mm: Z,
     h_mm: Z,
-    stroke: "#38bdf8",
-    fill: "rgba(56,189,248,0.10)",
+    stroke: "#c084fc",
   },
   {
     id: "zone-b",
     label: "ZONE B",
+    corner: "TOP-RIGHT",
+    role: "FIRE ZONE",
+    kind: "fire",
     x_mm: ARENA_MM - M - Z,
     y_mm: ARENA_MM - M - Z, // top-right
     w_mm: Z,
     h_mm: Z,
     stroke: "#a3e635",
-    fill: "rgba(163,230,53,0.10)",
   },
   {
     id: "water-station",
     label: "WATER",
+    corner: "BOTTOM-LEFT",
+    role: "REFILL",
+    kind: "water",
     x_mm: M,
     y_mm: M, // bottom-left
     w_mm: Z,
     h_mm: Z,
     stroke: "#22d3ee",
-    fill: "rgba(34,211,238,0.12)",
-    hatch: true,
   },
 ];
 
@@ -198,7 +287,45 @@ export const START_BOX = {
   y_mm: M,
   w_mm: Z,
   h_mm: Z,
+  label: "START",
+  corner: "BOTTOM-RIGHT" as ArenaCorner,
 } as const;
+
+/**
+ * The zone the rover is looking at when it sits in the start box, or null if
+ * no zone is in front of it.
+ *
+ * DERIVED FROM THE GEOMETRY, never typed in. Forward is +y (see
+ * FORWARD_HEADING_DEG), so "ahead" means: centred in the same vertical lane as
+ * the start box, and further up the arena. Whichever zone satisfies that is
+ * the operator's "Zone 1" — the trap documented at the top of this file — and
+ * the map prints its name inside the start box so nobody has to hold the two
+ * numbering schemes in their head.
+ *
+ * Deriving it means the caption cannot go stale: move a zone or move the start
+ * box and the arrow follows, or disappears if nothing is ahead any more. A
+ * hardcoded "AHEAD: ZONE B" would keep claiming a relationship the coordinates
+ * had stopped supporting, which is exactly the class of bug that produced the
+ * naming trap in the first place.
+ */
+export const ZONE_AHEAD_OF_START: Zone | null = (() => {
+  const cx = START_BOX.x_mm + START_BOX.w_mm / 2;
+  const cy = START_BOX.y_mm + START_BOX.h_mm / 2;
+  let best: Zone | null = null;
+  let bestDy = Infinity;
+  for (const z of ZONES) {
+    const zcx = z.x_mm + z.w_mm / 2;
+    const zcy = z.y_mm + z.h_mm / 2;
+    const dy = zcy - cy;
+    if (dy <= 0) continue; // behind or alongside: not ahead at heading 90
+    if (Math.abs(zcx - cx) > z.w_mm / 2) continue; // out of the forward lane
+    if (dy < bestDy) {
+      bestDy = dy;
+      best = z;
+    }
+  }
+  return best;
+})();
 
 /**
  * Where the rover is assumed to be when no odometry is published: the centre
