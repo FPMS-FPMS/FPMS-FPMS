@@ -144,7 +144,7 @@ const DATA_CACHE_CONTROL =
 
 /** The page itself: immutable between deploys, so cache it hard. */
 const PAGE_CACHE_CONTROL =
-  "public, max-age=600, stale-while-revalidate=86400, stale-if-error=86400";
+  "public, max-age=120, stale-while-revalidate=600, stale-if-error=86400";
 
 /**
  * The "camera is not public" refusal is a constant, and the commonest reply
@@ -1455,6 +1455,52 @@ ${ANALYTICS_HTML}
   </footer>
 </div>
 
+<script>
+/* A page that fails silently is undiagnosable by the only person who can see it.
+ *
+ * This page is public, so its audience is on phones and laptops this project
+ * will never have access to. When something throws mid-render the layout
+ * collapses to empty grid containers, which looks like a broken site and tells
+ * the visitor -- and us -- nothing. Reported from a phone as "it appears for a
+ * second, then just becomes grid", which is exactly what an uncaught exception
+ * between two render steps looks like from outside.
+ *
+ * So: catch it, show it, and keep it short enough to read on a phone. This is
+ * the same lesson as a windowed executable with no console -- the mechanism
+ * that would report the fault must not be the thing that is broken.
+ */
+(function () {
+  var shown = false;
+  function report(what, where) {
+    if (shown) return;
+    shown = true;
+    try {
+      var el = document.getElementById("jsfail");
+      if (!el) {
+        el = document.createElement("div");
+        el.id = "jsfail";
+        document.body.insertBefore(el, document.body.firstChild);
+      }
+      el.hidden = false;
+      el.setAttribute("role", "alert");
+      el.style.cssText =
+        "margin:12px;padding:14px 16px;border:1px solid #b45309;border-radius:12px;" +
+        "background:#fffbeb;color:#7c2d12;font:14px/1.5 system-ui,sans-serif";
+      el.textContent =
+        "This page hit a script error and stopped updating. The rest of the site " +
+        "still works. Details: " + String(what) + (where ? "  [" + where + "]" : "");
+    } catch (_) { /* nothing left to try */ }
+  }
+  window.addEventListener("error", function (e) {
+    report(e && e.message ? e.message : "unknown error",
+           e && e.filename ? (e.filename + ":" + e.lineno + ":" + e.colno) : "");
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e && e.reason;
+    report(r && r.message ? r.message : String(r), "promise");
+  });
+})();
+</script>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
