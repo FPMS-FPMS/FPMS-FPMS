@@ -78,6 +78,18 @@
  *   npx wrangler secret put FPMS_PUBLIC_CAMERA   # value: on
  */
 
+// Page fragments only. The analytics/demo ROUTE is registered in worker.js
+// ahead of handlePublic, because handlePublic owns the /api/public/* prefix
+// and answers 405 to every non-GET, so a route added after it is
+// unreachable. Importing handleAnalytics here too would be a second, dead
+// registration of the same handler.
+import {
+  ANALYTICS_STYLE,
+  ANALYTICS_HTML,
+  ANALYTICS_SCRIPT,
+} from "./analytics.js";
+
+
 /** Seconds before a rover that has stopped reporting is no longer "live". */
 const ONLINE_WINDOW_S = 90;
 /** Seconds before it is considered properly offline rather than just lagging. */
@@ -1092,6 +1104,7 @@ const PUBLIC_PAGE = `<!doctype html>
     position:absolute; width:1px; height:1px; overflow:hidden;
     clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap;
   }
+${ANALYTICS_STYLE}
 </style>
 </head>
 <body>
@@ -1197,6 +1210,8 @@ const PUBLIC_PAGE = `<!doctype html>
     <button id="refresh" type="button">Refresh now</button>
     <span class="stamp" id="poll-note">This page updates by itself every 30 seconds.</span>
   </p>
+
+${ANALYTICS_HTML}
 
   <footer>
     <p>FPMS &mdash; Fire Prevention &amp; Monitoring System. A student project
@@ -1524,5 +1539,6 @@ const PUBLIC_PAGE = `<!doctype html>
   refresh().then(schedule);
 })();
 </script>
+${ANALYTICS_SCRIPT}
 </body>
 </html>`;

@@ -1663,7 +1663,9 @@ export const ANALYTICS_SCRIPT = `<script>
     if (!max) {
       return emptyCard(
         "Detections by type", "No detections to break down",
-        "This chart fills in as soon as the fleet raises its first event."
+        state.mode === "demo"
+          ? "The replay has not reached the first scripted detection yet."
+          : "This chart fills in as soon as the fleet raises its first event."
       );
     }
 
@@ -1749,9 +1751,12 @@ export const ANALYTICS_SCRIPT = `<script>
     }
     if (!runs.length) {
       return emptyCard(
-        "Mission runs", "No runs recorded",
-        "Runs are reconstructed from mission telemetry, which reaches the cloud " +
-        "through the field laptop. None was relayed in this window."
+        "Mission runs",
+        state.mode === "demo" ? "The run has not started" : "No runs recorded",
+        state.mode === "demo"
+          ? "Scrub forward, or press play, to watch the scripted run build up."
+          : "Runs are reconstructed from mission telemetry, which reaches the " +
+            "cloud through the field laptop. None was relayed in this window."
       );
     }
 
@@ -2551,7 +2556,16 @@ export const ANALYTICS_SCRIPT = `<script>
 
   el("fx-live").addEventListener("click", function () { setMode("live"); });
   el("fx-demo").addEventListener("click", function () {
-    if (state.mode === "demo") { state.playing ? pause() : play(); return; }
+    if (state.mode === "demo") {
+      /* Already in demo: restart from the top rather than double as a
+         play/pause, which the dedicated button beside it already is. */
+      state.head = 0;
+      el("fx-scrub").value = "0";
+      updateClock();
+      render();
+      play();
+      return;
+    }
     setMode("demo");
   });
   el("fx-play").addEventListener("click", function () {
