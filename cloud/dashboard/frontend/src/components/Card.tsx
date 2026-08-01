@@ -1,5 +1,10 @@
 import { ReactNode } from "react";
 
+/**
+ * The console's primary surface. ~47 call sites, and only three prop shapes
+ * are ever used (bare, `glow`, `className`) — the API is deliberately narrow
+ * so the cards stay visually identical to each other.
+ */
 export function Card({
   children,
   className = "",
@@ -16,6 +21,13 @@ export function Card({
   );
 }
 
+/**
+ * Card header.
+ *
+ * NOTE THE ORDER: `subtitle` renders ABOVE `title`. It is an eyebrow/kicker,
+ * not a description, and 45 call sites are written on that assumption — do
+ * not "fix" it by swapping them.
+ */
 export function CardHeader({
   title,
   subtitle,
@@ -26,12 +38,18 @@ export function CardHeader({
   right?: ReactNode;
 }) {
   return (
-    <div className="mb-4 flex items-start justify-between gap-4">
-      <div>
-        <div className="text-xs uppercase tracking-widest text-slate-500">{subtitle}</div>
-        <div className="mt-0.5 text-lg font-semibold tracking-tight text-slate-100">{title}</div>
+    <div className="mb-4 flex items-start justify-between gap-4 border-b border-white/[0.06] pb-3">
+      <div className="min-w-0">
+        {subtitle ? (
+          <div className="truncate text-2xs font-medium uppercase tracking-[0.16em] text-slate-400">
+            {subtitle}
+          </div>
+        ) : null}
+        <h2 className="mt-1 text-lg font-semibold leading-tight tracking-tight text-slate-50">
+          {title}
+        </h2>
       </div>
-      {right}
+      {right ? <div className="shrink-0">{right}</div> : null}
     </div>
   );
 }

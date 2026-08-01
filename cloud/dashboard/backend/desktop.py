@@ -206,10 +206,24 @@ def _start_uvicorn() -> tuple[uvicorn.Server, threading.Thread]:
     def _run() -> None:
         # A daemon thread that raises dies silently — Python prints the
         # traceback to a stderr nobody is reading when we're windowed/frozen.
+        #
+        # "Nobody is reading" is literal in the frozen build: PyInstaller links
+        # it against the runw.exe bootloader, which has NO CONSOLE AT ALL. Every
+        # print(), every stderr traceback, every uvicorn startup banner is
+        # written to a handle that goes nowhere. The log file is the only
+        # channel that survives, so anything worth diagnosing has to go through
+        # `log`, and the exit has to be recorded even when it is clean —
+        # otherwise a server that stops on its own is indistinguishable from one
+        # that is running fine, which is exactly how this looked in the wild:
+        # "starting embedded uvicorn on :8010" and then silence forever.
         try:
             server.run()
-        except Exception:
+        except BaseException:  # noqa: BLE001 - SystemExit/KeyboardInterrupt too
             log.exception("uvicorn terminated with an exception")
+        finally:
+            log.info("uvicorn thread exited (started=%s, should_exit=%s)",
+                     getattr(server, "started", None),
+                     getattr(server, "should_exit", None))
 
     thread = threading.Thread(target=_run, daemon=True, name="fpms-uvicorn")
     thread.start()
@@ -296,12 +310,26 @@ def main() -> None:
 
     atexit.register(_shutdown)
 
+    # Each step below gets its own line, because in the frozen build the log
+    # file is the ONLY output channel (runw.exe bootloader, no console) and a
+    # silent gap between two log lines is unattributable — the app could be
+    # waiting on the port, blocked raising the tunnel, or already dead, and all
+    # three look identical from outside. They are separated here so the next
+    # person reads a location instead of guessing one.
+    log.info("waiting for the server to accept connections on %s:%d",
+             settings.bind_host, settings.bind_port)
     if not _wait_for_server(timeout_s=25):
         _shutdown()
-        log.error("backend never came up")
+        log.error("backend never came up on %s:%d within 25s — the uvicorn "
+                  "thread either failed to bind or is still starting. Check "
+                  "for an 'uvicorn terminated' line above.",
+                  settings.bind_host, settings.bind_port)
         raise SystemExit(f"backend never came up on port {settings.bind_port}")
+    log.info("server is accepting connections on %s:%d",
+             settings.bind_host, settings.bind_port)
 
     _maybe_autostart_tunnel()
+    log.info("tunnel step complete; headless=%s", headless)
 
     if headless:
         _run_forever()

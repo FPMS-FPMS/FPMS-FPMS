@@ -1,10 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#fbbf24"/>
-      <stop offset="1" stop-color="#c2410c"/>
-    </linearGradient>
-  </defs>
-  <rect width="32" height="32" rx="6" fill="#0b0f16"/>
-  <path d="M16 4 C 10 12, 22 14, 16 20 C 22 24, 8 26, 16 28 C 8 24, 12 18, 10 14 C 12 16, 14 12, 16 4 Z" fill="url(#g)"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="FPMS">
+  <rect width="64" height="64" rx="14" fill="#0b0f16"/>
+  <g fill="none" stroke="#38bdf8" stroke-linecap="round">
+    <path d="M10 39a22 22 0 0 1 44 0" stroke-width="3" opacity=".95"/>
+    <path d="M17 40a15 15 0 0 1 30 0" stroke-width="2.4" opacity=".7"/>
+  </g>
+  <path d="M33 13c-1 7-5 10-8 14-3 4-5 7-5 11a12 12 0 0 0 24 0c0-6-5-9-8-13-2-3-3-6-3-12z" fill="#f97316"/>
+  <path d="M32.5 34c-.6 3.4-2.6 5-3.8 6.9-1 1.6-1.5 2.8-1.5 4.3a5.3 5.3 0 0 0 10.6 0c0-2.4-1.8-3.9-3.2-5.6-1.2-1.5-2-2.9-2.1-5.6z" fill="#fdba76"/>
 </svg>
