@@ -9,6 +9,78 @@ Written 2026-07-31 at the end of a long session.
 
 ---
 
+## 2026-08-01: the drivetrain fault, and what slow actually means
+
+**A single bad motor cable caused everything.** The rear-left lead was dead, so
+one side dragged, the rover pivoted instead of driving, and at the firmware's
+50% feed-forward duty that pivot threw three wheels off. It was never the
+mission code, never `CMD_SCALE`, never Nav2, never the firmware. Hours went into
+those before anyone swapped a cable.
+
+Diagnosis order that worked, cheapest first — use it again:
+1. Command straight, measure **odometry yaw drift**. Symmetric drivetrain holds
+   heading; a weak side arcs. Reference points measured on this rover:
+   `-62deg` = one side dead, `-3deg` = all four healthy, `+217deg` = other side
+   dead. This is a real automated symmetry test and it needs no human watching.
+2. Move a KNOWN-GOOD motor into the suspect port (tests the board channel).
+3. Move the suspect motor into a KNOWN-GOOD port (tests motor + cable).
+4. Swap only the cable (separates cable from motor).
+
+**But that yaw test is only valid while the wiring is still.** Motor and encoder
+share one connector, so moving a plug moves its encoder, and the firmware's
+4-wheel kinematics then computes garbage heading — single pulses read
+`-325deg`, `+260deg`. Two wrong conclusions were published from that noise
+during this session, including "the M2 output stage is dead", which was false.
+**When the operator's eyes and this metric disagree mid-rewire, the eyes win.**
+
+### MOTOR LAYOUT CHANGED — turn directions are MIRRORED
+Rewired 2026-08-01 while chasing the fault:
+
+    M1 = FRONT-RIGHT   (was front-left)
+    M2 = REAR-RIGHT    (was rear-left)
+    M3 = FRONT-LEFT    (was front-right)
+    M4 = REAR-LEFT     (was rear-right)
+
+Firmware treats M1/M2 as one side and M3/M4 as the other, so FORWARD is
+unaffected — but every TURN is mirrored versus what the mission code assumes.
+Verify turn sign before trusting any heading control.
+
+### There is no slow speed on /cmd_vel. Slow is bought with TIME.
+Measured on this rover, wheels off:
+
+    wire 0.00295 (10% of cruise) -> no motion at all
+    wire 0.0295  (cruise)        -> violent
+    pulse 0.25s                  -> no motion
+    pulse 0.35s                  -> MOVES, ~0.18 per pulse
+
+The firmware slams ~50% duty on ANY non-zero setpoint, so amplitude buys
+nothing: 0.0010 span fast while 0.00295 did not move. The only lever is pulse
+width. **Minimum pulse that moves anything is ~0.35 s** — longer than the
+0.075-0.17 s the golden code used, because that commanded raw duty (instant
+torque) while this commands a velocity setpoint a PID must converge to.
+
+**EVERY number above is FREE-SPINNING, wheels off. All of it must be
+re-measured under load before any of it is trusted for distance.**
+
+### Other things that cost time this session
+- **Re-zero the origin after EVERY boot.** The origin file survives reboots but
+  the board's odometry restarts at 0, so a stale reference put the rover at
+  (-9182, -11926) mm in a 1200 mm arena. It plans confidently from that.
+- **The board went silent ~15 min after a reset, twice** — then ran over an hour
+  once the drivetrain was fixed. Suspect current draw from the dragging motor,
+  not a timer. If topics die, check board liveness FIRST; every downstream
+  symptom looks like a software fault (blind executor, frozen poses, probes
+  returning zero).
+- **WiFi swung -47 to -78 dBm.** Below about -70 the LiDAR telemetry stops
+  crossing entirely (small drive/mission messages still get through), and the
+  mission then refuses to start because its obstacle guard is blind. That
+  refusal is correct. Move the rover nearer the host.
+- The LiDAR takes a round trip Pi -> laptop broker -> Pi purely because the
+  broker is off-board. Running mosquitto ON the Pi removes WiFi from a
+  Nav2-critical path and needs no code change, only a broker address.
+
+---
+
 ## The single most useful thing to know
 
 This project has repeatedly been derailed by **confident conclusions drawn from
