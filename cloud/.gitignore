@@ -30,7 +30,14 @@ lambda/build/
 lambda/**/__pycache__/
 iot-core/rule-bridge/__pycache__/
 local-dev/__pycache__/
-dashboard/build/
+# Build OUTPUT only. The build SOURCES (launcher.py, fpms.spec, the icon,
+# make_logo.py, installer.iss) must stay tracked -- ignoring the whole
+# directory meant a fresh clone could not build the desktop app at all,
+# and a hard-won fix to the frozen launcher was silently left out of a
+# commit because of it.
+dashboard/build/fpms/
+dashboard/build/installer-dist/
+
 dashboard/dist/
 dashboard/dist-new/
 # Built SPA. Regenerate with `npm run build`. The Worker deploy uploads it from
