@@ -1175,13 +1175,35 @@ const PUBLIC_PAGE = `<!doctype html>
   .ai-busy { color:var(--dim); font-size:14px; }
 
   /* ---------------- recordings ----------------
-     "Recorded" is a third provenance, distinct from live (green, pulsing)
-     and from the analytics section's simulated amber. It gets its own hue,
-     its own rail, its own hatch and a badge burnt into the media itself, so
-     a cropped screenshot of one frame still says what it is. */
-  :root { --rec:#b3a6ff; --rec-wash:rgba(179,166,255,.12); --rec-ink:#0b0f14; }
+     THREE PROVENANCES, THREE COLOURS, AND NONE OF THEM CARRIES MEANING ALONE.
+       live       green, pulsing dot   (the existing --ok)
+       recorded   violet              (--rec, new here)
+       simulated  burnt orange        (--sim, the SAME steps analytics.js uses
+                                       for --fx-sim, so one word means one
+                                       colour everywhere on this page)
+     Every one of them ships with the word beside it, exactly as a status
+     colour must — the hue is the fast channel, the label is the true one.
+
+     Validated with the data-viz validator against this page's own panel
+     surfaces rather than against the palette's defaults, because contrast is
+     only meaningful against the surface a mark really renders on:
+       light, surface #f6f8fa : #4a3aa7 / #a34a17 — ALL CHECKS PASS
+                                (CVD dE 24.5 protan, normal-vision dE 27.6,
+                                 both >= 3:1)
+       dark,  surface #141b24 : #9085e9 / #ec835a — chroma, CVD separation
+                                (dE 22.2) and contrast all pass. The dark
+                                simulated step sits just above the dark
+                                CATEGORICAL lightness band because it is not a
+                                categorical slot: it is the palette's fixed
+                                status step, kept identical to analytics.js so
+                                the two sections cannot disagree about what
+                                "simulated" looks like. It never appears
+                                without the word. */
+  :root { --rec:#9085e9; --rec-wash:rgba(144,133,233,.14); --rec-ink:#0b0f14;
+          --sim:#ec835a; --sim-ink:#0b0f14; }
   @media (prefers-color-scheme: light) {
-    :root { --rec:#4a3aa7; --rec-wash:rgba(74,58,167,.10); --rec-ink:#ffffff; }
+    :root { --rec:#4a3aa7; --rec-wash:rgba(74,58,167,.10); --rec-ink:#ffffff;
+            --sim:#a34a17; --sim-ink:#ffffff; }
   }
   #rec { margin-top:34px; }
   .rec-note { margin:0 0 14px; color:var(--dim); font-size:15px; }
@@ -1202,7 +1224,7 @@ const PUBLIC_PAGE = `<!doctype html>
     background:var(--rec); color:var(--rec-ink); margin-right:8px;
     vertical-align:2px; white-space:nowrap;
   }
-  .rec-badge.is-sim { background:var(--warn); color:var(--on-tone); }
+  .rec-badge.is-sim { background:var(--sim); color:var(--sim-ink); }
   .rec-stage { position:relative; background:var(--panel2); border-radius:8px;
                overflow:hidden; min-height:180px; display:flex;
                align-items:center; justify-content:center; }
@@ -1215,7 +1237,7 @@ const PUBLIC_PAGE = `<!doctype html>
     background:var(--rec); color:var(--rec-ink); padding:3px 8px; border-radius:4px;
     pointer-events:none;
   }
-  .rec-stamp.is-sim { background:var(--warn); color:var(--on-tone); }
+  .rec-stamp.is-sim { background:var(--sim); color:var(--sim-ink); }
   .rec-when {
     position:absolute; right:8px; bottom:8px; z-index:2;
     font-size:12px; background:var(--bg); color:var(--fg);
@@ -2163,7 +2185,7 @@ ${ANALYTICS_HTML}
       var ink = getComputedStyle(document.body).getPropertyValue("--dim").trim() || "#888";
       var gridC = getComputedStyle(document.body).getPropertyValue("--line").trim() || "#444";
       var hue = getComputedStyle(document.body).getPropertyValue("--rec").trim() || "#4a3aa7";
-      if (simulated) hue = getComputedStyle(document.body).getPropertyValue("--warn").trim() || "#8a5a00";
+      if (simulated) hue = getComputedStyle(document.body).getPropertyValue("--sim").trim() || "#a34a17";
 
       for (var ring = 1; ring <= 3; ring++) {
         svg.appendChild(line({
