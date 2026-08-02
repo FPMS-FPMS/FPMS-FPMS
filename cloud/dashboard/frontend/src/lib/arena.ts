@@ -208,14 +208,22 @@ const M = ZONE_MARGIN_MM;
  *
  * HUES ARE ALLOCATED, NOT CHOSEN. The map already spends orange on the arena
  * border and the measured rover, amber on ASSUMED pose and OBSTACLE tracks,
- * emerald on MEASURED pose, green on TREE tracks, rose on danger, sky on the
- * measured trail and the planned route, and slate on walls. A zone painted in
- * any of those reads as one of those. Violet, lime and cyan are what is left,
- * and they are far enough apart on the wheel to survive a 17 % wash.
+ * emerald on MEASURED pose AND on the actual driven path, green on TREE tracks,
+ * rose on danger, blue on the planned route, and slate on walls. A zone painted
+ * in any of those reads as one of those. Violet, lime and cyan are what is
+ * left, and they are far enough apart on the wheel to survive a 17 % wash.
  *
  * `zone-a` used to be sky #38bdf8 — one hue step from the water station's cyan
  * and the same hue as the measured trail. Three regions the operator has to
  * tell apart at a glance had two nearly identical colours between them.
+ *
+ * The driven path used to be that same sky, one step from the planned route's
+ * sky-300 and a third step from the water station's cyan, which made the
+ * plan-versus-actual comparison a contrast between two near-identical blues and
+ * hid the plan wherever it entered the refill point. The driven path now takes
+ * emerald — the MEASURED ink, which is what it is — and the plan takes a true
+ * blue. Neither is ever the ONLY cue: planned is dashed and thin, driven is
+ * solid and heavier.
  */
 export const ZONES: readonly Zone[] = [
   {
@@ -546,6 +554,25 @@ export class PoseTrail {
   /** bit 0 = TRAIL_MEASURED, bit 1 = TRAIL_BREAK (do not join to previous). */
   readonly flags: Uint8Array;
   count = 0;
+  /**
+   * Path length of the CURRENT unbroken stroke, millimetres. Reset to 0 by a
+   * BREAK.
+   *
+   * This is the odometer, and it is the honest input to the drift picture. A
+   * break is the last moment the tracker was re-anchored to something — a
+   * re-zero, or the flip from an assumed pose to a reported one — so distance
+   * since the break is exactly "how far this rover has dead-reckoned without
+   * anything correcting it". Nothing localises this rover, so that number only
+   * ever goes up, and the map is supposed to say so.
+   *
+   * Accumulated from the SAMPLES that were kept, so the TRAIL_MIN_STEP_MM gate
+   * means it slightly under-counts a wandering path. It under-reports rather
+   * than over-reports, which is the correct direction for a number the operator
+   * reads as "at least this far since anyone knew where I was".
+   */
+  drivenMm = 0;
+  /** Path length over the whole surviving history, breaks excluded. */
+  totalMm = 0;
   private head = 0;
 
   constructor(cap: number = TRAIL_CAP) {
@@ -563,6 +590,8 @@ export class PoseTrail {
   clear(): void {
     this.count = 0;
     this.head = 0;
+    this.drivenMm = 0;
+    this.totalMm = 0;
   }
 
   /**
@@ -574,6 +603,7 @@ export class PoseTrail {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
 
     let brk = true;
+    let stepMm = 0;
     if (this.count > 0) {
       const last = (this.head - 1 + this.cap) % this.cap;
       const wasMeasured = (this.flags[last] & TRAIL_MEASURED) !== 0;
@@ -583,6 +613,15 @@ export class PoseTrail {
       const flipped = wasMeasured !== measured;
       if (!flipped && d2 < TRAIL_MIN_STEP_MM * TRAIL_MIN_STEP_MM) return false;
       brk = flipped || d2 > TRAIL_JUMP_MM * TRAIL_JUMP_MM;
+      // A break is a teleport, and the gap across it is not distance the rover
+      // drove. Counting it would inflate the odometer with a jump the whole
+      // BREAK mechanism exists to refuse to draw.
+      if (!brk) stepMm = Math.sqrt(d2);
+    }
+    if (brk) this.drivenMm = 0;
+    else {
+      this.drivenMm += stepMm;
+      this.totalMm += stepMm;
     }
 
     const h = this.head;
@@ -597,4 +636,136 @@ export class PoseTrail {
 
 export function createPoseTrail(cap?: number): PoseTrail {
   return new PoseTrail(cap);
+}
+
+// -------------------------------------------------------------- uncertainty ---
+
+/**
+ * How far the uncertainty rings are drawn — and, deliberately, NOT an error bar.
+ *
+ * ---------------------------------------------------------------------------
+ * READ THIS BEFORE PUTTING A NUMBER ON SCREEN NEXT TO THE RINGS
+ * ---------------------------------------------------------------------------
+ * Nobody has measured this rover's positional error. There is no localisation,
+ * no ground-truth run, no repeatability figure — the pose is integrated wheel
+ * odometry from a start the operator eyeballed into a 36 cm box. Any millimetre
+ * figure this file returned would be invented, and an invented error bar is
+ * worse than none: it is the one number an operator would plan around.
+ *
+ * So the contract is one-directional. This function turns a MEASURED input (the
+ * odometer, `PoseTrail.drivenMm`) into a PRESENTATION radius in millimetres,
+ * used for nothing but sizing a pulsing ring family that has no hard edge. The
+ * renderer never prints it, and no caller may. What the HUD prints is the
+ * input — "DRIVEN 1240 mm" — which is a real quantity the rover reported.
+ *
+ * The shape is linear because uncorrected differential-drive odometry error
+ * grows with path length, not with wall-clock time: a parked rover stops
+ * getting more lost, a driving one does not. `DRIFT_SPREAD_FRAC` is a drawing
+ * constant chosen so the ring is legible on a 120 cm arena, not a calibration.
+ */
+export const DRIFT_SPREAD_FRAC = 0.06;
+
+/**
+ * Ring spread for an ASSUMED position, millimetres.
+ *
+ * An assumed pose has driven nowhere — the glyph is pinned to ROVER_START — so
+ * a distance-driven model would size its ring at zero, which would state the
+ * exact opposite of the truth. The truth is that the rover is somewhere in the
+ * start box, so the ring opens at the box's half-width and the operator reads
+ * "somewhere in there", which is all anybody actually knows.
+ */
+export const ASSUMED_SPREAD_MM = ZONE_SIDE_MM / 2;
+
+/** Rendering-only. See DRIFT_SPREAD_FRAC — never label the result as an error. */
+export function driftSpreadMm(drivenMm: number): number {
+  if (!Number.isFinite(drivenMm) || drivenMm <= 0) return 0;
+  return drivenMm * DRIFT_SPREAD_FRAC;
+}
+
+// ------------------------------------------------------- plan versus actual ---
+
+/** Anything with world-millimetre coordinates: a waypoint, a pose, a track. */
+export type PathPoint = { readonly x_mm: number; readonly y_mm: number };
+
+/**
+ * Result of `nearestOnPath`, filled in place.
+ *
+ * An out-parameter rather than a return value because this is called from the
+ * render path's 2 Hz edge and a fresh object per call is the allocation pattern
+ * the whole renderer is written to avoid.
+ */
+export type NearestOnPath = {
+  /** Distance from the query point to the path, mm. Infinity when no path. */
+  dist_mm: number;
+  /** The closest point ON the path, world mm. NaN when there is no path. */
+  x_mm: number;
+  y_mm: number;
+  /** Index of the segment's first waypoint, or -1. */
+  seg: number;
+};
+
+export function createNearestOnPath(): NearestOnPath {
+  return { dist_mm: Infinity, x_mm: NaN, y_mm: NaN, seg: -1 };
+}
+
+/**
+ * Closest point on a planned polyline to (x, y) — the cross-track deviation.
+ *
+ * WHY PERPENDICULAR AND NOT "DISTANCE TO THE NEXT WAYPOINT". A route-following
+ * test asks whether the rover stayed ON the planned line, and distance to the
+ * next waypoint answers a different question: it is large at the start of every
+ * leg and small at the end of it, so it drops to nearly zero on a rover that
+ * cut a corner badly and swung back. Projecting onto the nearest SEGMENT gives
+ * the number an operator actually wants — how far off the intended track the
+ * rover is right now — and it is comparable between legs.
+ *
+ * Clamped to each segment so a rover past the final waypoint measures to the
+ * end of the route rather than to its infinite extension.
+ *
+ * O(n) over a route of a handful of waypoints, allocation-free, and called on
+ * the telemetry edge rather than per frame.
+ */
+export function nearestOnPath(
+  path: readonly PathPoint[] | null | undefined,
+  x: number,
+  y: number,
+  out: NearestOnPath,
+): void {
+  out.dist_mm = Infinity;
+  out.x_mm = NaN;
+  out.y_mm = NaN;
+  out.seg = -1;
+  if (!path || path.length < 2 || !Number.isFinite(x) || !Number.isFinite(y)) return;
+
+  let best = Infinity;
+  for (let i = 0; i < path.length - 1; i++) {
+    const ax = path[i].x_mm;
+    const ay = path[i].y_mm;
+    const bx = path[i + 1].x_mm;
+    const by = path[i + 1].y_mm;
+    if (!Number.isFinite(ax) || !Number.isFinite(ay)) continue;
+    if (!Number.isFinite(bx) || !Number.isFinite(by)) continue;
+
+    const vx = bx - ax;
+    const vy = by - ay;
+    const len2 = vx * vx + vy * vy;
+    // A zero-length segment (two identical waypoints) projects to its own
+    // endpoint rather than dividing by zero.
+    let t = len2 > 0 ? ((x - ax) * vx + (y - ay) * vy) / len2 : 0;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+
+    const px = ax + vx * t;
+    const py = ay + vy * t;
+    const dx = x - px;
+    const dy = y - py;
+    const d2 = dx * dx + dy * dy;
+    if (d2 < best) {
+      best = d2;
+      out.x_mm = px;
+      out.y_mm = py;
+      out.seg = i;
+    }
+  }
+  out.dist_mm = best === Infinity ? Infinity : Math.sqrt(best);
 }

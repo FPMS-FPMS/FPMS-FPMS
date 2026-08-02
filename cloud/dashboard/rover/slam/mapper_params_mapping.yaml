@@ -1,0 +1,370 @@
+# =============================================================================
+# mapper_params_mapping.yaml
+# slam_toolbox ONLINE ASYNC MAPPING for the FPMS rover.
+#
+# Launched by slam/fpms_slam_mapping.launch.py. Run this ONCE, drive the room,
+# serialise the result, then never run it again for that room - switch to
+# slam/mapper_params_localization.yaml.
+#
+# -----------------------------------------------------------------------------
+# EVERY NON-DEFAULT VALUE BELOW IS DERIVED, NOT COPIED.
+# -----------------------------------------------------------------------------
+# The baseline is slam_toolbox's own config/mapper_params_online_async.yaml
+# (humble branch, fetched 2026-08-02 from
+# https://raw.githubusercontent.com/SteveMacenski/slam_toolbox/humble/config/mapper_params_online_async.yaml).
+# Where a value differs from that file the upstream default is quoted in the
+# comment as `upstream: X` and the reason for the change is given. Where a
+# value is unchanged and load-bearing it is still listed, because "we thought
+# about it and kept it" and "we never looked at it" should not be
+# indistinguishable in a config file.
+#
+# -----------------------------------------------------------------------------
+# THE PLANT THIS IS TUNED FOR (measured, sourced)
+# -----------------------------------------------------------------------------
+#  * Scan: /scan_lidar, sensor_msgs/LaserScan, frame laser_frame, ~9.5 Hz,
+#    360 bins at 1 degree, range_min 0.12 m, range_max 6.0 m.
+#    Live sample: 350/360 bins return, min 0.861 m, median 1.983 m,
+#    max 6.000 m (clamped - fpms_lidar_ros.py turns >=6.0 into a no-return).
+#    So: a REAL room, feature-rich, roughly a few metres across, with at least
+#    one sightline past 6 m. Not an empty box, not a symmetric corridor.
+#  * The scan arrives over MQTT, not a serial driver. Measured round trip for
+#    a LiDAR-sized payload: min 13.7 ms, median 99.9 ms, p90 178.6 ms,
+#    max 207.3 ms (fpms_lidar_ros.py module docstring). Stamps are applied on
+#    ARRIVAL (SCAN_LATENCY_COMPENSATION_S = 0.0), so a scan is honestly
+#    labelled as old rather than dishonestly back-dated - but it IS old, and
+#    it is old by a JITTERING amount, which is the harder problem.
+#  * Motion is quantised. The firmware cannot express slow motion
+#    (NAV2_BRIEF.md 3b); usable speed is ~0.18 m/s and the minimum commandable
+#    pulse is ~0.35 s (R1_AUTONOMY.md 0), so the smallest displacement the
+#    chassis can produce is about 0.18 * 0.35 = 0.063 m. Call that the MOTION
+#    QUANTUM. It appears in several numbers below.
+#  * The chassis drives in bursts with full stops between, not continuously.
+#    Every parameter that gates on travel therefore sees a staircase, not a
+#    ramp.
+#  * Heading comes from an integrated gyro on a 4-wheel SKID-STEER chassis.
+#    R1_AUTONOMY.md 3.6: skid-steer violates the no-slip assumption by
+#    construction and heading is the weak link. The scan matcher is being
+#    asked to fix exactly this.
+# =============================================================================
+
+slam_toolbox:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # SOLVER
+    # -------------------------------------------------------------------------
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+
+    # upstream: None. A real room contains things that move - a chair, a cable,
+    # a person walking past while you drive the mapping run. Those produce a
+    # handful of constraints that are simply wrong, and a plain least-squares
+    # solver lets each of them pull the whole graph. Huber caps the influence
+    # of a single bad constraint while leaving the good ones untouched. Cost is
+    # a few percent of solve time on a graph this small.
+    ceres_loss_function: HuberLoss
+
+    # -------------------------------------------------------------------------
+    # FRAMES AND TOPICS
+    # -------------------------------------------------------------------------
+    # Must match fpms_odom_tf.py (ODOM_FRAME / BASE_FRAME) and nav2_params.yaml
+    # (robot_base_frame). base_footprint, not base_link: base_footprint is the
+    # ground-projected frame everything else in this stack keys off, and
+    # fpms_odom_tf.py publishes odom -> base_footprint directly, so this is a
+    # one-hop lookup rather than a two-hop one. laser_frame still hangs off
+    # base_link; tf2 resolves the chain.
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+
+    # upstream: /scan. NOT /scan - the drive board publishes a DEAD /scan where
+    # every range is 0.0 (NAV2_BRIEF.md 2). Subscribing to it would hand the
+    # scan matcher 360 obstacles at the sensor origin, forever.
+    scan_topic: /scan_lidar
+
+    mode: mapping
+
+    # -------------------------------------------------------------------------
+    # RATES AND TIMING - this is where the MQTT transport shows up
+    # -------------------------------------------------------------------------
+    debug_logging: false
+
+    # upstream: 1 (process every scan). Kept. 9.5 Hz is not a lot, and the
+    # limiting factor on node creation is minimum_travel_distance below, not
+    # scan rate. Throttling here would only make the pose used for a node
+    # older, which is the opposite of what a latent transport needs.
+    throttle_scans: 1
+
+    # upstream: 0.02 (50 Hz). Kept. This is the rate map->odom is re-broadcast,
+    # NOT the rate it is recomputed - the correction only changes when a node
+    # is added. Publishing it fast is cheap and keeps the transform's stamp
+    # fresh, which matters because Nav2's costmaps do a lot of TF lookups.
+    transform_publish_period: 0.02
+
+    # upstream: 5.0. Lowered: the room is small so rastering the occupancy grid
+    # is cheap, and during a mapping run the operator is watching rviz2 to
+    # decide where to drive next. A 5 s lag between driving somewhere and
+    # seeing it appear makes that loop useless.
+    map_update_interval: 1.0
+
+    # upstream: 0.05. Derived from the sensor, not from convention.
+    # The LiDAR samples at 1 degree. At the room's MEDIAN range of 1.98 m one
+    # degree of arc is 1.98 * pi/180 = 0.035 m, and single-shot range accuracy
+    # for this class of sensor is about +/-15 mm (LD06 datasheet / RPLIDAR A1
+    # spec, cited in R2_COORDINATES.md 4.5). So the sensor cannot resolve
+    # structure finer than ~30 mm at typical range: cells smaller than that
+    # buy nothing but CPU and a noisier map. Cells larger than that throw away
+    # resolution we paid for. 0.03 m is the match.
+    # NOTE this also sets the resolution of the global costmap: Nav2's
+    # StaticLayer resizes the master grid to the incoming map when the costmap
+    # is not rolling. nav2/nav2_params_slam.yaml is set to 0.03 to agree.
+    resolution: 0.03
+
+    # upstream: 0.0 / 20.0. Both are rastering bounds - how far along a beam
+    # slam_toolbox is willing to mark free space.
+    # min: the sensor's own range_min is 0.12 m; below that the returns are the
+    # sensor seeing its own housing. 0.15 gives a little margin.
+    # max: 20.0 is three times the sensor's physical maximum and would raster
+    # free space through walls into rooms nobody has seen. fpms_lidar_ros.py
+    # clamps at 6.0 m and converts anything at or above it to a no-return, so
+    # the largest TRUSTWORTHY return is just under 6.0 and the ones nearest
+    # that boundary are the least accurate. 5.5 keeps the rastering inside the
+    # band where returns are real.
+    min_laser_range: 0.15
+    max_laser_range: 5.5
+
+    # upstream: 0.5. This is a floor on the time between graph nodes, and it
+    # interacts badly with burst motion: a 0.35 s burst that covers one motion
+    # quantum finishes INSIDE the upstream 0.5 s window, so the node it earned
+    # is deferred until the next scan after the burst has already ended and the
+    # rover has stopped. 0.2 s is just over two scan periods at 9.5 Hz, which
+    # is the shortest interval at which a node can be backed by a genuinely new
+    # scan rather than a re-delivery of the previous one.
+    minimum_time_interval: 0.2
+
+    # upstream: 0.2. THE MQTT PARAMETER. This is how long slam_toolbox will
+    # wait for the odom->base_footprint transform that brackets a scan's stamp.
+    # Scan transport is measured at p90 179 ms and max 207 ms, and
+    # fpms_odom_tf.py publishes TF at ~10 Hz paced by /odom_raw, which has its
+    # own jitter. 0.2 s therefore sits exactly on top of the observed maximum -
+    # the worst possible place for a timeout, because it will fire
+    # intermittently and drop scans in a pattern that looks like a scan matcher
+    # problem. 0.5 s clears the measured maximum by 2.4x and matches the
+    # transform_tolerance already used for AMCL in nav2/nav2_params.yaml.
+    transform_timeout: 0.5
+
+    # upstream: 30.0. Kept. Costs memory proportional to TF rate; 10 Hz of one
+    # dynamic transform for 30 s is nothing, and a deep buffer is what lets a
+    # late scan still find a bracketing pair instead of being dropped.
+    tf_buffer_duration: 30.0
+
+    # upstream: 40000000. Kept - this exists so serialising the pose graph does
+    # not blow the stack, and serialising is the entire point of the mapping
+    # run.
+    stack_size_to_use: 40000000
+
+    # upstream: true. Kept for MAPPING only (it is false in the localization
+    # config). Interactive mode publishes the graph as rviz2 markers and lets
+    # the operator drag a node to force a loop closure. On a first mapping run
+    # of an unknown room that is a genuinely useful escape hatch.
+    enable_interactive_mode: true
+
+    # -------------------------------------------------------------------------
+    # WHEN TO ADD A NODE - the two parameters that decide how often the scan
+    # matcher gets to correct the odometry at all
+    # -------------------------------------------------------------------------
+    use_scan_matching: true
+
+    # upstream: true. Kept. Referencing a scan to its own barycentre rather
+    # than the sensor origin makes the match less sensitive to which part of
+    # the room happens to be in view, which matters here because the range
+    # distribution is lopsided (median 1.98 m, but one direction open past
+    # 6 m).
+    use_scan_barycenter: true
+
+    # upstream: 0.5. This is the single most consequential change in the file.
+    # 0.5 m is sized for a robot crossing a warehouse. Here it means the graph
+    # gains a node only every EIGHT motion quanta (0.5 / 0.063), so the scan
+    # matcher - the only thing in the system that can correct skid-steer
+    # heading error - runs roughly once per eight bursts, and between those
+    # runs the pose is pure dead reckoning off a gyro that R1_AUTONOMY.md 3.6
+    # identifies as the weak link. In a room a few metres across, 0.5 m is also
+    # a large fraction of the whole traverse.
+    # 0.10 m is ~1.6 motion quanta: small enough that essentially every burst
+    # earns a correction, large enough that it sits well clear of the
+    # stationary pose noise of /odom_raw (fpms_odom_tf.py rejects steps below
+    # its WHEEL_STILL_MPS threshold, so a parked rover does not creep up to
+    # 0.10 m and spam nodes).
+    minimum_travel_distance: 0.10
+
+    # upstream: 0.5 rad = 28.6 degrees. Also sized for a large robot. Prior
+    # autonomy on this exact chassis achieved +/-1-4 degrees per commanded turn
+    # (NAV2_BRIEF.md 5), so 28.6 degrees of uncorrected rotation is roughly ten
+    # turns' worth of accumulated error before the matcher is consulted - on
+    # the axis that is already the least trustworthy.
+    # 0.15 rad = 8.6 degrees is about twice the worst per-turn error, so a
+    # correction lands after every meaningful rotation without a stationary
+    # gyro drifting its way into a spurious node.
+    minimum_travel_heading: 0.15
+
+    # upstream: 10. The running buffer of recent scans the matcher builds its
+    # local reference from. At the 0.10 m node spacing chosen above, 10 scans
+    # spans only 1.0 m of travel - less than half the room's median sightline,
+    # so the local reference is a thin slice of a room the sensor can see all
+    # of. 30 spans ~3 m, comparable to the room itself, which gives the matcher
+    # the same geometry it can actually observe. Cost is linear in memory and
+    # in per-match work, both trivial on an RK3588 for a graph this size.
+    scan_buffer_size: 30
+
+    # upstream: 10.0. Must not exceed what the sensor can see or the buffer
+    # retains scans whose overlap with the current view is imaginary. Set to
+    # the sensor's real usable maximum (see max_laser_range above).
+    scan_buffer_maximum_scan_distance: 6.0
+
+    # upstream: 0.1 / 1.5. Kept. link_scan_maximum_distance at 1.5 m is a good
+    # fit for a room whose median sightline is 1.98 m - it chains scans that
+    # genuinely share geometry.
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # -------------------------------------------------------------------------
+    # LOOP CLOSURE - in a small room, a FALSE closure is far worse than a
+    # missed one
+    # -------------------------------------------------------------------------
+    do_loop_closing: true
+
+    # upstream: 3.0. How far from the current pose a node may be and still be
+    # considered a loop-closure candidate. The room's median sightline is
+    # 1.98 m; 3.0 m is therefore most of the room, which means nearly every
+    # node in the graph is a candidate for nearly every other. In a space that
+    # small, two genuinely different places can present similar geometry (two
+    # corners, two ends of the same wall), and a single accepted false closure
+    # does not degrade the map gracefully - it folds it. 1.5 m restricts
+    # candidates to nodes the robot was plausibly near, which is what the
+    # parameter is for.
+    loop_search_maximum_distance: 1.5
+
+    # upstream: 10. At 0.10 m node spacing a chain of 10 nodes is ~1 m of
+    # travel, which is a real amount of evidence in a room this size. Kept.
+    loop_match_minimum_chain_size: 10
+
+    # upstream: 3.0. Kept - this is a variance ceiling on the coarse match, and
+    # tightening it without a measurement of our actual match variance would be
+    # guessing.
+    loop_match_maximum_variance_coarse: 3.0
+
+    # upstream: 0.35 / 0.45. Raised. These are the response (match quality)
+    # thresholds a candidate must clear to become a closure. Raising them trades
+    # closures found for closures trusted, and in a room where the robot is
+    # never more than a couple of metres from where it has already been, the
+    # graph gets plenty of chances - a missed closure this pass will be offered
+    # again next pass. A wrong one will not be offered back.
+    loop_match_minimum_response_coarse: 0.45
+    loop_match_minimum_response_fine: 0.55
+
+    # -------------------------------------------------------------------------
+    # CORRELATION (scan matching) - this is what sets achievable accuracy
+    # -------------------------------------------------------------------------
+    # upstream: 0.5. The side length of the search window the matcher sweeps
+    # around the odometry prior, so it must exceed the largest plausible
+    # odometry error accumulated between two nodes. Between nodes we travel
+    # 0.10 m; even at a pessimistic 20% scale error plus slip that is ~0.02 m,
+    # and the MQTT latency adds at most 0.207 s * 0.18 m/s = 0.037 m of
+    # pose-vs-scan skew. Worst case ~0.06 m. A 0.3 m window is 5x that margin
+    # and covers a quarter of the search area of the upstream 0.5 m (the window
+    # is 2-D), which is CPU spent on nothing. Do NOT shrink further: if the
+    # prior is ever worse than half the window, the matcher silently converges
+    # to the edge of its own search space.
+    correlation_search_space_dimension: 0.3
+
+    # upstream: 0.01. Kept, deliberately, and this is the honest floor on
+    # translational accuracy per match: the matcher evaluates candidate poses
+    # on a 1 cm lattice. Halving it to 0.005 would quadruple the cell count of
+    # the search grid; worth trying ONLY after profiling shows headroom on the
+    # RK3588, and worth nothing at all until the LiDAR mount yaw is measured,
+    # because 1 degree of uncalibrated mount yaw is already ~10.5 mm of bias
+    # (R2_COORDINATES.md 4.5) - i.e. larger than this entire quantisation.
+    correlation_search_space_resolution: 0.01
+
+    # upstream: 0.1. Gaussian blur applied to the correlation lookup table. It
+    # widens the basin of attraction at the direct cost of sharpening: 0.1 m of
+    # smear on a 0.01 m lattice makes the response peak ten cells wide, which
+    # is the right trade when the odometry prior is bad and the wrong one when
+    # it is decent. Ours is decent over 0.10 m of travel. 0.03 matches both the
+    # map resolution and the sensor's own point spacing at median range
+    # (1.98 m * 1 degree = 0.035 m); smearing below the sensor's point spacing
+    # would just be sharpening noise.
+    correlation_search_space_smear_deviation: 0.03
+
+    # upstream: 8.0 / 0.05 / 0.03. The loop-closure search grid. 8.0 m is
+    # larger than the room, so most of that grid is guaranteed-empty cells
+    # being correlated every closure attempt. 3.0 m covers the room with
+    # margin. Resolution and smear are left at upstream: loop closure wants a
+    # WIDE basin (it is recovering from a large error by definition), the exact
+    # opposite of the fine matcher above.
+    loop_search_space_dimension: 3.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # -------------------------------------------------------------------------
+    # SCAN MATCHER PENALTIES - left at upstream, on purpose
+    # -------------------------------------------------------------------------
+    # These weight how hard the matcher is pulled back toward the odometry
+    # prior. A larger variance means a weaker pull, i.e. trust odometry less.
+    # There is a real argument for raising angle_variance_penalty here, because
+    # skid-steer heading is our worst input (R1_AUTONOMY.md 3.6) and we would
+    # rather the scan matcher overruled it. There is no measurement of this
+    # rover's actual heading covariance to set it from, so changing it would be
+    # substituting one guess for another while making the config look
+    # authoritative. Left at upstream and flagged: if the map shears
+    # rotationally during the mapping run, angle_variance_penalty is the first
+    # knob to raise (try 2.0), and say in the commit that it was tuned by
+    # observation.
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+
+    # upstream defaults, kept. coarse_search_angle_offset 0.349 rad = 20
+    # degrees of angular search, which comfortably covers the few degrees of
+    # per-turn heading error this chassis actually produces.
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    # -------------------------------------------------------------------------
+    # OCCUPANCY RASTERING
+    # -------------------------------------------------------------------------
+    # upstream: 2 / 0.1. Kept. min_pass_through is how many beams must traverse
+    # a cell before it is called anything at all, and occupancy_threshold is the
+    # hit ratio above which it is called occupied. With 350 of 360 bins
+    # returning at ~9.5 Hz there is no shortage of beams, and loosening either
+    # of these would let a single stray return paint an obstacle.
+    min_pass_through: 2
+    occupancy_threshold: 0.1
+
+# =============================================================================
+# DELIBERATELY NOT SET, AND WHY
+# =============================================================================
+# restamp_tf, use_map_saver
+#     Present in the humble-branch config on GitHub, but the rover has
+#     slam_toolbox 2.6.10 from apt (NAV2_BRIEF.md 6b) and it has not been
+#     verified that this build declares them. An undeclared parameter override
+#     is silently ignored in ROS 2, which is exactly the kind of "configured it
+#     and it did nothing" failure this stack does not need. Add them only after
+#     `ros2 param list /slam_toolbox` on the rover shows they exist.
+#
+# map_file_name, map_start_pose
+#     Mapping mode starts from nothing by design. These belong in
+#     mapper_params_localization.yaml.
+#
+# use_lifecycle_node
+#     Left at its default (false), so slam_toolbox is a plain node and does NOT
+#     need to be added to a nav2_lifecycle_manager node_names list. If it is
+#     ever turned on, the lifecycle manager must be told, or the manager will
+#     activate a stack that has no map->odom producer and blame the costmaps.
+# =============================================================================

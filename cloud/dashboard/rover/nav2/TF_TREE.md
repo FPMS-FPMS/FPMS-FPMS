@@ -7,22 +7,31 @@ the rest of the Nav2 blocking chain (LiDAR→ROS, map, AMCL, costmaps).
 ## The expected tree
 
 ```
-odom
- └── base_footprint         [DYNAMIC — /tf   — fpms_odom_tf.py]
-      └── base_link         [STATIC  — /tf_static — fpms_tf.launch.py]
-           ├── laser_frame  [STATIC  — /tf_static — fpms_tf.launch.py]
-           └── imu_frame    [STATIC  — /tf_static — fpms_tf.launch.py]
+map                        [DYNAMIC — /tf   — slam_toolbox]
+ └── odom
+      └── base_footprint    [DYNAMIC — /tf   — fpms_odom_tf.py]
+           └── base_link    [STATIC  — /tf_static — fpms_tf.launch.py]
+                ├── laser_frame  [STATIC  — /tf_static — fpms_tf.launch.py]
+                └── imu_frame    [STATIC  — /tf_static — fpms_tf.launch.py]
 ```
 
-`map -> odom` is not part of this tree yet — that edge is AMCL's, and AMCL
-needs a laser scan in ROS first (NAV2_BRIEF.md §7, still blocked as of this
-writing). Until AMCL is running, `odom` is the root of the tree as far as
+`map -> odom` is now owned by **`slam_toolbox`** (`../slam/`), not AMCL. Run
+either `slam/fpms_slam_mapping.launch.py` (building a map) or
+`slam/fpms_slam_localization.launch.py` (localising in one); both publish that
+edge, and only one of them may run at a time. `nav2_amcl` remains configured in
+`nav2_params.yaml` and is selectable via `fpms_nav2.launch.py
+localization_mode:=amcl`, but AMCL and slam_toolbox must **never** run together
+— that is two publishers on one edge, the same failure this file warns about
+everywhere else.
+
+Until a SLAM node is running, `odom` is the root of the tree as far as
 `ros2 run tf2_tools view_frames` is concerned, and that is expected, not a bug.
 
 ### Who owns which edge
 
 | Edge | Publisher | Topic | Kind |
 |---|---|---|---|
+| `map` → `odom` | `slam_toolbox` (via `../slam/*.launch.py`) | `/tf` | dynamic, 50 Hz (`transform_publish_period 0.02`), recomputed only when the scan matcher adds a node |
 | `odom` → `base_footprint` | `fpms_odom_tf.py` | `/tf` | dynamic, ~10 Hz (paced by `/odom_raw`) |
 | `base_footprint` → `base_link` | `fpms_tf.launch.py` (`static_transform_publisher`) | `/tf_static` | static, latched, published once |
 | `base_link` → `laser_frame` | `fpms_tf.launch.py` (`static_transform_publisher`) | `/tf_static` | static, latched, published once |
@@ -57,7 +66,14 @@ source /opt/ros/humble/setup.bash
 python3 fpms_odom_tf.py
 
 # Edges 2-4: base_footprint -> base_link -> {laser_frame, imu_frame}
-ros2 launch nav2/fpms_tf.launch.py
+# Pass the MEASURED mount offsets; require_measured refuses to start without them.
+ros2 launch nav2/fpms_tf.launch.py \
+    laser_x:=<m> laser_y:=<m> laser_z:=<m> laser_yaw:=<rad> \
+    measured:=true require_measured:=true
+
+# Edge 0: map -> odom  (pick exactly one)
+ros2 launch ../slam/fpms_slam_mapping.launch.py        # building a map
+ros2 launch ../slam/fpms_slam_localization.launch.py   # localising in one
 ```
 
 ## Verifying each edge with `tf2_echo`
@@ -119,19 +135,42 @@ not running, or wrong `ROS_DOMAIN_ID`.
 ros2 run tf2_ros tf2_echo base_link laser_frame
 ```
 
-**Healthy (structurally)** — prints once, translation is whatever
-`LASER_X/Y/Z_OFFSET_M` currently are in `fpms_tf.launch.py`. As of this
-writing those are **unmeasured placeholders** (`[0.0, 0.0, 0.065]`, yaw 0) —
+**Healthy (structurally)** — prints once, translation is whatever the
+`laser_x` / `laser_y` / `laser_z` **launch arguments** were set to. Their
+defaults are **unmeasured placeholders** (`[0.0, 0.0, 0.065]`, all angles 0) —
 the transform being present and non-NaN only proves the tree is connected, it
 does **not** prove the numbers are right. Do not treat a clean `tf2_echo` here
 as license to trust a map built with it.
 
+The offsets are launch arguments now, not source constants:
+
+```bash
+ros2 launch nav2/fpms_tf.launch.py \
+    laser_x:=0.052 laser_y:=0.000 laser_z:=0.071 \
+    laser_roll:=0.0 laser_pitch:=0.0 laser_yaw:=-0.0122 \
+    measured:=true
+```
+
+`require_measured:=true` makes the launch **refuse to start** while the
+offsets are still the placeholders. Use it for the mapping run — a map built
+on guessed offsets looks fine and is wrong.
+
+**Why the yaw is the one that matters:** 1° of mount yaw is ~10.5 mm of
+position error over a 600 mm lever arm (`../research/R2_COORDINATES.md` §4.5).
+It is a constant rotation of every scan, so it does not average out; it warps
+the map, and the warp is then baked into every mission localised against it.
+
 **Broken** — nothing prints → launch file not running / wrong domain. Values
 present but obstacles in the costmap appear offset or rotated from where they
-physically are → the placeholder offsets have not been replaced with measured
-ones yet. Measure with a ruler from `base_link` (35 mm above the ground,
-centred over the drive axle) to the LiDAR's optical centre, and the mount yaw,
-then edit the constants at the top of `fpms_tf.launch.py`.
+physically are → the placeholders have not been replaced with measured ones
+yet. The measurement procedure (including how to get the yaw to better than
+the LiDAR's 1° bin size, and the floor-strike arithmetic that makes mount
+*pitch* matter) is in the module docstring of `fpms_tf.launch.py`.
+
+**Not fixable here:** `LIDAR_ROTATION_SIGN` in `fpms_lidar_ros.py` (currently
+`-1`, marked UNVERIFIED) decides whether the scan is **mirrored**. A mirror is
+not a rigid transform — no value of `laser_yaw` can undo it. Run the left-wall
+test at the top of that file before trusting any map.
 
 ### 4. `base_link` → `imu_frame` (static, PLACEHOLDER OFFSETS)
 

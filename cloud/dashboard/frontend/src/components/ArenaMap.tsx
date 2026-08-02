@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef } from "react";
 import {
   ARENA_MM,
+  ASSUMED_SPREAD_MM,
   FORWARD_HEADING_DEG,
   GRID_MAJOR_MM,
   GRID_MINOR_MM,
@@ -11,9 +12,13 @@ import {
   TRAIL_MEASURED,
   ZONES,
   ZONE_AHEAD_OF_START,
+  createNearestOnPath,
   createPoseTrail,
+  driftSpreadMm,
+  nearestOnPath,
   shortCorner,
   type ArenaCorner,
+  type NearestOnPath,
   readPose,
   scaleFor,
   worldToCanvasX,
@@ -59,6 +64,56 @@ import { useChannelRef } from "../lib/ws";
  * mistaken for something that tracks the rover.
  *
  * ---------------------------------------------------------------------------
+ * THE COORDINATE SYSTEM IS THE POINT
+ * ---------------------------------------------------------------------------
+ * This is a metric map, not a picture of a robot, and the requirement is that
+ * an operator can read the rover's position TO THE CENTIMETRE without leaving
+ * the map. Four things carry that, and they are all on the STATIC layer except
+ * the last:
+ *
+ *   the ladder   a tick every 5 cm down both gutters, labelled every 30 cm, so
+ *                a position can be read off the edge by counting ticks. The
+ *                grid behind it is the same ladder drawn across the floor —
+ *                minor lines ARE the 5 cm ticks, so eye and edge agree.
+ *   the origin   world (0,0) is stated, not implied: a ringed dot in the
+ *                bottom-left corner with the axis senses (+X right, +Y up)
+ *                drawn as arrows off it. A map whose origin is a guess is a map
+ *                whose every coordinate is a guess.
+ *   the key      a scale bar with a mid-division, plus the two path styles.
+ *                Bottom-centre, in the one strip of floor no region claims.
+ *   the cursor   the rover's x and y printed IN THE GUTTER, on the axis, where
+ *                the reticle lines meet it. This is the part that makes the
+ *                centimetre readable without a lookup: follow the dashed line
+ *                out to the edge and the number is already there. Dynamic, but
+ *                the strings are rebuilt on the 2 Hz telemetry edge only.
+ *
+ * ---------------------------------------------------------------------------
+ * PLANNED VERSUS ACTUAL
+ * ---------------------------------------------------------------------------
+ * A route-following test exists to compare what was intended with what was
+ * achieved, so the two tracks must be separable at a glance and must never be
+ * confused for one another:
+ *
+ *   planned  blue, DASHED, thin, with hollow waypoint nodes. Intent.
+ *   actual   emerald when the pose is measured, amber when it is assumed;
+ *            SOLID, thicker, fading with age. Achieved.
+ *
+ * The two used to be sky-300 and sky-400 — the same hue one step apart, for the
+ * one comparison this map exists to support, with the cyan water station making
+ * it a three-way collision (the plan against the water measured dE 5.9 for
+ * NORMAL colour vision). The driven path now takes `theme.measured`, the same
+ * emerald as the POSE MEASURED badge, so the ink itself says where the line
+ * came from, and the plan took a true blue. Hue is never the only cue: dashed
+ * versus solid and 1.5 px versus 2 px separate them in greyscale and for a
+ * colour-blind operator, and the key at the bottom names both.
+ *
+ * The comparison is also made NUMERIC. `nearestOnPath` projects the rover onto
+ * the nearest route SEGMENT — cross-track deviation, not distance-to-waypoint,
+ * which is a different and much less useful number (see arena.ts) — and the HUD
+ * prints it as PLAN DEV alongside a link drawn from the rover to that point.
+ * The link is the answer to "am I on the line", visible without reading digits.
+ *
+ * ---------------------------------------------------------------------------
  * MEASURED VERSUS ASSUMED
  * ---------------------------------------------------------------------------
  * Nothing localises this rover. Its best case is a dead-reckoned pose that
@@ -75,6 +130,22 @@ import { useChannelRef } from "../lib/ws";
  * comes straight out of `readPose` and can only be cleared by real x_m/y_m
  * arriving, so no code path here can silence the warning with a coordinate it
  * made up.
+ *
+ * DRIFT GROWS, AND THE RINGS GROW WITH IT. A measured pose here is still dead
+ * reckoning from a start somebody eyeballed, with nothing correcting it, so its
+ * uncertainty is not a constant — it increases with every millimetre driven.
+ * The ring family is therefore sized from `PoseTrail.drivenMm`, the odometer
+ * since the last break, and it opens as the rover works. Two rules keep that
+ * honest and keep it from collapsing the measured/assumed distinction:
+ *
+ *   - IT IS STILL NOT AN ERROR BAR. Concentric, pulsing, no hard edge, and the
+ *     millimetre figure is never printed — see DRIFT_SPREAD_FRAC in arena.ts.
+ *     What the HUD prints is DRIVEN, the measured input, not a fabricated bound.
+ *   - AN ASSUMED POSE OPENS AT THE START BOX and does not grow, because it has
+ *     driven nowhere; its rings are amber and sit around a glyph that is
+ *     dashed and hollow. A measured pose opens at nothing and grows, in the
+ *     measured ink, around a solid glyph. Same visual family, opposite claims,
+ *     still impossible to confuse.
  *
  * ---------------------------------------------------------------------------
  * THE ARENA MUST BE FINDABLE
@@ -100,11 +171,12 @@ import { useChannelRef } from "../lib/ws";
  * ---------------------------------------------------------------------------
  * LAYERS AND THE FRAME BUDGET
  * ---------------------------------------------------------------------------
- *   static   arena border, grid, zones, start box, axis labels, scale bar,
+ *   static   arena border, grid, zones, start box, the axis ladder and its
+ *            labels, the origin marker, the key (scale bar + path styles),
  *            heading legend, FORWARD marker. Redrawn on mount, on resize and
  *            on a theme change.
- *   dynamic  route, trail, cloud, objects, rover, HUD. Redrawn per animation
- *            frame.
+ *   dynamic  route, driven path, plan-deviation link, cloud, objects, rover,
+ *            gutter cursor, HUD. Redrawn per animation frame.
  *
  * React renders this component approximately once. The LiDAR socket writes to
  * refs (useChannelRef), a rAF loop polls the sequence number, and clustering
@@ -116,7 +188,18 @@ import { useChannelRef } from "../lib/ws";
  * time it is called.
  */
 
-const PAD_PX = 34;
+/**
+ * Gutter around the arena, px. This is where the coordinate system lives.
+ *
+ * Sized by what has to fit, not by taste: a 5 px major tick, a 9 px centimetre
+ * label under it, and the live cursor plate that prints the rover's coordinate
+ * on the ladder. At 34 px the cursor plate did not fit beside a three-digit
+ * label in the left gutter and would have been clipped by the card edge, which
+ * is the one failure mode a readout must not have. The six pixels come out of
+ * the arena, which is a ~2 % smaller floor for a coordinate system that can
+ * actually be read.
+ */
+const PAD_PX = 40;
 
 const EMBER = "#f97316";
 const MONO = '10px "JetBrains Mono", ui-monospace, monospace';
@@ -143,6 +226,8 @@ const DASH_HALO = [2, 5];
 const DASH_ROUTE = [5, 4];
 const DASH_START = [4, 3];
 const DASH_HEADING = [4, 4];
+/** The rover-to-plan deviation link. Tight dots: a measurement, not a path. */
+const DASH_DEV = [1, 3];
 
 // ================================================================== theme ===
 
@@ -174,6 +259,19 @@ type ArenaTheme = {
   /** HUD panel wash and the outline behind on-map labels. */
   scrim: string;
   halo: string;
+  /**
+   * The ACTUAL DRIVEN PATH, and deliberately the same ink as `measured`.
+   *
+   * This was sky (#38bdf8 dark / #0369a1 light) — one hue step from the planned
+   * route's sky-300, which made the single comparison this map exists to
+   * support, intended versus achieved, a contrast between two nearly identical
+   * blues. Emerald is `theme.measured`, the POSE MEASURED badge's colour, so
+   * the driven line and the badge that vouches for it now match, and the plan
+   * moved out of the blue family it was sharing with the water station.
+   * Validated against the planned route on both surfaces — see ROUTE_INK_DARK
+   * for the runs — at dE 27.2 normal / 26.1 deutan on this floor; dashed versus
+   * solid and 1.5 px versus 2 px carry it with no colour at all.
+   */
   trailMeasured: string;
   trailAssumed: string;
   /** Provenance inks. Amber = assumed, emerald = measured. */
@@ -211,7 +309,7 @@ const THEME_DARK: ArenaTheme = {
   startText: "#cbd5e1",
   scrim: "rgba(7,9,13,0.72)",
   halo: "rgba(7,9,13,0.85)",
-  trailMeasured: "#38bdf8",
+  trailMeasured: "#34d399",
   trailAssumed: "#fbbf24",
   assumed: "#fbbf24",
   measured: "#34d399",
@@ -237,7 +335,7 @@ const THEME_LIGHT: ArenaTheme = {
   startText: "#334155",
   scrim: "rgba(255,255,255,0.82)",
   halo: "rgba(255,255,255,0.9)",
-  trailMeasured: "#0369a1",
+  trailMeasured: "#047857",
   trailAssumed: "#b45309",
   assumed: "#b45309",
   measured: "#047857",
@@ -343,6 +441,34 @@ type Hud = {
   posX: string;
   posY: string;
   hdg: string;
+  /** Odometer since the last break. The MEASURED input behind the drift rings. */
+  driven: string;
+  /** Cross-track deviation from the planned route, or `--` when either is absent. */
+  dev: string;
+  devInk: string;
+  /**
+   * The rover's coordinate, in centimetres, printed in the gutter ON the axis.
+   *
+   * One decimal place and no unit: the axis is already labelled "X cm", the
+   * plate sits between two centimetre ticks, and a unit repeated at every
+   * sample is noise. A millimetre resolution readout would be false precision
+   * on a pose this fleet dead-reckons — the HUD block carries the raw mm for
+   * anyone who wants it.
+   */
+  curX: string;
+  curY: string;
+  /** False when the pose is off the arena, in which case no plate is drawn. */
+  curOn: boolean;
+  /**
+   * Plate widths for the two cursor labels.
+   *
+   * Measured on the rebuild, not in the draw. `measureText` returns a
+   * TextMetrics object, so calling it per frame is per-frame allocation — the
+   * exact thing the HUD cache and the module-level dash arrays exist to avoid,
+   * and it would be four of them a frame here.
+   */
+  curXW: number;
+  curYW: number;
   leftW: number;
   rightW: number;
 };
@@ -418,8 +544,21 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
 
   const frameRef = useRef<ArenaFrame | null>(null);
   const poseRef = useRef<Pose>(readPose(null, null));
+  // Cross-track deviation from the planned route, recomputed on the telemetry
+  // edge and mutated in place. One object for the life of the card.
+  const devRef = useRef<NearestOnPath | null>(null);
+  if (devRef.current === null) devRef.current = createNearestOnPath();
   const sizeRef = useRef(0);
   const drawMsRef = useRef(0);
+  /**
+   * True when the operator has asked their OS for reduced motion.
+   *
+   * Read here rather than left to CSS because CSS cannot reach a canvas: the
+   * site stylesheet disables animation globally and the uncertainty rings, drawn
+   * pixel by pixel in the rAF loop, sail straight through it. Kept in a ref and
+   * updated by a listener so the loop reads it without restarting.
+   */
+  const stillRef = useRef(false);
   const themeRef = useRef<ArenaTheme>(THEME_DARK);
   const scanAtRef = useRef(0);
   const hudRef = useRef<Hud>({
@@ -436,6 +575,14 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
     posX: "X   -- mm",
     posY: "Y   -- mm",
     hdg: "HDG  --",
+    driven: "DRIVEN   -- mm",
+    dev: "PLAN DEV   -- mm",
+    devInk: THEME_DARK.textDim,
+    curX: "",
+    curY: "",
+    curOn: false,
+    curXW: 0,
+    curYW: 0,
     leftW: 0,
     rightW: 0,
   });
@@ -453,9 +600,14 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
 
     const engine = engineRef.current!;
     const trail = trailRef.current!;
+    const dev = devRef.current!;
     let raf = 0;
     let lastSeq = -1;
     let lastPoseEnv: unknown = Symbol("unset");
+    // The route is a prop that changes when a mission is planned, which is far
+    // rarer than the pose edge; tracking it separately means a new plan
+    // recomputes the deviation without waiting for the next telemetry frame.
+    let lastRoute: unknown = Symbol("unset");
     let disposed = false;
 
     const repaintStatic = (size: number) => {
@@ -522,8 +674,23 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
         );
       }
 
+      // A plan and a pose are compared against each other, so either changing
+      // invalidates the comparison. Recomputed here rather than in the draw:
+      // this is O(waypoints) and belongs on the message edge like everything
+      // else that produces a number the HUD prints.
+      const routeNow = routeRef.current;
+      const routeChanged = routeNow !== lastRoute;
+      if (poseChanged || routeChanged) {
+        lastRoute = routeNow;
+        const p = poseRef.current;
+        // An ASSUMED position has nothing to compare: measuring a constant we
+        // invented against the plan yields a deviation the rover never had.
+        if (p.position === "measured") nearestOnPath(routeNow, p.x_mm, p.y_mm, dev);
+        else nearestOnPath(null, NaN, NaN, dev);
+      }
+
       const ageMs = scanAtRef.current > 0 ? Date.now() - scanAtRef.current : Infinity;
-      if (scanChanged || poseChanged) {
+      if (scanChanged || poseChanged || routeChanged) {
         buildHud(
           hudRef.current,
           dctx,
@@ -532,6 +699,8 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
           themeRef.current,
           lidar.metaRef.current.connected,
           drawMsRef.current,
+          trail,
+          dev,
         );
       }
 
@@ -547,7 +716,9 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
         hudRef.current,
         ageMs,
         t0,
-        routeRef.current,
+        routeNow,
+        dev,
+        stillRef.current,
       );
       drawMsRef.current = performance.now() - t0;
     };
@@ -567,11 +738,21 @@ function ArenaMapImpl({ thing, accent = EMBER, poseEnvelope, route }: Props) {
     };
     mq?.addEventListener?.("change", onScheme);
 
+    // Reduced motion. Only the ring style depends on it and the loop reads the
+    // ref every frame, so the listener writes the flag and nothing repaints.
+    const rm = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    stillRef.current = rm ? rm.matches : false;
+    const onMotion = () => {
+      stillRef.current = rm ? rm.matches : false;
+    };
+    rm?.addEventListener?.("change", onMotion);
+
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
       ro.disconnect();
       mq?.removeEventListener?.("change", onScheme);
+      rm?.removeEventListener?.("change", onMotion);
     };
     // `accent` and `thing` are stable for the life of a card; the refs above
     // carry everything that actually changes.
@@ -697,29 +878,72 @@ function drawStatic(
   ctx.lineWidth = 1;
   ctx.strokeRect(hair(x0), hair(y0), Math.round(wpx), Math.round(wpx));
 
-  // ---- axis ticks ---------------------------------------------------------
-  // Labelled in centimetres: the arena is 120 cm and operators measure it with
-  // a tape, not in millimetres.
+  // ---- axis ladder --------------------------------------------------------
+  // A tick every 5 cm, a longer labelled tick every 30 cm. Labelled in
+  // centimetres: the arena is 120 cm and operators measure it with a tape, not
+  // in millimetres.
+  //
+  // The minor ticks are the reason a centimetre is readable at all. With 30 cm
+  // labels alone the operator has to interpolate a third of a metre by eye;
+  // with a 5 cm ladder they count ticks, and the ladder pitch is GRID_MINOR_MM
+  // — the same lines already drawn across the floor — so a tick in the gutter
+  // and a grid line under the rover are guaranteed to be the same coordinate.
+  ctx.strokeStyle = theme.gridMajor;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let v = 0; v <= ARENA_MM; v += GRID_MINOR_MM) {
+    if (Math.abs(v % GRID_MAJOR_MM) < 1e-6) continue;
+    const px = hair(worldToCanvasX(v, s, pad));
+    const py = hair(worldToCanvasY(v, s, pad));
+    ctx.moveTo(px, y0 + wpx);
+    ctx.lineTo(px, y0 + wpx + 3);
+    ctx.moveTo(x0 - 3, py);
+    ctx.lineTo(x0, py);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = theme.textDim;
+  ctx.beginPath();
+  for (let v = 0; v <= ARENA_MM; v += GRID_MAJOR_MM) {
+    const px = hair(worldToCanvasX(v, s, pad));
+    const py = hair(worldToCanvasY(v, s, pad));
+    ctx.moveTo(px, y0 + wpx);
+    ctx.lineTo(px, y0 + wpx + 5);
+    ctx.moveTo(x0 - 5, py);
+    ctx.lineTo(x0, py);
+  }
+  ctx.stroke();
+
   ctx.fillStyle = theme.textDim;
   ctx.font = MONO_SM;
   for (let v = 0; v <= ARENA_MM; v += GRID_MAJOR_MM) {
+    // Both axes skip zero: the origin marker below prints "0,0" in the corner
+    // between them, which says the same thing once instead of twice. Drawn as
+    // well, the x "0" and the y "0" and the "0,0" all land within a few pixels
+    // of each other and overlap into an unreadable smear — the one place on the
+    // ladder where a label is guaranteed to collide.
+    if (v === 0) continue;
     const px = worldToCanvasX(v, s, pad);
     const py = worldToCanvasY(v, s, pad);
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText(`${Math.round(v / 10)}`, px, y0 + wpx + 5);
+    ctx.fillText(`${Math.round(v / 10)}`, px, y0 + wpx + 7);
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillText(`${Math.round(v / 10)}`, x0 - 5, py);
+    ctx.fillText(`${Math.round(v / 10)}`, x0 - 7, py);
   }
-  // Axis names, so "0..120" is not left as a bare number sequence. Origin is
-  // bottom-left; both captions sit at the far end of their own axis.
+  // Axis names, so "0..120" is not left as a bare number sequence, and the
+  // SENSE of each axis with it. Origin is bottom-left, so the captions sit at
+  // the far end of their own axis pointing away from it.
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
-  ctx.fillText("X cm", x0 + wpx + 3, y0 + wpx + 5);
+  ctx.fillText("X cm >", x0 + wpx + 2, y0 + wpx + 7);
   ctx.textAlign = "right";
   ctx.textBaseline = "bottom";
-  ctx.fillText("Y cm", x0 - 3, y0 - 3);
+  ctx.fillText("^ Y cm", x0 - 2, y0 - 3);
+
+  // ---- origin -------------------------------------------------------------
+  drawOrigin(ctx, x0, y0, wpx, s, theme);
 
   // ---- heading legend -----------------------------------------------------
   // The convention, painted where it is used: heading is CCW from +x, so the
@@ -733,13 +957,141 @@ function drawStatic(
   ctx.textAlign = "left";
   ctx.fillText("180°", x0 + 6, y0 + wpx / 2);
 
-  // ---- scale bar ----------------------------------------------------------
-  // Bottom-centre: the gap between the water station and the start box is the
-  // one strip of floor no zone claims.
+  // ---- key: scale bar and the two path styles ------------------------------
+  drawKey(ctx, x0, y0, wpx, s, theme);
+
+  // ---- FORWARD marker -----------------------------------------------------
+  drawForwardMarker(ctx, x0, y0, wpx, theme);
+}
+
+/**
+ * World (0,0), stated rather than implied.
+ *
+ * Every coordinate on this map, every zone rectangle and every waypoint the
+ * mission executor emits is measured from this one corner, and until now it was
+ * the only thing on the map you had to infer — a "0" at each end of the axis
+ * ladder and nothing marking the point where they meet. An operator who assumes
+ * the origin is the centre (which is where most bird's-eye views put it) reads
+ * every number on this dashboard wrong by 600 mm in both axes.
+ *
+ * So the corner gets a ringed dot on the floor, a short heavy run of each axis
+ * out of it, and the coordinate written in the diagonal gutter where no tick
+ * label can collide with it. The two little runs also carry the axis SENSE:
+ * they leave the origin in the +x and +y directions, which on screen is right
+ * and UP, and up-is-+y is the one thing a canvas will silently invert.
+ */
+function drawOrigin(
+  ctx: CanvasRenderingContext2D,
+  x0: number,
+  y0: number,
+  wpx: number,
+  s: number,
+  theme: ArenaTheme,
+): void {
+  const oy = y0 + wpx; // world y = 0 is the BOTTOM of the arena
+  // One minor grid cell (5 cm) of each axis, so the run is itself a legend for
+  // what one grid square is worth.
+  const run = Math.max(8, Math.min(26, GRID_MINOR_MM * s));
+
+  ctx.strokeStyle = theme.text;
+  ctx.globalAlpha = 0.75;
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(hair(x0) + run, hair(oy));
+  ctx.lineTo(hair(x0), hair(oy));
+  ctx.lineTo(hair(x0), hair(oy) - run);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.lineCap = "butt";
+
+  ctx.fillStyle = theme.floor;
+  ctx.beginPath();
+  ctx.arc(x0, oy, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = theme.text;
+  ctx.stroke();
+  ctx.fillStyle = theme.text;
+  ctx.beginPath();
+  ctx.arc(x0, oy, 1.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Diagonally outside the corner: the x ladder runs along the bottom and the
+  // y ladder down the left side, so the only space guaranteed free of tick
+  // labels is the square between them.
+  ctx.font = MONO_SM;
+  ctx.fillStyle = theme.textDim;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  ctx.fillText("0,0", x0 - 15, oy + 7);
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+// The key's two path samples, as text. Module constants so the static layer
+// composes nothing, and so the words on the map and the styles in drawTrail /
+// drawRoute are edited in one place when either changes.
+const KEY_ACTUAL = "DRIVEN";
+const KEY_PLANNED = "PLANNED";
+
+/**
+ * Width of the unclaimed strip along the bottom of the arena, world mm.
+ *
+ * DERIVED, not measured off the current layout. The key and the scale bar sit
+ * between the bottom-left region and the start box, and that gap is only wide
+ * enough by arithmetic: move a zone in arena.ts, or change ZONE_SIDE_MM, and
+ * this shrinks with it and the key gates itself out rather than being drawn
+ * across a region. A hardcoded pixel budget would silently start overlapping.
+ */
+const BOTTOM_GAP_MM = (() => {
+  let right = 0;
+  for (const z of ZONES) {
+    // Bottom half only: a top-corner zone does not bound this strip.
+    if (z.y_mm + z.h_mm / 2 > ARENA_MM / 2) continue;
+    if (z.x_mm >= START_BOX.x_mm) continue;
+    right = Math.max(right, z.x_mm + z.w_mm);
+  }
+  return Math.max(0, START_BOX.x_mm - right);
+})();
+
+/**
+ * Scale bar plus the plan-versus-actual key, bottom-centre.
+ *
+ * PLACEMENT. The strip of floor between the water station (bottom-left) and the
+ * start box (bottom-right) is the only part of the arena no region claims, and
+ * the HUD blocks are anchored to the top corners, so this is the one place a
+ * persistent block can sit without covering something.
+ *
+ * WHY THE KEY IS STATIC. The two path styles are a property of the map, like
+ * the FORWARD marker: they mean the same thing whether or not a route is
+ * currently planned or the rover has moved. Drawing it only when data exists
+ * would remove the legend at exactly the moment an operator is trying to work
+ * out which line is which, and it would put measureText in the rAF loop.
+ *
+ * DEGRADATION. Everything here is width-gated, in the order things become
+ * worth less: the samples' words go first, then the key entirely, and the scale
+ * bar is last because a map with no scale is not a metric map at all.
+ */
+function drawKey(
+  ctx: CanvasRenderingContext2D,
+  x0: number,
+  y0: number,
+  wpx: number,
+  s: number,
+  theme: ArenaTheme,
+): void {
+  const cx = x0 + wpx / 2;
   const barMm = GRID_MAJOR_MM;
   const barPx = barMm * s;
-  const bx = x0 + wpx / 2 - barPx / 2;
-  const by = y0 + wpx - 11;
+  if (!(barPx > 12)) return;
+
+  // ---- scale bar -----------------------------------------------------------
+  // With a mid-division, so the bar reads as two 15 cm halves and can be halved
+  // again by eye. A bar with only two ends can be compared to a distance; a
+  // divided one can be used to measure it.
+  const bx = cx - barPx / 2;
+  const by = y0 + wpx - 12;
   ctx.strokeStyle = theme.text;
   ctx.globalAlpha = 0.6;
   ctx.lineWidth = 1;
@@ -750,20 +1102,69 @@ function drawStatic(
   ctx.lineTo(hair(bx + barPx), hair(by));
   ctx.moveTo(hair(bx + barPx), hair(by) - 3);
   ctx.lineTo(hair(bx + barPx), hair(by) + 3);
+  ctx.moveTo(hair(bx + barPx / 2), hair(by) - 2);
+  ctx.lineTo(hair(bx + barPx / 2), hair(by) + 2);
   ctx.stroke();
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = theme.text;
   ctx.globalAlpha = 0.7;
+  ctx.fillStyle = theme.text;
   ctx.font = MONO_SM;
   ctx.textAlign = "center";
   ctx.textBaseline = "bottom";
-  ctx.fillText(`${Math.round(barMm / 10)} cm`, bx + barPx / 2, by - 4);
+  ctx.fillText(`${Math.round(barMm / 10)} cm`, cx, by - 4);
   ctx.globalAlpha = 1;
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
 
-  // ---- FORWARD marker -----------------------------------------------------
-  drawForwardMarker(ctx, x0, y0, wpx, theme);
+  // ---- path key ------------------------------------------------------------
+  // The band this may occupy is the gap between the two bottom regions. Derived
+  // from the geometry rather than guessed, so moving a zone moves the gate.
+  const band = BOTTOM_GAP_MM * s;
+
+  const sampleW = 18;
+  const gap = 5;
+  const padX = 5;
+  const rowH = 11;
+  ctx.font = MONO_SM;
+  const textW = Math.max(ctx.measureText(KEY_ACTUAL).width, ctx.measureText(KEY_PLANNED).width);
+  const plateW = sampleW + gap + textW + padX * 2;
+  const plateH = rowH * 2 + 6;
+  if (plateW > band || wpx < 190) return;
+
+  const plateX = cx - plateW / 2;
+  const plateY = by - 18 - plateH;
+  scrim(ctx, plateX, plateY, plateW, plateH, theme);
+
+  const sx = plateX + padX;
+  const tx = sx + sampleW + gap;
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "left";
+  ctx.lineWidth = 1.5;
+
+  // Actual first: it is the line the operator is watching, and the plan is the
+  // reference it is watched against.
+  let ry = plateY + 3 + rowH / 2;
+  ctx.strokeStyle = theme.trailMeasured;
+  ctx.setLineDash(DASH_NONE);
+  ctx.beginPath();
+  ctx.moveTo(sx, hair(ry));
+  ctx.lineTo(sx + sampleW, hair(ry));
+  ctx.stroke();
+  ctx.fillStyle = theme.text;
+  ctx.fillText(KEY_ACTUAL, tx, ry);
+
+  ry += rowH;
+  ctx.strokeStyle = theme.id === "light" ? ROUTE_INK_LIGHT : ROUTE_INK_DARK;
+  ctx.setLineDash(DASH_ROUTE);
+  ctx.beginPath();
+  ctx.moveTo(sx, hair(ry));
+  ctx.lineTo(sx + sampleW, hair(ry));
+  ctx.stroke();
+  ctx.setLineDash(DASH_NONE);
+  ctx.fillStyle = theme.textDim;
+  ctx.fillText(KEY_PLANNED, tx, ry);
+
+  ctx.lineWidth = 1;
+  ctx.textBaseline = "alphabetic";
 }
 
 /** One corner region of the arena, as the static layer needs to draw it. */
@@ -1149,7 +1550,9 @@ function drawDynamic(
   hud: Hud,
   scanAgeMs: number,
   tMs: number,
-  route?: readonly RoutePoint[] | null,
+  route: readonly RoutePoint[] | null | undefined,
+  dev: NearestOnPath,
+  stillOnly: boolean,
 ): void {
   if (size <= 0) return;
   const s = scaleFor(size, PAD_PX);
@@ -1163,8 +1566,13 @@ function drawDynamic(
   // measurement should never be obscured by intent.
   drawRoute(ctx, route, s, pad, theme);
 
-  // ---- trail --------------------------------------------------------------
+  // ---- actual driven path -------------------------------------------------
+  // Over the plan, deliberately: where the two coincide the operator should see
+  // the driven line, because that is the one that happened.
   drawTrail(ctx, trail, s, pad, theme);
+
+  // ---- plan versus actual -------------------------------------------------
+  drawDeviation(ctx, dev, pose, s, pad, theme);
 
   // ---- point cloud --------------------------------------------------------
   // A scan older than STALE_MS is faded rather than removed. The rover's own
@@ -1291,18 +1699,171 @@ function drawDynamic(
 
   // ---- rover --------------------------------------------------------------
   drawReticle(ctx, pose, s, pad, theme);
-  drawRover(ctx, pose, s, pad, accent, theme, tMs);
+  drawCursor(ctx, pose, hud, s, pad, theme);
+  drawRover(ctx, pose, s, pad, accent, theme, tMs, trail.drivenMm, stillOnly);
 
   // ---- HUD ----------------------------------------------------------------
   drawHud(ctx, size, hud, theme, stale, scanAgeMs);
 }
 
-/** Ink for the planned route. Cool and desaturated so it never competes with
- *  the accent-coloured live scan — the plan is context, the scan is truth. */
-const ROUTE_INK_DARK = "rgba(125,211,252,0.85)";
-const ROUTE_FILL_DARK = "rgba(125,211,252,0.16)";
-const ROUTE_INK_LIGHT = "rgba(2,132,199,0.9)";
-const ROUTE_FILL_LIGHT = "rgba(2,132,199,0.14)";
+/**
+ * The link from the rover to the nearest point on the planned route.
+ *
+ * This is the whole plan-versus-actual comparison in one mark: a short link
+ * means the rover is on the line, a long one means it is not, and the direction
+ * says which side it drifted to. It is drawn as a dotted tether with a hollow
+ * ring at the plan end rather than as a solid line, because the ring is a point
+ * on the PLAN and must not be mistakable for a measurement — the rover was
+ * never there.
+ *
+ * Suppressed below a few pixels: a link shorter than its own end markers is
+ * visual noise reporting a deviation the operator does not need to act on, and
+ * the HUD's PLAN DEV still carries the number.
+ */
+function drawDeviation(
+  ctx: CanvasRenderingContext2D,
+  dev: NearestOnPath,
+  pose: Pose,
+  s: number,
+  pad: number,
+  theme: ArenaTheme,
+): void {
+  if (!Number.isFinite(dev.dist_mm) || !Number.isFinite(dev.x_mm)) return;
+  const rx = worldToCanvasX(pose.x_mm, s, pad);
+  const ry = worldToCanvasY(pose.y_mm, s, pad);
+  const px = worldToCanvasX(dev.x_mm, s, pad);
+  const py = worldToCanvasY(dev.y_mm, s, pad);
+  if (!Number.isFinite(rx) || !Number.isFinite(ry)) return;
+  const dx = px - rx;
+  const dy = py - ry;
+  if (dx * dx + dy * dy < 25) return;
+
+  const ink = theme.id === "light" ? ROUTE_INK_LIGHT : ROUTE_INK_DARK;
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = 1;
+  ctx.setLineDash(DASH_DEV);
+  ctx.beginPath();
+  ctx.moveTo(rx, ry);
+  ctx.lineTo(px, py);
+  ctx.stroke();
+  ctx.setLineDash(DASH_NONE);
+
+  ctx.beginPath();
+  ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+/**
+ * The rover's coordinate, printed in the gutter where the reticle meets the
+ * axis ladder.
+ *
+ * "Read the position to the centimetre without leaving the map" is the
+ * requirement, and this is the mark that delivers it. The reticle already draws
+ * the eye from the rover out to each axis; this puts the number at the end of
+ * that journey, sat on the ladder it belongs to, so reading a coordinate is a
+ * glance rather than a lookup in the corner HUD.
+ *
+ * Inks by provenance, like everything else that states a position: an assumed
+ * coordinate is amber and carries the same `?` the HUD does, so a number read
+ * off the axis cannot be mistaken for a measured one.
+ *
+ * The strings come from the cached HUD (2 Hz edge). Per frame this is two
+ * scrims and two fillText calls and allocates nothing.
+ */
+function drawCursor(
+  ctx: CanvasRenderingContext2D,
+  pose: Pose,
+  hud: Hud,
+  s: number,
+  pad: number,
+  theme: ArenaTheme,
+): void {
+  if (!hud.curOn) return;
+  const cx = worldToCanvasX(pose.x_mm, s, pad);
+  const cy = worldToCanvasY(pose.y_mm, s, pad);
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+
+  const x0 = worldToCanvasX(0, s, pad);
+  const y0 = worldToCanvasY(ARENA_MM, s, pad);
+  const wpx = ARENA_MM * s;
+  // Provenance is carried by the INK alone here, not by a "?" suffix like the
+  // HUD's. The gutter is only wide enough for "120.0" and a suffix would push
+  // the plate into the arena or off the card; the plate is amber for an assumed
+  // coordinate and the reticle line arriving at it is amber too, so nothing on
+  // this path lets an assumption read as a fix.
+  const ink = pose.position === "assumed" ? theme.assumed : theme.measured;
+
+  ctx.font = MONO_SM;
+  ctx.textBaseline = "middle";
+
+  // The plate sits ON the ladder's label band and its scrim occludes whichever
+  // centimetre label is behind it — deliberately. The number it hides is the
+  // coarse version of the number it prints, so replacing "60" with "58.7"
+  // locally is a gain, and it is how every axis crosshair worth using behaves.
+  // The reticle's own bright tick is drawn inside the last 4 px against the
+  // arena edge, which is left clear so the plate never covers it.
+  const hgt = 13;
+
+  // X, in the bottom gutter, centred on the rover's column. Clamped to the card
+  // so a plate near either wall stays on screen rather than being clipped.
+  const wx = hud.curXW + 6;
+  let bx = cx - wx / 2;
+  if (bx < 2) bx = 2;
+  if (bx + wx > x0 + wpx + PAD_PX - 2) bx = x0 + wpx + PAD_PX - 2 - wx;
+  const byy = y0 + wpx + 5;
+  scrim(ctx, bx, byy, wx, hgt, theme);
+  ctx.fillStyle = ink;
+  ctx.textAlign = "center";
+  ctx.fillText(hud.curX, bx + wx / 2, byy + hgt / 2);
+
+  // Y, in the left gutter, on the rover's row. Right-aligned to the ladder so
+  // it reads as part of the same column of numbers.
+  const wy = hud.curYW + 6;
+  let ly = cy - hgt / 2;
+  if (ly < 2) ly = 2;
+  if (ly + hgt > y0 + wpx + PAD_PX - 2) ly = y0 + wpx + PAD_PX - 2 - hgt;
+  const lx = Math.max(2, x0 - 5 - wy);
+  scrim(ctx, lx, ly, wy, hgt, theme);
+  ctx.fillStyle = ink;
+  ctx.fillText(hud.curY, lx + wy / 2, ly + hgt / 2);
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+/**
+ * Ink for the planned route. Cool, so it never competes with the ember rover
+ * and the accent-coloured live scan — the plan is context, the scan is truth.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS A TRUE BLUE AND NOT THE SKY IT USED TO BE
+ * ---------------------------------------------------------------------------
+ * The route was sky #7dd3fc, the driven trail was sky #38bdf8 and the water
+ * station is cyan #22d3ee: three near-identical blues carrying three unrelated
+ * meanings. Measured on this floor rather than argued about, the route against
+ * the water station came out at dE 5.9 for NORMAL colour vision — a hard fail,
+ * and it meant the planned route running into the refill point (which every
+ * refill leg does) was very nearly invisible at the one place an operator most
+ * needs to see it.
+ *
+ * Plan and driven path now sit in different hue families, which is also Nav2's
+ * convention for global-plan versus executed path:
+ *
+ *   node scripts/validate_palette.js "#3987e5,#34d399" --mode dark \
+ *     --surface "#0b0f16" --pairs all
+ *     [PASS] CVD separation      dE 26.1 (deutan) / 15.2 (tritan)
+ *     [PASS] Normal-vision floor dE 27.2
+ *     [PASS] Contrast vs surface both >= 3:1
+ *
+ * Light was validated the same way against #ffffff ("#1d4ed8,#047857,#b45309":
+ * normal-vision dE 21.9, CVD 7.9 — the 6-8 band, which is legal here because
+ * the dash pattern and the line weight carry the distinction with no colour at
+ * all). Hue is never the only cue on this map.
+ */
+const ROUTE_INK_DARK = "rgba(57,135,229,0.95)";
+const ROUTE_FILL_DARK = "rgba(57,135,229,0.20)";
+const ROUTE_INK_LIGHT = "rgba(29,78,216,0.9)";
+const ROUTE_FILL_LIGHT = "rgba(29,78,216,0.16)";
 
 /**
  * Draw the nominal planned route: dashed spine, a node per waypoint, and a
@@ -1382,12 +1943,21 @@ function drawRoute(
 const TRAIL_BANDS = 6;
 
 /**
- * Where the rover has actually been.
+ * THE ACTUAL DRIVEN PATH — where the rover has really been, as opposed to where
+ * the plan said it would go.
+ *
+ * This is one half of the comparison a route-following test exists to make, so
+ * it is drawn to be told apart from `drawRoute`'s plan at a glance and in three
+ * independent ways: SOLID against the plan's dashes, thicker (2 px against
+ * 1.5), and in `theme.trailMeasured` — emerald, the ink of the POSE MEASURED
+ * badge — against the plan's sky. Any one of those survives the loss of the
+ * other two, which is the point: a colour-blind operator reads solid-versus-
+ * dashed, and a greyscale print reads weight.
  *
  * Older samples fade, so the recent path reads as the current one without
- * throwing history away. Two properties are load-bearing:
+ * throwing history away. Two further properties are load-bearing:
  *
- *   - a MEASURED run is a solid cyan line; an ASSUMED run is dashed amber. A
+ *   - a MEASURED run is a solid emerald line; an ASSUMED run is dashed amber. A
  *     dead-reckoned track and a track of where the map guessed the rover was
  *     are not the same claim and must not share a style.
  *   - a sample flagged TRAIL_BREAK lifts the pen. Joining across a teleport
@@ -1411,7 +1981,10 @@ function drawTrail(
   const ys = trail.ys;
   const flags = trail.flags;
 
-  ctx.lineWidth = 1.5;
+  // Heavier than the planned route's 1.5: the achieved path outranks the
+  // intended one wherever they overlap, and weight is the cue that says so
+  // without needing colour.
+  ctx.lineWidth = 2;
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
 
@@ -1450,6 +2023,7 @@ function drawTrail(
 
   ctx.setLineDash(DASH_NONE);
   ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
   ctx.lineCap = "butt";
 }
 
@@ -1508,6 +2082,96 @@ function drawReticle(
 /** Pulse period for the uncertainty halo, ms. Slow — it is a state, not an alarm. */
 const HALO_PERIOD_MS = 2600;
 
+/** Concentric rings in the halo family. More than one is what makes it read as
+ *  a gradient of belief rather than as a boundary. */
+const HALO_RINGS = 3;
+
+/**
+ * Uncertainty rings, sized by how far the rover has dead-reckoned.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS AND IS NOT
+ * ---------------------------------------------------------------------------
+ * It is NOT an error bar, and nothing about it may be read as one — no radius
+ * is printed, the rings pulse and fade so there is no hard edge to measure
+ * against, and the scale factor is a drawing constant documented as such
+ * (DRIFT_SPREAD_FRAC, arena.ts). It IS an honest statement of the one thing
+ * that is definitely true about this rover's pose: nothing localises it, so the
+ * further it drives the less the coordinate is worth, and the picture should
+ * get vaguer as that happens rather than staying reassuringly crisp.
+ *
+ * The old halo was a single expanding ring at a FIXED radius, which said "not
+ * pinned down" but said it identically at 5 cm driven and at 5 m. `spreadMm` is
+ * the fix: it comes from `PoseTrail.drivenMm`, the odometer since the tracker
+ * was last re-anchored, so the rings open as the run goes on and snap back the
+ * moment a break re-anchors them.
+ *
+ * MEASURED AND ASSUMED STILL DIVERGE, which the header guarantees:
+ *   assumed   amber, opens at ASSUMED_SPREAD_MM (half the start box) and does
+ *             not grow, because an assumed pose has driven nowhere — the rover
+ *             is somewhere in that box and that is the whole claim.
+ *   measured  the measured ink, opens at nothing and grows with the odometer,
+ *             around a glyph that is solid where the assumed one is dashed.
+ */
+function drawUncertainty(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  spreadPx: number,
+  /** Radius of the rover glyph, px. The rings start OUTSIDE it. */
+  glyphPx: number,
+  ink: string,
+  tMs: number,
+  stillOnly: boolean,
+): void {
+  if (!(spreadPx > 1.5)) return;
+
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash(DASH_HALO);
+
+  // ---- reduced motion ------------------------------------------------------
+  // The site stylesheet kills CSS animation globally, and it cannot touch a
+  // pixel this loop paints — a canvas is outside the reach of any media query.
+  // So the rings have to opt out themselves, and the state has to SURVIVE the
+  // opt-out: if the only thing saying "this position is uncertain" is a pulse,
+  // then an operator who has asked for no motion is shown a map that quietly
+  // stops mentioning it. Three static rings, stepped in alpha rather than in
+  // time, carry the same gradient of belief with nothing moving.
+  if (stillOnly) {
+    for (let k = 0; k < HALO_RINGS; k++) {
+      const f = (k + 1) / HALO_RINGS;
+      ctx.globalAlpha = 0.34 * (1 - f * 0.6);
+      ctx.beginPath();
+      ctx.arc(cx, cy, glyphPx + spreadPx * (0.12 + f * 1.05), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.setLineDash(DASH_NONE);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
+    return;
+  }
+
+  const t = (tMs % HALO_PERIOD_MS) / HALO_PERIOD_MS;
+  for (let k = 0; k < HALO_RINGS; k++) {
+    // Each ring is offset a third of a cycle from the last, so one is always
+    // emerging as another dies and the family never blinks out entirely.
+    const phase = (t + k / HALO_RINGS) % 1;
+    // Anchored to the chassis and growing outward from it. A ring drawn INSIDE
+    // the glyph is invisible at best and reads as part of the rover at worst,
+    // and it would mean a small spread showed nothing at all rather than
+    // showing a tight one — the difference this whole mark exists to convey.
+    const r = glyphPx + spreadPx * (0.12 + phase * 1.05);
+    ctx.globalAlpha = 0.42 * (1 - phase);
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.setLineDash(DASH_NONE);
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
+}
+
 function drawRover(
   ctx: CanvasRenderingContext2D,
   pose: Pose,
@@ -1516,6 +2180,8 @@ function drawRover(
   accent: string,
   theme: ArenaTheme,
   tMs: number,
+  drivenMm: number,
+  stillOnly: boolean,
 ): void {
   const cx = worldToCanvasX(pose.x_mm, s, pad);
   const cy = worldToCanvasY(pose.y_mm, s, pad);
@@ -1528,22 +2194,25 @@ function drawRover(
   const bodyInk = posAssumed ? theme.assumed : accent;
   const noseInk = hdgAssumed ? theme.assumed : accent;
 
-  // Uncertainty halo. Expanding rings, not a fixed circle, because a fixed
-  // circle states a radius and nobody has measured this rover's positional
-  // error. The ring says "not pinned down" and declines to say how far.
-  if (posAssumed) {
-    const t = (tMs % HALO_PERIOD_MS) / HALO_PERIOD_MS;
-    const r = L * 0.85 + t * L * 1.7;
-    ctx.strokeStyle = theme.assumed;
-    ctx.globalAlpha = 0.4 * (1 - t);
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash(DASH_HALO);
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash(DASH_NONE);
-    ctx.globalAlpha = 1;
-  }
+  // Uncertainty rings — see drawUncertainty. Expanding and concentric, never a
+  // fixed circle, because a fixed circle states a radius and nobody has
+  // measured this rover's positional error.
+  //
+  // An assumed pose opens at the start box and stays there; a measured one is
+  // sized from the odometer and grows, because a measured pose here is still
+  // dead reckoning with nothing correcting it. Both are drawn, in their own
+  // ink, so "measured" is never allowed to look like "known".
+  const spreadMm = posAssumed ? ASSUMED_SPREAD_MM : driftSpreadMm(drivenMm);
+  drawUncertainty(
+    ctx,
+    cx,
+    cy,
+    spreadMm * s,
+    Math.hypot(L, W) / 2,
+    posAssumed ? theme.assumed : theme.measured,
+    tMs,
+    stillOnly,
+  );
 
   ctx.save();
   ctx.translate(cx, cy);
@@ -1627,6 +2296,8 @@ function buildHud(
   theme: ArenaTheme,
   connected: boolean,
   lastDrawMs: number,
+  trail: PoseTrail,
+  dev: NearestOnPath,
 ): void {
   const counts = frame ? frame.counts : null;
 
@@ -1676,9 +2347,43 @@ function buildHud(
     hud.badgeInk = theme.measured;
     hud.sub = "DEAD-RECKONED · NOT LOCALISED";
   }
-  hud.posX = `X ${mm(pose.x_mm)}${posA ? " ?" : ""}`;
-  hud.posY = `Y ${mm(pose.y_mm)}${posA ? " ?" : ""}`;
+  // Both units on one line. Millimetres are what the rover reports and what the
+  // mission executor plans in, so they are the primary figure; centimetres are
+  // what the arena is marked in and what a tape measure reads, so an operator
+  // checking the map against the floor does not have to divide by ten in their
+  // head. The axis ladder is in cm and this is the bridge to it.
+  hud.posX = `X ${mm(pose.x_mm)} ${cm(pose.x_mm)}${posA ? " ?" : ""}`;
+  hud.posY = `Y ${mm(pose.y_mm)} ${cm(pose.y_mm)}${posA ? " ?" : ""}`;
   hud.hdg = `HDG ${degText(pose.heading_deg)}${hdgA ? " ?" : ""}`;
+
+  // ---- drift, stated by its cause -----------------------------------------
+  // The odometer, not an error figure. This is the MEASURED input the
+  // uncertainty rings are sized from (see drawUncertainty); printing it instead
+  // of the ring radius is what keeps the rings from being read as a bound
+  // somebody measured. An assumed pose has driven nothing by definition, so it
+  // renders `--` rather than a truthful-looking 0.
+  hud.driven = posA ? "DRIVEN   -- mm" : `DRIVEN ${mm(trail.drivenMm)}`;
+
+  // ---- plan versus actual, as a number ------------------------------------
+  // Absent whenever either half of the comparison is missing: no route planned,
+  // or a position nobody measured. `dev.dist_mm` is already Infinity in both
+  // cases, so `mm()` renders `--` and the zero rule holds — "PLAN DEV 0 mm"
+  // would tell an operator the rover is perfectly on the line at the exact
+  // moment there is no line.
+  hud.dev = `PLAN DEV ${mm(dev.dist_mm)}`;
+  hud.devInk = Number.isFinite(dev.dist_mm) ? theme.text : theme.textDim;
+
+  // ---- gutter cursor ------------------------------------------------------
+  // Suppressed when the pose is outside the arena. The plates are clamped to
+  // the card's edge, so an out-of-bounds coordinate would print a number at the
+  // wall while the reticle pointed somewhere else — a readout that contradicts
+  // the mark it belongs to is worse than no readout, and the block above still
+  // carries the raw millimetres.
+  const inX = Number.isFinite(pose.x_mm) && pose.x_mm >= 0 && pose.x_mm <= ARENA_MM;
+  const inY = Number.isFinite(pose.y_mm) && pose.y_mm >= 0 && pose.y_mm <= ARENA_MM;
+  hud.curOn = inX && inY;
+  hud.curX = hud.curOn ? (pose.x_mm / 10).toFixed(1) : "";
+  hud.curY = hud.curOn ? (pose.y_mm / 10).toFixed(1) : "";
 
   // measureText once per rebuild so the scrims can be sized without touching
   // text metrics inside the draw.
@@ -1690,10 +2395,12 @@ function buildHud(
   hud.leftW = lw;
   ctx.font = MONO_SM;
   let rw = 0;
-  for (const t of [hud.badge, hud.sub, hud.posX, hud.posY, hud.hdg]) {
+  for (const t of [hud.badge, hud.sub, hud.posX, hud.posY, hud.hdg, hud.driven, hud.dev]) {
     rw = Math.max(rw, ctx.measureText(t).width);
   }
   hud.rightW = rw;
+  hud.curXW = hud.curOn ? ctx.measureText(hud.curX).width : 0;
+  hud.curYW = hud.curOn ? ctx.measureText(hud.curY).width : 0;
 }
 
 function drawHud(
@@ -1744,7 +2451,7 @@ function drawHud(
   // ---- right block: where we think the rover is ---------------------------
   const rx = size - 8;
   const rw = hud.rightW + 10;
-  scrim(ctx, rx - rw + 5, 4, rw, 11 * 5 + 8, theme);
+  scrim(ctx, rx - rw + 5, 4, rw, 11 * 7 + 8, theme);
   ctx.font = MONO_SM;
   ctx.textAlign = "right";
   let ry = 15;
@@ -1758,6 +2465,11 @@ function drawHud(
   wr(hud.posX, hud.badgeInk);
   wr(hud.posY, hud.badgeInk);
   wr(hud.hdg, hud.badgeInk);
+  // The odometer takes the provenance ink too: it is derived from the same
+  // positions, so it is exactly as trustworthy as they are and must not read as
+  // an independent measurement sat under two caveated ones.
+  wr(hud.driven, hud.badgeInk);
+  wr(hud.dev, hud.devInk);
   ctx.textAlign = "left";
 }
 
@@ -1833,6 +2545,19 @@ function pad2(v: number): string {
  */
 function mm(v: number): string {
   return Number.isFinite(v) ? `${Math.round(v).toString().padStart(4, " ")} mm` : "  -- mm";
+}
+
+/**
+ * The same value in centimetres, to one decimal — the unit the arena is marked
+ * in and the axis ladder is labelled in.
+ *
+ * One decimal and no more. The requirement is centimetre readability, the pose
+ * is dead-reckoned wheel odometry, and printing 97.24 cm would dress a drifting
+ * estimate up as a tenth-of-a-millimetre measurement. Absent is `--`, never 0,
+ * for the reason in `mm`.
+ */
+function cm(v: number): string {
+  return Number.isFinite(v) ? `${(v / 10).toFixed(1).padStart(5, " ")} cm` : "   -- cm";
 }
 
 function degText(v: number): string {

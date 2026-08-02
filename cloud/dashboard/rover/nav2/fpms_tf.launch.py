@@ -4,8 +4,8 @@ fpms_tf.launch.py - static TF publishers that complete the FPMS Nav2 tree.
 
 WHY THIS FILE EXISTS
 ======================
-Nav2 needs a connected TF tree from `odom` down to every sensor frame. Only
-one edge in that tree changes at runtime:
+Nav2 and slam_toolbox both need a connected TF tree from `odom` down to the
+laser frame. Only one edge in that tree changes at runtime:
 
     odom -> base_footprint      DYNAMIC, published by fpms_odom_tf.py.
 
@@ -17,6 +17,9 @@ are STATIC transforms, which is exactly what this launch file publishes:
     base_link      -> laser_frame
     base_link      -> imu_frame
 
+`map -> odom` is published by slam_toolbox (see ../slam/), NOT here and NOT by
+fpms_odom_tf.py. REP-105 gives that edge to the localiser and to nobody else.
+
 This file does NOT publish odom -> base_footprint. Do not add it here: that
 edge already has an owner (fpms_odom_tf.py) and a second broadcaster for the
 same edge is a textbook way to get two disagreeing transforms fighting each
@@ -26,16 +29,12 @@ you look closely at timestamps and one of the two publishers "wins" at random.
 REQUIRED COMPANION CHANGE - READ BEFORE LAUNCHING THIS FILE
 ================================================================
 fpms_odom_tf.py ALSO ships a static broadcaster for base_footprint ->
-laser_frame directly (its `PUBLISH_LASER_STATIC_TF` flag, on by default). That
-predates base_link existing in this tree at all. Running both that broadcaster
-and this launch file at once gives `laser_frame` two different parents
-(base_footprint from one node, base_link from this one) - not a warning, an
-actively broken, non-tree TF graph. fpms_odom_tf.py's own comment anticipated
-exactly this ("Set PUBLISH_LASER_STATIC_TF=False if a URDF / robot_state_
-publisher is ever introduced, so this node does not fight it for ownership of
-the transform") - this launch file IS that introduction, so
-`PUBLISH_LASER_STATIC_TF` has been set to False in fpms_odom_tf.py alongside
-adding this file. If you ever see `laser_frame` with two parents in
+laser_frame directly (its `PUBLISH_LASER_STATIC_TF` flag). That predates
+base_link existing in this tree at all. Running both that broadcaster and this
+launch file at once gives `laser_frame` two different parents (base_footprint
+from one node, base_link from this one) - not a warning, an actively broken,
+non-tree TF graph. `PUBLISH_LASER_STATIC_TF` is already `False` in
+fpms_odom_tf.py. If you ever see `laser_frame` with two parents in
 `ros2 run tf2_tools view_frames`, this is the first thing to check.
 
 WHY base_link EXISTS AT ALL (base_footprint alone is not enough)
@@ -58,26 +57,109 @@ centreline - and therefore base_link - sits 35mm above the ground. This is not
 a placeholder; it follows directly from the measured wheel diameter and needs
 no further measurement.
 
-LIDAR AND IMU MOUNT OFFSETS - UNMEASURED, DO NOT TRUST, DO NOT SHIP ON
-============================================================================
-Both `laser_frame` and `imu_frame` are placeholders. NOBODY HAS PUT A RULER ON
-THIS ROBOT YET. The numbers below are plausible-looking guesses (LiDAR roughly
-centred and up on a mast, IMU roughly at body centre) chosen so the tree is
-CONNECTED and Nav2 does not crash - they are not a substitute for measurement.
+################################################################################
+#  THE MOUNT OFFSETS BELOW ARE PLACEHOLDERS. NOBODY HAS PUT A RULER ON THIS    #
+#  ROBOT. THEY ARE NOW LAUNCH ARGUMENTS SO THEY CAN BE SUPPLIED WITHOUT        #
+#  EDITING CODE - THAT DOES NOT MAKE THE DEFAULTS TRUE.                        #
+################################################################################
 
-    A wrong laser offset makes obstacles appear in the wrong place in the
-    costmap. This is the single most common reason Nav2 "refuses to plan" or
-    plans through what should be a wall: not a planner bug, a TF bug that
-    looks like a planner bug.
+WHY THIS MATTERS MORE THAN IT LOOKS - THE ARITHMETIC
+=======================================================
+R2_COORDINATES.md section 4.5: a constant LiDAR mount-yaw error rotates the
+ENTIRE inferred pose about the sensor. Over a 600 mm lever arm that is
 
-Before trusting ANY map, costmap or AMCL pose produced with this launch file:
-  1. Physically measure, with a ruler/calipers, from the base_link point
-     defined above (35mm above ground, centred over the drive axle) to the
-     LiDAR's optical centre and to the IMU chip, in the same x-forward /
-     y-left / z-up body convention used below.
-  2. Measure the LiDAR's mounting YAW - if its zero-degree ray does not point
-     exactly out the nose, every scan is rotated by that error.
-  3. Replace the constants below. Nothing else in this file needs to change.
+    1 degree of mount yaw  ~=  10.5 mm of position error
+
+so a mount yaw that is "about right, probably within a couple of degrees" is
+already a ~2 cm bias on every fix, applied consistently, in a direction that
+depends on heading - i.e. it does not average out, it warps the map. For a
+centimetre-accuracy target the mount yaw has to be known to better than
+~0.5 degrees. Nothing in software can find this number for you; it is a
+property of how the sensor is bolted on.
+
+A wrong laser TRANSLATION is milder but not free: it puts every obstacle in
+the wrong place in the costmap, and during rotation it makes the world appear
+to swing about the wrong centre, which the scan matcher sees as inconsistent
+geometry and partially absorbs into pose error.
+
+A wrong laser PITCH is the sneaky one. The scan plane must be level. If the
+LiDAR is mounted with a downward pitch `p` and sits at height `h` above the
+floor, the beams strike the floor at range `h / tan(p)`:
+
+    h = 0.10 m, p = 1 deg  ->  floor strike at  5.7 m
+    h = 0.10 m, p = 2 deg  ->  floor strike at  2.9 m
+
+The room this rover is in returns a median of ~1.98 m and a maximum of 6.0 m,
+so a mount pitch of only 1-2 degrees turns the far half of every scan into a
+ring of phantom obstacles on the floor. That is not a subtle degradation - it
+is a fake wall that moves with the robot, and it will wreck both the map and
+every costmap built from it.
+
+WHAT THE OPERATOR MUST PHYSICALLY MEASURE
+============================================
+All in the ROS body convention: +x out the nose, +y to the robot's LEFT,
++z up. Origin is `base_link` = 35 mm above the floor, on the chassis
+centreline, over the drive axle.
+
+  1. laser_x  - horizontal distance from base_link to the LiDAR's OPTICAL
+                CENTRE (the rotating mirror axis, not the case edge), positive
+                forward. Callipers or a steel rule; +/- 2 mm is good enough.
+  2. laser_y  - same, positive to the left. If the LiDAR looks centred, still
+                measure it: 5 mm of lateral offset is 5 mm of map bias.
+  3. laser_z  - height of the optical centre above base_link, i.e.
+                (height above floor) - 0.035. Least critical of the three for
+                planar SLAM, but needed for the pitch check below.
+  4. laser_yaw - THE IMPORTANT ONE, and it is an ANGLE, not a distance.
+                Method: park the rover with its nose squarely against a flat
+                wall, run `ros2 topic echo /scan_lidar --once`, and find the
+                index of the minimum range. Index 180 is dead ahead. Each
+                index is 1 degree, so `laser_yaw = (180 - argmin) * pi/180`.
+                Better: take the ranges either side of the minimum and fit,
+                which gets you well below the 1 degree bin size. Repeat with
+                the rover rotated 90 and 180 degrees; the answer must be the
+                same every time. If it is not, the mount is loose.
+  5. laser_roll / laser_pitch - level the scan plane. Put a small spirit level
+                or a phone inclinometer on the LiDAR's mounting face and read
+                both axes. Target < 0.5 degrees. If you cannot get it level
+                mechanically, measure the residual and pass it here; the TF
+                will at least place the returns correctly, though a tilted
+                plane still slices the room at an angle.
+  6. IMU offsets - only matter if a robot_localization EKF is ever added.
+                fpms_odom_tf.py reads /imu's gyro-z directly and a pure yaw
+                rate about a vertical axis is insensitive to translation, so
+                these stay at zero, honestly labelled, until an EKF needs them.
+
+NOT MEASURABLE HERE, BUT A HARD PREREQUISITE
+===============================================
+`LIDAR_ROTATION_SIGN` in fpms_lidar_ros.py (currently -1, marked UNVERIFIED)
+decides whether the scan is MIRRORED. A mirror is not a rigid transform: no
+value of laser_yaw can undo it. In a feature-rich room a mirrored scan will
+not converge, or will converge to something confidently wrong. Run the
+left-wall test documented at the top of fpms_lidar_ros.py BEFORE trusting any
+map. That file is owned by another agent - report the result, do not edit it.
+
+Also note the double-correction trap: `LIDAR_ZERO_OFFSET_DEG` in
+fpms_lidar_ros.py rotates the scan in the same sense `laser_yaw` does. It is
+currently 0.0. **Correct mount yaw in exactly one of the two places - this
+one.** Applying half in each is how you end up chasing a bias that changes
+whenever either file is touched.
+
+USAGE
+========
+    # defaults (PLACEHOLDERS - the launch says so, loudly)
+    ros2 launch nav2/fpms_tf.launch.py
+
+    # with real measurements
+    ros2 launch nav2/fpms_tf.launch.py \
+        laser_x:=0.052 laser_y:=0.000 laser_z:=0.071 \
+        laser_yaw:=-0.0122 measured:=true
+
+    # refuse to start unless the offsets have actually been supplied
+    ros2 launch nav2/fpms_tf.launch.py require_measured:=true ...
+
+`require_measured:=true` is the one to put in the mapping run's command line.
+It turns "we forgot to pass the offsets" from a map you will trust for weeks
+into a launch that fails in two seconds.
 
 ROS_DOMAIN_ID
 ===============
@@ -93,6 +175,8 @@ fpms_odom_tf.py and deadband_sweep.py.
 import os
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -116,43 +200,47 @@ BASE_LINK_Z_M = 0.035   # = WHEEL_DIAMETER_M / 2, from NAV2_BRIEF hardware truth
 BASE_LINK_YAW_RAD = 0.0
 
 # ============================================================================
-# !! base_link -> laser_frame - PLACEHOLDER. UNMEASURED. DO NOT TRUST.      !!
-# !! MUST BE MEASURED ON THE PHYSICAL ROBOT WITH A RULER BEFORE ANY MAP OR !!
-# !! COSTMAP BUILT WITH THIS TRANSFORM IS TRUSTED.                         !!
-#
-# x forward(+)/back(-), y left(+)/right(-), z up(+) from base_link (which is
-# already 35mm off the ground - see BASE_LINK_Z_M above). yaw is the mount
-# rotation: if the LiDAR's zero-degree ray does not point straight out the
-# nose, every obstacle Nav2 sees is rotated by exactly this error.
-#
-# These numbers are NOT the same numbers that used to live in fpms_odom_tf.py
-# (LASER_X/Y/Z_OFFSET_M there) - those were measured relative to
-# base_footprint (ground level); these are relative to base_link (35mm up).
-# Do not copy one set into the other without adjusting Z by BASE_LINK_Z_M.
+# !! base_link -> laser_frame - PLACEHOLDER DEFAULTS. UNMEASURED.           !!
+# These are the values used when the corresponding launch argument is not
+# given. They exist so the tree is CONNECTED and nothing NaNs - they are not
+# measurements and the launch banner says so every time it starts.
+# See "WHAT THE OPERATOR MUST PHYSICALLY MEASURE" in the module docstring.
 # ============================================================================
-LASER_X_OFFSET_M = 0.0        # MEASURE ME
-LASER_Y_OFFSET_M = 0.0        # MEASURE ME
-LASER_Z_OFFSET_M = 0.065      # MEASURE ME (placeholder: mast guess, 100mm above ground - 35mm base_link rise)
-LASER_YAW_RAD = 0.0           # MEASURE ME
+LASER_X_DEFAULT = 0.0        # MEASURE ME
+LASER_Y_DEFAULT = 0.0        # MEASURE ME
+LASER_Z_DEFAULT = 0.065      # MEASURE ME (mast guess: 100mm above floor - 35mm base_link rise)
+LASER_ROLL_DEFAULT = 0.0     # MEASURE ME (level the scan plane)
+LASER_PITCH_DEFAULT = 0.0    # MEASURE ME (level the scan plane - see floor-strike arithmetic)
+LASER_YAW_DEFAULT = 0.0      # MEASURE ME (1 deg = ~10.5 mm of position error)
 
 # ============================================================================
-# !! base_link -> imu_frame - PLACEHOLDER. UNMEASURED. DO NOT TRUST.        !!
-# !! MUST BE MEASURED ON THE PHYSICAL ROBOT BEFORE ANY HEADING DERIVED     !!
-# !! THROUGH THIS FRAME IS TRUSTED FOR ANYTHING BEYOND THE GYRO-Z          !!
-# !! INTEGRATION fpms_odom_tf.py ALREADY DOES DIRECTLY OFF /imu.          !!
-#
-# Best guess only: IMU is assumed roughly at the chassis/body centre, i.e.
-# co-located with base_link (zero offset, zero rotation). This is very likely
-# wrong in Z at minimum (the ESP32-S3 drive board the IMU lives on is not at
-# axle height) - it is set to zero purely so the tree is connected and
-# nothing NaNs, not because zero is a real measurement.
+# !! base_link -> imu_frame - PLACEHOLDER DEFAULTS. UNMEASURED.             !!
+# Zero because the IMU is assumed roughly at body centre. Very likely wrong in
+# Z (the ESP32-S3 board the IMU lives on is not at axle height). Harmless
+# today: fpms_odom_tf.py integrates /imu gyro-z directly and yaw rate about a
+# vertical axis does not care where on the rigid body it is measured. It stops
+# being harmless the moment a robot_localization EKF fuses IMU acceleration.
 # ============================================================================
-IMU_X_OFFSET_M = 0.0          # MEASURE ME
-IMU_Y_OFFSET_M = 0.0          # MEASURE ME
-IMU_Z_OFFSET_M = 0.0          # MEASURE ME
-IMU_ROLL_RAD = 0.0            # MEASURE ME
-IMU_PITCH_RAD = 0.0           # MEASURE ME
-IMU_YAW_RAD = 0.0             # MEASURE ME
+IMU_X_DEFAULT = 0.0          # MEASURE ME (only if an EKF is added)
+IMU_Y_DEFAULT = 0.0          # MEASURE ME (only if an EKF is added)
+IMU_Z_DEFAULT = 0.0          # MEASURE ME (only if an EKF is added)
+IMU_ROLL_DEFAULT = 0.0       # MEASURE ME (only if an EKF is added)
+IMU_PITCH_DEFAULT = 0.0      # MEASURE ME (only if an EKF is added)
+IMU_YAW_DEFAULT = 0.0        # MEASURE ME (only if an EKF is added)
+
+# The exact placeholder tuple, used by require_measured to tell "the operator
+# supplied a number that happens to be zero" apart from "the operator supplied
+# nothing at all". Only the laser is checked: it is the only frame SLAM and the
+# costmaps actually consume.
+_LASER_PLACEHOLDER = (
+    LASER_X_DEFAULT, LASER_Y_DEFAULT, LASER_Z_DEFAULT,
+    LASER_ROLL_DEFAULT, LASER_PITCH_DEFAULT, LASER_YAW_DEFAULT,
+)
+
+# 1 degree of mount yaw over this lever arm, in millimetres. R2_COORDINATES.md
+# section 4.5. Printed in the banner so the cost of skipping the measurement is
+# on screen rather than in a document nobody opens.
+_YAW_LEVER_ARM_M = 0.6
 
 
 def _enforce_domain_id():
@@ -201,34 +289,191 @@ def _static_tf_node(name, parent, child, x, y, z, roll, pitch, yaw):
     )
 
 
-def generate_launch_description():
-    _enforce_domain_id()
+def _f(context, name):
+    """Resolve one launch argument to a float, with a legible error."""
+    raw = LaunchConfiguration(name).perform(context)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            "refuse: launch argument %s=%r is not a number. Offsets are in "
+            "METRES and angles in RADIANS - if you measured 12 degrees, pass "
+            "0.2094, not 12." % (name, raw))
 
-    footprint_to_base = _static_tf_node(
-        "fpms_tf_base_footprint_to_base_link",
-        BASE_FOOTPRINT, BASE_LINK,
-        BASE_LINK_X_M, BASE_LINK_Y_M, BASE_LINK_Z_M,
-        0.0, 0.0, BASE_LINK_YAW_RAD,
-    )
 
-    base_to_laser = _static_tf_node(
-        "fpms_tf_base_link_to_laser_frame",
-        BASE_LINK, LASER_FRAME,
-        LASER_X_OFFSET_M, LASER_Y_OFFSET_M, LASER_Z_OFFSET_M,
-        0.0, 0.0, LASER_YAW_RAD,
-    )
+def _b(context, name):
+    """Resolve one launch argument to a bool the way ros2 launch users type it."""
+    raw = str(LaunchConfiguration(name).perform(context)).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(
+        "refuse: launch argument %s=%r is not a boolean (true/false)."
+        % (name, raw))
 
-    base_to_imu = _static_tf_node(
-        "fpms_tf_base_link_to_imu_frame",
-        BASE_LINK, IMU_FRAME,
-        IMU_X_OFFSET_M, IMU_Y_OFFSET_M, IMU_Z_OFFSET_M,
-        IMU_ROLL_RAD, IMU_PITCH_RAD, IMU_YAW_RAD,
-    )
+
+def _launch_setup(context, *_args, **_kwargs):
+    """Resolve arguments, shout about unmeasured ones, then build the nodes.
+
+    This is an OpaqueFunction rather than plain Node actions because the
+    banner has to contain the ACTUAL numbers in use. A warning that says
+    "offsets may be placeholders" is ignorable; one that prints
+    `laser_yaw = 0.0 rad (PLACEHOLDER, = 0.0 mm of bias you have not
+    measured)` is not.
+    """
+    lx = _f(context, "laser_x")
+    ly = _f(context, "laser_y")
+    lz = _f(context, "laser_z")
+    lroll = _f(context, "laser_roll")
+    lpitch = _f(context, "laser_pitch")
+    lyaw = _f(context, "laser_yaw")
+
+    ix = _f(context, "imu_x")
+    iy = _f(context, "imu_y")
+    iz = _f(context, "imu_z")
+    iroll = _f(context, "imu_roll")
+    ipitch = _f(context, "imu_pitch")
+    iyaw = _f(context, "imu_yaw")
+
+    measured = _b(context, "measured")
+    require_measured = _b(context, "require_measured")
+
+    laser = (lx, ly, lz, lroll, lpitch, lyaw)
+    still_placeholder = laser == _LASER_PLACEHOLDER
+
+    if require_measured and (still_placeholder or not measured):
+        raise SystemExit(
+            "refuse: require_measured:=true but the base_link -> laser_frame "
+            "offsets are still the unmeasured placeholders "
+            "(x=%g y=%g z=%g roll=%g pitch=%g yaw=%g, measured:=%s).\n"
+            "        Measure them - see the module docstring of "
+            "nav2/fpms_tf.launch.py - then pass them as launch arguments and "
+            "add measured:=true.\n"
+            "        This guard exists because a map built on guessed offsets "
+            "looks fine and is wrong, and you will trust it for weeks."
+            % (lx, ly, lz, lroll, lpitch, lyaw, measured))
+
+    if still_placeholder or not measured:
+        print(
+            "\n"
+            "################################################################\n"
+            "#  fpms_tf.launch.py: LiDAR MOUNT OFFSETS ARE UNMEASURED       #\n"
+            "################################################################\n"
+            "  base_link -> laser_frame  x=%.4f y=%.4f z=%.4f m\n"
+            "                            roll=%.5f pitch=%.5f yaw=%.5f rad\n"
+            "  Nobody has put a ruler on this robot. Every map, costmap and\n"
+            "  pose produced with these numbers inherits the error.\n"
+            "  1 deg of mount yaw = %.1f mm of position error over a %.2f m\n"
+            "  lever arm (R2_COORDINATES.md 4.5).\n"
+            "  Measure, then pass laser_x/y/z/roll/pitch/yaw and measured:=true.\n"
+            "  Use require_measured:=true to make this an error, not a notice.\n"
+            "################################################################\n"
+            % (lx, ly, lz, lroll, lpitch, lyaw,
+               1000.0 * _YAW_LEVER_ARM_M * (3.14159265358979 / 180.0),
+               _YAW_LEVER_ARM_M))
+    else:
+        print("fpms_tf.launch.py: base_link -> laser_frame offsets declared "
+              "MEASURED: x=%.4f y=%.4f z=%.4f m, roll=%.5f pitch=%.5f "
+              "yaw=%.5f rad" % (lx, ly, lz, lroll, lpitch, lyaw))
+
+    if (ix, iy, iz, iroll, ipitch, iyaw) != (
+            IMU_X_DEFAULT, IMU_Y_DEFAULT, IMU_Z_DEFAULT,
+            IMU_ROLL_DEFAULT, IMU_PITCH_DEFAULT, IMU_YAW_DEFAULT):
+        print("fpms_tf.launch.py: non-default IMU offsets supplied "
+              "(x=%.4f y=%.4f z=%.4f roll=%.5f pitch=%.5f yaw=%.5f)"
+              % (ix, iy, iz, iroll, ipitch, iyaw))
 
     print("fpms_tf.launch.py: publishing base_footprint->base_link->"
           "laser_frame and base_link->imu_frame as STATIC transforms. "
-          "laser/imu offsets are UNMEASURED PLACEHOLDERS - see this file's "
-          "module docstring before trusting any map. odom->base_footprint "
-          "is NOT published here (fpms_odom_tf.py owns it).")
+          "odom->base_footprint is NOT published here (fpms_odom_tf.py owns "
+          "it) and map->odom is NOT published here (slam_toolbox owns it).")
 
-    return LaunchDescription([footprint_to_base, base_to_laser, base_to_imu])
+    return [
+        _static_tf_node(
+            "fpms_tf_base_footprint_to_base_link",
+            BASE_FOOTPRINT, BASE_LINK,
+            BASE_LINK_X_M, BASE_LINK_Y_M, BASE_LINK_Z_M,
+            0.0, 0.0, BASE_LINK_YAW_RAD,
+        ),
+        _static_tf_node(
+            "fpms_tf_base_link_to_laser_frame",
+            BASE_LINK, LASER_FRAME,
+            lx, ly, lz, lroll, lpitch, lyaw,
+        ),
+        _static_tf_node(
+            "fpms_tf_base_link_to_imu_frame",
+            BASE_LINK, IMU_FRAME,
+            ix, iy, iz, iroll, ipitch, iyaw,
+        ),
+    ]
+
+
+def generate_launch_description():
+    _enforce_domain_id()
+
+    declare = [
+        DeclareLaunchArgument(
+            "laser_x", default_value=str(LASER_X_DEFAULT),
+            description="base_link -> laser_frame X in METRES, +forward. "
+                        "UNMEASURED PLACEHOLDER by default."),
+        DeclareLaunchArgument(
+            "laser_y", default_value=str(LASER_Y_DEFAULT),
+            description="base_link -> laser_frame Y in METRES, +left. "
+                        "UNMEASURED PLACEHOLDER by default."),
+        DeclareLaunchArgument(
+            "laser_z", default_value=str(LASER_Z_DEFAULT),
+            description="base_link -> laser_frame Z in METRES, +up, measured "
+                        "from 35 mm above the floor. UNMEASURED PLACEHOLDER."),
+        DeclareLaunchArgument(
+            "laser_roll", default_value=str(LASER_ROLL_DEFAULT),
+            description="LiDAR mount roll in RADIANS. Non-zero tilts the scan "
+                        "plane; see the floor-strike arithmetic in the "
+                        "module docstring."),
+        DeclareLaunchArgument(
+            "laser_pitch", default_value=str(LASER_PITCH_DEFAULT),
+            description="LiDAR mount pitch in RADIANS. 1-2 degrees of "
+                        "downward pitch puts the far half of every scan into "
+                        "the floor. UNMEASURED PLACEHOLDER."),
+        DeclareLaunchArgument(
+            "laser_yaw", default_value=str(LASER_YAW_DEFAULT),
+            description="LiDAR mount yaw in RADIANS. THE CRITICAL ONE: 1 "
+                        "degree = ~10.5 mm of position error. Correct mount "
+                        "yaw HERE, not in fpms_lidar_ros.py's "
+                        "LIDAR_ZERO_OFFSET_DEG - never both."),
+        DeclareLaunchArgument(
+            "imu_x", default_value=str(IMU_X_DEFAULT),
+            description="base_link -> imu_frame X in METRES. Only matters if "
+                        "a robot_localization EKF is added."),
+        DeclareLaunchArgument(
+            "imu_y", default_value=str(IMU_Y_DEFAULT),
+            description="base_link -> imu_frame Y in METRES."),
+        DeclareLaunchArgument(
+            "imu_z", default_value=str(IMU_Z_DEFAULT),
+            description="base_link -> imu_frame Z in METRES."),
+        DeclareLaunchArgument(
+            "imu_roll", default_value=str(IMU_ROLL_DEFAULT),
+            description="IMU mount roll in RADIANS."),
+        DeclareLaunchArgument(
+            "imu_pitch", default_value=str(IMU_PITCH_DEFAULT),
+            description="IMU mount pitch in RADIANS."),
+        DeclareLaunchArgument(
+            "imu_yaw", default_value=str(IMU_YAW_DEFAULT),
+            description="IMU mount yaw in RADIANS."),
+        DeclareLaunchArgument(
+            "measured", default_value="false",
+            description="Set true ONLY after physically measuring the laser "
+                        "offsets. It suppresses the unmeasured banner - it "
+                        "does not change any transform."),
+        DeclareLaunchArgument(
+            "require_measured", default_value="false",
+            description="Set true to REFUSE to launch while the laser "
+                        "offsets are still the placeholders. Use this for the "
+                        "mapping run."),
+    ]
+
+    ld = LaunchDescription()
+    for a in declare:
+        ld.add_action(a)
+    ld.add_action(OpaqueFunction(function=_launch_setup))
+    return ld

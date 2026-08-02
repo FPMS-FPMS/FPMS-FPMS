@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChannel } from "./ws";
 import { apiPostJson } from "./api";
 
@@ -266,6 +266,25 @@ export type PlanWaypoint = {
   dock?: boolean;
 };
 
+/**
+ * One leg of a planned route — a target the rover drives to and holds at,
+ * as opposed to one turn/drive SEGMENT within a leg.
+ *
+ * Read off `leg_meta` in fpms_missions._preview. `label` is the rover's own
+ * plain-English name for the corner; it is shown next to the mission id rather
+ * than instead of it, because the two disagree by design.
+ */
+export type PlanLeg = {
+  i: number | null;
+  name: string | null;
+  label: string | null;
+  x_mm: number | null;
+  y_mm: number | null;
+  finalHeadingDeg: number | null;
+  segments: number | null;
+  distanceMm: number | null;
+};
+
 export type MissionPlan = {
   mission: string | null;
   backend: string | null;
@@ -277,6 +296,24 @@ export type MissionPlan = {
   /** Publish time, epoch seconds. Used as the plan's identity for dismissal. */
   ts: number | null;
   waypoints: PlanWaypoint[] | null;
+  /** Ordered targets. A single-target mission has one; `patrol` has three. */
+  legs: PlanLeg[] | null;
+  legsN: number | null;
+  /** The executor's own prose description of the route, when it sends one. */
+  routeText: string | null;
+  /** "retrace" | "none" — how the executor intends to get back. */
+  returnStrategy: string | null;
+  /**
+   * The pose the route was planned FROM. Load-bearing for the follow gate: a
+   * plan is only a description of what will happen if the rover is still where
+   * it was when the plan was made.
+   */
+  fromX: number | null;
+  fromY: number | null;
+  fromHeadingDeg: number | null;
+  /** Final target of the route, arena mm. */
+  targetX: number | null;
+  targetY: number | null;
 };
 
 /**
@@ -302,6 +339,20 @@ export function readPlan(env: unknown): MissionPlan | null {
           dock: w.dock === true,
         }))
     : null;
+  const legs: PlanLeg[] | null = Array.isArray(raw.legs)
+    ? raw.legs.map((l: any) => ({
+        i: num(l?.i),
+        name: text(l?.name),
+        label: text(l?.label),
+        x_mm: num(l?.x_mm),
+        y_mm: num(l?.y_mm),
+        finalHeadingDeg: num(l?.final_heading_deg),
+        segments: num(l?.segments),
+        distanceMm: num(l?.distance_mm),
+      }))
+    : null;
+  const from = raw.from && typeof raw.from === "object" ? raw.from : {};
+  const tgt = raw.target && typeof raw.target === "object" ? raw.target : {};
   return {
     mission: text(raw.mission),
     backend: text(raw.backend),
@@ -312,7 +363,218 @@ export function readPlan(env: unknown): MissionPlan | null {
     poseAssumed: raw.pose_assumed === true,
     ts: num((env as any)?.ts),
     waypoints: wps && wps.length ? wps : null,
+    legs: legs && legs.length ? legs : null,
+    legsN: num(raw.legs_n) ?? (legs && legs.length ? legs.length : null),
+    routeText: text(raw.route),
+    returnStrategy: text(raw.return_strategy),
+    fromX: num(from.x_mm),
+    fromY: num(from.y_mm),
+    fromHeadingDeg: num(from.heading_deg),
+    targetX: num(tgt.x_mm),
+    targetY: num(tgt.y_mm),
   };
+}
+
+/* -------------------------------------------------------------------- arming
+ *
+ * THE ARM GATE IS THIS DASHBOARD'S, NOT THE ROVER'S.
+ *
+ * Nothing on the rover has an arm concept: fpms_missions accepts a `mission`
+ * from any client that can reach the broker, and fpms_teleop accepts `jog`,
+ * `nudge`, `turn` and `test_motors` the same way. There is no interlock in the
+ * firmware, none in micro-ROS, and none in the MQTT bridge.
+ *
+ * So this is a gate on the SENDER. It stops the mission console from putting a
+ * motion command on the wire until the operator has said, in a separate and
+ * deliberate act, that the arena is clear. That is worth having — every
+ * wrong-corner and rover-off-the-bench incident on this project began with a
+ * single click — but it must never be described as a safety system on the
+ * machine, because a second browser tab, the Drive page or a `mosquitto_pub`
+ * will drive this rover while the console says DISARMED.
+ *
+ * The one control that ignores the gate entirely is ABORT: see
+ * MISSION_ABORT_ACTION.
+ */
+export const MISSION_ARM_NOTE =
+  "ARM is enforced by this dashboard, not by the rover. The firmware has no " +
+  "arm concept — fpms-missions and fpms-teleop accept commands from any " +
+  "client whether or not this console says ARMED. Disarming blocks THIS " +
+  "page's motion buttons; it does not immobilise the machine, and it does not " +
+  "stop a mission already running. Use ABORT for that.";
+
+/**
+ * How long a previewed route stays good enough to follow.
+ *
+ * A plan is computed from the pose the rover had at preview time. Pose here is
+ * dead-reckoned and drifts, and the rover may have been nudged, re-zeroed or
+ * driven from another tab in the meantime, so an old plan describes a route
+ * from somewhere the rover no longer is. Three minutes is long enough to read
+ * the route and walk the arena, short enough that a plan from before a coffee
+ * break cannot be followed by accident.
+ */
+export const PLAN_MAX_AGE_MS = 180_000;
+
+/**
+ * How long to wait for a preview before saying it never came back.
+ *
+ * The executor answers a preview in well under a second when it is running;
+ * this timeout exists to distinguish "planning" from "nothing is listening",
+ * which are states an operator must never have to guess between.
+ */
+export const PLAN_WAIT_MS = 8000;
+
+/* ------------------------------------------------------------ encoder read */
+
+/**
+ * The answer to `read_encoders`.
+ *
+ * NAMED FOR WHAT THE BOARD ACTUALLY HAS. The Yahboom MicroROS Board V2.0
+ * publishes an integrated pose and a twist on /odom_raw and nothing else — no
+ * /wheel_ticks, no joint_states, no per-wheel counters. `ticksAvailable` is
+ * therefore false on this rover and `ticksLeft`/`ticksRight` stay null; they
+ * are kept in the shape so that a board which DOES publish counts is rendered
+ * rather than ignored, and so that a consumer cannot mistake a pose for a tick
+ * count. Every numeric field is `number | null` for the usual reason.
+ */
+export type EncoderReading = {
+  ok: boolean | null;
+  ticksAvailable: boolean;
+  ticksLeft: number | null;
+  ticksRight: number | null;
+  sourceTopic: string | null;
+  note: string | null;
+  xM: number | null;
+  yM: number | null;
+  headingDeg: number | null;
+  arenaXmm: number | null;
+  arenaYmm: number | null;
+  twistLinMps: number | null;
+  twistAngRadps: number | null;
+  groundSpeedMps: number | null;
+  gyroZRadps: number | null;
+  yawIntegratedDeg: number | null;
+  frames: number | null;
+  hz: number | null;
+  ageS: number | null;
+  stale: boolean | null;
+  rosOk: boolean | null;
+};
+
+export function readEncoders(data: unknown): EncoderReading | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, any>;
+  const pose = d.pose && typeof d.pose === "object" ? d.pose : {};
+  const arena = d.arena_mm && typeof d.arena_mm === "object" ? d.arena_mm : {};
+  const twist = d.twist && typeof d.twist === "object" ? d.twist : {};
+  const derived = d.derived && typeof d.derived === "object" ? d.derived : {};
+  return {
+    ok: typeof d.ok === "boolean" ? d.ok : null,
+    // Absent means "this reply does not claim ticks exist", which is the same
+    // operational fact as false. It is never defaulted to true.
+    ticksAvailable: d.ticks_available === true,
+    ticksLeft: num(d.ticks_left),
+    ticksRight: num(d.ticks_right),
+    sourceTopic: text(d.source_topic),
+    note: text(d.note),
+    xM: num(pose.x_m),
+    yM: num(pose.y_m),
+    headingDeg: num(pose.heading_deg),
+    arenaXmm: num(arena.x_mm),
+    arenaYmm: num(arena.y_mm),
+    twistLinMps: num(twist.linear_x_mps),
+    twistAngRadps: num(twist.angular_z_radps),
+    groundSpeedMps: num(derived.ground_speed_mps),
+    gyroZRadps: num(derived.gyro_z_radps),
+    yawIntegratedDeg: num(derived.yaw_integrated_deg),
+    frames: num(d.odom_frames_since_boot),
+    hz: num(d.odom_hz),
+    ageS: num(d.odom_age_s),
+    stale: typeof d.stale === "boolean" ? d.stale : null,
+    rosOk: typeof d.ros_ok === "boolean" ? d.ros_ok : null,
+  };
+}
+
+/* ------------------------------------------------------------ event replies */
+
+/** One event off `fpms/<thing>/events/<subtype>`, normalised. */
+export type RoverEvent = {
+  subtype: string;
+  action: string | null;
+  name: string | null;
+  preview: boolean;
+  accepted: boolean | null;
+  error: string | null;
+  at: number;
+  data: Record<string, unknown>;
+};
+
+export type RoverEventFeed = {
+  /** Last accepted reply. For a preview, `preview` is true and nothing moved. */
+  ack: RoverEvent | null;
+  /** Last refusal, carrying the executor's own reason string. */
+  nack: RoverEvent | null;
+  /** Last events/mission_done — the MEASURED outcome, not the requested one. */
+  done: RoverEvent | null;
+  /** Last read_encoders reply, already parsed. */
+  encoders: { at: number; reading: EncoderReading | null } | null;
+};
+
+const EMPTY_EVENTS: RoverEventFeed = {
+  ack: null, nack: null, done: null, encoders: null,
+};
+
+/**
+ * The rover's replies, for one thing.
+ *
+ * All events share ONE bridge channel ("events", from `fpms/+/events/#`), so a
+ * consumer that just reads the channel's latest envelope sees whichever event
+ * happened last and loses the one it was waiting for. This keeps the newest of
+ * each KIND instead, filtered to the selected rover: a preview refusal stays on
+ * screen while telemetry keeps flowing behind it.
+ *
+ * Messages are consumed by counter rather than by value so a repeated identical
+ * reply — press PLAN twice, get the same ack twice — still registers as new.
+ */
+export function useRoverEvents(thing: string | null): RoverEventFeed {
+  const ch = useChannel<any>("events");
+  const [feed, setFeed] = useState<RoverEventFeed>(EMPTY_EVENTS);
+  const seenRef = useRef(0);
+
+  // A different rover's replies are not this rover's. Clearing on switch stops
+  // a stale refusal from being read as the new selection's answer.
+  useEffect(() => {
+    seenRef.current = 0;
+    setFeed(EMPTY_EVENTS);
+  }, [thing]);
+
+  useEffect(() => {
+    if (!thing) return;
+    if (ch.messages === seenRef.current) return;
+    seenRef.current = ch.messages;
+    const env = ch.data as Record<string, any> | null;
+    if (!env || env.thing !== thing) return;
+    const subtype = typeof env.subtype === "string" ? env.subtype : "";
+    const data = readEnvelope(env) ?? {};
+    const d = data as Record<string, any>;
+    const ev: RoverEvent = {
+      subtype,
+      action: text(d.action),
+      name: text(d.name),
+      preview: d.preview === true,
+      accepted: typeof d.accepted === "boolean" ? d.accepted : null,
+      error: text(d.error) ?? text(d.reason),
+      at: Date.now(),
+      data,
+    };
+    if (subtype === "ack") setFeed((f) => ({ ...f, ack: ev }));
+    else if (subtype === "nack") setFeed((f) => ({ ...f, nack: ev }));
+    else if (subtype === "mission_done") setFeed((f) => ({ ...f, done: ev }));
+    else if (subtype === "encoders") {
+      setFeed((f) => ({ ...f, encoders: { at: ev.at, reading: readEncoders(data) } }));
+    }
+  }, [ch.messages, ch.data, thing]);
+
+  return feed;
 }
 
 /**

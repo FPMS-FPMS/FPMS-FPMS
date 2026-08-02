@@ -1,0 +1,312 @@
+# =============================================================================
+# nav2_params_slam.yaml
+#
+# OVERLAY on nav2_params.yaml, for running Nav2 against a slam_toolbox map of
+# the REAL ROOM instead of a hand-authored 1200 x 1200 mm arena grid.
+#
+# It is loaded AFTER nav2_params.yaml by nav2/fpms_nav2.launch.py when
+# `localization_mode:=slam`. ROS 2 merges parameter files in order and later
+# files win, so this file contains ONLY the values that change. Everything not
+# mentioned here - robot_radius, the goal checkers, the RPP speed derivation,
+# the behavior server - is inherited unchanged, and its derivation stays in one
+# place instead of being copy-pasted and then drifting.
+#
+# -----------------------------------------------------------------------------
+# WHY AN OVERLAY EXISTS AT ALL: THE WORLD CHANGED
+# -----------------------------------------------------------------------------
+# nav2_params.yaml is derived, carefully, for a 1200 x 1200 mm walled box with
+# a known static map. The rover is not in one. A live scan sample returns 350
+# of 360 bins with min 0.861 m, median 1.983 m, max 6.000 m: a real room
+# several metres across, feature-rich, with at least one sightline past 6 m.
+#
+# Three numbers in the base file are derived FROM the arena assumption and are
+# actively wrong once it is dropped:
+#   * obstacle_max_range 1.80 / raytrace_max_range 2.00 - explicitly chosen to
+#     discard "the room OUTSIDE the arena". The room is now the world; those
+#     clips would throw away three quarters of the sensor.
+#   * local_costmap 0.9 x 0.9 m - sized so a rolling window would not exceed a
+#     1.2 m world. Too small to hold an obstacle 2 m away.
+#   * global_costmap resolution 0.01 - chosen to match arena_map.yaml. The SLAM
+#     map is 0.03, and the static layer resizes the master grid to whatever the
+#     incoming map is, so 0.01 here is a value that does not survive contact.
+#
+# -----------------------------------------------------------------------------
+# EVERYTHING BELOW IS DERIVED. NOTHING IS COPIED FROM AN UPSTREAM PARAM SET.
+# -----------------------------------------------------------------------------
+# R1_AUTONOMY.md 2.1 established that upstream Nav2 defaults (robot_radius 0.22,
+# inflation_radius 0.55) inflate a small space into a single obstacle, and 2.2
+# established that no published Nav2 param set exists below room scale -
+# TurtleBot3 Burger, built for a 0.1 m-radius robot, still ships
+# inflation_radius 0.5. So there is nothing to copy. The arithmetic for each
+# value is shown inline. Treat these as a starting point requiring bench
+# validation, not as citations.
+#
+# =============================================================================
+# TWIST SIGN - READ THIS BEFORE ADDING ANY NODE THAT CONSUMES ODOMETRY
+# =============================================================================
+# NAV2_BRIEF.md 3a: /odom_raw's twist.linear.x is SIGN-INVERTED relative to its
+# own pose.position. Measured, wheels-off: commanded +0.012 reported twist
+# -0.842 while pose moved +1.395.
+#
+# WHERE THE CORRECTION ALREADY LIVES
+#   fpms_odom_tf.py is the single point of correction. It takes translation
+#   from POSE deltas (never from twist), and it republishes a corrected twist:
+#
+#       self._last_linear_v = ODOM_TWIST_SIGN * tx      # fpms_odom_tf.py:1848
+#
+#   on the topic `/odom`, with `ODOM_TWIST_SIGN = -1` at line 387. So `/odom`
+#   is safe to consume and `/odom_raw` is not. No additional republisher node
+#   needs to be written. What DOES need to happen is that fpms_odom_tf.py is
+#   actually installed and running - NAV2_BRIEF.md 5 records it as "authored,
+#   NOT yet installed", and its service file exists but is not enabled. Until
+#   it runs there is no /odom, no odom -> base_footprint, and therefore no SLAM.
+#
+# WHAT MUST CONSUME WHAT
+#   slam_toolbox        IMMUNE. It reads the TF odom -> base_footprint and the
+#                       scan. It subscribes to no odometry message at all.
+#   controller_server   Humble hard-codes its OdomSmoother onto the relative
+#   behavior_server     topic `odom`, which resolves to `/odom` in the root
+#                       namespace - i.e. correct BY DEFAULT, but by accident
+#                       rather than by declaration. fpms_nav2.launch.py now
+#                       remaps `odom` -> `/odom` explicitly so the correctness
+#                       survives anyone adding a namespace. Note that Humble's
+#                       controller_server has NO `odom_topic` parameter (that
+#                       arrived in Iron); setting one here would be silently
+#                       ignored, which is why there isn't one below.
+#   bt_navigator        Has a real `odom_topic` parameter. Already `/odom` in
+#                       nav2_params.yaml. Re-asserted below so a reader of this
+#                       file does not have to go and check.
+#   robot_localization  NOT RUN, and should not be. R2_COORDINATES.md 7.8 puts
+#                       its contribution at ~0 mm of absolute accuracy here. If
+#                       one is ever added it must be fed /odom, never
+#                       /odom_raw - an EKF fed the raw twist integrates the
+#                       motion backwards.
+#   anything new        Subscribe to /odom. If you think you need /odom_raw,
+#                       you need fpms_odom_tf.py instead.
+#
+# THE SIGN IS FIXED. THE SCALE IS NOT.
+#   /odom's twist has the right SIGN but an unverified MAGNITUDE: the board
+#   passes linear.x through "with no gain" yet commanding 0.10 produces ~0.61
+#   m/s actual, about 6x (NAV2_BRIEF.md 3b). So any parameter that thresholds a
+#   reported velocity is thresholding an uncalibrated number. This is why
+#   nav2_params.yaml uses SimpleGoalChecker (position only) and not
+#   StoppedGoalChecker (position AND reported velocity) - StoppedGoalChecker
+#   would be the better primitive for a segment-and-settle chassis, and it
+#   becomes usable the moment somebody measures the velocity scale. Do not
+#   switch to it before then.
+# =============================================================================
+
+# =============================================================================
+# LOCAL COSTMAP
+# =============================================================================
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      # SIZE DERIVATION, redone for a room.
+      # The rolling window must contain the pure-pursuit carrot plus the
+      # inflation band around it, or RPP steers at a point off the edge of its
+      # own costmap and the collision check sees free space where it cannot
+      # see at all:
+      #     required half-window = lookahead_dist (0.25) + inflation_radius (0.30)
+      #                          = 0.55 m  ->  1.10 m minimum window
+      # 2.0 m is that with ~2x margin, and it also means an obstacle enters the
+      # window about 5 s before the rover reaches it at the 0.18 m/s cruise -
+      # enough time for a burst-and-stop chassis to actually do something about
+      # it. The base file's 0.9 m was sized so the window would not exceed a
+      # 1.2 m world; there is no such ceiling now.
+      # Cost: 2.0 / 0.03 = 67 x 67 = 4489 cells at 5 Hz. Nothing.
+      width: 2.0
+      height: 2.0
+
+      # Was 0.01, to match a hand-drawn arena grid. 0.03 matches the SLAM map
+      # (slam/mapper_params_mapping.yaml `resolution`), which in turn is
+      # derived from the sensor: 1 degree of arc at the room's 1.98 m median
+      # range is 0.035 m, and single-shot range accuracy is ~+/-15 mm, so the
+      # LiDAR cannot resolve structure finer than ~30 mm at typical range.
+      # Keeping local and global at the same resolution also means an obstacle
+      # does not change shape as it crosses between them.
+      resolution: 0.03
+
+      obstacle_layer:
+        scan:
+          # The base file clips marking at 1.80 m and clearing at 2.00 m,
+          # explicitly to discard "the room OUTSIDE the arena". That reasoning
+          # died with the arena.
+          #
+          # marking at 4.0 m: comfortably past the 1.0 m half-window, so
+          # nothing inside the local costmap is ever un-markable. Not taken all
+          # the way to the sensor limit because a return at 5.5 m has a 96 mm
+          # angular footprint (5.5 m x 1 degree) and inherits the full pose
+          # uncertainty of a robot that will not arrive there for 30 s - marking
+          # it early buys smear, not safety.
+          # clearing at 5.5 m: matches slam_toolbox's max_laser_range. Clearing
+          # should always reach at least as far as marking, or an obstacle
+          # marked at 4 m can never be raytraced away once it leaves.
+          obstacle_max_range: 4.0
+          raytrace_max_range: 5.5
+
+      inflation_layer:
+        # INFLATION, re-derived for a room. Nav2's default is 0.55 m; the base
+        # file uses 0.20 m because four walls 1.2 m apart left no room for
+        # anything larger. Neither constraint applies now.
+        #
+        # 0.30 m = 2 x robot_radius. Consequences, stated so they can be
+        # checked against the actual room:
+        #   * a gap narrower than 2 x robot_radius = 0.30 m is impassable
+        #     (lethal), which is physically true and not a tuning choice;
+        #   * a gap narrower than 2 x inflation_radius = 0.60 m has no
+        #     zero-cost cell down its centre, so the planner will route around
+        #     it if any alternative exists, and squeeze through only if none
+        #     does. For a room, 0.60 m is the right threshold: it is about the
+        #     width of a chair gap.
+        # The live scan's minimum return is 0.861 m, so the rover is not
+        # currently in anything tighter than this permits.
+        inflation_radius: 0.30
+
+        # The gradient band is inflation_radius - inscribed_radius
+        # = 0.30 - 0.15 = 0.15 m, three times wider than the base file's
+        # 0.05 m band, so it does not need the base file's very steep 10.0.
+        # Nav2's inflation cost decays as exp(-factor * (d - inscribed_radius)):
+        #     factor 8.0, d = 0.30  ->  exp(-8.0 * 0.15) = 0.30
+        # i.e. cost has fallen to ~30% (about 76 of 252) by the outer edge
+        # before stepping to zero. A step that small does not make the planner
+        # hug the inflation boundary, which is what a shallow factor (Nav2's
+        # 3.0 leaves ~64% at the edge) actually causes.
+        # MUST STAY EQUAL to FollowPath/inflation_cost_scaling_factor below.
+        cost_scaling_factor: 8.0
+
+# =============================================================================
+# GLOBAL COSTMAP
+# =============================================================================
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      # global_frame stays `map`, robot_base_frame stays `base_footprint`, both
+      # inherited. The difference from the base file is WHO publishes map ->
+      # odom: slam_toolbox, not AMCL. Nav2 cannot tell and does not need to.
+
+      # MUST equal slam_toolbox's `resolution`. Nav2's StaticLayer calls
+      # resizeMap() on the master grid to match the incoming map whenever the
+      # costmap is not rolling, so a mismatch here does not error - it is
+      # silently overwritten, and every other value derived from resolution
+      # (inflation cell counts, planner grid) quietly refers to a grid that no
+      # longer exists. Setting it correctly makes the file honest.
+      resolution: 0.03
+
+      # Fallback extent only - overridden the moment slam_toolbox's /map
+      # arrives. The base file's 2 x 2 m was sized for a 1.2 m arena and would
+      # be far too small for the seconds before the map lands, during which the
+      # global costmap is what the planner sees. 10 x 10 m centred on the odom
+      # origin covers a room with a 6 m sightline.
+      width: 10
+      height: 10
+      origin_x: -5.0
+      origin_y: -5.0
+
+      # Was 1.0 Hz, on the reasoning that "the arena is static and known".
+      # A real room is neither. 2 Hz still costs almost nothing at 0.03 m
+      # resolution and lets a global replan see furniture that moved.
+      update_frequency: 2.0
+      publish_frequency: 1.0
+
+      static_layer:
+        # slam_toolbox publishes /map with transient-local (latched) durability
+        # and republishes it only every map_update_interval. Without this, a
+        # costmap that connects between publications waits - during mapping
+        # that is 1 s, during localisation 5 s, and the symptom is a global
+        # costmap that is empty for exactly as long as it takes the operator to
+        # start blaming SLAM. Already true in the base file; re-asserted because
+        # it is load-bearing for the SLAM path specifically.
+        map_subscribe_transient_local: true
+
+      obstacle_layer:
+        scan:
+          # Same derivation as the local costmap. All copies of these ranges
+          # must agree - there are two in the base file and two here.
+          obstacle_max_range: 4.0
+          raytrace_max_range: 5.5
+
+      inflation_layer:
+        # Identical to the local costmap, and that is deliberate: a plan the
+        # global costmap considers cheap and the local costmap considers
+        # near-lethal is a plan the controller will fight the planner over.
+        inflation_radius: 0.30
+        cost_scaling_factor: 8.0
+
+# =============================================================================
+# CONTROLLER SERVER
+# =============================================================================
+controller_server:
+  ros__parameters:
+    progress_checker:
+      # Base file: 10.0 s to move required_movement_radius (0.10 m). That was
+      # sized for a 1.2 m arena where every path is short. In a room, a leg can
+      # begin with a rotate-to-heading, and the waypoint follower's pause
+      # (waypoint_pause_duration) can land inside the window too. A burst-and-
+      # stop chassis (0.35 s pulses with settle time, NAV2_BRIEF.md 3b) that is
+      # working perfectly can easily spend 10 s covering less than 0.10 m.
+      # 20.0 s keeps the check meaningful - a rover that has moved less than
+      # 100 mm in 20 s is genuinely stuck - without false-triggering on the
+      # motion model the chassis actually has. R1_AUTONOMY.md 2.1 flags this
+      # exact parameter as one that "will false-trigger" here.
+      movement_time_allowance: 20.0
+
+    FollowPath:
+      # Base file: 1.8 m, justified as "the arena diagonal is 1.70 m, so this
+      # covers the whole world". A room is bigger than that, and if this is
+      # shorter than the path RPP can fail to find the closest pose on it at
+      # all. 6.0 m covers the sensor's own maximum sightline.
+      max_robot_pose_search_dist: 6.0
+
+      # MUST EQUAL inflation_layer/cost_scaling_factor above (8.0, was 10.0).
+      # RPP uses this to reconstruct distance-from-obstacle from a cost value
+      # for its cost-regulated speed scaling. If the two disagree, RPP's idea
+      # of how far away a wall is, is wrong by a factor it never checks.
+      inflation_cost_scaling_factor: 8.0
+
+# =============================================================================
+# BT NAVIGATOR
+# =============================================================================
+bt_navigator:
+  ros__parameters:
+    # Re-asserted, not changed. This is the one Nav2 node in Humble with a real
+    # `odom_topic` parameter, and it is the one place a reader can confirm from
+    # a params file that Nav2 is on the sign-corrected topic and not on
+    # /odom_raw. See the TWIST SIGN block at the top of this file.
+    odom_topic: /odom
+
+# =============================================================================
+# NOT OVERRIDDEN, AND WHY - the things a reader will look for and not find
+# =============================================================================
+# amcl:
+#     Not launched at all when localization_mode:=slam. slam_toolbox owns
+#     map -> odom and two publishers for that edge is a broken TF graph, the
+#     same rule TF_TREE.md applies to every other edge. Its configuration stays
+#     in nav2_params.yaml as a fallback path (localization_mode:=amcl), but
+#     R2_COORDINATES.md 4.4 puts published AMCL accuracy at 8.5 cm RMSE empty /
+#     33.7 cm cluttered, so it is a robustness fallback, not a precision one.
+#
+# map_server:
+#     Also not launched. slam_toolbox publishes /map itself, in both mapping
+#     and localization modes. Running map_server as well would put two
+#     publishers on /map and the static layer would take whichever arrived
+#     last.
+#
+# robot_radius (0.15):
+#     Inherited. Derived from ROVER_LEN_MM 240 / ROVER_WID_MM 180 as the
+#     CIRCUMSCRIBED radius sqrt(0.12^2 + 0.09^2) = 0.15, because the rover
+#     rotates in place. The base file flags an unresolved discrepancy: the task
+#     notes say ~230 mm wide, arena.ts says 180 mm. STILL UNMEASURED. If 230 is
+#     right this becomes 0.17 and every inflation number above shifts with it.
+#
+# desired_linear_vel (0.18) and the goal tolerances:
+#     Inherited unchanged. They are properties of the firmware's velocity
+#     quantisation (NAV2_BRIEF.md 3b), not of the room, so dropping the arena
+#     assumption does not touch them.
+#
+# planner_server/tolerance (0.05):
+#     Inherited. It is tight, and in a room with furniture a goal placed within
+#     0.05 m of an obstacle will simply fail to plan rather than silently
+#     ending half a metre short - which is the correct failure. Raise it only
+#     if real goals start being rejected, and say so when you do.
+# =============================================================================

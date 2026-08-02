@@ -1,0 +1,229 @@
+# =============================================================================
+# mapper_params_localization.yaml
+# slam_toolbox LOCALIZATION mode for the FPMS rover.
+#
+# Launched by slam/fpms_slam_localization.launch.py. This is what runs for
+# every mission after the room has been mapped once. It loads a serialised
+# pose graph, matches live scans against it, and publishes map -> odom. It
+# does NOT extend the map.
+#
+# Read mapper_params_mapping.yaml first - it carries the derivations for every
+# shared value and the measured facts about the plant. This file documents only
+# what DIFFERS and why, so the two do not drift apart through copy-paste.
+#
+# Baseline for the diffs: slam_toolbox's own config/mapper_params_localization.yaml
+# (humble branch, fetched 2026-08-02 from
+# https://raw.githubusercontent.com/SteveMacenski/slam_toolbox/humble/config/mapper_params_localization.yaml).
+#
+# -----------------------------------------------------------------------------
+# WHY slam_toolbox LOCALIZATION AND NOT AMCL
+# -----------------------------------------------------------------------------
+# AMCL is already configured in nav2/nav2_params.yaml and is a perfectly good
+# fallback, but its published translational accuracy is ~8.5 cm RMSE in an
+# empty environment and ~33.7 cm in a cluttered real office
+# (https://arxiv.org/pdf/2308.05443, cited in R2_COORDINATES.md 4.4). That is
+# an order of magnitude short of a centimetre target. slam_toolbox's
+# localization mode does correlative scan matching against the pose graph
+# rather than resampling a finite particle set over a rasterised grid, so its
+# resolution floor is correlation_search_space_resolution (1 cm here), not the
+# particle spread. Keep AMCL as the robustness fallback; do not use it as the
+# precision path.
+# =============================================================================
+
+slam_toolbox:
+  ros__parameters:
+
+    # -------------------------------------------------------------------------
+    # SOLVER - identical to mapping. See mapper_params_mapping.yaml.
+    # -------------------------------------------------------------------------
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: HuberLoss
+
+    # -------------------------------------------------------------------------
+    # FRAMES AND TOPICS - identical to mapping, and they MUST be. A localisation
+    # run whose base_frame differs from the mapping run's is silently offset by
+    # whatever base_footprint -> base_link is.
+    # -------------------------------------------------------------------------
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan_lidar
+
+    # THE mode SWITCH. With this set, slam_toolbox runs elastic pose-graph
+    # localization: new scans are matched against the deserialised graph and
+    # kept only in a short rolling buffer, so the map on disk is never
+    # modified and the graph does not grow without bound over a long mission.
+    mode: localization
+
+    # -------------------------------------------------------------------------
+    # THE MAP TO LOAD
+    # -------------------------------------------------------------------------
+    # NO FILE EXTENSION. slam_toolbox appends `.posegraph` and `.data` itself,
+    # so this must name a pair of files:
+    #     slam/maps/fpms_room.posegraph
+    #     slam/maps/fpms_room.data
+    # produced by the mapping run's `/slam_toolbox/serialize_map` service.
+    #
+    # This value is OVERWRITTEN at launch by fpms_slam_localization.launch.py's
+    # `map_name` argument, so that a params file checked into a public repo
+    # cannot carry an absolute path to some other machine's home directory.
+    # The value here is only the fallback when the launch file is bypassed.
+    map_file_name: maps/fpms_room
+
+    # Where the rover is, in MAP coordinates, at the moment this node starts.
+    # [x_metres, y_metres, yaw_radians].
+    #
+    # This is a REAL input, not a formality. slam_toolbox's localization mode
+    # does local correlative matching - it refines a pose, it does not solve the
+    # global kidnapped-robot problem. correlation_search_space_dimension below
+    # is 0.3 m, so a starting guess more than ~0.15 m out is outside the search
+    # window and the matcher will lock onto the wrong local minimum or fail to
+    # converge at all. In a room with repeated structure it can lock onto a
+    # wrong-but-plausible pose and report high confidence.
+    #
+    # [0.0, 0.0, 0.0] means "the rover is exactly where it was when the mapping
+    # run started". That is only true if it is physically put back there.
+    # THE OPERATOR MUST EITHER:
+    #   (a) mark the mapping run's start pose on the floor and put the rover
+    #       back on that mark before every mission, or
+    #   (b) pass the real start pose via the launch argument, or
+    #   (c) publish a 2D Pose Estimate in rviz2 on /initialpose after startup
+    #       and before commanding any motion.
+    # Overwritten by fpms_slam_localization.launch.py's `start_pose` argument.
+    map_start_pose: [0.0, 0.0, 0.0]
+
+    # -------------------------------------------------------------------------
+    # RATES AND TIMING
+    # -------------------------------------------------------------------------
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+
+    # upstream: 5.0. Kept. In localization mode the published /map is the
+    # loaded one and does not grow, so there is nothing to re-raster quickly.
+    # Nav2's static layer subscribes transient-local and gets it on connect.
+    map_update_interval: 5.0
+
+    # Must equal the mapping run's resolution. The deserialised graph carries
+    # its own geometry, but this value governs the raster published on /map,
+    # and a mismatch means Nav2's global costmap silently resizes itself to a
+    # different grid than the one the map was built on. See
+    # nav2/nav2_params_slam.yaml, which is set to 0.03 to agree.
+    resolution: 0.03
+
+    min_laser_range: 0.15
+    max_laser_range: 5.5
+
+    # upstream: 0.5. Same reasoning as the mapping config: a 0.35 s burst
+    # covering one ~0.063 m motion quantum must be able to produce a
+    # localisation update rather than being deferred past the end of the move.
+    minimum_time_interval: 0.2
+
+    # upstream: 0.2. Same MQTT reasoning as mapping - measured scan transport
+    # p90 179 ms, max 207 ms, so a 0.2 s timeout sits on the observed maximum
+    # and fires intermittently. 0.5 s clears it 2.4x.
+    transform_timeout: 0.5
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    # upstream: true in the mapping config. FALSE here: interactive mode exists
+    # so an operator can drag graph nodes to force loop closures during
+    # mapping. During a mission there is no operator and nothing should be able
+    # to hand-edit the pose graph. It also stops publishing a marker array for
+    # every node in the loaded map, which on a mission is pure overhead.
+    enable_interactive_mode: false
+
+    # -------------------------------------------------------------------------
+    # WHEN TO LOCALISE - tighter than mapping, and that is the point
+    # -------------------------------------------------------------------------
+    use_scan_matching: true
+    use_scan_barycenter: true
+
+    # upstream: 0.5. Tighter than the mapping config's 0.10, because the two
+    # are answering different questions. In mapping, a node is a permanent
+    # graph vertex and adding them too densely bloats the graph for no gain. In
+    # localization the "node" is a transient match that produces a map -> odom
+    # correction, and BETWEEN corrections the pose is pure dead reckoning off a
+    # skid-steer gyro. R2_COORDINATES.md 6a puts uncorrected dead reckoning at
+    # ~+/-40-75 mm RSS over a 1 m leg, so every centimetre of uncorrected
+    # travel is error we are choosing to accept.
+    # 0.05 m is just under one motion quantum (~0.063 m), so EVERY burst the
+    # chassis can physically produce triggers a correction. It is still ~50x
+    # the stationary pose noise of /odom_raw, so a parked rover does not
+    # accumulate its way into a spurious update.
+    minimum_travel_distance: 0.05
+
+    # upstream: 0.5 rad (28.6 deg). 0.10 rad = 5.7 degrees, i.e. a correction
+    # after roughly every commanded turn given the +/-1-4 degree per-turn error
+    # measured on this chassis (NAV2_BRIEF.md 5). Heading is the input we least
+    # trust, so it is the one we re-observe most often.
+    minimum_travel_heading: 0.10
+
+    # upstream: 3. This is the rolling window of recent scans localization mode
+    # keeps; it is what makes the mode "elastic" and it is what bounds memory
+    # over a long mission. 3 is very short - it throws away context after ~0.15 m
+    # of travel at our node spacing. 15 spans ~0.75 m, enough for the matcher to
+    # use recent structure as well as the loaded map, while still bounded.
+    # Do NOT raise this to the mapping config's 30: in localization mode the
+    # buffer is re-matched continuously, so its size is a per-update CPU cost
+    # rather than a one-off, and unlike mapping there is no benefit past the
+    # point where the loaded map dominates the evidence.
+    scan_buffer_size: 15
+    scan_buffer_maximum_scan_distance: 6.0
+
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # -------------------------------------------------------------------------
+    # LOOP CLOSURE - applies to the rolling buffer, not the loaded map
+    # -------------------------------------------------------------------------
+    do_loop_closing: true
+
+    # upstream localization config: 3 (vs 10 in the mapping config). Kept at 3:
+    # the rolling buffer is only 15 scans deep, so demanding a 10-node chain
+    # would mean closures almost never fire.
+    loop_match_minimum_chain_size: 3
+
+    # Same reasoning as mapping: in a small room a false closure folds the
+    # estimate rather than degrading it, and a missed one will be offered again
+    # a second later. Thresholds raised from upstream 0.35/0.45.
+    loop_search_maximum_distance: 1.5
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.45
+    loop_match_minimum_response_fine: 0.55
+
+    # -------------------------------------------------------------------------
+    # CORRELATION - identical to mapping. Derivations in that file.
+    # -------------------------------------------------------------------------
+    # 0.3 m window: >= 5x the worst plausible odometry error between updates,
+    # a quarter the search area of upstream's 0.5 m. Note the consequence
+    # spelled out under map_start_pose above: this window is also the capture
+    # range for the INITIAL pose, so a start-pose guess worse than ~0.15 m does
+    # not converge.
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.03
+
+    loop_search_space_dimension: 3.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # -------------------------------------------------------------------------
+    # SCAN MATCHER PENALTIES - upstream, on purpose. See mapper_params_mapping.yaml.
+    # -------------------------------------------------------------------------
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    min_pass_through: 2
+    occupancy_threshold: 0.1

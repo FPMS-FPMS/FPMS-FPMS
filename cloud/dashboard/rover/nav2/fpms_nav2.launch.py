@@ -13,29 +13,62 @@ stack has to be brought up and verified one link at a time. Separate processes
 are worth the extra RAM here.
 
 -------------------------------------------------------------------------------
-WHAT THIS LAUNCHES
+LOCALISATION MODES - the argument that matters most
 -------------------------------------------------------------------------------
-  map_server          serves arena_map.pgm on /map
-  amcl                map -> odom
-  controller_server   RegulatedPurePursuit -> cmd_vel
-  planner_server      NavFn
-  behavior_server     spin / backup / drive_on_heading / wait
-  bt_navigator        NavigateToPose, NavigateThroughPoses
-  waypoint_follower   FollowWaypoints (the three-zone mission)
-  two lifecycle managers (localisation, navigation)
+`localization_mode` selects who publishes map -> odom. Exactly one thing may:
+TF_TREE.md's "one publisher per edge, no exceptions" applies to this edge as
+much as to any other.
+
+  slam  (DEFAULT)  slam_toolbox owns map -> odom AND publishes /map. This
+                   launch file starts NEITHER map_server NOR amcl - they are
+                   started by slam/fpms_slam_localization.launch.py's node
+                   instead, which must ALREADY BE RUNNING. Also loads
+                   nav2_params_slam.yaml on top of nav2_params.yaml.
+                   This is the real-localisation path: the rover localises off
+                   the room's own geometry, against a map it built.
+
+  amcl             The pre-SLAM path: map_server serves a static map file and
+                   nav2_amcl owns map -> odom. Kept because AMCL is already
+                   configured and is a genuine robustness fallback, but
+                   R2_COORDINATES.md 4.4 puts published AMCL accuracy at
+                   ~8.5 cm RMSE in an empty environment and ~33.7 cm in a
+                   cluttered one, so it is not the precision path.
+
+  none             No map, no map -> odom producer, costmaps on odom alone.
+                   Dead reckoning with all the unbounded drift that implies
+                   (REP-105: pose in odom "can drift over time, without any
+                   bounds"). Useful only for bringing up the controller in
+                   isolation. If you use this, set the costmaps' global_frame
+                   to odom as well or every lifecycle node will block forever
+                   waiting for a transform nobody is publishing.
 
 -------------------------------------------------------------------------------
 WHAT THIS DOES *NOT* LAUNCH, AND MUST ALREADY BE RUNNING
 -------------------------------------------------------------------------------
-  the LiDAR -> ROS bridge          publishing sensor_msgs/LaserScan
+  the LiDAR -> ROS bridge          fpms_lidar_ros.py, publishing /scan_lidar
   fpms_odom_tf.py                  /odom and odom -> base_footprint TF
+  nav2/fpms_tf.launch.py           base_footprint -> base_link -> laser_frame
+  slam/fpms_slam_localization...   map -> odom   (localization_mode:=slam only)
   the cmd_vel unit shim            /cmd_vel_nav -> /cmd_vel  (see below)
 
 Nav2 will start happily without any of them and then fail in ways that point at
-the wrong component - a missing scan reads as "AMCL is not converging", a
-missing TF reads as a tf2 extrapolation error inside the controller. Run the
-prerequisites checklist in README.md before this file. It exists because these
-failures are genuinely hard to diagnose from the Nav2 side.
+the wrong component - a missing scan reads as "the localiser is not
+converging", a missing TF reads as a tf2 extrapolation error inside the
+controller. Verify each link with `ros2 topic echo` / `tf2_echo` before this
+file. It exists because these failures are genuinely hard to diagnose from the
+Nav2 side.
+
+-------------------------------------------------------------------------------
+ODOMETRY: /odom, NEVER /odom_raw
+-------------------------------------------------------------------------------
+NAV2_BRIEF.md 3a: /odom_raw's twist.linear.x is sign-inverted relative to its
+own pose. fpms_odom_tf.py is the single point of correction and republishes on
+/odom. Humble's controller_server and behavior_server hard-code their
+OdomSmoother onto the RELATIVE topic `odom`, which happens to resolve to /odom
+in the root namespace - correct by accident. `odom_remap` below makes it
+correct by declaration, so that adding a namespace one day cannot silently
+point them at nothing. The full argument is in the TWIST SIGN block at the top
+of nav2_params_slam.yaml.
 
 -------------------------------------------------------------------------------
 WHY cmd_vel IS REMAPPED AWAY FROM /cmd_vel BY DEFAULT
@@ -49,8 +82,8 @@ That something is a shim node, and it is not this launch file's job. What IS
 this launch file's job is making sure that when the shim is missing, the rover
 STAYS STILL rather than executing a 6x command. Hence the default
 cmd_vel_topic of /cmd_vel_nav: nothing is subscribed, nothing moves, and the
-mistake is visible in `ros2 topic info` instead of at 1.1 m/s across a 1.2 m
-arena. Point this at /cmd_vel only once the shim is verified.
+mistake is visible in `ros2 topic info` instead of at 1.1 m/s across a room.
+Point this at /cmd_vel only once the shim is verified.
 """
 
 import os
@@ -58,10 +91,9 @@ import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    GroupAction,
+    OpaqueFunction,
     SetEnvironmentVariable,
 )
-from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -85,29 +117,246 @@ NAVIGATION_NODES = [
     "waypoint_follower",
 ]
 
+VALID_MODES = ("slam", "amcl", "none")
 
-def generate_launch_description():
+
+def _mode(context):
+    """Resolve and validate localization_mode, failing loudly on a typo.
+
+    A misspelled mode must not silently fall through to "no localisation" -
+    that is a rover navigating on dead reckoning while the operator believes it
+    is localised, which is the single worst failure this stack can have.
+    """
+    raw = LaunchConfiguration("localization_mode").perform(context).strip().lower()
+    if raw not in VALID_MODES:
+        raise SystemExit(
+            "refuse: localization_mode=%r is not one of %s. See this file's "
+            "docstring." % (raw, ", ".join(VALID_MODES)))
+    return raw
+
+
+def _launch_setup(context, *_args, **_kwargs):
     params_file = LaunchConfiguration("params_file")
+    overlay_file = LaunchConfiguration("overlay_params_file").perform(context)
     map_yaml = LaunchConfiguration("map")
     autostart = LaunchConfiguration("autostart")
     use_sim_time = LaunchConfiguration("use_sim_time")
     log_level = LaunchConfiguration("log_level")
     cmd_vel_topic = LaunchConfiguration("cmd_vel_topic")
-    use_localization = LaunchConfiguration("use_localization")
 
+    mode = _mode(context)
+
+    # yaml_filename is injected here rather than hard-coded in nav2_params.yaml
+    # so that the params file cannot carry a stale absolute path to somebody
+    # else's map. convert_types=True lets "true"/"false" arguments land as real
+    # booleans rather than strings, which Nav2 rejects.
+    configured_params = RewrittenYaml(
+        source_file=params_file,
+        root_key="",
+        param_rewrites={
+            "use_sim_time": use_sim_time,
+            "yaml_filename": map_yaml,
+        },
+        convert_types=True,
+    )
+
+    # ROS 2 merges parameter files in list order and LATER FILES WIN, so the
+    # overlay is appended, never prepended. It carries only the values that
+    # change when the world is a real room rather than a 1.2 m arena; see its
+    # own header. Empty string means "no overlay", which is what the amcl and
+    # none modes want.
+    param_files = [configured_params]
+    if mode == "slam":
+        if not overlay_file:
+            overlay_file = os.path.join(THIS_DIR, "nav2_params_slam.yaml")
+        if not os.path.isfile(overlay_file):
+            raise SystemExit(
+                "refuse: overlay_params_file %r does not exist." % overlay_file)
+        param_files.append(overlay_file)
+    elif overlay_file:
+        param_files.append(overlay_file)
+
+    # Applied to every Nav2 node. /tf and /tf_static are listed explicitly
+    # because they are the transforms that break first if a namespace is ever
+    # introduced, and because a Nav2 node quietly talking to the wrong /tf is
+    # the single most confusing failure in this stack.
+    common_remaps = [("/tf", "/tf"), ("/tf_static", "/tf_static")]
+
+    # See "ODOMETRY" in the module docstring. This is a no-op in the root
+    # namespace and exists to make that no-op explicit.
+    odom_remap = [("odom", "/odom")]
+
+    # Only controller_server and behavior_server emit velocity. Both must be
+    # redirected or a recovery spin would bypass the unit shim and hit the board
+    # at ~6x - the exact hazard the shim exists to prevent. Both also consume
+    # odometry, hence odom_remap.
+    drive_remaps = common_remaps + odom_remap + [("cmd_vel", cmd_vel_topic)]
+
+    arguments = ["--ros-args", "--log-level", log_level]
+
+    actions = []
+
+    if mode == "amcl":
+        actions += [
+            Node(
+                package="nav2_map_server",
+                executable="map_server",
+                name="map_server",
+                output="screen",
+                respawn=False,
+                parameters=param_files,
+                remappings=common_remaps,
+                arguments=arguments,
+            ),
+            Node(
+                package="nav2_amcl",
+                executable="amcl",
+                name="amcl",
+                output="screen",
+                respawn=False,
+                parameters=param_files,
+                remappings=common_remaps,
+                arguments=arguments,
+            ),
+            Node(
+                package="nav2_lifecycle_manager",
+                executable="lifecycle_manager",
+                name="lifecycle_manager_localization",
+                output="screen",
+                parameters=[{
+                    "use_sim_time": use_sim_time,
+                    "autostart": autostart,
+                    "node_names": LOCALIZATION_NODES,
+                    # Longer than the Nav2 default. AMCL's first scan callback
+                    # has to wait for the LiDAR bridge, and a bridge that
+                    # reconnects to the serial device can take several seconds.
+                    "bond_timeout": 10.0,
+                }],
+            ),
+        ]
+
+    actions += [
+        Node(
+            package="nav2_controller",
+            executable="controller_server",
+            name="controller_server",
+            output="screen",
+            respawn=False,
+            parameters=param_files,
+            remappings=drive_remaps,
+            arguments=arguments,
+        ),
+        Node(
+            package="nav2_planner",
+            executable="planner_server",
+            name="planner_server",
+            output="screen",
+            respawn=False,
+            parameters=param_files,
+            remappings=common_remaps,
+            arguments=arguments,
+        ),
+        Node(
+            package="nav2_behaviors",
+            executable="behavior_server",
+            name="behavior_server",
+            output="screen",
+            respawn=False,
+            parameters=param_files,
+            remappings=drive_remaps,
+            arguments=arguments,
+        ),
+        Node(
+            package="nav2_bt_navigator",
+            executable="bt_navigator",
+            name="bt_navigator",
+            output="screen",
+            respawn=False,
+            parameters=param_files,
+            remappings=common_remaps + odom_remap,
+            arguments=arguments,
+        ),
+        Node(
+            package="nav2_waypoint_follower",
+            executable="waypoint_follower",
+            name="waypoint_follower",
+            output="screen",
+            respawn=False,
+            parameters=param_files,
+            remappings=common_remaps,
+            arguments=arguments,
+        ),
+        Node(
+            package="nav2_lifecycle_manager",
+            executable="lifecycle_manager",
+            name="lifecycle_manager_navigation",
+            output="screen",
+            parameters=[{
+                "use_sim_time": use_sim_time,
+                "autostart": autostart,
+                "node_names": NAVIGATION_NODES,
+                # This manager is declared AFTER the localisation one so it
+                # activates second. That order is load-bearing: without
+                # map -> odom the global costmap never finishes activating, the
+                # manager times out on controller_server, and the error blames
+                # the controller for what is really a missing transform.
+                #
+                # In slam mode there IS no localisation manager here, because
+                # slam_toolbox is a plain node, not a lifecycle node
+                # (use_lifecycle_node defaults false). It must therefore be
+                # RUNNING AND PUBLISHING map -> odom before this launch, or the
+                # global costmap blocks exactly as it would with a dead AMCL.
+                "bond_timeout": 10.0,
+            }],
+        ),
+    ]
+
+    if mode == "slam":
+        print("fpms_nav2.launch.py: localization_mode=slam. map -> odom and "
+              "/map come from slam_toolbox (slam/fpms_slam_localization."
+              "launch.py), which MUST already be running. map_server and amcl "
+              "are NOT started. Overlay: %s" % overlay_file)
+    elif mode == "amcl":
+        print("fpms_nav2.launch.py: localization_mode=amcl. map_server + "
+              "nav2_amcl own map -> odom. Published AMCL accuracy is ~8.5-33.7 "
+              "cm (R2_COORDINATES.md 4.4) - this is the fallback path, not the "
+              "precision one.")
+    else:
+        print("fpms_nav2.launch.py: localization_mode=none. NOTHING publishes "
+              "map -> odom. The costmaps' global_frame must be odom or every "
+              "lifecycle node will block. Pose drift is unbounded.")
+
+    return actions
+
+
+def generate_launch_description():
     declare_args = [
         DeclareLaunchArgument(
             "params_file",
             default_value=os.path.join(THIS_DIR, "nav2_params.yaml"),
-            description="Nav2 parameter file. Defaults to the one beside this "
-                        "launch file - NOT nav2_bringup's, whose defaults are "
-                        "sized for rooms and make this 1.2 m arena impassable.",
+            description="Base Nav2 parameter file. Defaults to the one beside "
+                        "this launch file - NOT nav2_bringup's, whose defaults "
+                        "inflate a small space into a single obstacle.",
+        ),
+        DeclareLaunchArgument(
+            "overlay_params_file", default_value="",
+            description="Extra parameter file merged AFTER params_file (later "
+                        "wins). Empty means: nav2_params_slam.yaml when "
+                        "localization_mode:=slam, nothing otherwise.",
+        ),
+        DeclareLaunchArgument(
+            "localization_mode", default_value="slam",
+            description="Who publishes map -> odom: 'slam' (slam_toolbox, the "
+                        "real-localisation path), 'amcl' (static map + "
+                        "particle filter, the fallback), or 'none' (dead "
+                        "reckoning). See this file's docstring.",
         ),
         DeclareLaunchArgument(
             "map",
             default_value=os.path.join(THIS_DIR, "arena_map.yaml"),
-            description="Occupancy grid for the arena. See README.md for how "
-                        "to generate arena_map.pgm.",
+            description="Occupancy grid for map_server. Used ONLY when "
+                        "localization_mode:=amcl - in slam mode the map comes "
+                        "from slam_toolbox and this is ignored.",
         ),
         DeclareLaunchArgument(
             "autostart", default_value="true",
@@ -131,14 +380,7 @@ def generate_launch_description():
             description="Where Nav2 publishes velocity. DEFAULTS TO A TOPIC "
                         "THE BOARD DOES NOT LISTEN TO, on purpose - the unit "
                         "shim must sit between Nav2 and /cmd_vel. See the "
-                        "module docstring and README.md.",
-        ),
-        DeclareLaunchArgument(
-            "use_localization", default_value="true",
-            description="Set false to run planner+controller on odom alone "
-                        "(no map, no AMCL). Useful while the LiDAR bridge is "
-                        "still being built - the stack will then dead-reckon, "
-                        "with all the drift that implies.",
+                        "module docstring.",
         ),
     ]
 
@@ -153,149 +395,10 @@ def generate_launch_description():
     # dying in a pipe buffer. Matches how the existing fpms-* services log.
     set_stdout = SetEnvironmentVariable("RCUTILS_LOGGING_BUFFERED_STREAM", "0")
 
-    # yaml_filename is injected here rather than hard-coded in nav2_params.yaml
-    # so that the params file cannot carry a stale absolute path to somebody
-    # else's arena. convert_types=True lets "true"/"false" arguments land as
-    # real booleans rather than strings, which Nav2 rejects.
-    configured_params = RewrittenYaml(
-        source_file=params_file,
-        root_key="",
-        param_rewrites={
-            "use_sim_time": use_sim_time,
-            "yaml_filename": map_yaml,
-        },
-        convert_types=True,
-    )
-
-    # Applied to every Nav2 node. /tf and /tf_static are listed explicitly
-    # because they are the transforms that break first if a namespace is ever
-    # introduced, and because a Nav2 node quietly talking to the wrong /tf is
-    # the single most confusing failure in this stack.
-    common_remaps = [("/tf", "/tf"), ("/tf_static", "/tf_static")]
-
-    # Only controller_server and behavior_server emit velocity. Both must be
-    # redirected or a recovery spin would bypass the unit shim and hit the board
-    # at ~6x - the exact hazard the shim exists to prevent.
-    drive_remaps = common_remaps + [("cmd_vel", cmd_vel_topic)]
-
-    arguments = ["--ros-args", "--log-level", log_level]
-
-    localization = GroupAction(
-        condition=IfCondition(use_localization),
-        actions=[
-            Node(
-                package="nav2_map_server",
-                executable="map_server",
-                name="map_server",
-                output="screen",
-                respawn=False,
-                parameters=[configured_params],
-                remappings=common_remaps,
-                arguments=arguments,
-            ),
-            Node(
-                package="nav2_amcl",
-                executable="amcl",
-                name="amcl",
-                output="screen",
-                respawn=False,
-                parameters=[configured_params],
-                remappings=common_remaps,
-                arguments=arguments,
-            ),
-            Node(
-                package="nav2_lifecycle_manager",
-                executable="lifecycle_manager",
-                name="lifecycle_manager_localization",
-                output="screen",
-                parameters=[{
-                    "use_sim_time": use_sim_time,
-                    "autostart": autostart,
-                    "node_names": LOCALIZATION_NODES,
-                    # Longer than the Nav2 default. AMCL's first scan callback
-                    # has to wait for the LiDAR bridge, and a bridge that
-                    # reconnects to the serial device can take several seconds.
-                    "bond_timeout": 10.0,
-                }],
-            ),
-        ],
-    )
-
-    navigation = GroupAction(actions=[
-        Node(
-            package="nav2_controller",
-            executable="controller_server",
-            name="controller_server",
-            output="screen",
-            respawn=False,
-            parameters=[configured_params],
-            remappings=drive_remaps,
-            arguments=arguments,
-        ),
-        Node(
-            package="nav2_planner",
-            executable="planner_server",
-            name="planner_server",
-            output="screen",
-            respawn=False,
-            parameters=[configured_params],
-            remappings=common_remaps,
-            arguments=arguments,
-        ),
-        Node(
-            package="nav2_behaviors",
-            executable="behavior_server",
-            name="behavior_server",
-            output="screen",
-            respawn=False,
-            parameters=[configured_params],
-            remappings=drive_remaps,
-            arguments=arguments,
-        ),
-        Node(
-            package="nav2_bt_navigator",
-            executable="bt_navigator",
-            name="bt_navigator",
-            output="screen",
-            respawn=False,
-            parameters=[configured_params],
-            remappings=common_remaps,
-            arguments=arguments,
-        ),
-        Node(
-            package="nav2_waypoint_follower",
-            executable="waypoint_follower",
-            name="waypoint_follower",
-            output="screen",
-            respawn=False,
-            parameters=[configured_params],
-            remappings=common_remaps,
-            arguments=arguments,
-        ),
-        Node(
-            package="nav2_lifecycle_manager",
-            executable="lifecycle_manager",
-            name="lifecycle_manager_navigation",
-            output="screen",
-            parameters=[{
-                "use_sim_time": use_sim_time,
-                "autostart": autostart,
-                "node_names": NAVIGATION_NODES,
-                # This manager is declared AFTER the localisation one so it
-                # activates second. That order is load-bearing: without
-                # map -> odom the global costmap never finishes activating, the
-                # manager times out on controller_server, and the error blames
-                # the controller for what is really a missing transform.
-                "bond_timeout": 10.0,
-            }],
-        ),
-    ])
-
     ld = LaunchDescription()
     ld.add_action(set_domain)
     ld.add_action(set_stdout)
     for a in declare_args:
         ld.add_action(a)
-    ld.add_action(localization)
-    ld.add_action(navigation)
+    ld.add_action(OpaqueFunction(function=_launch_setup))
     return ld
