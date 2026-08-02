@@ -514,3 +514,61 @@ firmware/
     ├── battery/                ADC1 ch2, decivolts
     └── aux_io/                 buzzer + two servo channels
 ```
+
+---
+
+## Verified build, 2026-08-02
+
+Built on the rover itself (Orange Pi 5B, aarch64, Ubuntu 22.04, ESP-IDF v5.2.2):
+
+```
+Project build complete.
+build/bootloader/bootloader.bin              20,880 B
+build/partition_table/partition-table.bin     3,072 B
+build/fpms_rover_firmware.bin               431,856 B
+```
+
+### Two things that block the build, neither obvious
+
+**1. `catkin_pkg` must be installed into ESP-IDF's OWN virtualenv, not the system Python.**
+`export.sh` activates `~/.espressif/python_env/idf5.2_py3.10_env`, so a system-wide
+`pip install catkin_pkg` looks correct and changes nothing. The failure is
+`ModuleNotFoundError: No module named 'catkin_pkg'` from inside a CMake step.
+
+```bash
+. ~/esp/esp-idf/export.sh
+python -m pip install catkin_pkg lark-parser "empy<4" colcon-common-extensions
+```
+
+**2. ROS 2 must be sourced BEFORE ESP-IDF.**
+The micro-ROS component builds real ROS packages as part of the firmware and needs
+`ament_cmake_core` from a ROS install. Without it the build fails with
+`Could not find a package configuration file provided by "ament_cmake_core"`.
+Source ROS first so ament is discoverable, then IDF, so IDF's venv and toolchain
+win on PATH:
+
+```bash
+source /opt/ros/humble/setup.bash     # FIRST
+. ~/esp/esp-idf/export.sh             # SECOND
+idf.py set-target esp32s3 && idf.py build
+```
+
+### Flash
+
+Auto-reset over DTR/RTS is **measured working** on this board through its CP210x —
+no BOOT/RESET button press is needed, so this can be scripted end to end.
+Stop the agent first to free the port, and restart it after (allow 90-225 s for
+the board's XRCE client to reconnect):
+
+```bash
+sudo systemctl stop micro-ros-agent
+idf.py -p /dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0 -b 921600 flash
+sudo systemctl start micro-ros-agent
+```
+
+The stock 4 MB image is backed up at `rover/firmware_backup/` (gitignored, it is
+Yahboom's binary). To revert:
+
+```bash
+python -m esptool --chip esp32s3 --port <port> write_flash 0x0 yahboom_microros_v2_stock.bin
+```
