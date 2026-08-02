@@ -1,0 +1,11 @@
+## ESP-IDF component manifest for the application component.
+##
+## micro-ROS is deliberately NOT listed here. The micro-ROS ESP-IDF
+## component is not distributed through the ESP Component Registry; its
+## own README says to clone it into the project's components/ directory,
+## which is what the README next to this file tells you to do. Declaring
+## it as a managed dependency would silently pull nothing.
+
+dependencies:
+  idf:
+    version: ">=5.2,<6.0"

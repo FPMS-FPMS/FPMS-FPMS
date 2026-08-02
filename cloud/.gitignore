@@ -67,3 +67,9 @@ dashboard/models/*_rknn_model/
 
 # --- logs / scratch ----------------------------------------------------------
 *.log
+
+# Vendor firmware images. The 4MB stock dump from the Yahboom MicroROS Board is
+# THEIR binary, and this repo is public -- backing it up is fair use, publishing
+# it is redistribution. It lives on disk and on the rover, not in git.
+# md5 d7e02541627eaa40946c647169bd38d9, read 2026-08-02 with esptool read_flash.
+dashboard/rover/firmware_backup/

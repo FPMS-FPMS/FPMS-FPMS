@@ -1,0 +1,19 @@
+# Partition table for the 4 MB flash on this board.
+#
+# The flash size is 4 MB, MEASURED with `esptool.py flash_id` on the actual
+# rover — not read off a datasheet, and not the 16 MB some configs assume.
+# Getting this wrong produces an image that flashes and then fails to boot.
+#
+# A micro-ROS application is large (the whole middleware is statically
+# linked in), so the default single-app layout is not big enough. 3 MB of
+# app leaves ~940 kB spare in a 4 MB device: comfortable, and no OTA slot
+# because this board is flashed over USB and has no network path anyway.
+#
+# nvs holds the runtime calibration written by `save_to_nvs` (see
+# rover_config.c). Keep it: erasing it loses the min-PWM and geometry
+# calibration, which is exactly what this firmware exists to make cheap.
+#
+# Name,     Type, SubType,  Offset,   Size,   Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  3M,

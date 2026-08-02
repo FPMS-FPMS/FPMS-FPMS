@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# micro-ROS component: cloned by the operator, not vendored.
+# It is ~100 MB of middleware and it belongs to the micro-ROS project.
+components/micro_ros_espidf_component/
+
+# Flash backups are multi-megabyte vendor binaries. Keep them OUT of this
+# public repo — see README, "Before you flash anything".
+*.bin

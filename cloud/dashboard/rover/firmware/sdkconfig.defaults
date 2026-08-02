@@ -1,0 +1,61 @@
+# ESP-IDF defaults for the FPMS rover firmware.
+#
+# `idf.py set-target esp32s3` folds these into a fresh sdkconfig. If you
+# already have an sdkconfig, delete it after changing this file — ESP-IDF
+# does not re-apply defaults to an existing config.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---------------------------------------------------------------------
+# THE CONSOLE MUST BE OFF.
+#
+# UART0 is the micro-ROS transport (Type-C -> CP2102 -> GPIO43/44). A
+# single ESP_LOGI, or the IDF boot banner, corrupts the XRCE framing and
+# the agent will never establish a session. This is not a preference.
+#
+# To debug with printf, comment the line below, uncomment the UART1 block,
+# and watch GPIO17 — that is the LiDAR header, which this firmware does
+# not use. Never send the console back to UART0.
+# ---------------------------------------------------------------------
+CONFIG_ESP_CONSOLE_NONE=y
+# CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+# CONFIG_ESP_CONSOLE_UART_NUM=1
+# CONFIG_ESP_CONSOLE_UART_TX_GPIO=17
+# CONFIG_ESP_CONSOLE_UART_RX_GPIO=18
+
+# ---------------------------------------------------------------------
+# Flash. 4 MB, measured with esptool flash_id on this board.
+# ---------------------------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------------------------------------------------------------------
+# FreeRTOS. 1000 Hz tick so the 10 ms control period is exact rather than
+# rounded up to the next tick; dual core so the control loop and the
+# middleware do not share one.
+# ---------------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+# CONFIG_FREERTOS_UNICORE is not set
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# The interrupt watchdog and task watchdog stay ON. If a wheel loop hangs
+# we want a reboot (which parks the bridges) rather than a rover driving
+# on its last command.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# ---------------------------------------------------------------------
+# micro-ROS. Middleware is Micro XRCE-DDS; transport is CUSTOM, set up in
+# main/uart_transport.c so the 921600 baud rate lives next to the code
+# that has to match the host agent.
+# ---------------------------------------------------------------------
+CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE=y
+# CONFIG_MICRO_ROS_ESP_UART_TRANSPORT is not set

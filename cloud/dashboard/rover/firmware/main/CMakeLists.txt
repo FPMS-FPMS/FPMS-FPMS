@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "uros_node.c"
+        "uros_params.c"
+        "uart_transport.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        micro_ros_espidf_component
+        driver
+        esp_timer
+        board_pins
+        rover_config
+        pwm_motor
+        encoder
+        motor
+        car_motion
+        odometry
+        imu_icm42670
+        battery
+        aux_io
+)
