@@ -572,3 +572,47 @@ Yahboom's binary). To revert:
 ```bash
 python -m esptool --chip esp32s3 --port <port> write_flash 0x0 yahboom_microros_v2_stock.bin
 ```
+
+## FLASHED AND RUNNING — 2026-08-02
+
+Written to the board over the serial link with no button press (auto-reset via
+DTR/RTS through the CP210x, as predicted):
+
+```
+Writing at 0x0007527b... (100 %)
+Hash of data verified.
+Leaving... Hard resetting via RTS pin...
+== FLASH DONE ==
+```
+
+First boot after flashing, measured over 12 s:
+
+```
+/odom_raw   120 msgs  (10 Hz)   pose (0.0, 0.0)  twist.vx 0.0
+/imu        301 msgs  (25 Hz)
+/battery     12 msgs  ( 1 Hz)   raw 130
+```
+
+micro-ROS agent reconnected on its own and logged `create_replier` entries — the
+runtime parameter services, which the stock firmware did not have. That is the
+clearest single sign the new image is the one running.
+
+### Calibration state — NOTHING here is measured yet
+
+`battery` reads raw 130 where stock read ~120: `bat_divider` is an unverified
+guess, so treat the value as uncalibrated rather than as a voltage. Every
+constant below is a ROS parameter with NVS persistence, so calibrating costs a
+`ros2 param set`, never a reflash:
+
+  min_pwm             defaults to 0 (pass-through)
+  enc_counts_per_rev  1170   from the recovered Arduino source
+  wheel_circum_mm     219.9  70 mm wheels
+  track_width_m       EFFECTIVE, not geometric — skid-steer runs 1.5-2.5x
+  max_wheel_mps       unmeasured
+  bat_divider         a guess
+
+### The host stack still compensates for bugs this firmware no longer has
+
+Until these are changed together, the rover will drive wrong in a NEW way:
+`ODOM_TWIST_SIGN` (3 files), `TURN_WIRE_SIGN`, and `CMD_SCALE = 6.1` — the last
+must be RE-MEASURED, since it described a saturated loop rather than a gain.
