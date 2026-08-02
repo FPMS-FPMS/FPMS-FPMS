@@ -11,6 +11,7 @@ import {
   emptyCapabilities,
   mergeCapabilities,
   useRoverCapabilities,
+  type RoverCapabilities,
 } from "../lib/capabilities";
 
 /**
@@ -54,56 +55,184 @@ import {
  */
 type Owner = "control" | "drive" | "none";
 
+/**
+ * `does` is a one-line statement of what pressing the verb ACTUALLY causes, in
+ * the operator's terms — not a restatement of its name. It is rendered in the
+ * verb reference at the bottom of this page for every verb, whether or not the
+ * rover has announced itself, because "the full set is reachable" is only half
+ * the requirement: the other half is that nobody has to press a verb to find
+ * out what it does.
+ *
+ * `moves` marks the verbs that put the chassis in motion. It is the flag the
+ * reference colours by, and it is stated per verb rather than inferred from the
+ * name — `test_motors` and `mission` both move a rover and neither says so.
+ */
 const CATALOG: Record<
   string,
-  { owner: Owner; label: string; blindSafe: boolean; note?: string }
+  { owner: Owner; label: string; blindSafe: boolean; moves: boolean; does: string; note?: string }
 > = {
   // -- fpms-teleop, motion
-  stop: { owner: "control", label: "Stop", blindSafe: true },
+  stop: {
+    owner: "control",
+    label: "Stop",
+    blindSafe: true,
+    moves: false,
+    does: "Zeroes the wire and halts the motors. fpms-missions subscribes the same verb and aborts a running mission on it — this is the abort.",
+  },
   estop: {
     owner: "control",
     label: "E-stop",
     blindSafe: true,
+    moves: false,
+    does: "Identical halt to `stop`. fpms-teleop routes stop, estop and auto_off through one ungated handler.",
     note: "fpms-teleop routes stop, estop and auto_off through one ungated handler — this is a second name for the same halt, not a stronger one.",
   },
   jog: {
     owner: "drive",
     label: "Jog (stick)",
     blindSafe: false,
+    moves: true,
+    does: "Streamed analog velocity. The rover halts itself if jogs stop arriving for 600 ms, so it must be sent continuously while held.",
     note: "A streamed analog command; it needs the joystick on the Drive tab, not a button.",
   },
-  nudge: { owner: "control", label: "Nudge", blindSafe: false },
-  turn: { owner: "control", label: "Turn", blindSafe: false },
-  test_motors: { owner: "control", label: "Test motors", blindSafe: false },
-  auto_off: { owner: "control", label: "Autonomy OFF", blindSafe: true },
+  nudge: {
+    owner: "control",
+    label: "Nudge",
+    blindSafe: false,
+    moves: true,
+    does: "Drives a bounded distance forward or back, closed-loop on odometry, then stops. This is how you go slowly on this chassis.",
+  },
+  turn: {
+    owner: "control",
+    label: "Turn",
+    blindSafe: false,
+    moves: true,
+    does: "Rotates in place to a requested angle, closed-loop on the integrated gyro.",
+  },
+  test_motors: {
+    owner: "control",
+    label: "Test motors",
+    blindSafe: false,
+    moves: true,
+    does: "Drives a short bounded leg in each direction and reports what the odometry measured. The rover moves on the floor.",
+  },
+  auto_off: {
+    owner: "control",
+    label: "Autonomy OFF",
+    blindSafe: true,
+    moves: false,
+    does: "Treated as a stop by fpms-teleop and as an abort by fpms-missions. Same ungated path as `stop`.",
+  },
   // -- fpms-teleop, actuators and reads
-  beep: { owner: "control", label: "Beep", blindSafe: false },
-  servo: { owner: "control", label: "Servo", blindSafe: false },
-  read_encoders: { owner: "control", label: "Pose / odometry", blindSafe: true },
-  set_speed: { owner: "control", label: "Apply speeds", blindSafe: false },
-  drive_status: { owner: "control", label: "Bridge snapshot", blindSafe: true },
-  drive_connect: { owner: "control", label: "Bridge stream on", blindSafe: true },
-  drive_disconnect: { owner: "control", label: "Bridge stream off", blindSafe: true },
+  beep: {
+    owner: "control",
+    label: "Beep",
+    blindSafe: false,
+    moves: false,
+    does: "Sounds the buzzer for a duration. 1–9 ms are firmware mode flags, not durations — 1 latches the beeper on.",
+  },
+  servo: {
+    owner: "control",
+    label: "Servo",
+    blindSafe: false,
+    moves: false,
+    does: "Moves one of the two hobby servos to an angle. Not drive motion.",
+  },
+  read_encoders: {
+    owner: "control",
+    label: "Pose / odometry",
+    blindSafe: true,
+    moves: false,
+    does: "Returns the board's cumulative /odom_raw pose and twist. This board publishes no raw tick counts at all.",
+  },
+  set_speed: {
+    owner: "control",
+    label: "Apply speeds",
+    blindSafe: false,
+    moves: false,
+    does: "Retunes the jog and nudge caps on the running service. It does not survive a restart, and a smaller number does not buy a slower rover.",
+  },
+  drive_status: {
+    owner: "control",
+    label: "Bridge snapshot",
+    blindSafe: true,
+    moves: false,
+    does: "fpms-teleop's full state: motion_allowed and why not, micro-ROS link, battery, pose, limits and its live verb list. Pure read.",
+  },
+  drive_connect: {
+    owner: "control",
+    label: "Bridge stream on",
+    blindSafe: true,
+    moves: false,
+    does: "Resumes fpms-teleop's drive telemetry. The Drive tab's health panel and its motion lockout both key off that feed.",
+  },
+  drive_disconnect: {
+    owner: "control",
+    label: "Bridge stream off",
+    blindSafe: true,
+    moves: false,
+    does: "Pauses fpms-teleop's drive telemetry. This LOCKS OUT the Drive tab, which treats a silent feed as an unknown rover state.",
+  },
   // -- fpms-missions / fpms-teleop, autonomy
   mission: {
     owner: "drive",
     label: "Missions",
     blindSafe: false,
+    moves: true,
+    does: "Hands a named route to the executor, which drives it unattended. Also carries the preview and arm payload modes.",
     note: "Named routes with a plan-first preview; lives on the Drive tab beside the map that shows the route.",
   },
   set_coordinate: {
     owner: "drive",
     label: "Set coordinate",
     blindSafe: false,
+    moves: false,
+    does: "Overwrites the rover's believed position in arena mm. Moves nothing, but every mission planned afterwards inherits the number.",
     note: "Needs an x/y in arena mm. Firing it empty could be read as 'you are at the origin', which would silently offset every mission afterwards.",
   },
   // -- fpms-rover-agent
-  ping: { owner: "control", label: "Ping", blindSafe: true },
-  status: { owner: "control", label: "Status", blindSafe: true },
-  connect: { owner: "control", label: "Connect", blindSafe: true },
-  disconnect: { owner: "control", label: "Disconnect", blindSafe: true },
-  restart: { owner: "control", label: "Restart agent", blindSafe: true },
-  auto_on: { owner: "control", label: "Autonomy ON", blindSafe: true },
+  ping: {
+    owner: "control",
+    label: "Ping",
+    blindSafe: true,
+    moves: false,
+    does: "Echoes a timestamp back. The log reports the full browser-to-rover round trip.",
+  },
+  status: {
+    owner: "control",
+    label: "Status",
+    blindSafe: true,
+    moves: false,
+    does: "fpms-rover-agent's snapshot — camera, LiDAR, frame and scan counts. Distinct from drive_status, which is the teleop bridge's.",
+  },
+  connect: {
+    owner: "control",
+    label: "Connect",
+    blindSafe: true,
+    moves: false,
+    does: "Starts fpms-rover-agent publishing camera frames and LiDAR scans.",
+  },
+  disconnect: {
+    owner: "control",
+    label: "Disconnect",
+    blindSafe: true,
+    moves: false,
+    does: "Stops camera and LiDAR publishing. The arena maps go stale and the obstacle guard loses its feed.",
+  },
+  restart: {
+    owner: "control",
+    label: "Restart agent",
+    blindSafe: true,
+    moves: false,
+    does: "Bounces the systemd unit. Odometry and any in-flight command are lost.",
+  },
+  auto_on: {
+    owner: "control",
+    label: "Autonomy ON",
+    blindSafe: true,
+    moves: false,
+    does: "Nothing — no autonomy loop exists on this rover. It is offered so the refusal names where autonomy actually lives: the `mission` verb.",
+  },
 };
 
 /**
@@ -630,6 +759,31 @@ export default function Control() {
         </p>
       </Card>
 
+      {/*
+        THE ONE THING TO KNOW BEFORE TOUCHING A SPEED BOX ON THIS PAGE.
+        Stated plainly, above the Motion and Tuning cards rather than as a
+        footnote inside them, because both of those cards contain a numeric
+        input that LOOKS like a speed dial and is not one.
+      */}
+      <div className="rounded-xl border-2 border-amber-500/50 bg-amber-500/10 p-4">
+        <div className="text-base font-semibold tracking-wide text-amber-100">
+          There is no slow speed on this chassis
+        </div>
+        <p className="mt-1 max-w-4xl text-sm text-amber-50/90">
+          The firmware applies roughly <b>50% duty to any non-zero setpoint</b>.
+          Lowering a number in a speed box does not produce a slower rover — it
+          produces a rover that either moves at the speed it always moves at, or
+          does not move at all. There is no gentle duty and there is no slow
+          setpoint. <b>Slowness comes from short bursts with full stops between
+          them</b>: that is what the bounded{" "}
+          <span className="font-mono">nudge</span> and{" "}
+          <span className="font-mono">turn</span> verbs below do, and what the
+          mission executor's dead-reckoning backend does. The speed inputs on
+          this page set the rover's <i>caps</i>, which is a different thing from
+          a throttle, and no control here is offered that would imply otherwise.
+        </p>
+      </div>
+
       <div className="grid gap-5 lg:grid-cols-2">
         {/* ---------------------------------------------------------- Motion */}
         <Card>
@@ -1096,6 +1250,15 @@ export default function Control() {
             </>
           )}
 
+          {/* THE FULL VERB SET, ALWAYS. The chip row above only exists once a
+              rover has announced; this table does not wait for that, because
+              "make the full verb set reachable and honest about what each does"
+              is not satisfied by a page that shows nothing until a message that
+              is published once and not retained happens to arrive. Every verb
+              this dashboard knows about, plus every verb any rover has
+              advertised, with what it does and where its control lives. */}
+          <VerbReference caps={caps} />
+
           {caps.services.length > 0 && (
             <div className="mt-4 grid gap-2 sm:grid-cols-2">
               {caps.services.map((s) => (
@@ -1211,6 +1374,99 @@ export default function Control() {
           </div>
         )}
       </Card>
+    </div>
+  );
+}
+
+/**
+ * Every verb, what it does, and where its control is.
+ *
+ * The union of the dashboard's CATALOG and whatever the rovers have advertised,
+ * so it is complete in both directions before anything has announced and after.
+ * A verb the rover advertised that this file has never heard of appears with its
+ * owner and reply topic and an explicit "this dashboard does not know what this
+ * does" — which is the honest rendering, and far more useful than omitting it.
+ */
+function VerbReference({ caps }: { caps: RoverCapabilities }) {
+  const names = Array.from(new Set([...Object.keys(CATALOG), ...caps.actions])).sort();
+
+  return (
+    <div className="mt-4">
+      <div className="lbl mb-2">
+        Verb reference · {names.length} commands, what each one does
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] border-collapse text-left text-xs">
+          <thead>
+            <tr className="border-b border-white/10 text-slate-500">
+              <th className="py-1.5 pr-3 font-normal">verb</th>
+              <th className="py-1.5 pr-3 font-normal">control</th>
+              <th className="py-1.5 pr-3 font-normal">answered by</th>
+              <th className="py-1.5 font-normal">what it does</th>
+            </tr>
+          </thead>
+          <tbody>
+            {names.map((a) => {
+              const c = CATALOG[a];
+              const advertised = caps.actions.has(a);
+              const unowned = caps.notOwned[a];
+              return (
+                <tr key={a} className="border-b border-white/5 align-top">
+                  <td className="py-1.5 pr-3">
+                    <span className="font-mono text-slate-200">{a}</span>
+                    {c?.moves && (
+                      <span
+                        className="ml-1.5 text-[10px] text-ember-300"
+                        title="This verb puts the chassis in motion"
+                      >
+                        · MOVES
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-1.5 pr-3 text-slate-400">
+                    {!c ? (
+                      <span className="text-amber-300">none on this dashboard</span>
+                    ) : c.owner === "control" ? (
+                      "this page"
+                    ) : c.owner === "drive" ? (
+                      "Drive tab"
+                    ) : (
+                      <span className="text-amber-300">none</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 pr-3 font-mono text-[11px] text-slate-500">
+                    {unowned ? (
+                      <span className="text-amber-300">nobody</span>
+                    ) : caps.owners[a] ? (
+                      `fpms-${caps.owners[a]}`
+                    ) : advertised ? (
+                      "not stated"
+                    ) : (
+                      // Silence is not a denial: events/online is published once
+                      // and not retained, so "not advertised" here overwhelmingly
+                      // means nobody has spoken rather than that the verb is gone.
+                      <span title="No rover has announced a verb list containing this. events/online is published once and not retained, so this is usually silence rather than absence.">
+                        not announced
+                      </span>
+                    )}
+                    {caps.replyTopics[a] && (
+                      <div className="text-slate-600">→ {caps.replyTopics[a]}</div>
+                    )}
+                  </td>
+                  <td className="py-1.5 text-slate-400">
+                    {unowned ?? c?.does ?? (
+                      <span className="text-amber-300">
+                        Advertised by the rover; this dashboard has no description
+                        and no control for it. Do not fire it blind.
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

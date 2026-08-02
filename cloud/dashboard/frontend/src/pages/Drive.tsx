@@ -28,6 +28,9 @@ import {
   useRoverCapabilities,
   type MissionInfo,
 } from "../lib/capabilities";
+// Arena geometry is READ, never restated: ARENA_MM is the single source of
+// truth for the pose sanity check below.
+import { ARENA_MM } from "../lib/arena";
 
 /**
  * Manual driving. Control.tsx is the command console — discrete actions and
@@ -177,6 +180,75 @@ const REBOOT_SLACK_S = 2;
 const ACK_TIMEOUT_MS = 3000;
 const LOG_LIMIT = 40;
 
+/* ---- front clearance ------------------------------------------------------
+ *
+ * THE NUMBER THAT PREDICTED THE LAST COLLISION.
+ *
+ * A mission ran at full speed, outran its own 11 Hz odometry and struck an
+ * obstacle. Front clearance fell 989 mm -> 117 mm on the way in. It was visible
+ * the whole time — as one cell in a nine-up grid of mission stats, below the
+ * fold, in the same weight as "elapsed". It is now a full-width readout above
+ * the controls, coloured by state, that shouts when it closes.
+ *
+ * The value is `front_mm` from fpms_missions.snapshot(). It is `null` when the
+ * LiDAR is blind, and null renders "--" — never 0, which would read as "the
+ * bumper is against something".
+ */
+
+/**
+ * Fallback stop threshold, millimetres — `FRONT_STOP_MM` in fpms_missions.py.
+ *
+ * Used only until the executor announces `limits.front_stop_mm` on
+ * events/online. That message is published once and not retained, so a
+ * dashboard opened after the rover booted has never seen it, and refusing to
+ * colour the readout for the rest of the session would be worse than colouring
+ * it against the value the rover ships with. Which of the two is in play is
+ * always printed.
+ */
+const FRONT_STOP_FALLBACK_MM = 120;
+
+/**
+ * How much headroom above the stop threshold still counts as CLOSING.
+ *
+ * A presentation constant, not a rover setting, and deliberately generous — the
+ * point is that the readout changes character on the way down rather than at
+ * the bottom.
+ */
+const CLOSING_FACTOR = 3;
+
+/* ---- pose sanity ----------------------------------------------------------
+ *
+ * A reported position outside the arena is a BROKEN ESTIMATE, not a position.
+ *
+ * A run reported (625, -2720) mm while the rover had physically moved under a
+ * metre inside a 1200 mm arena, and an earlier one reported (-9182, -11926).
+ * Both were plotted. A glyph off the edge of the canvas reads as a rendering
+ * fault; what it actually meant was that the dead-reckoning integration had come
+ * apart and every distance, ETA and arrival test computed from it was wrong.
+ *
+ * The bound is ARENA_MM from lib/arena plus one rover length of slack, so a
+ * machine legitimately straddling the line at the start box is not called
+ * broken. Nothing is clamped or corrected — the number is printed in full and
+ * the map is handed the heartbeat instead, so it draws the assumed start and
+ * raises its own badge.
+ *
+ * NOTE: an identical guard exists in Lidar.tsx. It is duplicated rather than
+ * shared because both pages own their own file and lib/arena is not this
+ * change's to edit; if a third consumer needs it, it belongs in lib/arena
+ * beside ARENA_MM.
+ */
+const POSE_SLACK_MM = 240; // ROVER_LEN_MM — a rover straddling the line is fine.
+
+function poseOutOfArena(x: number | null, y: number | null): boolean {
+  if (x === null || y === null) return false;
+  return (
+    x < -POSE_SLACK_MM ||
+    y < -POSE_SLACK_MM ||
+    x > ARENA_MM + POSE_SLACK_MM ||
+    y > ARENA_MM + POSE_SLACK_MM
+  );
+}
+
 /**
  * Which executor drives a mission.
  *
@@ -273,7 +345,30 @@ export default function Drive() {
     planTs !== null && planTs === dismissedPlanTs ? null : planRaw;
   const planRoute = plan?.waypoints ?? null;
 
-  const mission = readMission(readTelemetry(missionCh.data));
+  const missionRaw = readTelemetry(missionCh.data);
+  const mission = readMission(missionRaw);
+
+  /**
+   * ARM STATE, READ OFF THE RAW SNAPSHOT.
+   *
+   * fpms_missions.snapshot() publishes `armed` (bool, or null when the runner is
+   * not up) and `arm_required` (bool, the executor's REQUIRE_ARM). lib/mission's
+   * MissionState does not carry them, so they are read here directly rather than
+   * inferred — inferring an interlock is exactly the class of thing that must
+   * not be guessed.
+   *
+   * THE ASYMMETRY IS DELIBERATE. Motion is locked out only on POSITIVE evidence
+   * that arming is required and has not happened. "Nothing has published an arm
+   * state" is NOT treated as unarmed, because the arm concept lives entirely in
+   * the mission executor: a rover with fpms-missions stopped would otherwise
+   * have its joystick locked out forever by a service that is not running and
+   * was never needed for manual teleop. That case gets a named chip instead of a
+   * lockout, so the operator can see the difference.
+   */
+  const armed = typeof missionRaw?.armed === "boolean" ? missionRaw.armed : null;
+  const armRequired =
+    typeof missionRaw?.arm_required === "boolean" ? missionRaw.arm_required : null;
+  const notArmed = armRequired === true && armed !== true;
 
   /**
    * What THIS rover says it can drive.
@@ -329,19 +424,27 @@ export default function Drive() {
    * the point: this must never manufacture a coordinate, or the badge saying
    * the position is assumed would disappear while it still was.
    */
-  const mapPose =
-    poseEnvelopeFromMm(
-      mission?.poseX ?? null,
-      mission?.poseY ?? null,
-      mission?.poseHeadingDeg ?? null,
-    ) ??
-    poseEnvelopeFromMm(num(tele?.x_mm), num(tele?.y_mm), num(tele?.heading_deg));
-  const mapPoseSource =
-    mapPose === null
-      ? null
-      : mission?.poseX !== null && mission?.poseX !== undefined
-        ? "mission executor"
-        : "teleop bridge";
+  const execX = mission?.poseX ?? null;
+  const execY = mission?.poseY ?? null;
+  const bridgeX = num(tele?.x_mm);
+  const bridgeY = num(tele?.y_mm);
+  const rawPoseX = execX ?? bridgeX;
+  const rawPoseY = execY ?? bridgeY;
+
+  /**
+   * OUT-OF-ARENA IS REFUSED, not plotted. See poseOutOfArena above. The refused
+   * case takes the same path as "no position at all" — operationally they are
+   * the same statement, nobody knows where this rover is — and differs only in
+   * that this one is a fault and gets said loudly.
+   */
+  const poseBroken = poseOutOfArena(rawPoseX, rawPoseY);
+  const brokenPoseSource = execX !== null ? "mission executor" : "teleop bridge";
+
+  const mapPose = poseBroken
+    ? null
+    : poseEnvelopeFromMm(execX, execY, mission?.poseHeadingDeg ?? null) ??
+      poseEnvelopeFromMm(bridgeX, bridgeY, num(tele?.heading_deg));
+  const mapPoseSource = mapPose === null ? null : execX !== null ? "mission executor" : "teleop bridge";
 
   // Staleness is a function of wall time, not of arriving data — without a tick
   // a feed that simply stops would keep rendering its last value as current
@@ -403,12 +506,14 @@ export default function Drive() {
   const motionLocked = rosDown || teleStale || neverSeen;
 
   type LockKind = "ros" | "stale" | "never";
-  const lockKind: LockKind | null = rosDown
-    ? "ros"
-    : teleStale
-      ? "stale"
-      : neverSeen
-        ? "never"
+  // Ordered by which fact is most load-bearing when several are true at once: a
+  // rover that has never been seen is not usefully described as "stale".
+  const lockKind: LockKind | null = neverSeen
+    ? "never"
+    : rosDown
+      ? "ros"
+      : teleStale
+        ? "stale"
         : null;
 
   const LOCK_TITLE: Record<LockKind, string> = {
@@ -424,6 +529,24 @@ export default function Drive() {
         : lockKind === "never"
           ? `Nothing has ever arrived on ${thing ? `drive:${thing}` : "this channel"} since the page loaded, so this dashboard has no idea whether ${thing ?? "the rover"} is powered, where it is, or whether anything it is sent would be acted on.`
           : null;
+
+  /**
+   * THE ARM LOCKOUT IS SCOPED TO WHAT ARMING ACTUALLY GATES.
+   *
+   * fpms_missions checks `armed()` in exactly one place — the run path of the
+   * `mission` verb — and refuses with "rover is not armed". fpms_teleop has no
+   * arm concept at all: jog, nudge, turn and test_motors are accepted whether or
+   * not the executor is armed.
+   *
+   * So an unarmed rover locks out the MISSION buttons, with the rover's own
+   * refusal as the reason, and does NOT lock out the stick. Locking the stick on
+   * it would be this dashboard inventing an interlock the machine does not have
+   * and attributing it to the rover — and, since REQUIRE_ARM ships enabled and
+   * an arm expires after 120 s unused, it would leave manual driving dead
+   * whenever fpms-missions happened to be running. Both facts are named
+   * separately on screen rather than merged into one "locked".
+   */
+  const missionLocked = motionLocked || notArmed;
 
   // The hub replays its last broadcast to each new subscriber, so without this
   // an ack from minutes ago would appear on mount as if it had just landed.
@@ -628,6 +751,17 @@ export default function Drive() {
           ? `${thing} has never reported this session — nothing to drive`
           : "";
 
+  // Mission buttons carry the arm gate on top of the link gate, and name which
+  // of the two stopped them.
+  const missionDisabled = noRover || missionLocked;
+  const missionDisabledHint = noRover
+    ? "no rover selected"
+    : motionLocked
+      ? disabledHint
+      : notArmed
+        ? `${thing} is not armed — fpms-missions refuses every mission with "rover is not armed" until it is`
+        : "";
+
   return (
     <ErrorBoundary label="Drive">
       <div className="space-y-5">
@@ -694,6 +828,118 @@ export default function Drive() {
                 <b>STOP ALL still works</b> and is still worth pressing.
               </p>
             </div>
+          </div>
+        )}
+
+        {/* A REPORTED POSITION THAT IS NOT A POSITION. Above everything it
+            affects, because it invalidates all of it: the map, the mission
+            card's coordinates, the planned route and the distance remaining are
+            all computed from this number. */}
+        {poseBroken && (
+          <div className="flex items-start gap-3 rounded-xl border-2 border-rose-500/60 bg-rose-950/50 p-4">
+            <span className="mt-1 inline-block h-3 w-3 shrink-0 rounded-full bg-rose-400 pulse-dot text-rose-400" />
+            <div>
+              <div className="text-base font-semibold text-rose-100">
+                POSE ESTIMATE BROKEN — reported position is outside the arena
+              </div>
+              <p className="mt-1 max-w-3xl text-sm text-rose-200/90">
+                The {brokenPoseSource} reports{" "}
+                <span className="font-mono">
+                  ({rawPoseX === null ? "--" : Math.round(rawPoseX)},{" "}
+                  {rawPoseY === null ? "--" : Math.round(rawPoseY)}) mm
+                </span>
+                , which is outside the {ARENA_MM} × {ARENA_MM} mm arena. That is
+                not a position — it is a dead-reckoning integration that has come
+                apart. It is <b>not plotted</b>: the map below has fallen back to
+                the assumed start corner and says so. Every distance, ETA and
+                arrival test on this page is computed from the same broken value.
+                Stop the rover and use <b>Set coordinate</b> below before running
+                anything.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* FRONT CLEARANCE, IN THE EYE-LINE. This is the number that fell
+            989 mm -> 117 mm during the run that ended in a collision, while
+            being rendered as one cell of a nine-up stat grid below the fold. */}
+        <ErrorBoundary label="Drive clearance">
+          <ClearanceBar
+            mm={mission?.frontMm ?? null}
+            stopMm={num(caps.limits.front_stop_mm) ?? FRONT_STOP_FALLBACK_MM}
+            stopFromRover={num(caps.limits.front_stop_mm) !== null}
+            running={!!mission?.running}
+            lidarOk={mission?.lidarOk ?? null}
+            hasExecutor={missionCh.messages > 0}
+          />
+        </ErrorBoundary>
+
+        {/* NOT ARMED — a named lockout in its own right, kept apart from the
+            link lockout because it stops a different set of controls. It is the
+            rover's own refusal, quoted, not a gate this dashboard invented. */}
+        {notArmed && !motionLocked && thing && (
+          <div className="flex items-start gap-3 rounded-xl border-2 border-amber-500/50 bg-amber-500/10 p-4">
+            <span className="mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full bg-amber-400 pulse-dot text-amber-400" />
+            <div>
+              <div className="text-base font-semibold text-amber-100">
+                NOT ARMED — missions are locked out
+              </div>
+              <p className="mt-1 max-w-3xl text-sm text-amber-100/85">
+                fpms-missions reports{" "}
+                <span className="font-mono">arm_required = true</span> and{" "}
+                <span className="font-mono">
+                  armed = {armed === null ? "not reported" : "false"}
+                </span>
+                . It refuses every run with <i>“rover is not armed”</i>, so the
+                mission buttons below are disabled rather than left to produce
+                refusals. An arm is the operator's consent that the arena is
+                clear; it expires on its own, and any stop or abort clears it.{" "}
+                <b>
+                  The stick, the turns and the nudges are NOT affected — teleop
+                  has no arm concept
+                </b>
+                , and pretending otherwise would attribute an interlock to a
+                machine that does not have one.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Arm state, said out loud in all three cases. armed / not armed / not
+            reported are three different situations and only one is a lockout.
+            Collapsing "the executor is not running" into "not armed" would
+            blame an interlock for a service that was never up. */}
+        {thing && (
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+            <span className="lbl">Arming</span>
+            {armRequired === null ? (
+              <span
+                className="chip"
+                title="fpms-missions has not published arm_required. Arming lives entirely in the mission executor, so nothing here is asserted about it — and nothing is locked out on the strength of a message that was never sent."
+              >
+                not reported — executor silent
+              </span>
+            ) : armRequired === false ? (
+              <span className="chip" title="The executor reports arm_required = false">
+                not required by the executor
+              </span>
+            ) : armed === true ? (
+              <span className="chip-ok" title="The executor reports armed = true">
+                ARMED
+              </span>
+            ) : (
+              <span
+                className="chip-hot"
+                title="The executor requires arming and reports it is not armed. It refuses every mission with “rover is not armed”."
+              >
+                NOT ARMED — missions refused by the rover
+              </span>
+            )}
+            <span>
+              Arming gates the <span className="font-mono">mission</span> verb and
+              nothing else. It is the executor's, it times out on its own, and
+              this dashboard reads it rather than setting it.
+            </span>
           </div>
         )}
 
@@ -800,14 +1046,22 @@ export default function Drive() {
                 right={
                   <div className="flex flex-wrap items-center gap-2">
                     <span
-                      className={mapPoseSource ? "chip font-mono" : "chip-warn font-mono"}
+                      className={
+                        poseBroken
+                          ? "chip-hot font-mono"
+                          : mapPoseSource
+                            ? "chip font-mono"
+                            : "chip-warn font-mono"
+                      }
                       title={
-                        mapPoseSource
-                          ? `Rover drawn from the ${mapPoseSource}'s dead-reckoned pose`
-                          : "Nothing is publishing a position — the rover is drawn at the assumed start corner"
+                        poseBroken
+                          ? "The reported position is outside the arena and has been refused — the glyph is at the assumed start, not where anything claims the rover is"
+                          : mapPoseSource
+                            ? `Rover drawn from the ${mapPoseSource}'s dead-reckoned pose — integrated from an assumed start, not measured`
+                            : "Nothing is publishing a position — the rover is drawn at the assumed start corner"
                       }
                     >
-                      pose · {mapPoseSource ?? "assumed"}
+                      pose · {poseBroken ? "REFUSED" : (mapPoseSource ?? "assumed")}
                     </span>
                     {planRoute ? (
                       <span className="chip font-mono" title="A planned route is shown">
@@ -827,9 +1081,11 @@ export default function Drive() {
                 />
               </div>
               <p className="mt-3 text-xs text-slate-500">
-                {mapPoseSource
-                  ? `The rover glyph is the ${mapPoseSource}'s own position, dead-reckoned in arena millimetres — nothing on this rover localises against the map, so it drifts and only a set coordinate resets it.`
-                  : "Nothing is publishing a position, so the rover is drawn at the assumed start corner and the map says SIMULATED. Neither the mission executor nor the teleop bridge has reported x/y."}
+                {poseBroken
+                  ? `The ${brokenPoseSource} reported a position outside the arena, so it has been refused rather than drawn. The glyph below is the assumed start corner and the map says SIMULATED — that is this dashboard declining to plot a broken estimate, not the rover parking itself.`
+                  : mapPoseSource
+                    ? `The rover glyph is the ${mapPoseSource}'s own position — dead-reckoned in arena millimetres from an ASSUMED start, never measured. Nothing on this rover localises against the map, so it drifts and only a set coordinate resets it.`
+                    : "Nothing is publishing a position, so the rover is drawn at the assumed start corner and the map says SIMULATED. Neither the mission executor nor the teleop bridge has reported x/y."}
               </p>
             </Card>
           </ErrorBoundary>
@@ -1090,17 +1346,32 @@ export default function Drive() {
                   key={m.name}
                   className={m.primary ? "btn-primary" : "btn"}
                   label={m.label}
-                  onFire={() => move("mission", { name: m.name, backend })}
-                  disabled={motionDisabled}
+                  onFire={() => {
+                    // Gated on the mission lock, not the motion lock: arming is
+                    // the executor's and applies here and nowhere else.
+                    if (!thing || missionLocked) return;
+                    fire("mission", [thing], { name: m.name, backend });
+                  }}
+                  disabled={missionDisabled}
                   hint={
-                    motionDisabled
-                      ? disabledHint
+                    missionDisabled
+                      ? missionDisabledHint
                       : `Run ${m.name} (${m.where}) using the ${backend} backend`
                   }
                 />
               ))}
             </div>
             <p className="mt-3 text-xs text-slate-500">
+              {notArmed && !motionLocked ? (
+                <>
+                  <b className="text-amber-200">
+                    Disabled because {thing} is not armed.
+                  </b>{" "}
+                  The executor would refuse each of these with “rover is not
+                  armed”. The stick and the bounded turns and nudges above are
+                  unaffected — teleop does not have an arm gate.{" "}
+                </>
+              ) : null}
               All {missionOptions.length} are confirm-gated: each one drives the
               rover somewhere on its own, and from here a rover on blocks and a
               rover on the floor look identical. The PLAN row above is not gated
@@ -1499,6 +1770,159 @@ const PHASE_LABEL: Record<LinkPhase, string> = {
   never: "NEVER SEEN",
 };
 
+/* ---- front clearance ----------------------------------------------------- */
+
+type ClearanceState = "clear" | "closing" | "blocked" | "unknown";
+
+function clearanceState(mm: number | null, stopMm: number): ClearanceState {
+  if (mm === null) return "unknown";
+  if (mm <= stopMm) return "blocked";
+  if (mm <= stopMm * CLOSING_FACTOR) return "closing";
+  return "clear";
+}
+
+const CLEAR_BOX: Record<ClearanceState, string> = {
+  clear: "border-emerald-500/40 bg-emerald-500/5",
+  closing: "border-amber-500/50 bg-amber-500/10",
+  blocked: "border-rose-500/60 bg-rose-950/40",
+  unknown: "border-slate-500/40 bg-black/30",
+};
+const CLEAR_INK: Record<ClearanceState, string> = {
+  clear: "text-emerald-300",
+  closing: "text-amber-300",
+  blocked: "text-rose-300",
+  unknown: "text-slate-500",
+};
+const CLEAR_CHIP: Record<ClearanceState, string> = {
+  clear: "chip-ok",
+  closing: "chip-warn",
+  blocked: "chip-hot",
+  unknown: "chip",
+};
+const CLEAR_WORD: Record<ClearanceState, string> = {
+  clear: "CLEAR",
+  closing: "CLOSING",
+  blocked: "BLOCKED",
+  unknown: "NO READING",
+};
+
+/**
+ * How far it is to whatever is in front of the rover, at the size that number
+ * deserves.
+ *
+ * Reads `front_mm` off fpms_missions.snapshot(). The executor OMITS that field
+ * when its LiDAR is blind rather than sending a zero, so `null` here means "no
+ * one is measuring the path ahead" and renders `--`. Rendering it as 0 would
+ * say the bumper is against something — the exact opposite of the truth on a
+ * rover whose scanner has dropped out, and the most dangerous single
+ * mistranslation available on this page.
+ *
+ * The three loud states are deliberately not symmetric with the quiet one:
+ * CLOSING opens at three times the stop distance so the readout changes
+ * character on the way in rather than at the moment the executor is already
+ * braking.
+ */
+function ClearanceBar({
+  mm,
+  stopMm,
+  stopFromRover,
+  running,
+  lidarOk,
+  hasExecutor,
+}: {
+  mm: number | null;
+  stopMm: number;
+  stopFromRover: boolean;
+  running: boolean;
+  lidarOk: boolean | null;
+  hasExecutor: boolean;
+}) {
+  const state = clearanceState(mm, stopMm);
+  const loud = state === "blocked" || (state === "unknown" && running);
+
+  return (
+    <div className={`rounded-xl border-2 p-4 ${CLEAR_BOX[state]}`}>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-4">
+          {loud && (
+            <span className="inline-block h-3 w-3 shrink-0 rounded-full bg-rose-400 pulse-dot text-rose-400" />
+          )}
+          <div>
+            <div className="lbl">Front clearance</div>
+            <div
+              className={`font-mono text-5xl font-semibold tabular-nums ${CLEAR_INK[state]}`}
+            >
+              {mm === null ? "--" : Math.round(mm)}
+              <span className="ml-1 text-xl text-slate-500">mm</span>
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={CLEAR_CHIP[state]}>{CLEAR_WORD[state]}</span>
+          <span
+            className="chip font-mono"
+            title={
+              stopFromRover
+                ? "front_stop_mm, as the mission executor announced it"
+                : "The executor has not announced its limits — this is the value fpms_missions ships with"
+            }
+          >
+            stops at {Math.round(stopMm)} mm
+            {stopFromRover ? "" : " · default"}
+          </span>
+          {lidarOk === false && (
+            <span className="chip-hot" title="The executor reports its obstacle guard has no fresh scan">
+              guard blind
+            </span>
+          )}
+        </div>
+      </div>
+
+      {state === "blocked" && (
+        <p className="mt-3 text-sm text-rose-100">
+          <b>Inside the executor's stop distance.</b> A mission would stop here.
+          If the rover is still moving, either it is braking now or it is not
+          seeing this — hit STOP ALL rather than waiting to find out which.
+        </p>
+      )}
+      {state === "closing" && (
+        <p className="mt-3 text-sm text-amber-100/90">
+          <b>Closing on something.</b> The last collision on this rover went{" "}
+          <span className="font-mono">989 mm → 117 mm</span> while nobody was
+          watching this number. Slow is bought with short bursts and full stops,
+          not with a smaller setpoint — see Speed floor below.
+        </p>
+      )}
+      {state === "unknown" && (
+        <p className="mt-3 text-sm text-slate-400">
+          {!hasExecutor ? (
+            <>
+              <b>No mission telemetry.</b> Front clearance comes from
+              fpms-missions, which is not publishing on this bay, so nothing on
+              this page is watching the path ahead. The LiDAR tab derives the
+              same distance straight from the live scan when a scan is arriving.
+            </>
+          ) : running ? (
+            <>
+              <b>The rover is driving and no front distance is being reported.</b>{" "}
+              The executor omits <span className="font-mono">front_mm</span> when
+              its LiDAR is blind rather than sending a zero. Treat the path ahead
+              as <b>unknown</b>, not as open.
+            </>
+          ) : (
+            <>
+              The executor is not reporting a front distance. It omits{" "}
+              <span className="font-mono">front_mm</span> when the LiDAR is blind
+              — an absent reading is shown as <span className="font-mono">--</span>,
+              never as 0.
+            </>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /* ---- speed envelope ------------------------------------------------------ */
 
 /**
@@ -1618,7 +2042,7 @@ function SpeedFloorCard({ tele }: { tele: Record<string, unknown> | null }) {
   return (
     <Card>
       <CardHeader
-        title="Speed floor"
+        title="There is no slow speed on this chassis"
         subtitle="What the bottom of the range actually does"
         right={
           <div className="flex flex-wrap items-center gap-2">
@@ -1642,6 +2066,20 @@ function SpeedFloorCard({ tele }: { tele: Record<string, unknown> | null }) {
           </div>
         }
       />
+
+      {/* The plain statement, first and unqualified. Everything below it is
+          evidence for it or caveats to it, and an operator who reads nothing
+          else on this card must still leave with this. */}
+      <div className="mb-4 rounded-lg border-2 border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-50">
+        <b>The firmware applies roughly 50% duty to ANY non-zero setpoint.</b> A
+        smaller number in a speed box does not produce a slower rover — it
+        produces a rover that either moves at the speed it always moves at, or
+        does not move at all. There is no gentle duty and there is no slow
+        setpoint. <b>Slowness on this chassis comes from short bursts with full
+        stops between them</b>, which is what the mission executor's
+        dead-reckoning backend does and what the {NUDGE_MM} mm nudge buttons do.
+        No control on this page is offered that would imply otherwise.
+      </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
         <FloorReadout

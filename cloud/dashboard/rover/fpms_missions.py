@@ -1288,11 +1288,55 @@ def apply_segments(pose, segs, measured=True):
     return pose
 
 
+# THE HARD CEILING ON HOW LONG THE WHEELS MAY TURN, ON WALL CLOCK ALONE.
+#
+# 2026-08-02: a 300mm segment ran roughly a metre and struck an obstacle. The
+# distance limit never fired, and the reason is worth stating exactly, because
+# every other guard in this file shares the assumption it broke.
+#
+# `_displacement` projects the odometry delta onto the heading. During that run
+# the reported pose jumped to (474, -1995) while the rover was heading +y, so
+# the projection `along` went large and NEGATIVE. The test is
+# `sign * along >= stop_at`; a negative value can never satisfy a positive
+# threshold, so the segment could not terminate on distance. Only the LiDAR
+# front guard stopped it.
+#
+# So: garbage odometry silently DISABLES the distance limit. Every guard that
+# reads odometry has that failure mode. This one does not read odometry at all.
+#
+# The bound is deliberately crude — worst-case speed x time — because its whole
+# job is to survive the sensors being wrong. FULL_DUTY_MPS is derived from that
+# incident (~0.87m travelled in ~1.45s before the guard fired) and is a MEASURED
+# LOWER BOUND on how fast this chassis moves when the firmware applies its
+# ~50% duty floor. It is not a setpoint and cannot be tuned down: the firmware's
+# PWM_MOTOR_DEAD_ZONE (200 of 400 ticks) is ADDED as feed-forward, so 50.25%
+# duty is the smallest non-zero output that exists. See research/R4_FIRMWARE.md.
+FULL_DUTY_MPS = 0.65
+BURST_CAP_SLACK = 1.6
+
+
+def burst_cap_s(seg):
+    """Longest the wheels may run for this segment, ignoring all sensors.
+
+    Answers one question only: at the fastest this chassis can physically move,
+    how long until it has covered the segment? Anything beyond that is the
+    rover running blind, whatever the odometry claims.
+    """
+    if seg.kind != "drive":
+        return None
+    mm = abs(seg.target)
+    return max(MIN_PULSE_S + 0.2, (mm / 1000.0) / FULL_DUTY_MPS * BURST_CAP_SLACK)
+
+
 def segment_timeout_s(seg):
     """Per-segment ceiling: 3x the nominal duration, plus the settle, plus slack.
 
     Generous on purpose — this is the backstop for a segment that is making slow
     progress, while the stall detector is what catches one making none.
+
+    NOTE this is derived from CRUISE_MPS, a SETPOINT the firmware ignores, so it
+    is far too generous in wall-clock terms. burst_cap_s above is the real
+    ceiling; this remains as the slow-progress backstop it was written to be.
     """
     if seg.kind == "drive":
         nominal = abs(seg.target) / 1000.0 / max(CRUISE_MPS, 1e-6)
@@ -1580,6 +1624,7 @@ ABORT_BATT = "battery low"
 ABORT_OBSTACLE = "obstacle inside stop distance"
 ABORT_TIMEOUT = "mission timeout"
 ABORT_SEG_TIMEOUT = "segment timeout"
+ABORT_BURST_CAP = ("burst cap: the wheels ran longer than the segment could possibly need at full duty — the odometry is not to be trusted")
 ABORT_STALL = "segment stalled"
 ABORT_WIRE = "another /cmd_vel writer"
 ABORT_SHUTDOWN = "service shutting down"
@@ -2504,6 +2549,12 @@ class DeadReckonBackend:
                     # cost one twitch instead of a mission.
                     reason = ABORT_TURN_SIGN
                     break
+                if cap is not None and now - t0 > cap:
+                    # Sensor-independent. If this fires, something upstream is
+                    # lying — distance, heading or both — and the only safe
+                    # action is to stop the wheels and say so.
+                    reason = ABORT_BURST_CAP
+                    break
                 if now - t0 > timeout:
                     reason = ABORT_SEG_TIMEOUT
                     break
@@ -2558,6 +2609,7 @@ class DeadReckonBackend:
         target_mm = abs(seg.target)
         stop_at = target_mm * DRIVE_COAST_FACTOR
         timeout = segment_timeout_s(seg)
+        cap = burst_cap_s(seg)
         speed = DOCK_MPS if seg.dock else CRUISE_MPS
         reason = "done"
         along = lateral = 0.0
