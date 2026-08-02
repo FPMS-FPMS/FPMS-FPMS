@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import Layout from "./components/Layout";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import Intro from "./pages/Intro";
 import Control from "./pages/Control";
 import Drive from "./pages/Drive";
@@ -68,6 +69,11 @@ function NoSuchPage() {
 }
 
 export default function App() {
+  // MUST be above the early returns below. App returns early while auth
+  // status is loading and again for the login screen; a hook called after
+  // those would be skipped on that render and React would see the hook
+  // order change on the next one.
+  const { pathname } = useLocation();
   const [status, setStatus] = useState<AuthStatus | null>(null);
 
   const refresh = () =>
@@ -96,6 +102,20 @@ export default function App() {
 
   return (
     <Layout controlsDisabled={locked}>
+      {/*
+        EVERY page is wrapped, and the key resets the boundary on navigation.
+
+        Without this, one throw anywhere in a page unmounted the WHOLE React
+        tree -- nav, footer and all -- leaving only the Layout's empty grid
+        containers behind. Reported as "overview bugs it and goes into a grid",
+        with every other tab fine, because the throw was in a component only
+        Overview renders. A page-level fault should cost you that page, not the
+        application, and it should say what it was.
+
+        Keyed on pathname so navigating away clears a caught error; otherwise
+        the boundary latches and every subsequent page looks broken too.
+      */}
+      <ErrorBoundary key={pathname} label="page">
       <Routes>
         <Route path="/" element={<Intro />} />
         <Route
@@ -125,6 +145,7 @@ export default function App() {
         {/* Must be LAST: react-router takes the first match. */}
         <Route path="*" element={<NoSuchPage />} />
       </Routes>
+      </ErrorBoundary>
     </Layout>
   );
 }
