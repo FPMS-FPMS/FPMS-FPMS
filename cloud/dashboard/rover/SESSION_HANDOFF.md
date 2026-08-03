@@ -9,6 +9,88 @@ Written 2026-07-31 at the end of a long session.
 
 ---
 
+## 2026-08-02: the firmware is the wall, and it is one constant
+
+**READ THIS BEFORE PROPOSING ANY ACCURACY WORK.** Three sessions have now tried
+to get slow, precise motion out of this rover by tuning software. It cannot be
+done, and the reason is a single line of vendor firmware:
+
+```c
+#define PWM_MOTOR_DEAD_ZONE (200)                  // of a 400-tick scale
+if (speed > 0) return speed + PWM_MOTOR_DEAD_ZONE; // ADDED as feed-forward
+```
+
+The smallest non-zero output that exists is 201/400 = **50.25% duty**. The
+bottom half of the actuator range is not implemented, and it is not reachable
+from ROS. Consequence, measured:
+
+    minimum pulse 0.35s x full duty ~0.65 m/s  =  ~230mm MINIMUM MOVE
+
+A second defect hides behind it: the control loop quantises its own integrand,
+so a 0.2-count-per-period setpoint cannot be represented -- the PID dithers and
+the dead zone converts each dither into a 50% kick. That pair explains every
+contradictory measurement in this file: 0.00295 dead on the floor, 0.0010
+running away wheels-off, the 0.35s minimum burst. One root cause, two symptoms.
+
+**So: centimetre accuracy is a FIRMWARE problem.** SLAM can locate to 2-5cm but
+the actuator cannot act on it. Do not accept a task to "tune it slower".
+
+### What is already done, so do not redo it
+- **Stock 4MB flash backed up**, md5 `d7e02541627eaa40946c647169bd38d9`, at
+  `rover/firmware_backup/` (gitignored -- it is Yahboom's binary). One-command
+  revert; used successfully once already.
+- **esptool auto-reset WORKS on this board.** It connects, identifies and reads
+  all 4MB over DTR/RTS through the CP210x with NO button press. Flashing is
+  fully scriptable; the operator never touches the board.
+- **ESP-IDF v5.2.2 is installed on the rover** at `~/esp/esp-idf`, toolchain
+  built for esp32s3.
+- **Two non-obvious build blockers are solved and documented** in
+  `rover/firmware/README.md`: `catkin_pkg` must go into ESP-IDF's OWN venv
+  (a system pip install verifies correct and changes nothing), and ROS 2 must
+  be sourced BEFORE ESP-IDF.
+- Hardware constants confirmed by three independent sources: motor GPIOs
+  4/5/15/16/9/10/13/14, encoders 6/7/47/48/11/12/1/2, 70mm wheels, 1170 CPR,
+  IMU ICM42670P, flash 4MB.
+- **The operator's own Arduino driver, recovered from this machine's build
+  cache, drives this board with NO dead zone** using `ledcWrite()` at 25kHz,
+  full 0-255 range. Proof the hardware is capable. See `research/R6_LOCAL_ASSETS.md`.
+
+### What FAILED, and why -- do not repeat these
+1. **A from-scratch micro-ROS firmware** (`rover/firmware/`) compiled, flashed,
+   booted and published telemetry, but the motors never energised. Silent. It
+   used MCPWM, a topology inferred from a third-party repo rather than a
+   schematic.
+2. **Swapping that to LEDC** boot-looped. No readable panic at 115200 or 921600.
+   A USB-serial console at the correct rate would have diagnosed it in seconds
+   -- do that FIRST next time.
+3. **The real upstream firmware** `github.com/PrwTsrt/microros_esp32_diffdrive`
+   still does not build. Two of its bugs are already fixed in
+   `/home/ubuntu/upstream_fw` on the rover: a missing `#include <unistd.h>` in
+   `components/icm42670p/icm42670p.c`, and its TRACKED `sdkconfig` which an
+   earlier build script deleted (restore with `git checkout -- sdkconfig`).
+   It now fails at `#error micro-ROS transports misconfigured` because the
+   component defaults to UDP and this firmware needs custom/serial. Adding an
+   `app-colcon.meta` with `-DRMW_UXRCE_TRANSPORT=custom` was NOT sufficient.
+
+**THE ONE REMAINING BLOCKER: that repo depends on `menuconfig` state its author
+never committed.** Next session should run `idf.py menuconfig` interactively and
+select the micro-ROS UART transport option, rather than guessing at sdkconfig
+symbols one at a time. That is a config incantation, not a code problem.
+
+### Operating notes earned today
+- **The WiFi drops SSH mid-command constantly.** Run anything longer than ~60s
+  detached with `nohup ... > /tmp/x.log 2>&1 &` and poll the log. A mission
+  script run inline was lost twice this way.
+- **`/tmp` is wiped on every boot.** The MQTT probe helpers live there; recreate
+  them or move them to `/home/ubuntu`.
+- The mission executor now REFUSES an origin file written before the current
+  boot, and refuses a start pose outside the arena. Both were real incidents.
+- `FRONT_STOP_MM` is measured FROM THE LIDAR, which sits behind the nose. 120
+  was a never-fires backstop and the rover drove into an obstacle with the guard
+  "working". It is now 400. The golden code used 310-410.
+
+---
+
 ## 2026-08-01: the drivetrain fault, and what slow actually means
 
 **A single bad motor cable caused everything.** The rear-left lead was dead, so
