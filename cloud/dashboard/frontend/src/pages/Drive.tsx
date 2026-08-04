@@ -4,6 +4,9 @@ import { StatusPill } from "../components/StatusPill";
 import ErrorBoundary from "../components/ErrorBoundary";
 import Joystick, { type StickValue } from "../components/Joystick";
 import { ArenaMap } from "../components/ArenaMap";
+// The same control the mission console renders, not a copy of it — the rule
+// about the boxes starting EMPTY is worth exactly one implementation.
+import { SetCoordinate } from "../components/MissionConsole";
 import { useChannel } from "../lib/ws";
 import { apiPostJson } from "../lib/api";
 import { useThings } from "../lib/things";
@@ -2381,62 +2384,6 @@ function Readout({
 }
 
 /* ---- small pieces -------------------------------------------------------- */
-
-function SetCoordinate({
-  onFire,
-  disabled,
-}: {
-  onFire: (x: number, y: number) => void;
-  disabled: boolean;
-}) {
-  // Empty, not "0". These boxes used to arrive pre-filled with 0/0, so the
-  // control was one click away from publishing "you are at the arena origin"
-  // — a coordinate nobody typed and nothing measured, on a page that may never
-  // have heard from the rover at all. An unfilled box disables the button.
-  const [x, setX] = useState("");
-  const [y, setY] = useState("");
-  const nx = Number(x);
-  const ny = Number(y);
-  const valid =
-    x.trim() !== "" && y.trim() !== "" && Number.isFinite(nx) && Number.isFinite(ny);
-
-  return (
-    <div className="flex flex-wrap items-end gap-3">
-      <label className="flex flex-col gap-1">
-        <span className="lbl">x (mm)</span>
-        <input
-          type="number"
-          value={x}
-          onChange={(e) => setX(e.target.value)}
-          placeholder="--"
-          className="w-28 rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-ember-500/40"
-        />
-      </label>
-      <label className="flex flex-col gap-1">
-        <span className="lbl">y (mm)</span>
-        <input
-          type="number"
-          value={y}
-          onChange={(e) => setY(e.target.value)}
-          placeholder="--"
-          className="w-28 rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 font-mono text-sm text-slate-200 outline-none focus:border-ember-500/40"
-        />
-      </label>
-      <button
-        className="btn-primary"
-        disabled={disabled || !valid}
-        onClick={() => valid && onFire(nx, ny)}
-        title={
-          valid
-            ? "Set the rover's believed position"
-            : "Type both coordinates — there is no default, because a default here is a made-up position"
-        }
-      >
-        Set coordinate
-      </button>
-    </div>
-  );
-}
 
 /**
  * Arms on the first click and fires on the second, disarming after a few

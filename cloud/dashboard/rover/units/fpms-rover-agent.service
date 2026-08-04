@@ -1,0 +1,16 @@
+[Unit]
+Description=FPMS rover agent (camera + lidar -> dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/fpms-rover-agent
+Restart=always
+RestartSec=5
+User=ubuntu
+SupplementaryGroups=video dialout
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

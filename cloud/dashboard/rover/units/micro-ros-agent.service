@@ -1,0 +1,49 @@
+[Unit]
+Description=micro-ROS Agent (Yahboom MicroROS Board V2.0 / ESP32-S3) on USB port 1.3
+Documentation=https://micro.ros.org
+After=network-online.target dev-serial-by\x2dpath-platform\x2dfc880000.usb\x2dusb\x2d0:1.3:1.0\x2dport0.device
+Wants=network-online.target
+# BindsTo the physical port: if the CP2102 re-enumerates (unplug, brownout,
+# USB reset) the unit stops and is restarted against the recreated node rather
+# than clinging to a stale fd that will never produce another byte.
+BindsTo=dev-serial-by\x2dpath-platform\x2dfc880000.usb\x2dusb\x2d0:1.3:1.0\x2dport0.device
+
+[Service]
+Type=simple
+User=ubuntu
+SupplementaryGroups=dialout
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# Stable by-path device: both CP2102 adapters report the identical
+# ID_SERIAL "0001", so udev can only create ONE /dev/serial/by-id link for the
+# pair - by-id is unusable here and the USB topology path is the only thing
+# that distinguishes the ESP32-S3 board (1.3) from the LiDAR (1.2).
+# Never use /dev/ttyUSB1 here - it renumbers across boots.
+#
+# -b 921600 is correct and must not be "fixed": the board's own flash config
+# prints "ros serial baudrate: 921600" at boot, so agent and client agree.
+# THE FIX FOR THE DEAD LINK.
+# Micro-XRCE-DDS's TermiosAgentLinux never issues a TIOCMSET, so it inherits the
+# kernel default of raising DTR and RTS on the open that takes the port from
+# closed to open. On this board RTS drives the ESP32-S3 EN pin, so the agent's
+# own open pinned the MCU in hardware reset for as long as it held the port -
+# forever. Measured: lines asserted -> 56 bytes in 15s and the agent idling at
+# 0.00s CPU for 48 minutes; lines cleared -> full boot and a session in ~6s.
+#
+# The wrapper runs a holder process next to the agent that clears RTS/DTR from a
+# second descriptor and keeps that descriptor open, because the lines snap back
+# to 0x06 the moment it closes. See the wrapper for the full ordering argument.
+#
+# This is what makes the link self-healing: agent opens -> board is reset -> the
+# holder releases the reset -> board boots into an agent that is already
+# listening. Every restart of this unit re-establishes the session with nobody
+# touching the hardware, which also covers the stock micro-ROS client's lack of
+# any reconnection state machine.
+ExecStart=/usr/local/bin/fpms-uros-agent-run
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

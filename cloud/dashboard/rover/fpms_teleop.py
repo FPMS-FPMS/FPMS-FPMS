@@ -63,7 +63,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import BatteryState, Imu
 from std_msgs.msg import UInt16, Int32
 
 import paho.mqtt.client as mqtt
@@ -103,6 +103,9 @@ STARTED = time.time()
 # ground speed — about 6x. The operator judged that far too fast. Everything
 # below is therefore expressed in REAL m/s and divided by CMD_SCALE on the way
 # out. If the rover is ever re-measured, this constant is the only edit.
+# REVERTED 2026-08-02: the custom firmware boot-looped, so the board is back
+# on Yahboom stock, which needs these workarounds again. See
+# rover/firmware/README.md -- do NOT change these without changing the image.
 CMD_SCALE = 6.1
 
 
@@ -147,6 +150,9 @@ def to_cmd_ang(desired_radps):
 # Scattering -1 through the readers is how half of them end up corrected and the
 # other half do not, which is a worse bug than the original because it is
 # intermittent by code path rather than constant.
+# REVERTED 2026-08-02: the custom firmware boot-looped, so the board is back
+# on Yahboom stock, which needs these workarounds again. See
+# rover/firmware/README.md -- do NOT change these without changing the image.
 ODOM_TWIST_SIGN = -1
 
 # Angular twist is NOT corrected: no trial above exercised rotation, so whether
@@ -1074,6 +1080,15 @@ class TeleopNode(Node):
         }
         self.create_subscription(Odometry, "/odom_raw", self._on_odom, qos)
         self.create_subscription(Imu, "/imu", self._on_imu, qos)
+        # UInt16 DECIVOLTS -- the Yahboom factory firmware convention, restored
+        # 2026-08-04. This flipped twice: linorobot2_hardware published
+        # sensor_msgs/BatteryState in volts, so this briefly had to be
+        # BatteryState; going back to factory firmware flips it back.
+        #
+        # A wrong type here matches NOTHING and does so SILENTLY: /battery still
+        # lists publishers, the topic looks alive, and battery_v just stays None
+        # forever. It presented as "the dashboard shows no battery" both times.
+        # _on_battery accepts either message shape, so only this line matters.
         self.create_subscription(UInt16, "/battery", self._on_battery, qos)
         # /scan is deliberately NOT subscribed: every range on this board reads
         # 0.0, so a subscription would only produce a plausible-looking stream of
@@ -1275,9 +1290,15 @@ class TeleopNode(Node):
             log(f"imu callback error {e}")
 
     def _on_battery(self, msg):
+        # linorobot2_hardware publishes sensor_msgs/BatteryState in VOLTS; the
+        # vendor firmware published std_msgs/UInt16 in DECIVOLTS. Accept either
+        # and keep battery_raw in decivolts, so _battery_v_unlocked() and every
+        # downstream consumer are unchanged.
         try:
+            volts = getattr(msg, "voltage", None)
             with self.lock:
-                self.battery_raw = int(msg.data)
+                self.battery_raw = (int(round(volts * 10.0)) if volts is not None
+                                    else int(msg.data))
                 now = time.monotonic()
                 self.battery_last = now
                 self.battery_times.append(now)

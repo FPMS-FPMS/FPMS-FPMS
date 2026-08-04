@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from typing import Any
 
@@ -101,6 +102,25 @@ _NO_CREDS_HELP = (
     "every rover panel will wait forever with no visible error."
 )
 
+# How long a connection may go without a single message before we treat it as
+# wedged and force a reconnect.
+#
+# The rover heartbeats several topics a second, so 45s of total silence on a
+# link we believe is up is never normal traffic — it is the failure below.
+# Only armed once at least one message has arrived, so a dashboard opened
+# before the rover is powered on does not reconnect-loop against an idle broker.
+_STALL_AFTER_S = 45.0
+_WATCHDOG_TICK_S = 5.0
+
+# A reconnect only fixes a wedged link. If the rover is simply switched off, or
+# parked with nothing publishing, every reconnect is futile and the next one is
+# no more likely to help — so back off instead of cycling the subscription every
+# 45s forever. This matters because each reconnect briefly drops our
+# subscription, and on a QoS 0 bridge anything published in that gap is gone,
+# meaning an over-eager watchdog would CAUSE the message loss it exists to
+# detect. Resets to the base interval the moment real traffic returns.
+_STALL_BACKOFF_MAX_S = 600.0
+
 
 class Bridge:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -118,6 +138,19 @@ class Bridge:
         self.connect_attempts = 0
         self.subscribed: list[str] = []
         self._last_auth_log_at = 0.0
+        # Set when a message could not be routed. Kept in status() because the
+        # symptom of the bug these guard against is invisible otherwise: the
+        # panels freeze while everything still reports "connected".
+        self.dispatch_errors = 0
+        self.last_dispatch_error: str | None = None
+        self._last_dispatch_log_at = 0.0
+        # Watchdog bookkeeping.
+        self.stall_recoveries = 0
+        # Consecutive futile recoveries, used to widen the stall threshold.
+        self._futile_recoveries = 0
+        self._messages_at_last_recovery = 0
+        self._stop_watchdog = threading.Event()
+        self._watchdog: threading.Thread | None = None
 
         self.client = mqtt.Client(
             client_id=settings.mqtt_client_id,
@@ -188,13 +221,131 @@ class Bridge:
                       "retrying. Until it succeeds every rover panel stays empty.",
                       settings.mqtt_host, port, e)
         self.client.loop_start()
+        self._start_watchdog()
 
     def stop(self) -> None:
+        self._stop_watchdog.set()
         self.client.loop_stop()
         try:
             self.client.disconnect()
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- watchdog --------------------------------------------------------
+    def _start_watchdog(self) -> None:
+        if self._watchdog and self._watchdog.is_alive():
+            return
+        self._stop_watchdog.clear()
+        self._watchdog = threading.Thread(target=self._watchdog_run, daemon=True,
+                                          name="fpms-mqtt-watchdog")
+        self._watchdog.start()
+
+    def seconds_since_message(self) -> float | None:
+        if self.last_message_at is None:
+            return None
+        return max(0.0, time.time() - self.last_message_at)
+
+    def _network_thread_alive(self) -> bool | None:
+        """Is paho's network loop still running?
+
+        `_thread` is private API, so treat its absence as "cannot tell" rather
+        than "dead" — reconnecting on a wrong guess would be worse than the
+        stall we are trying to detect.
+        """
+        thread = getattr(self.client, "_thread", None)
+        if thread is None:
+            return None
+        return bool(thread.is_alive())
+
+    def stall_threshold_s(self) -> float:
+        """Current silence budget — base, doubled per consecutive futile retry."""
+        return min(_STALL_AFTER_S * (2 ** self._futile_recoveries), _STALL_BACKOFF_MAX_S)
+
+    def is_stalled(self) -> bool:
+        """Connected, has received traffic before, and has now gone silent."""
+        if not self.connected:
+            return False
+        age = self.seconds_since_message()
+        return age is not None and age > self.stall_threshold_s()
+
+    def _watchdog_run(self) -> None:
+        """Recover a feed that has gone quiet without disconnecting.
+
+        Two distinct failures land here, and both used to be permanent:
+
+          1. paho's network thread died (see _on_message). Nothing else notices,
+             because the death is silent and `connected` is never cleared.
+          2. The TCP connection is up but wedged — a half-open socket the OS has
+             not torn down, which happens on this project's WiFi link. paho's
+             own keepalive eventually catches most of these, but not while the
+             socket still accepts writes.
+
+        The remedy for both is the same: force a reconnect. It is safe to do
+        while healthy — worst case we re-subscribe — so this deliberately does
+        not try to distinguish them beyond what it logs.
+        """
+        while not self._stop_watchdog.wait(_WATCHDOG_TICK_S):
+            try:
+                alive = self._network_thread_alive()
+                stalled = self.is_stalled()
+                if alive is False:
+                    log.error(
+                        "MQTT network thread is DEAD (messages_seen=%d, "
+                        "dispatch_errors=%d, last error: %s) — restarting it. "
+                        "Every panel was frozen on its last value until now.",
+                        self.messages_seen, self.dispatch_errors,
+                        self.last_dispatch_error,
+                    )
+                    self.connected = False
+                    self.stall_recoveries += 1
+                    self.last_error = "MQTT network thread died; restarted by watchdog"
+                    self.last_error_at = time.time()
+                    try:
+                        self.client.loop_stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        self.client.reconnect()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("watchdog reconnect failed: %s", e)
+                    try:
+                        self.client.loop_start()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("watchdog loop_start failed: %s", e)
+                elif stalled:
+                    age = self.seconds_since_message()
+                    # Did the previous recovery actually bring traffic back? If
+                    # not, widen the budget so a powered-off rover is not
+                    # reconnected against every 45s for the rest of the session.
+                    if self.messages_seen > self._messages_at_last_recovery:
+                        self._futile_recoveries = 0
+                    else:
+                        self._futile_recoveries = min(self._futile_recoveries + 1, 4)
+                    self._messages_at_last_recovery = self.messages_seen
+                    log.warning(
+                        "MQTT looks connected but no message has arrived for "
+                        "%.0fs — forcing a reconnect (recovery #%d, next check "
+                        "after %.0fs of silence).",
+                        age or 0.0, self.stall_recoveries + 1,
+                        self.stall_threshold_s(),
+                    )
+                    self.stall_recoveries += 1
+                    self.last_error = (
+                        f"no telemetry for {age:.0f}s while connected; "
+                        "watchdog forced a reconnect"
+                    )
+                    self.last_error_at = time.time()
+                    # Reset the clock so one stall does not fire a reconnect
+                    # every tick while the broker is genuinely quiet.
+                    self.last_message_at = time.time()
+                    try:
+                        self.client.reconnect()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("watchdog reconnect failed: %s", e)
+            except Exception:  # noqa: BLE001
+                # The watchdog is the thing that keeps the feed alive; it must
+                # outlive anything it observes.
+                log.exception("MQTT watchdog tick failed")
 
     def effective_port(self) -> int:
         """The port we actually dial — see start(), which promotes 1883→8883
@@ -216,6 +367,16 @@ class Bridge:
             "messages_seen": self.messages_seen,
             "things_seen": sorted(self.things_seen),
             "last_message_at": self.last_message_at,
+            # Age, not just a timestamp: a frozen feed and a healthy one look
+            # identical from last_message_at alone unless the reader does the
+            # subtraction, and every reader was getting that wrong.
+            "seconds_since_message": self.seconds_since_message(),
+            "stalled": self.is_stalled(),
+            "stall_after_s": self.stall_threshold_s(),
+            "stall_recoveries": self.stall_recoveries,
+            "dispatch_errors": self.dispatch_errors,
+            "last_dispatch_error": self.last_dispatch_error,
+            "network_thread_alive": self._network_thread_alive(),
             "connect_attempts": self.connect_attempts,
             "subscribed": list(self.subscribed),
             # Presence only — the password itself is never returned. /api/health
@@ -230,7 +391,16 @@ class Bridge:
             "last_error_at": self.last_error_at,
         }
         # A single field the UI (and a human reading curl output) can act on.
-        if self.connected:
+        if self.connected and st["stalled"]:
+            # Connected but silent is its own failure and used to report no
+            # problem at all, which is how a dead feed passed for a healthy one.
+            st["problem"] = (
+                f"Connected to {settings.mqtt_host}:{self.effective_port()} but no "
+                f"telemetry has arrived for {st['seconds_since_message']:.0f}s. "
+                "The rover may be off, off the network, or the broker link is "
+                "wedged — the watchdog is forcing reconnects."
+            )
+        elif self.connected:
             st["problem"] = None
         elif self.auth_failed:
             st["problem"] = (
@@ -338,34 +508,94 @@ class Bridge:
         log.warning("MQTT disconnected from %s: %s", settings.mqtt_host, reason_code)
 
     def _on_message(self, _client, _userdata, msg: mqtt.MQTTMessage) -> None:
-        self.messages_seen += 1
-        self.last_message_at = time.time()
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except Exception:  # noqa: BLE001
-            log.exception("bad payload on %s", msg.topic)
-            return
-        parts = msg.topic.split("/")
-        if len(parts) < 4 or parts[0] != "fpms":
-            return
-        thing = parts[1]
-        channel_kind = parts[2]
-        subtype = parts[3]
-        self.things_seen.add(thing)
+        """Route one broker message. MUST NOT raise.
 
-        if channel_kind == "telemetry":
-            self._dispatch_telemetry(thing, subtype, payload)
-        elif channel_kind == "events":
-            self._dispatch_event(thing, subtype, payload)
+        THIS IS WHY THE PANELS WOULD FREEZE WHILE THE APP SAID "CONNECTED".
+
+        paho runs this on its own network thread and does not wrap the callback:
+        an exception escaping here propagates out of _handle_on_message, through
+        loop_read, and out of the thread's loop_forever — which only handles
+        socket-level errors. The network thread then DIES. No on_disconnect
+        fires, so `self.connected` stays True forever, /api/health keeps
+        reporting a healthy broker link, and every panel sits on its last good
+        value looking merely stale rather than broken. Only restarting the app
+        cleared it, which is exactly what "the LiDAR randomly goes stale" was.
+
+        Only the JSON decode used to be guarded. Everything downstream was not,
+        and two calls in that path can genuinely raise on a healthy system:
+          - run_coroutine_threadsafe() raises RuntimeError once the uvicorn loop
+            is closed — i.e. every message that lands during shutdown, and any
+            that arrive after a loop restart.
+          - forwarder.offer() promises it never raises, but it reaches
+            settings_store.get() -> Path.is_file() on ~/.fpms/settings.json for
+            every single message. That is an OS call on a file another thread
+            rewrites, and on Windows it raises if the file is locked mid-write.
+
+        So the guard is the whole body, not one more narrow except: the contract
+        that matters is that no single bad message can ever take the feed down.
+        """
+        try:
+            self.messages_seen += 1
+            self.last_message_at = time.time()
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+            except Exception:  # noqa: BLE001
+                log.exception("bad payload on %s", msg.topic)
+                return
+            parts = msg.topic.split("/")
+            if len(parts) < 4 or parts[0] != "fpms":
+                return
+            thing = parts[1]
+            channel_kind = parts[2]
+            subtype = parts[3]
+            self.things_seen.add(thing)
+
+            if channel_kind == "telemetry":
+                self._dispatch_telemetry(thing, subtype, payload)
+            elif channel_kind == "events":
+                self._dispatch_event(thing, subtype, payload)
+        except BaseException as e:  # noqa: BLE001 - the whole point is to catch everything
+            self.dispatch_errors += 1
+            self.last_dispatch_error = f"{type(e).__name__}: {e}"
+            now = time.time()
+            # Throttled: a closed event loop fails on every message at full
+            # telemetry rate, and an unthrottled traceback per frame would bury
+            # the log faster than anyone could read it.
+            if self.dispatch_errors == 1 or now - self._last_dispatch_log_at > 30:
+                self._last_dispatch_log_at = now
+                log.exception(
+                    "failed to dispatch %s (%d dispatch errors so far). The "
+                    "message was dropped; the broker link is being kept alive.",
+                    msg.topic, self.dispatch_errors,
+                )
+
+    def _broadcast(self, channel: str, envelope: dict[str, Any]) -> None:
+        """Hand an envelope to the asyncio hub from paho's thread.
+
+        Swallows the closed-loop case specifically: during shutdown the loop
+        goes away while messages are still arriving, and that is expected, not
+        an error worth a traceback per frame.
+        """
+        if self.loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(hub.broadcast(channel, envelope), self.loop)
 
     # ---- routing helpers -------------------------------------------------
     def _dispatch_telemetry(self, thing: str, subtype: str, payload: dict[str, Any]) -> None:
         channel = f"{subtype}:{thing}"
         envelope = {"thing": thing, "subtype": subtype, "ts": self.last_message_at, "data": payload}
-        asyncio.run_coroutine_threadsafe(hub.broadcast(channel, envelope), self.loop)
+        self._broadcast(channel, envelope)
         # Throttled copy to the cloud app. The local dashboard always sees the
         # full rate; only the uplink is rate-limited.
-        cloud_forwarder.forwarder.offer(thing, subtype, "telemetry", payload)
+        #
+        # Guarded separately from the caller's catch-all so a cloud-side problem
+        # cannot cost us the local broadcast that already happened above — and
+        # so the local dashboard, which is the thing the operator is watching,
+        # never depends on the uplink working.
+        try:
+            cloud_forwarder.forwarder.offer(thing, subtype, "telemetry", payload)
+        except Exception:  # noqa: BLE001
+            log.debug("cloud forwarder offer failed for %s/%s", thing, subtype, exc_info=True)
 
         if subtype == "thermal" and isinstance(payload.get("grid"), list):
             try:
@@ -379,21 +609,22 @@ class Bridge:
                 "ts": self.last_message_at,
                 "data": analysis,
             }
-            asyncio.run_coroutine_threadsafe(
-                hub.broadcast(f"thermal-analysis:{thing}", analysis_envelope),
-                self.loop,
-            )
+            self._broadcast(f"thermal-analysis:{thing}", analysis_envelope)
 
     def _dispatch_event(self, thing: str, subtype: str, payload: dict[str, Any]) -> None:
         # Events bypass the throttle entirely — an alert must not wait.
-        cloud_forwarder.forwarder.offer(thing, subtype, "events", payload)
+        try:
+            cloud_forwarder.forwarder.offer(thing, subtype, "events", payload)
+        except Exception:  # noqa: BLE001
+            log.debug("cloud forwarder offer failed for event %s/%s", thing, subtype,
+                      exc_info=True)
         envelope = {
             "thing": thing,
             "subtype": subtype,
             "ts": self.last_message_at,
             "data": payload,
         }
-        asyncio.run_coroutine_threadsafe(hub.broadcast("events", envelope), self.loop)
+        self._broadcast("events", envelope)
         # Fire an HQ email alert for fire/alert-class events. No-op if SMTP
         # isn't configured. Runs in the paho thread but SMTP is fast enough
         # and this is a one-shot per event.

@@ -1,0 +1,16 @@
+[Unit]
+Description=FPMS static TF tree (base_footprint->base_link->laser_frame/imu_frame)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=HOME=/home/ubuntu
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/nav2/fpms_tf.launch.py'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

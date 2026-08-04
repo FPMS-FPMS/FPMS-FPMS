@@ -40,6 +40,10 @@ def _log_path() -> Path:
     return d / "launch.log"
 
 
+def _session_marker_path() -> Path:
+    return _log_path().with_name("session.running")
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -54,6 +58,48 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("fpms.desktop")
+
+
+def _claim_session() -> None:
+    """Record that this process is running, and report how the last one ended.
+
+    Every exit path in this file logs its reason, so a launch.log that shows a
+    start with no matching reason means the process was killed from outside
+    (Task Manager, a taskkill, a reboot) or died at the C level without ever
+    reaching Python — a WebView2 fault, for instance.
+
+    That distinction previously had to be reconstructed by hand from the shape
+    of the log, and "it silently exited" was unanswerable because a clean quit
+    and an external kill left the same evidence: nothing. The marker turns it
+    into one line at the next start.
+    """
+    marker = _session_marker_path()
+    try:
+        if marker.is_file():
+            stale = marker.read_text(encoding="utf-8").strip()
+            log.warning(
+                "PREVIOUS SESSION DID NOT SHUT DOWN CLEANLY — it left no exit "
+                "reason in this log. That means it was killed from outside "
+                "(Task Manager/taskkill/reboot/power loss) or crashed below "
+                "Python. Previous session: %s",
+                stale or "<unrecorded>",
+            )
+        marker.write_text(
+            f"pid={os.getpid()} started={time.strftime('%Y-%m-%d %H:%M:%S')}",
+            encoding="utf-8",
+        )
+    except OSError:
+        # Diagnostics must never be able to stop the app from starting.
+        log.debug("could not write session marker", exc_info=True)
+
+
+def _release_session(reason: str) -> None:
+    """Log why we are exiting and clear the crash marker."""
+    log.info("EXITING: %s", reason)
+    try:
+        _session_marker_path().unlink(missing_ok=True)
+    except OSError:
+        log.debug("could not clear session marker", exc_info=True)
 
 
 def _server_alive() -> bool:
@@ -274,6 +320,7 @@ def main() -> None:
     headless = headless_env or headless_arg
 
     log.info("FPMS launcher starting — headless=%s, log=%s", headless, _log_path())
+    _claim_session()
 
     # A. If another FPMS is already up, just attach a window (or run headless).
     if _server_alive():
@@ -285,6 +332,8 @@ def main() -> None:
                 # Window failed but there's already a server owned by someone
                 # else — nothing more we can do. Exit cleanly.
                 log.info("window unavailable and server owned externally — exiting")
+        _release_session("attached to an FPMS backend owned by another process; "
+                         "that server keeps running, only this window is gone")
         return
 
     # B. Port in TIME_WAIT from a previous run?
@@ -296,6 +345,7 @@ def main() -> None:
         time.sleep(wait_s)
     else:
         log.error("port %d held by another process; exiting", settings.bind_port)
+        _release_session(f"port {settings.bind_port} is held by another process")
         raise SystemExit(
             f"Port {settings.bind_port} is held by another process. "
             f"Close any previous FPMS instance and try again."
@@ -324,6 +374,7 @@ def main() -> None:
                   "thread either failed to bind or is still starting. Check "
                   "for an 'uvicorn terminated' line above.",
                   settings.bind_host, settings.bind_port)
+        _release_session("the backend never accepted connections within 25s")
         raise SystemExit(f"backend never came up on port {settings.bind_port}")
     log.info("server is accepting connections on %s:%d",
              settings.bind_host, settings.bind_port)
@@ -335,10 +386,19 @@ def main() -> None:
         _run_forever()
         _shutdown()
         thread.join(timeout=5)
+        _release_session("headless run was interrupted (Ctrl+C or process stop)")
         return
 
     log.info("opening native window")
     window_ran = _open_window()
+    if window_ran:
+        # The single most common "the app silently exited" report is this line:
+        # closing the window closes the whole application, backend included, and
+        # nothing on screen says so. Naming it here is what makes the log
+        # answer the question instead of just ending.
+        log.info("the native window was closed — the backend shuts down with it, "
+                 "so :%d is no longer served. Relaunch with "
+                 "Start-FPMS-Dashboard.cmd to bring it back.", settings.bind_port)
     if not window_ran:
         # WebView failed. Rather than kill the server the user is relying on
         # (Cloudflare Tunnel + LAN peers), keep it alive headless. Also open
@@ -354,6 +414,8 @@ def main() -> None:
     _shutdown()
     thread.join(timeout=5)
     log.info("shut down cleanly")
+    _release_session("the operator closed the window" if window_ran else
+                     "no window could be opened and the headless run ended")
 
 
 if __name__ == "__main__":

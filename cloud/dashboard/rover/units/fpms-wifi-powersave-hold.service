@@ -1,0 +1,14 @@
+[Unit]
+Description=Hold wifi power_save OFF (bcmdhd re-enables it every ~30s)
+Documentation=man:iw(8)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/fpms-wifi-ps-hold
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

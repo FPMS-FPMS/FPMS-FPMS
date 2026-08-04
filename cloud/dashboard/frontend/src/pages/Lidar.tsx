@@ -5,14 +5,18 @@ import { LidarView } from "../components/LidarView";
 import { ArenaMap } from "../components/ArenaMap";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { MissionStrip } from "../components/MissionStrip";
+import { MissionConsole, useMissionConsole } from "../components/MissionConsole";
 import { useChannel } from "../lib/ws";
 import { apiPost } from "../lib/api";
 import { useThings } from "../lib/things";
 import {
   poseEnvelopeFromMm,
-  postMissionAbort,
   readPlan,
+  readReplan,
   useMission,
+  useRoverEvents,
+  type MissionPlan,
+  type ReplanDetail,
 } from "../lib/mission";
 import {
   emptyCapabilities,
@@ -68,6 +72,14 @@ import {
  *   MISSION STATE   a strip per rover. Unknown phases count as RUNNING.
  *   PLANNED ROUTE   the same preview the Drive tab shows, on the same map, so
  *                   "where is it going" does not require switching tabs.
+ *   MISSION CONTROL the console itself — ARM, PLAN, FOLLOW, SET COORDINATE —
+ *                   is rendered here from `components/MissionConsole`, the same
+ *                   component the Mission page is built from. It is NOT a
+ *                   second copy: the arm gate, the plan-before-follow rule and
+ *                   the confirm are stated once and inherited. Watching the map
+ *                   and starting the run were on different tabs, so the
+ *                   operator planned on one and watched on the other, which is
+ *                   how a route gets followed without being read.
  *   REAL POSE       the map used to draw every rover at the assumed start
  *                   corner, because `readPose` reads the rover-agent heartbeat
  *                   and that heartbeat carries no position. The mission
@@ -159,7 +171,8 @@ export default function Lidar() {
           position outside the arena is refused outright rather than plotted.
           When nothing publishes a position at all, the rover falls back to a known
           start corner and the map raises its own SIMULATED badge. The dashed line
-          is the last planned route from a <b>PLAN</b> preview on the Drive tab; it
+          is the route from the last <b>PLAN</b> preview — pressed on this card, on
+          the Mission tab or on Drive, since all three ask the same executor; it
           is nominal intent, and the executor re-measures its bearing after every
           leg and inserts corrections, so the driven path will not match it exactly.
         </p>
@@ -549,6 +562,10 @@ function RoverLidar({
   const drive = useChannel<any>(`drive:${thing}`);
   const planCh = useChannel<any>(`mission_plan:${thing}`);
   const feed = useMission(thing);
+  // The rover's own replies. Without this a PLAN the executor REFUSED would
+  // look identical to one that simply had not come back yet, and the operator
+  // would sit waiting for a route that is never going to arrive.
+  const events = useRoverEvents(thing);
   const [busy, setBusy] = useState(false);
 
   // Staleness has to be a function of wall time, not of arriving data: without
@@ -567,16 +584,15 @@ function RoverLidar({
   };
 
   /**
-   * Abort, from the map.
+   * The mission console for this bay — the arm gate, the four runs, the
+   * backend and SET COORDINATE, all of it shared with the Mission page.
    *
-   * Watching a rover drive somewhere wrong and having to change tabs to stop it
-   * is the exact gap this closes. It publishes `stop`, which fpms-missions
-   * subscribes and aborts on — it used to publish `mission {name:"abort"}`,
-   * a name neither publisher accepts, so this button answered with a nack and
-   * stopped nothing. Gated on nothing: an abort has to work precisely when
-   * everything else looks broken.
+   * Held here rather than inside the component because ABORT lives in the
+   * mission strip above it, and ABORT is what SHUTS the arm gate. A card whose
+   * stop button could not reach the gate would leave the console armed after
+   * the operator had hit the panic control.
    */
-  const abort = () => { void postMissionAbort(thing); };
+  const mc = useMissionConsole({ thing, caps, plan: planCh, feed, events, drive });
 
   const plan = readPlan(planCh.data);
   const m = feed.mission;
@@ -620,7 +636,13 @@ function RoverLidar({
 
   const region = posed ? regionAt(rawX, rawY) : null;
 
-  const route = plan?.waypoints ?? null;
+  // The console's SHOW button picks which of the four previews is drawn; until
+  // one is picked that is simply the newest one, which is what this card drew
+  // before the console existed. The chip and the footer read the same value, so
+  // the line on the map and the words under it can never describe two different
+  // routes.
+  const shown = mc.focusPlan ?? plan;
+  const route = shown?.waypoints ?? null;
 
   /**
    * SCAN FRESHNESS, AND WHY IT IS SHOUTED ABOUT DURING A RUN.
@@ -692,8 +714,8 @@ function RoverLidar({
               className={route ? "chip font-mono" : "chip font-mono text-slate-500"}
               title={
                 route
-                  ? `Nominal planned route from the last preview of ${plan?.mission ?? "a mission"}`
-                  : "No planned route — run a PLAN on the Drive tab to see one here"
+                  ? `Nominal planned route from the last preview of ${shown?.mission ?? "a mission"}`
+                  : "No planned route — press PLAN on one of the four runs below"
               }
             >
               {route ? `route · ${route.length} pts` : "no plan"}
@@ -709,8 +731,36 @@ function RoverLidar({
 
       {/* Mission first, above the map. Someone glancing at this card while
           standing next to the arena needs "is it driving itself" answered
-          before anything else on it. */}
-      <MissionStrip thing={thing} feed={feed} onAbort={abort} className="mb-4" />
+          before anything else on it.
+
+          The strip's ABORT is the console's: it publishes `stop`, which
+          fpms-missions subscribes and aborts on — it used to publish
+          `mission {name:"abort"}`, a name neither publisher accepts, so the
+          button answered with a nack and stopped nothing — AND it shuts the arm
+          gate below. Gated on nothing: an abort has to work precisely when
+          everything else looks broken. */}
+      <MissionStrip thing={thing} feed={feed} onAbort={mc.abort} className="mb-4" />
+
+      {/* The controls, between "is it driving" and "what is in front of it".
+          Deliberately above the map rather than under it: the operator arms,
+          plans, reads the dashed line and only then follows, and a FOLLOW
+          button below the fold is one the map never got looked at for. */}
+      <MissionConsole
+        mc={mc}
+        className="mb-4 rounded-xl border border-white/10 bg-black/20 p-4"
+      />
+
+      {/* WHY THE LINE ON THE MAP LOOKS LIKE THAT. The route was already drawn
+          but never explained: which planner produced it, what it was avoiding,
+          and whether the executor has since had to reroute were all published
+          by the rover and read by nothing. */}
+      <PlannerBand
+        plan={shown}
+        replan={readReplan(events.replan)}
+        replanCount={events.replanCount}
+        now={now}
+        className="mb-4"
+      />
 
       {/* CLEARANCE, IN THE EYE-LINE. This sits above the map on purpose: it is
           the number that predicts a collision, and it used to be a cell in a
@@ -745,7 +795,8 @@ function RoverLidar({
             assumed start corner and says so. Anything computed from this number
             — the planned route, the distance remaining, the arrival test — is
             computed from the same broken value. Abort, stop the rover, and use{" "}
-            <b>Set coordinate</b> on the Drive tab before running anything else.
+            <b>Set coordinate</b> in the console above before running anything
+            else.
           </div>
         </div>
       )}
@@ -806,11 +857,11 @@ function RoverLidar({
             in {region}
           </span>
         ) : null}
-        {plan ? (
+        {shown ? (
           <span className="font-mono" title="Nominal — the executor re-measures its bearing after every leg and inserts corrections">
-            plan · {plan.mission ?? "?"} ·{" "}
-            {plan.distanceMm === null ? "--" : `${Math.round(plan.distanceMm)} mm`} · ETA{" "}
-            {plan.etaS === null ? "--" : `~${Math.round(plan.etaS)} s`}
+            plan · {shown.mission ?? "?"} ·{" "}
+            {shown.distanceMm === null ? "--" : `${Math.round(shown.distanceMm)} mm`} · ETA{" "}
+            {shown.etaS === null ? "--" : `~${Math.round(shown.etaS)} s`}
           </span>
         ) : null}
         {m?.segmentKind ? <span className="font-mono">leg · {m.segmentKind}</span> : null}
@@ -885,6 +936,127 @@ function RoverLidar({
         </button>
       </div>
     </Card>
+  );
+}
+
+/**
+ * An occupancy grid older than this is describing a world that has moved on.
+ *
+ * The grid ages independently of the LiDAR channel this page draws: the rover
+ * folds scans into it on the mission node, so the map on screen can be updating
+ * at 5 Hz while the thing the PLANNER is routing against has not been refreshed
+ * in a minute. Those two staleness states look identical from the map alone,
+ * which is half of why "the plan isn't working" has been so hard to pin down.
+ */
+const OCC_STALE_S = 20;
+
+/** Compact "5s" / "2m 10s". Kept module-private, as the page's other helpers are. */
+function ageText(s: number | null): string {
+  if (s === null) return "--";
+  if (s < 60) return `${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${Math.round(s % 60)}s`;
+}
+
+/**
+ * Planner state for the route currently drawn on the map.
+ *
+ * Renders nothing when there is no plan — this band must not add a row of
+ * dashes to a card that is simply idle.
+ */
+function PlannerBand({
+  plan,
+  replan,
+  replanCount,
+  now,
+  className = "",
+}: {
+  plan: MissionPlan | null;
+  replan: ReplanDetail | null;
+  replanCount: number;
+  now: number;
+  className?: string;
+}) {
+  if (!plan) return null;
+
+  const occ = plan.occupancy;
+  // The grid's age is reported by the rover as of the moment it published the
+  // plan, so the time since we RECEIVED that plan has to be added back on.
+  // Showing the rover's figure alone would freeze at whatever it was when the
+  // plan landed and read as fresh forever — the exact failure this band exists
+  // to make visible.
+  const sincePlanS = plan.ts === null ? null : Math.max(0, (now - plan.ts * 1000) / 1000);
+  const occAgeS =
+    occ === null || occ.ageS === null ? null : occ.ageS + (sincePlanS ?? 0);
+  const occStale = occAgeS !== null && occAgeS > OCC_STALE_S;
+  const astar = (plan.planner ?? "").toLowerCase() === "astar";
+
+  return (
+    <div className={`flex flex-wrap items-center gap-2 text-[11px] ${className}`}>
+      {plan.planner && (
+        <span
+          className={astar ? "chip-ok font-mono" : "chip font-mono"}
+          title={
+            astar
+              ? "A* routed this line around cells the rover has actually observed"
+              : `Planner reported by the rover: ${plan.planner}`
+          }
+        >
+          planner · {plan.planner}
+        </span>
+      )}
+
+      {occ && (
+        <span
+          className={occStale ? "chip-warn font-mono" : "chip font-mono"}
+          title={
+            occStale
+              ? `The occupancy grid this route was planned against last saw a scan ` +
+                `${ageText(occAgeS)} ago. Obstacles in it may no longer exist, and ` +
+                `new ones will not be in it.`
+              : `Occupancy grid: ${occ.cells ?? "?"} occupied of ${
+                  occ.cellsTracked ?? "?"
+                } tracked, ${occ.scans ?? "?"} scans folded in`
+          }
+        >
+          grid · {occ.cells ?? "?"} cells · {ageText(occAgeS)}
+          {occStale ? " STALE" : ""}
+        </span>
+      )}
+
+      {replanCount > 0 && (
+        <span
+          className="chip-warn font-mono"
+          title={
+            replan
+              ? `Last reroute on leg ${replan.leg ?? "?"} (${replan.replanI ?? "?"}/${
+                  replan.replanMax ?? "?"
+                }): ${replan.reason ?? "no reason given"}${
+                  replan.viaN ? ` — ${replan.viaN} detour point(s)` : ""
+                }`
+              : "The executor has rerouted mid-leg"
+          }
+        >
+          replans · {replanCount}
+          {replan?.replanMax ? ` / ${replan.replanMax} per leg` : ""}
+        </span>
+      )}
+
+      {/* The planner's own words. Truncated on screen, full text on hover — it
+          can be several clauses long when more than one thing forced the
+          detour, and this band must stay on one line. */}
+      {plan.plannerNote && (
+        <span className="max-w-full truncate text-slate-400" title={plan.plannerNote}>
+          {plan.plannerNote}
+        </span>
+      )}
+
+      {replan?.reason && (
+        <span className="text-amber-300/80" title="Reason for the newest reroute">
+          rerouted: {replan.reason}
+        </span>
+      )}
+    </div>
   );
 }
 

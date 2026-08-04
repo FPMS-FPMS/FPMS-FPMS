@@ -285,6 +285,25 @@ export type PlanLeg = {
   distanceMm: number | null;
 };
 
+/**
+ * What the rover's occupancy grid knows right now, from `occ.stats()`.
+ *
+ * `ageS` is the one that matters operationally: it is how long ago the grid
+ * last saw a scan, so a grid with cells in it but a large age is describing
+ * obstacles that may no longer be there. That is the difference between "the
+ * planner routed around a wall" and "the planner routed around a ghost".
+ */
+export type PlanOccupancy = {
+  /** Cells currently occupied (TTL applied). */
+  cells: number | null;
+  /** Cells ever tracked, including expired ones. */
+  cellsTracked: number | null;
+  /** Scans folded into the grid. */
+  scans: number | null;
+  /** Seconds since the grid last took a scan. null = never. */
+  ageS: number | null;
+};
+
 export type MissionPlan = {
   mission: string | null;
   backend: string | null;
@@ -314,6 +333,18 @@ export type MissionPlan = {
   /** Final target of the route, arena mm. */
   targetX: number | null;
   targetY: number | null;
+  /**
+   * WHICH planner drew this line — "astar" when it routed around observed
+   * obstacles, or the straight-line fallback. Additive on the rover side; older
+   * firmware omits it and this stays null, which every consumer must tolerate.
+   */
+  planner: string | null;
+  /** The planner's own prose for why the route is not a straight line. */
+  plannerNote: string | null;
+  /** Replans the executor will allow per leg before it gives up. */
+  replanMax: number | null;
+  /** State of the occupancy grid the route was planned against. */
+  occupancy: PlanOccupancy | null;
 };
 
 /**
@@ -372,6 +403,22 @@ export function readPlan(env: unknown): MissionPlan | null {
     fromHeadingDeg: num(from.heading_deg),
     targetX: num(tgt.x_mm),
     targetY: num(tgt.y_mm),
+    planner: text(raw.planner),
+    plannerNote: text(raw.planner_note),
+    replanMax: num(raw.replan_max),
+    occupancy: readOccupancy(raw.occupancy),
+  };
+}
+
+/** `occ.stats()` off a plan or a replan event. Absent on older rover builds. */
+export function readOccupancy(raw: unknown): PlanOccupancy | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, any>;
+  return {
+    cells: num(o.cells),
+    cellsTracked: num(o.cells_tracked),
+    scans: num(o.scans),
+    ageS: num(o.age_s),
   };
 }
 
@@ -517,10 +564,22 @@ export type RoverEventFeed = {
   done: RoverEvent | null;
   /** Last read_encoders reply, already parsed. */
   encoders: { at: number; reading: EncoderReading | null } | null;
+  /**
+   * Last events/replan — the executor rerouting mid-leg around something it
+   * has just seen. This is the single most informative thing the rover says
+   * about "the plan isn't working", and it used to be dropped on the floor:
+   * the switch below ignored every subtype it did not name, so a replan
+   * reached the browser, matched nothing, and vanished. The route on the map
+   * would change with no explanation anywhere for why.
+   */
+  replan: RoverEvent | null;
+  /** How many replans have arrived this session. Resets on rover switch. */
+  replanCount: number;
 };
 
 const EMPTY_EVENTS: RoverEventFeed = {
   ack: null, nack: null, done: null, encoders: null,
+  replan: null, replanCount: 0,
 };
 
 /**
@@ -535,6 +594,40 @@ const EMPTY_EVENTS: RoverEventFeed = {
  * Messages are consumed by counter rather than by value so a repeated identical
  * reply — press PLAN twice, get the same ack twice — still registers as new.
  */
+/** One `events/replan` payload, normalised. */
+export type ReplanDetail = {
+  /** Human name of the leg being rerouted. */
+  leg: string | null;
+  legI: number | null;
+  /** Which replan this is on the current leg, and the cap it counts towards. */
+  replanI: number | null;
+  replanMax: number | null;
+  /** The executor's own words for what it saw. */
+  reason: string | null;
+  targetX: number | null;
+  targetY: number | null;
+  /** Detour points A* inserted, arena mm. */
+  viaN: number | null;
+  occupancy: PlanOccupancy | null;
+};
+
+export function readReplan(ev: RoverEvent | null): ReplanDetail | null {
+  if (!ev) return null;
+  const d = ev.data as Record<string, any>;
+  const tgt = d.target && typeof d.target === "object" ? d.target : {};
+  return {
+    leg: text(d.leg),
+    legI: num(d.leg_i),
+    replanI: num(d.replan_i),
+    replanMax: num(d.replan_max),
+    reason: text(d.reason),
+    targetX: num(tgt.x_mm),
+    targetY: num(tgt.y_mm),
+    viaN: Array.isArray(d.waypoints) ? d.waypoints.length : null,
+    occupancy: readOccupancy(d.occupancy),
+  };
+}
+
 export function useRoverEvents(thing: string | null): RoverEventFeed {
   const ch = useChannel<any>("events");
   const [feed, setFeed] = useState<RoverEventFeed>(EMPTY_EVENTS);
@@ -571,6 +664,8 @@ export function useRoverEvents(thing: string | null): RoverEventFeed {
     else if (subtype === "mission_done") setFeed((f) => ({ ...f, done: ev }));
     else if (subtype === "encoders") {
       setFeed((f) => ({ ...f, encoders: { at: ev.at, reading: readEncoders(data) } }));
+    } else if (subtype === "replan") {
+      setFeed((f) => ({ ...f, replan: ev, replanCount: f.replanCount + 1 }));
     }
   }, [ch.messages, ch.data, thing]);
 

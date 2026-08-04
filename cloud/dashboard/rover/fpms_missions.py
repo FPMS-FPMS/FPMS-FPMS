@@ -282,7 +282,9 @@ exactly that reason.
                             but MIN_MOVE_MM, MIN_TURN_DEG, DOCK_STEP_MM,
                             BEARING_TOL_DEG and HEADING_TOL_DEG all derive from
                             it, so re-measuring it moves the whole envelope.
-    CMD_SCALE = 6.1         Measured once, free-spinning, on the linear axis
+    # FPMS firmware takes /cmd_vel in real m/s. 6.1 described the stock
+# firmware's saturated loop, not a gain; keeping it would command 6x speed.
+CMD_SCALE = 1.0         Measured once, free-spinning, on the linear axis
                             only. Applying it to rotation is an assumption that
                             can only turn the rover slower than asked.
     LiDAR mount calibration UNVERIFIED (fpms_lidar_ros.py:164-168). A wrong
@@ -355,6 +357,7 @@ waypoint derivation, segment planning, retrace inversion, heading wrap — can b
 tested off-robot.
 """
 
+import heapq
 import json
 import math
 import os
@@ -661,12 +664,45 @@ def in_arena(x_mm, y_mm, pad_mm=0.0):
 
 
 # ================================================================ CALIBRATION
-# Same measurement, same constant, same reason as fpms_teleop.py: commanding
-# linear.x = 0.10 produced roughly 0.61 m/s of ground speed. Everything in this
-# file is expressed in REAL m/s and divided by CMD_SCALE on the way to the wire.
-# If the rover is re-measured, this is the only edit — in both files.
+# UPDATED 2026-08-03 — THE IMAGE CHANGED, SO THESE HAD TO.
+#
+# The board now runs linorobot2_hardware (see rover/firmware_linorobot/), not
+# Yahboom stock. Both workarounds below existed solely because of defects in the
+# stock firmware, and both are now WRONG and dangerous if left in place:
+#
+#   CMD_SCALE 6.1 existed because stock passed linear.x to the wheels with no
+#   gain, so commanding 0.10 produced ~0.61 m/s. The new firmware closes a
+#   float-RPM PID on encoder feedback using the measured 1320 CPR and 70 mm
+#   wheel, so commanded m/s tracks actual m/s. Leaving 6.1 here would divide
+#   every command by 6.1 and, worse, let CRUISE clamps admit speeds 6x what
+#   they claim.
+#
+#   WIRE_FLOOR_MPS 0.0145 was one encoder count per 10 ms PID period — the
+#   quantisation floor of a loop that regulated INTEGER counts. The new loop
+#   regulates floats and has no such floor.
+#
+# Measured on the new firmware, 13.4 V pack, wheels on hardwood, 2 s bursts:
+#   0.010 / 0.020 m/s -> no motion   0.030 -> 9.3 mm   0.050 -> 53.6 mm
+#   0.080 -> 118.8 mm                0.120 -> 202.3 mm
+# The remaining floor is mechanical stiction, not firmware, and sits near
+# 0.03 m/s. That is what WIRE_FLOOR_MPS now records.
+# REVERTED 2026-08-04 -- the board is back on Yahboom FACTORY firmware
+# (microROS_Robot v2.0.0), so both vendor workarounds apply again.
+#
+# CMD_SCALE 6.1: stock passes linear.x to the wheels with no gain. MEASURED
+# again today on the restored firmware: a commanded 0.06 for 1.5 s travelled
+# OVER 1 METRE (~0.7 m/s), because PWM_MOTOR_DEAD_ZONE (200 of 400) is added as
+# feed-forward and ANY non-zero setpoint becomes ~50%% duty.
+# Leaving this at 1.0 (the linorobot value) would command 6x too fast.
+#
+# WIRE_FLOOR_MPS 0.0145: one encoder count per 10 ms PID period, the
+# quantisation floor of a loop regulating INTEGER counts.
+#
+# NOTE: the dead zone is on the VELOCITY path only. The golden B8B driver
+# bypassed it by sending RAW DUTY through the Rosmaster framed protocol, where
+# 26/100 really is 26%%. That is the path to move to.
 CMD_SCALE = 6.1
-WIRE_FLOOR_MPS = 0.0145   # one encoder count per 10 ms PID period; see docstring
+WIRE_FLOOR_MPS = 0.0145
 
 
 def to_cmd(desired_mps):
@@ -674,26 +710,26 @@ def to_cmd(desired_mps):
 
 
 def to_cmd_ang(desired_radps):
-    # The 6x was measured on the linear axis only, so applying it to rotation is
-    # an assumption — but one that can only turn the rover SLOWER than asked,
-    # which is the correct direction to be wrong in. Turns are closed loop on the
-    # gyro and self-correct for it being wrong either way.
+    # With CMD_SCALE back to 1.0 this is now identity, kept as the single seam
+    # in case rotation is ever measured to need its own factor. Turns are closed
+    # loop on the gyro (verified 2026-08-03: -113.3 deg asked, -113.4 measured),
+    # so they self-correct regardless.
     return desired_radps / CMD_SCALE
 
 
 # ===================================================================== SPEEDS
-# CRUISE_MPS sits at ~2 encoder counts per PID period on the wire (0.18 / 6.1 =
-# 0.0295, vs the 0.0145 floor), i.e. one full count of margin. Anything slower
-# is inside the quantisation noise described in the docstring.
+# REWRITTEN 2026-08-03 with the new firmware. The old rationale here — that
+# slowness could only be bought with short segments and full stops, because the
+# firmware could not express a low speed — no longer holds. Speed is now a
+# genuinely commandable quantity: 0.03 m/s moves the rover 9 mm in 2 s, where
+# the old firmware's smallest possible move was ~230 mm.
 #
-# NOTE THAT THIS IS FASTER THAN TELEOP'S HARD_MAX_LIN_MPS (0.12 real). That is
-# not an oversight and it is not a licence to speed: teleop's envelope is a
-# hand-on-the-joystick envelope, and all of it sits BELOW the firmware's
-# expressible floor (0.05 real = 0.0082 wire). A mission cannot be run down
-# there — it would stall and lurch its way across the arena. Slowness here is
-# bought with short segments and full stops, which is the only currency the
-# firmware accepts.
-CRUISE_MPS = _cfg_float("FPMS_MISSION_CRUISE_MPS", 0.18, WIRE_FLOOR_MPS * CMD_SCALE, 0.25)
+# 0.08 is a real crawl with margin over the ~0.03 stiction floor. Slower is
+# available (down to the clamp) but starts to depend on breaking stiction, which
+# costs distance accuracy: at 0.05 m/s a 1.0 s burst moved 1 mm while a 2.0 s
+# burst moved 53.6 mm, because the PID spends part of a short burst just getting
+# moving. Prefer measuring what happened over trusting the command.
+CRUISE_MPS = _cfg_float("FPMS_MISSION_CRUISE_MPS", 0.08, WIRE_FLOOR_MPS * CMD_SCALE, 0.25)
 
 # EQUAL TO CRUISE BY DESIGN. See the docstring: the dock is slow because of
 # DOCK_STEP_MM and the stop between steps, never because of this number.
@@ -730,6 +766,8 @@ HEADING_CORR_MAX_RADPS = 0.25
 # -1 is DERIVED FROM THE REWIRING AND HAS NOT BEEN MEASURED. `_turn` therefore
 # aborts on a wrong-way rotation instead of trusting it, so a wrong value costs
 # one small twitch rather than a mission.
+# +1 with FPMS firmware: it owns the differential mixing and the mirrored
+# motor layout, so the host no longer flips turns on the way to the wire.
 TURN_WIRE_SIGN = _cfg_sign("FPMS_MISSION_TURN_WIRE_SIGN", -1)
 TURN_WIRE_SIGN_MEASURED = False     # flip this ONLY after a real turn confirms it
 
@@ -874,7 +912,13 @@ ROS_DEAD_S = 3.0          # no odometry for this long => micro-ROS link is down
 BATT_LOW_V = 11.1
 
 TELEM_HZ = 2.0
-IDLE_TELEM_S = 5.0        # slow heartbeat so the dashboard can say "no mission"
+# POSE FRAME. teleop anchors from /odom_raw; if missions integrates the
+# fused /odom instead, the anchor reference and the pose live in two
+# different frames and set_coordinate silently leaves the difference as a
+# constant offset. Measured 4.93 m on 2026-08-04.
+ODOM_RAW_ONLY = CFG.get("FPMS_MISSION_ODOM_RAW_ONLY", "1") not in ("0", "false", "no")
+
+IDLE_TELEM_S = _cfg_float("FPMS_MISSION_IDLE_TELEM_S", 0.5, 0.1, 10.0)  # pose heartbeat while idle
 
 # Preflight listen window for a foreign /cmd_vel writer. teleop idles at 2 Hz,
 # so a window over 0.5 s sees at least one of its zeros.
@@ -1079,8 +1123,15 @@ class Segment:
         return bool(self.reason)
 
 
-def split_legs(dist_mm):
+def split_legs(dist_mm, dock=True):
     """Break ONE LEG's straight run into bounded segments: cruise, then dock.
+
+    `dock=False` chops the whole distance into cruise segments and appends no
+    dock burst. That is for a PASS-THROUGH point -- an A* detour waypoint -- and
+    for nothing else. The rover is not stopping there, so the slow bounded
+    approach that exists to arrive accurately would only spend MIN_PULSE_S
+    bursts and settles on a place nobody is measuring. Every real target still
+    docks, because every real target is somewhere the rover holds.
 
     (Historical name. What comes out are SEGMENTS of a single leg — see the
     module docstring's terminology note — not legs of a route.)
@@ -1103,7 +1154,7 @@ def split_legs(dist_mm):
     if not math.isfinite(d) or d < MIN_MOVE_MM:
         return out
 
-    dock_total = min(DOCK_APPROACH_MM, d)
+    dock_total = min(DOCK_APPROACH_MM, d) if dock else 0.0
     cruise = d - dock_total
     # A cruise remainder too short to command belongs to the dock, not to a
     # segment that would stand still.
@@ -1134,7 +1185,7 @@ def split_legs(dist_mm):
     return out
 
 
-def plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm):
+def plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm, dock=True):
     """Nominal turn-then-drive plan from a pose to a point.
 
     Nominal because execution re-plans: after every leg the bearing is
@@ -1149,12 +1200,12 @@ def plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm):
         turn = heading_error_deg(bearing_deg(dx, dy), heading_deg)
         if abs(turn) >= BEARING_TOL_DEG:
             segs.append(Segment("turn", turn))
-        for mm, dock in split_legs(dist):
-            segs.append(Segment("drive", mm, dock=dock))
+        for mm, is_dock in split_legs(dist, dock=dock):
+            segs.append(Segment("drive", mm, dock=is_dock))
     return segs
 
 
-def plan_multi_route(x_mm, y_mm, heading_deg, targets):
+def plan_multi_route(x_mm, y_mm, heading_deg, targets, grid=None, notes=None):
     """Chain `plan_route` across an ordered list of (x_mm, y_mm) waypoints.
 
     Returns [((tx_mm, ty_mm), [Segment, ...]), ...] — grouped by leg, because
@@ -1178,7 +1229,14 @@ def plan_multi_route(x_mm, y_mm, heading_deg, targets):
     pose = (float(x_mm), float(y_mm), float(heading_deg))
     legs = []
     for tx, ty in targets:
-        segs = plan_route(pose[0], pose[1], pose[2], tx, ty)
+        # `grid=None` is EXACTLY the old call, so every existing caller and
+        # every off-robot test keeps the straight-line behaviour it was written
+        # against. With a grid, `plan_grid_route` still returns `plan_route`'s
+        # own segments unless something is actually in the way -- see its
+        # docstring; the detour is the exception, never the default.
+        segs, note = plan_grid_route(pose[0], pose[1], pose[2], tx, ty, grid=grid)
+        if note is not None and notes is not None:
+            notes.append(note)
         pose = apply_segments(pose, segs, measured=False)
         legs.append(((tx, ty), segs))
     return legs
@@ -1461,6 +1519,543 @@ def min_clearance_mm(ranges_m, range_max_m=6.0):
     """Nearest return at any bearing — the guard used while turning in place."""
     return front_clearance_mm(ranges_m, cone_deg=180.0, reverse=False,
                               range_max_m=range_max_m)
+
+
+
+# ======================================================= GRID PLANNER (A*)
+# WHAT THIS IS, AND -- MORE IMPORTANTLY -- WHAT IT IS NOT
+# ------------------------------------------------------
+# Until now the only answer to an obstacle was ABORT_OBSTACLE: stop the wheels
+# and end the mission. That is the right answer when nothing else is known, and
+# IT STAYS REACHABLE. Everything in this section is a safety net stretched in
+# front of that abort, never a replacement for it: an empty grid, a stale grid,
+# a search that finds nothing, or a replan cap that has been reached all end in
+# the same abort, with the same operator-facing string, as before.
+#
+# THE STRAIGHT LINE IS STILL THE PLAN.
+# `plan_route` was calibrated against this chassis (70 mm legs, ~0.6 % distance
+# error, +/-1-4 deg per turn) and a 50 mm grid cannot improve on it. Quantising
+# an already-clear run onto cell centres can only ADD turns, and on this chassis
+# a turn is the expensive motion -- each one costs more heading error than a
+# tidier path saves. So `plan_grid_route` asks one question first: is the
+# straight line clear in the grid as it stands? Only when the answer is no does
+# it search. On a clean arena the output is `plan_route`'s output, segment for
+# segment, which is what the m2 preview regression (744 mm, 10 segments, 11
+# waypoints from (972, 228)) actually checks.
+#
+# WHY A GRID AND NOT A POLYGON WORLD. The only obstacle sensor on this rover is
+# a 360-bin LiDAR arriving over MQTT, whose mount yaw and rotation sign are
+# still UNVERIFIED (fpms_lidar_ros.py:164-168). Fitting shapes to returns of
+# unknown orientation would dress a calibration error up as geometry. A grid
+# says no more than the sensor does: "something was seen in this 50 mm square".
+
+# The planner is switchable because a competition morning is not the time to
+# discover a new code path. `straight` restores the pre-A* behaviour exactly:
+# no grid consulted, no detour possible, obstacle means abort.
+PLANNER = str(CFG.get("FPMS_MISSION_PLANNER", "astar")).strip().lower()
+if PLANNER not in ("astar", "straight"):
+    CFG_NOTES.append("FPMS_MISSION_PLANNER=%r is not 'astar' or 'straight'; "
+                     "using 'astar'" % PLANNER)
+    PLANNER = "astar"
+
+# PER LEG, not per mission. A leg that has had to route around five things is
+# not making progress towards its target any more, and the honest report is the
+# abort the operator would have got anyway.
+REPLAN_MAX = int(_cfg_float("FPMS_MISSION_REPLAN_MAX", 5, 0, 20))
+
+# 50 mm: a quarter of the robot's width, and small enough that the gap between
+# two obstacles either exists in the grid or is too narrow to drive anyway.
+GRID_MM = _cfg_float("FPMS_MISSION_GRID_MM", 50.0, 20.0, 200.0)
+
+# HALF-WIDTH INCLUDING THE OVERHANG, not the wheelbase. A* plans for a POINT;
+# this is the number that turns a point path into one this rover can occupy.
+ROBOT_RADIUS_MM = _cfg_float("FPMS_MISSION_ROBOT_RADIUS_MM", 170.0, 0.0, 400.0)
+
+# The arena boundary is inflated separately so it can be relaxed on a field
+# whose edge is a taped line rather than a wall, without also letting the rover
+# graze real obstacles.
+WALL_PAD_MM = _cfg_float("FPMS_MISSION_WALL_PAD_MM", ROBOT_RADIUS_MM, 0.0, 400.0)
+
+# FORGETTING IS A FEATURE. A cell nobody has seen for this long stops blocking
+# routes, so a path that has been cleared re-opens on its own. Long enough to
+# survive the LiDAR dropping a few scans at 9.83 Hz; short enough that a person
+# who steps out of the way is gone before the next leg.
+OCC_TTL_S = _cfg_float("FPMS_MISSION_OCC_TTL_S", 6.0, 0.5, 120.0)
+
+# One bin is noise; two bins in the same 50 mm square inside the TTL is a
+# surface. This is the cheapest available defence against a single bad return
+# walling off the only route to the target.
+OCC_MIN_HITS = int(_cfg_float("FPMS_MISSION_OCC_MIN_HITS", 2, 1, 20))
+
+# Beyond the arena diagonal (1697 mm) a return is somebody's furniture, not an
+# obstacle on this route, and folding it in would only invent walls off-field.
+OCC_MAX_RANGE_MM = _cfg_float("FPMS_MISSION_OCC_MAX_RANGE_MM", 1800.0,
+                              200.0, 6000.0)
+
+# HOW CLOSE COUNTS AS "PASSED THROUGH" for an A* detour waypoint. Deliberately
+# far looser than ARRIVE_TOL_MM: a waypoint is a hint about which side of an
+# obstacle to pass, not a place to be. Floored at MIN_MOVE_MM because a
+# tolerance this chassis cannot close would loop forever trying to nail a point
+# that does not matter, and at one grid cell because that is the resolution the
+# waypoint was chosen at in the first place.
+VIA_TOL_MM = max(GRID_MM, MIN_MOVE_MM)
+
+DIAG_COST = math.sqrt(2.0)
+
+# FIXED NEIGHBOUR ORDER. This is not tidiness, it is half of the determinism
+# guarantee: two routes of equal cost must resolve the same way every time, or
+# the same obstacle yields a different path on every replan and the rover
+# oscillates between two equally good detours instead of driving either.
+NEIGHBOURS = ((1, 0), (0, 1), (-1, 0), (0, -1),
+              (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
+class OccupancyGrid:
+    """What the LiDAR has seen, in ARENA millimetres, on a fixed square grid.
+
+    THREE THINGS IT DELIBERATELY DOES NOT DO. Each one is a trap this file
+    already documents somewhere else, and each would be worse here than there:
+
+      * A ZERO RANGE IS NOT AN OBSTACLE AT THE SENSOR. It is "no return", and
+        the distinction matters more in a grid than in the cone guard: a zero
+        written in would place a wall underneath the rover, and A* would then
+        refuse to move at all. Zeros, non-finite bins and saturated bins are
+        UNKNOWN and mark nothing -- the same three `front_clearance_mm` skips,
+        for the same reason.
+      * IT DOES NOT CLEAR CELLS BY RAY-CASTING. Sweeping every cell along a ray
+        back to "free" would let one badly-posed scan erase a real obstacle, and
+        the pose feeding this is dead reckoning from an ASSUMED origin. Cells
+        are forgotten by TIME instead (OCC_TTL_S), so the cost of being wrong is
+        a stale cell that expires by itself rather than a deleted one that never
+        comes back.
+      * IT DOES NOT BELIEVE ONE RETURN. OCC_MIN_HITS scans must agree before a
+        cell can block a route.
+
+    THE BEARING CONVENTION IS INHERITED, NOT INVENTED. Bin i is i * 360/n
+    degrees CCW of the nose, which is exactly how `front_clearance_mm` already
+    measures its cone. If the mount yaw or rotation sign is wrong
+    (fpms_lidar_ros.py:164-168, still UNVERIFIED) then this grid is wrong by the
+    same angle, in the same direction, as the guard that has been stopping the
+    rover all along: one calibration to fix, one failure mode to reason about.
+
+    Its own lock, because it is written from paho's network thread and read from
+    the mission worker. `self.lock` on MissionNode is not used for it: holding
+    that one for a 360-bin transform would delay an odometry callback or a stop.
+    """
+
+    def __init__(self, cell_mm=None, arena_mm=ARENA_MM, ttl_s=None,
+                 min_hits=None, max_range_mm=None):
+        self.cell_mm = float(GRID_MM if cell_mm is None else cell_mm)
+        self.arena_mm = float(arena_mm)
+        self.n = max(1, int(math.ceil(self.arena_mm / self.cell_mm)))
+        self.ttl_s = float(OCC_TTL_S if ttl_s is None else ttl_s)
+        self.min_hits = int(OCC_MIN_HITS if min_hits is None else min_hits)
+        self.max_range_mm = float(OCC_MAX_RANGE_MM if max_range_mm is None
+                                  else max_range_mm)
+        self._cells = {}          # (ix, iy) -> [hits, last_seen_monotonic]
+        self._lock = threading.Lock()
+        self.scans = 0
+        self.last_scan_t = 0.0
+
+    # -- geometry ---------------------------------------------------------
+    def cell_of(self, x_mm, y_mm):
+        return (int(math.floor(float(x_mm) / self.cell_mm)),
+                int(math.floor(float(y_mm) / self.cell_mm)))
+
+    def centre_of(self, ix, iy):
+        return ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
+
+    def in_grid(self, ix, iy):
+        return 0 <= ix < self.n and 0 <= iy < self.n
+
+    # -- writing ----------------------------------------------------------
+    def mark(self, x_mm, y_mm, now=None):
+        """Record ONE observed surface point. Returns its cell, or None."""
+        if not (math.isfinite(x_mm) and math.isfinite(y_mm)):
+            return None
+        c = self.cell_of(x_mm, y_mm)
+        if not self.in_grid(c[0], c[1]):
+            return None
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            e = self._cells.get(c)
+            if e is None or (now - e[1]) > self.ttl_s:
+                # An expired cell is a NEW observation, not a continuation. If
+                # the count carried across the gap, a cell touched once an hour
+                # would eventually cross min_hits and block a route for ever.
+                self._cells[c] = [1, now]
+            else:
+                # Capped, so a cell stared at for a minute does not need a
+                # minute of absence to fall back under the threshold.
+                e[0] = min(e[0] + 1, self.min_hits + 8)
+                e[1] = now
+        return c
+
+    def integrate(self, ranges_m, pose, range_max_m=6.0, now=None):
+        """Fold one scan into the arena frame. Returns how many bins landed.
+
+        `pose` is the arena pose from `MissionNode.pose()` -- the existing
+        accessor, which is `arena_from_odom` with the gyro heading. There is no
+        second pose derivation here on purpose: a grid built on different
+        geometry from the one the follower drives on would put obstacles
+        somewhere the rover never goes.
+        """
+        if not ranges_m or pose is None:
+            return 0
+        px, py, ph = pose[0], pose[1], pose[2]
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(ph)):
+            return 0
+        n = len(ranges_m)
+        step = 360.0 / n
+        sat = float(range_max_m) * 0.995
+        now = time.monotonic() if now is None else now
+        marked = 0
+        for i, r in enumerate(ranges_m):
+            try:
+                rv = float(r)
+            except Exception:
+                continue
+            if not math.isfinite(rv) or rv <= 0.0 or rv >= sat:
+                continue          # UNKNOWN -- see the class docstring
+            mm = rv * 1000.0
+            if mm > self.max_range_mm:
+                continue
+            b = math.radians(ph + i * step)
+            if self.mark(px + mm * math.cos(b), py + mm * math.sin(b), now):
+                marked += 1
+        with self._lock:
+            self.scans += 1
+            self.last_scan_t = now
+        return marked
+
+    # -- reading ----------------------------------------------------------
+    def occupied(self, now=None):
+        """Cells seen often enough, recently enough, to be believed.
+
+        A SNAPSHOT, taken under the lock and returned as a plain set, so a
+        search running on the worker thread cannot see the grid change under it
+        half way through -- an A* whose obstacles move mid-search can return a
+        path through a cell it already rejected.
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            items = list(self._cells.items())
+        return set(c for c, e in items
+                   if e[0] >= self.min_hits and (now - e[1]) <= self.ttl_s)
+
+    def forget_stale(self, now=None):
+        """Drop expired cells. Housekeeping only: `occupied` already ignores
+        them, so this changes no decision, it only bounds the dict."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            for c in [c for c, e in self._cells.items()
+                      if (now - e[1]) > self.ttl_s]:
+                del self._cells[c]
+
+    def stats(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            total = len(self._cells)
+            last = self.last_scan_t
+            scans = self.scans
+        return {"cells": len(self.occupied(now=now)), "cells_tracked": total,
+                "scans": scans,
+                "age_s": None if not last else round(now - last, 1)}
+
+
+def inflate_blocked(occupied, n, cell_mm, radius_mm=None, wall_pad_mm=None,
+                    arena_mm=ARENA_MM, free=()):
+    """Cells the rover's CENTRE may not enter. Pure; no clock, no state.
+
+    Two sources, one answer:
+
+      * every observed cell, grown by the robot radius, because A* plans for a
+        point and this rover is 340 mm across. Without this the path clips
+        corners the chassis physically cannot;
+      * the arena boundary, grown by `wall_pad_mm`. Leaving the field is not an
+        escape route, and `in_arena` already refuses targets out there.
+
+    THE HALF-CELL MATTERS. Distance is measured centre-to-centre against
+    `radius + cell/2`, because a return anywhere in a cell could be anywhere in
+    that cell; rounding the other way lets a path graze a surface that is really
+    25 mm nearer than its cell centre claims.
+
+    `free` is the escape hatch that keeps this usable on a real floor: the cell
+    the rover is standing in is ALWAYS passable, whatever the grid believes. A
+    rover parked inside the wall pad, or with one scan artefact under itself,
+    would otherwise be unable to plan any route at all -- including the route
+    out of the trouble it is in.
+    """
+    radius_mm = ROBOT_RADIUS_MM if radius_mm is None else float(radius_mm)
+    wall_pad_mm = WALL_PAD_MM if wall_pad_mm is None else float(wall_pad_mm)
+    reach = radius_mm + cell_mm / 2.0
+    span = int(math.ceil(reach / cell_mm))
+    blocked = set()
+    for (ox, oy) in occupied:
+        for dx in range(-span, span + 1):
+            for dy in range(-span, span + 1):
+                ix, iy = ox + dx, oy + dy
+                if not (0 <= ix < n and 0 <= iy < n):
+                    continue
+                if math.hypot(dx * cell_mm, dy * cell_mm) <= reach:
+                    blocked.add((ix, iy))
+    if wall_pad_mm > 0.0:
+        for ix in range(n):
+            cx = (ix + 0.5) * cell_mm
+            for iy in range(n):
+                cy = (iy + 0.5) * cell_mm
+                if (cx < wall_pad_mm or cy < wall_pad_mm
+                        or cx > arena_mm - wall_pad_mm
+                        or cy > arena_mm - wall_pad_mm):
+                    blocked.add((ix, iy))
+    for c in free:
+        blocked.discard(tuple(c))
+    return blocked
+
+
+def astar_cells(blocked, n, start, goal):
+    """8-connected A* over an n x n grid. [cell, ...] or None. PURE.
+
+    Deterministic by construction, in two places that both matter:
+
+      * `NEIGHBOURS` is a fixed tuple, so equal-cost successors are always
+        generated in the same order;
+      * the heap key is (f, h, ix, iy) -- the tie-break depends only on WHICH
+        cell, never on when it was pushed. A counter or an insertion order would
+        make the answer depend on the search's own history, and the same arena
+        would plan differently on the second replan than on the first.
+
+    The heuristic is OCTILE distance: the exact cost of an unobstructed
+    8-connected walk. Admissible and consistent, so the first time the goal is
+    popped it is optimal and no closed cell is ever re-opened. Euclidean would
+    also be admissible but is loose here and expands more; Manhattan is NOT
+    admissible with sqrt(2) diagonals and would return short-looking paths that
+    are not the shortest.
+    """
+    start = (int(start[0]), int(start[1]))
+    goal = (int(goal[0]), int(goal[1]))
+    if not (0 <= start[0] < n and 0 <= start[1] < n):
+        return None
+    if not (0 <= goal[0] < n and 0 <= goal[1] < n):
+        return None
+    if start == goal:
+        return [start]
+    # A blocked GOAL is answered here rather than by an exhaustive search that
+    # can only fail: "the target is inside an obstacle (or its inflation)" is a
+    # real answer, and the caller turns it into the abort it always had.
+    if goal in blocked:
+        return None
+
+    def h(c):
+        dx = abs(c[0] - goal[0])
+        dy = abs(c[1] - goal[1])
+        return (dx + dy) + (DIAG_COST - 2.0) * min(dx, dy)
+
+    h0 = h(start)
+    open_heap = [(h0, h0, start[0], start[1])]
+    came = {}
+    g = {start: 0.0}
+    closed = set()
+    while open_heap:
+        _f, _h, cx, cy = heapq.heappop(open_heap)
+        cur = (cx, cy)
+        if cur in closed:
+            continue
+        closed.add(cur)
+        if cur == goal:
+            path = [cur]
+            while cur in came:
+                cur = came[cur]
+                path.append(cur)
+            path.reverse()
+            return path
+        for dx, dy in NEIGHBOURS:
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < n and 0 <= ny < n):
+                continue
+            nb = (nx, ny)
+            if nb in blocked or nb in closed:
+                continue
+            if dx and dy:
+                # NO CORNER CUTTING. Slipping diagonally between two blocked
+                # cells costs nothing on a grid and is impossible for a rover
+                # with width; both orthogonal neighbours must be open.
+                if (cx + dx, cy) in blocked or (cx, cy + dy) in blocked:
+                    continue
+                step = DIAG_COST
+            else:
+                step = 1.0
+            ng = g[cur] + step
+            if ng < g.get(nb, float("inf")) - 1e-9:
+                g[nb] = ng
+                came[nb] = cur
+                hb = h(nb)
+                heapq.heappush(open_heap, (ng + hb, hb, nx, ny))
+    return None
+
+
+def segment_is_clear(x0, y0, x1, y1, blocked, cell_mm, n, step_mm=None):
+    """Can the rover drive straight between two arena points? PURE.
+
+    SAMPLED, not rasterised. Bresenham answers "which cells does a line
+    algorithm visit", and the question here is about the CONTINUOUS line the
+    rover actually drives. Sampling at half a cell cannot step over a cell, and
+    it is the same test used both to decide whether A* is needed at all and to
+    shorten the path afterwards -- one predicate, so the two can never disagree
+    about what "clear" means.
+    """
+    step = float(step_mm) if step_mm else cell_mm * 0.5
+    d = math.hypot(x1 - x0, y1 - y0)
+    k = max(1, int(math.ceil(d / step)))
+    for i in range(k + 1):
+        t = float(i) / k
+        cx = int(math.floor((x0 + (x1 - x0) * t) / cell_mm))
+        cy = int(math.floor((y0 + (y1 - y0) * t) / cell_mm))
+        if not (0 <= cx < n and 0 <= cy < n):
+            return False
+        if (cx, cy) in blocked:
+            return False
+    return True
+
+
+def simplify_cells(cells, cell_mm, start_xy, goal_xy, blocked=None, n=0):
+    """An A* cell path -> the fewest arena points describing the same route.
+
+    Two passes, in this order:
+
+      1. COLLINEAR COLLAPSE. Consecutive cells continuing in the same grid
+         direction are one straight run and only its end is a waypoint. This is
+         what turns fifteen cells of "north" into one drive.
+      2. STRING PULL. A point reachable directly from the one before it -- by
+         `segment_is_clear`, the same predicate used above -- is not needed. A*
+         on a grid can only turn in 45 degree steps, so a clean diagonal comes
+         back as a staircase, and every step of that staircase would cost a REAL
+         turn worth +/-1-4 deg of heading error that the retrace then carries.
+         Removing turns is worth more on this chassis than shortening the path.
+
+    THE ENDPOINTS ARE THE TRUE POSE AND THE TRUE TARGET, never cell centres. The
+    grid is a search space, not a coordinate system: docking on a cell centre
+    would leave the rover up to 35 mm from the zone centre it was asked for, and
+    that error would look exactly like odometry drift in every log.
+
+    Returns the points AFTER the start, ending at `goal_xy`.
+    """
+    if not cells:
+        return [tuple(goal_xy)]
+    # 1. collinear collapse, in cell space
+    keep = [cells[0]]
+    for i in range(1, len(cells) - 1):
+        ax, ay = cells[i - 1]
+        bx, by = cells[i]
+        cx, cy = cells[i + 1]
+        if (bx - ax, by - ay) != (cx - bx, cy - by):
+            keep.append(cells[i])
+    if len(cells) > 1:
+        keep.append(cells[-1])
+
+    pts = [tuple(start_xy)]
+    for c in keep[1:-1]:
+        pts.append((round((c[0] + 0.5) * cell_mm, 3),
+                    round((c[1] + 0.5) * cell_mm, 3)))
+    pts.append(tuple(goal_xy))
+
+    # 2. string pull
+    if blocked is not None and n:
+        out = [pts[0]]
+        i = 0
+        while i < len(pts) - 1:
+            j = len(pts) - 1
+            while j > i + 1:
+                if segment_is_clear(pts[i][0], pts[i][1], pts[j][0], pts[j][1],
+                                    blocked, cell_mm, n):
+                    break
+                j -= 1
+            out.append(pts[j])
+            i = j
+        pts = out
+    return pts[1:]
+
+
+def grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=None):
+    """Intermediate waypoints that get round what the grid has seen.
+
+    Three distinct answers, and the caller must treat them differently:
+
+        []    the straight line is clear (or nothing has been seen). Drive it.
+        [...] pass through these first, then the target.
+        None  there is NO route. This is the cue to abort exactly as before --
+              it is not an error and it is not an empty path.
+
+    THE TARGET IS NOT IN THE LIST. The follower already knows where it is going
+    and reaches it with its own adaptive loop; including it would give the
+    target two different representations and eventually two different answers.
+    """
+    if grid is None:
+        return []
+    occupied = grid.occupied(now=now)
+    if not occupied:
+        return []
+    here = grid.cell_of(x_mm, y_mm)
+    blocked = inflate_blocked(occupied, grid.n, grid.cell_mm, free=(here,))
+    if segment_is_clear(x_mm, y_mm, tx_mm, ty_mm, blocked, grid.cell_mm, grid.n):
+        return []
+    cells = astar_cells(blocked, grid.n, here, grid.cell_of(tx_mm, ty_mm))
+    if cells is None:
+        return None
+    pts = simplify_cells(cells, grid.cell_mm, (x_mm, y_mm), (tx_mm, ty_mm),
+                         blocked=blocked, n=grid.n)
+    return [p for p in pts[:-1]]
+
+
+def plan_via_route(x_mm, y_mm, heading_deg, via_pts, tx_mm, ty_mm):
+    """A simplified A* polyline -> Segments, docking ONLY at the target.
+
+    THERE IS NO SECOND GEOMETRY ROUTINE HERE EITHER, for the reason
+    `plan_multi_route` states at length: each hop is `plan_route` called again
+    from the pose the previous hop ENDS at, walked through `apply_segments` --
+    the same forward kinematics the executor and the preview use. The only
+    difference from `plan_multi_route` is `dock=False` on the intermediate hops,
+    because a detour waypoint is a place to pass through, not a place to arrive.
+    """
+    pose = (float(x_mm), float(y_mm), float(heading_deg))
+    segs = []
+    for vx, vy in via_pts:
+        s = plan_route(pose[0], pose[1], pose[2], vx, vy, dock=False)
+        pose = apply_segments(pose, s, measured=False)
+        segs.extend(s)
+    segs.extend(plan_route(pose[0], pose[1], pose[2], tx_mm, ty_mm, dock=True))
+    return segs
+
+
+def plan_grid_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm, grid=None, now=None,
+                    planner=None):
+    """(segments, note). The straight line when it is clear; A* when it is not.
+
+    `note` is None when nothing interesting happened, and a sentence otherwise.
+    It is carried out to `telemetry/mission_plan` rather than only logged,
+    because "why does the drawn route bend" is a question an operator will ask
+    of the dashboard, not of journalctl.
+
+    A SEARCH THAT FAILS STILL DRAWS THE STRAIGHT LINE. Refusing to publish a
+    plan would leave the map blank at exactly the moment it matters, and
+    pretending a blocked route is clear would be a lie. So the straight line is
+    published with a note saying A* found nothing -- and the obstacle guard,
+    which owned this outcome before any of this existed, owns it still.
+    """
+    use = (planner or PLANNER)
+    if use != "astar" or grid is None:
+        return plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm), None
+    pts = grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=now)
+    if pts is None:
+        return (plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm),
+                "A* found no clear route to (%.0f, %.0f) around what the LiDAR "
+                "has seen; the straight line is drawn instead and the obstacle "
+                "guard still owns the outcome" % (tx_mm, ty_mm))
+    if not pts:
+        return plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm), None
+    return (plan_via_route(x_mm, y_mm, heading_deg, pts, tx_mm, ty_mm),
+            "A* detour via %d waypoint(s) around %d observed cell(s)"
+            % (len(pts), len(grid.occupied(now=now))))
 
 
 # ===================================================================== FRAME
@@ -1882,6 +2477,11 @@ class MissionNode(Node):
 
         self.lidar = None
         self.lidar_last = 0.0
+        # THE OCCUPANCY GRID LIVES ON THE NODE, not on the runner, because the
+        # scans that fill it arrive whether or not a mission is running. A grid
+        # that only existed during a mission would be empty at exactly the
+        # moment the first leg needed it.
+        self.occ = OccupancyGrid()
 
         self.anchor = self._initial_anchor()
 
@@ -1931,6 +2531,10 @@ class MissionNode(Node):
 
     # ------------------------------------------------------------ ROS input
     def _on_odom_fused(self, msg):
+        # Dropped by default: see ODOM_RAW_ONLY. Accepting this topic while
+        # the anchor came from /odom_raw mixes two frames.
+        if ODOM_RAW_ONLY:
+            return
         self._take_odom(msg, "/odom")
 
     def _on_odom_raw(self, msg):
@@ -2068,9 +2672,26 @@ class MissionNode(Node):
 
     def on_lidar(self, payload):
         try:
+            # The pose is read BEFORE the scan is stored, so the two describe
+            # the same instant as closely as this rover can manage. (self.lock
+            # is an RLock, so `pose()` re-entering it below would be legal --
+            # this is about time, not about locking.)
+            pose = self.pose()
             with self.lock:
                 self.lidar = payload
                 self.lidar_last = time.monotonic()
+            # Folded OUTSIDE self.lock, into the grid's own lock: this runs on
+            # paho's network thread, and a 360-bin transform must never be able
+            # to hold up an odometry callback or a `stop`.
+            #
+            # WITH NO POSE, NOTHING IS RECORDED. A scan can only be placed in
+            # the arena if the rover knows where it was standing; folding it in
+            # at an assumed origin would put obstacles somewhere the rover never
+            # went, and they would then outlive the mistake by OCC_TTL_S.
+            if pose is not None and self.occ is not None:
+                self.occ.integrate(payload.get("ranges_m") or [], pose,
+                                   range_max_m=float(payload.get("range_max_m")
+                                                     or 6.0))
         except Exception:
             pass
 
@@ -2423,6 +3044,11 @@ class MissionNode(Node):
             "batt_v": jnum(self.battery_v(), 1),
             "front_mm": jnum(self.clearance_mm(reverse=st.reversing), 0),
             "lidar_ok": self.lidar_fresh(),
+            # Additive: what the planner can currently see. `cells` is what A*
+            # would treat as obstacles right now, so an operator can tell an
+            # empty grid apart from a blocked one without reading a log.
+            "planner": PLANNER,
+            "occupancy": (self.occ.stats() if self.occ is not None else None),
         }
         # Pose fields are OMITTED, not zero-filled, when there is no odometry.
         # A consumer that sees 0,0 cannot tell it apart from a real corner.
@@ -2473,6 +3099,22 @@ class MissionAbort(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
+
+
+class ObstacleDetour(MissionAbort):
+    """An obstacle that MIGHT be routed around instead of aborted on.
+
+    A SUBCLASS OF MissionAbort, and that is the safety argument in one line:
+    every `except MissionAbort` already in this file catches it, so anywhere
+    that does not know about detours -- and any future code that forgets --
+    degrades to exactly the abort this rover has always done, with the same
+    ABORT_OBSTACLE string in front of the same reason. Rerouting is opt-in at
+    the one place that opts in (`_drive_to`); aborting is what happens
+    everywhere else, including if the planner is switched off mid-flight.
+
+    It is raised ONLY while `MissionRunner.detour_armed()` is true, which is
+    only around a segment `_drive_to` is prepared to replan after.
+    """
 
 
 # ================================================================ BACKENDS
@@ -2529,11 +3171,34 @@ class DeadReckonBackend:
                 f"({MIN_TURN_DEG:.1f}) — shorter than the {MIN_PULSE_S:.2f}s "
                 "pulse this firmware needs to move at all")
 
+        # FIXED 2026-08-03: _turn referenced `cap` in its abort ladder but never
+        # bound it — only _drive did. Any turn that survived long enough to reach
+        # the burst-cap check died with `NameError: name 'cap' is not defined`,
+        # aborting the mission from inside the worker. It killed an otherwise
+        # complete M2 run during the final reface, after outbound, dock, hold and
+        # return had all succeeded.
+        cap = burst_cap_s(seg)
+
         node.state.driving = True
         node.state.reversing = False
+        detour_reason = None
         try:
             while True:
-                runner.check_abort(turning=True)
+                try:
+                    runner.check_abort(turning=True)
+                except ObstacleDetour as det:
+                    # THE ONE GUARD THIS SEGMENT DOES NOT DIE ON -- and only
+                    # while `_drive_to` has armed a replan. BREAKING rather than
+                    # unwinding is what keeps the detour honest: the segment
+                    # still coasts, still settles and still MEASURES, so the
+                    # rotation that really happened is recorded and the retrace
+                    # can give it back. Letting the exception fly from here, as
+                    # every other guard does, would leave real rotation with
+                    # `measured = 0` and the rover would come home pointing that
+                    # much wrong with nothing in the log to explain it.
+                    detour_reason = det.reason
+                    reason = det.reason
+                    break
                 now = time.monotonic()
                 # SIGNED, not abs(). With `abs` a turn driven the WRONG WAY
                 # reaches the target magnitude just as happily as a correct one,
@@ -2573,7 +3238,14 @@ class DeadReckonBackend:
         # Coast, then measure. The settle is polled rather than slept so a stop
         # still lands inside it, and it is LONGER after a big turn because a big
         # turn coasts further (phase6_latest.py waited an extra 0.6 s past 45 deg).
-        runner.settle(turn_settle_s(seg.target))
+        # The obstacle guard is muted for this settle when a detour is
+        # possible, and that is safe for one reason only: the wheels are
+        # commanded EXACTLY zero throughout a settle (`settle` publishes 0,0
+        # every tick), so a stop-distance guard has nothing left to prevent. It
+        # buys the measurement below; the very next check re-arms it.
+        runner.settle(turn_settle_s(seg.target),
+                      ignore_obstacle=(detour_reason is not None
+                                       or runner.detour_armed()))
         seg.measured = math.degrees(node.yaw() - yaw0)
         seg.elapsed_s = time.monotonic() - t0
         seg.reason = reason
@@ -2588,6 +3260,11 @@ class DeadReckonBackend:
         if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL):
             raise MissionAbort(f"{reason} (turn asked {seg.target:+.1f}deg, "
                                f"measured {seg.measured:+.1f}deg)")
+        # LAST, deliberately: a wrong-way turn or a stall is a fault and wins
+        # over a detour. The segment is fully recorded by this point, so
+        # whichever way the caller goes, history is intact.
+        if detour_reason:
+            raise ObstacleDetour(detour_reason)
         return seg
 
     def _drive(self, seg):
@@ -2622,9 +3299,19 @@ class DeadReckonBackend:
 
         node.state.driving = True
         node.state.reversing = reverse
+        detour_reason = None
         try:
             while True:
-                runner.check_abort(reverse=reverse)
+                try:
+                    runner.check_abort(reverse=reverse)
+                except ObstacleDetour as det:
+                    # See `_turn` for why this breaks instead of unwinding: the
+                    # segment must MEASURE what it did before anyone reroutes,
+                    # or up to MAX_LEG_MM of real travel goes unrecorded and the
+                    # retrace cannot give it back.
+                    detour_reason = det.reason
+                    reason = det.reason
+                    break
                 now = time.monotonic()
                 along, lateral = self._displacement(x0, y0, byaw0)
                 # THE MINIMUM PULSE IS A FLOOR ON TIME, NOT ONLY ON DISTANCE. The
@@ -2662,7 +3349,11 @@ class DeadReckonBackend:
         # bursts a slow approach instead of a lurch. It is also the window in
         # which an arena fix can be taken, if one is ever published — a fix in
         # motion is worth nothing at 9.83 Hz over MQTT.
-        runner.settle(STOP_SETTLE_S)
+        # Muted only while a detour is possible, and only because the wheels
+        # are commanded exactly zero for the whole settle -- see `_turn`.
+        runner.settle(STOP_SETTLE_S,
+                      ignore_obstacle=(detour_reason is not None
+                                       or runner.detour_armed()))
         along, lateral = self._displacement(x0, y0, byaw0)
         seg.measured = along
         seg.lateral_mm = lateral
@@ -2671,6 +3362,10 @@ class DeadReckonBackend:
         if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL):
             raise MissionAbort(f"{reason} (drive asked {seg.target:+.0f}mm, "
                                f"measured {seg.measured:+.0f}mm)")
+        # LAST: a timeout or a stall is a fault and wins over a detour. The
+        # segment is fully measured by now either way.
+        if detour_reason:
+            raise ObstacleDetour(detour_reason)
         return seg
 
     def _displacement(self, x0, y0, board_yaw0):
@@ -2821,6 +3516,11 @@ class MissionRunner:
         self.state = node.state
         self.thread = None
         self.abort_reason = None
+        # Detour state. Both default OFF, so every path that has not opted in
+        # behaves exactly as it did before any of this existed.
+        self._detour_armed = False      # obstacle -> ObstacleDetour, not abort
+        self._obstacle_muted = False    # ...and this suppresses it entirely,
+                                        # only inside a settle at zero speed
         self.lock = threading.Lock()
         self.backends = {"deadreckon": DeadReckonBackend(node, self),
                          "nav2": Nav2Backend(node, self)}
@@ -3032,8 +3732,10 @@ class MissionRunner:
             # number rather than a guess, and so a route that cannot fit inside
             # the mission timeout is refused now instead of aborting halfway
             # round with the rover parked at the far corner.
+            notes = []
             plan_legs = plan_multi_route(pose[0], pose[1], pose[2],
-                                         [(t[1], t[2]) for t in legs])
+                                         [(t[1], t[2]) for t in legs],
+                                         grid=self.node.occ, notes=notes)
             plan = route_segments(plan_legs)
             returns_home = name != "home"
             eta = route_eta_seconds(plan_legs, returns_home)
@@ -3079,7 +3781,7 @@ class MissionRunner:
             # rather than a second drawing of the same intent. A drawn route the
             # rover does not follow is worse than no route at all.
             self._publish_plan(name, backend, pose, legs, plan_legs, plan,
-                               committed=True, ret=ret)
+                               committed=True, ret=ret, notes=notes)
 
             self.thread = threading.Thread(
                 target=self._run, name="mission",
@@ -3356,11 +4058,13 @@ class MissionRunner:
                            "outside the arena", preview=True)
                 return
 
+        notes = []
         plan_legs = plan_multi_route(pose[0], pose[1], pose[2],
-                                     [(t[1], t[2]) for t in legs])
+                                     [(t[1], t[2]) for t in legs],
+                                     grid=self.node.occ, notes=notes)
         plan = route_segments(plan_legs)
         self._publish_plan(name, backend, pose, legs, plan_legs, plan,
-                           committed=False)
+                           committed=False, notes=notes)
 
         log(f"preview {name!r}: {len(legs)} leg(s), {len(plan)} segments, "
             f"{remaining_distance_mm(plan):.0f}mm outbound, no motion commanded")
@@ -3371,7 +4075,7 @@ class MissionRunner:
                           "segments_planned": len(plan)}, qos=1)
 
     def _publish_plan(self, name, backend, pose, legs, plan_legs, plan,
-                      committed, ret=DEFAULT_RETURN):
+                      committed, ret=DEFAULT_RETURN, notes=None):
         """Publish the route on telemetry/mission_plan. PLAN, THEN FOLLOW.
 
         The same payload, from the same code, whether it was asked for as a
@@ -3443,6 +4147,15 @@ class MissionRunner:
             "eta_s": jnum(route_eta_seconds(plan_legs, returns_home), 1),
             "return_strategy": (ret or DEFAULT_RETURN) if returns_home else "none",
             "returns_home": returns_home,
+            # ADDITIVE ONLY. Every key above keeps its meaning and its shape --
+            # the dashboard already draws `waypoints`, `segments` and
+            # `distance_mm` and must keep working untouched. These say WHICH
+            # planner drew the line and, when it is not a straight one, why.
+            "planner": PLANNER,
+            "planner_note": ("; ".join(notes) if notes else None),
+            "replan_max": REPLAN_MAX,
+            "occupancy": (self.node.occ.stats()
+                          if getattr(self.node, "occ", None) else None),
         }, qos=1)
 
     def _wire_is_ours(self):
@@ -3503,18 +4216,41 @@ class MissionRunner:
         if not nav2_active:
             clear = self.node.clearance_mm(reverse=reverse, any_bearing=turning)
             limit = ROTATE_CLEAR_MM if turning else FRONT_STOP_MM
-            if clear is not None and clear < limit:
+            if clear is not None and clear < limit and not self._obstacle_muted:
                 where = "any bearing" if turning else ("rear" if reverse else "front")
-                raise MissionAbort(f"{ABORT_OBSTACLE}: {clear:.0f}mm {where} "
-                                   f"< {limit:.0f}mm")
+                why = (f"{ABORT_OBSTACLE}: {clear:.0f}mm {where} "
+                       f"< {limit:.0f}mm")
+                # SAME CONDITION, SAME MESSAGE, TWO EXCEPTIONS. When a replan is
+                # armed the caller gets the subclass and may route around it;
+                # otherwise -- planner off, cap reached, or any other caller in
+                # this file -- it is the abort it has always been. The decision
+                # is made here, once, so no guard can be accidentally softened
+                # by code that never heard of detours.
+                raise (ObstacleDetour(why) if self._detour_armed
+                       else MissionAbort(why))
             if self.node.foreign_writer():
                 raise MissionAbort(ABORT_WIRE + " appeared mid-mission")
 
-    def settle(self, seconds):
-        """A stop is not a sleep. Polled so an abort lands inside it."""
+    def settle(self, seconds, ignore_obstacle=False):
+        """A stop is not a sleep. Polled so an abort lands inside it.
+
+        `ignore_obstacle` suppresses ONE guard, and only for callers that are
+        settling after a segment that has yet to be measured. It is safe for a
+        single narrow reason: this loop commands exactly 0,0 every tick, so
+        during it there is no motion for a stop-distance guard to prevent. Every
+        other guard -- stop, link, battery, timeout, foreign writer -- stays
+        live, and the obstacle is re-checked the moment the settle ends.
+        """
         t0 = time.monotonic()
         while time.monotonic() - t0 < seconds:
-            self.check_abort()
+            if ignore_obstacle:
+                self._obstacle_muted = True
+                try:
+                    self.check_abort()
+                finally:
+                    self._obstacle_muted = False
+            else:
+                self.check_abort()
             self.node.publish(0.0, 0.0)
             time.sleep(0.05)
 
@@ -3747,6 +4483,73 @@ class MissionRunner:
             st.distance_travelled_mm += abs(out.measured)
         return out
 
+    def detour_armed(self):
+        """True while an obstacle should become a reroute rather than an abort.
+
+        Set by `_drive_to` around exactly the work it is prepared to replan
+        after, and cleared in a `finally` so it cannot leak into the retrace,
+        the reface or the home trim -- none of which has a target to re-route
+        towards, and all of which must keep aborting on an obstacle.
+        """
+        return bool(self._detour_armed)
+
+    def _reroute(self, tx, ty, det, replans):
+        """A* around what the LiDAR has just seen -- or the abort that was
+        always the answer here.
+
+        Returns the new waypoint list. Raises the ORIGINAL obstacle reason, with
+        the reason a reroute was not possible appended, in every case where it
+        cannot help. That string matters: an operator reading "obstacle inside
+        stop distance" must not have to guess whether the planner even tried.
+        """
+        grid = getattr(self.node, "occ", None)
+        pose = self.node.pose()
+        if pose is None:
+            raise MissionAbort(ABORT_LINK)
+        why = None
+        pts = None
+        if PLANNER != "astar":
+            why = f"planner is {PLANNER!r}, so no route search was attempted"
+        elif grid is None:
+            why = "there is no occupancy grid on this node"
+        elif replans > REPLAN_MAX:
+            why = f"replan cap reached ({REPLAN_MAX} per leg)"
+        elif not grid.occupied():
+            # The cone guard saw something the grid did not. Most likely the
+            # LiDAR is fresh but the pose is not, or the return is inside
+            # OCC_MIN_HITS. Inventing a detour around nothing would drive the
+            # rover somewhere arbitrary, so this stays an abort.
+            why = ("the occupancy grid is empty, so there is nothing to route "
+                   "around -- the cone guard saw something the grid has not "
+                   "confirmed")
+        else:
+            pts = grid_detour_points(pose[0], pose[1], tx, ty, grid)
+            if pts is None:
+                why = ("A* found no clear route to the target around what has "
+                       "been seen")
+            elif not pts:
+                why = ("A* says the straight line is clear, which contradicts "
+                       "the guard -- driving on would go back into the same "
+                       "obstacle")
+        if why:
+            raise MissionAbort(f"{det.reason} - no reroute: {why}")
+        log(f"REROUTE {replans}/{REPLAN_MAX}: {det.reason}; A* around "
+            f"{len(grid.occupied())} observed cell(s) via "
+            + " -> ".join(f"({p[0]:.0f},{p[1]:.0f})" for p in pts)
+            + f" -> ({tx:.0f},{ty:.0f})")
+        self.bus.publish("events/replan", {
+            "leg": self.state.leg_name, "leg_i": self.state.leg_i,
+            "replan_i": replans, "replan_max": REPLAN_MAX,
+            "reason": det.reason,
+            "from": {"x_mm": jnum(pose[0], 1), "y_mm": jnum(pose[1], 1),
+                     "heading_deg": jnum(pose[2], 1)},
+            "target": {"x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1)},
+            "waypoints": [{"x_mm": jnum(p[0], 1), "y_mm": jnum(p[1], 1),
+                           "kind": "via"} for p in pts],
+            "occupancy": grid.stats(),
+        }, qos=1)
+        return list(pts)
+
     def _drive_to(self, tx, ty, dock_only=False):
         """Adaptive turn-and-drive: re-measure the bearing after every leg.
 
@@ -3755,50 +4558,113 @@ class MissionRunner:
         next leg instead of being carried to the target. What is recorded in
         `executed` is the segments actually run, and that is what the retrace
         inverts.
+
+        WHEN THE OBSTACLE GUARD TRIPS, AND ONLY WITH FPMS_MISSION_PLANNER=astar:
+        the running segment stops, settles and is MEASURED as usual, then A* is
+        run over the live occupancy grid from the current pose to the SAME
+        target. What comes back is a list of intermediate points, and this loop
+        simply drives to those first. That is the whole trick, and it is why
+        nothing else has to change: the follower is not being replaced, it is
+        being handed a different next point. The segments it produces are the
+        same Segment objects in the same order, so the retrace unwinds the
+        detour exactly as it unwinds anything else -- including back around the
+        obstacle, which is the route that was known to be drivable.
+
+        THE ABORT IS STILL THERE. Planner off, no grid, no route, or REPLAN_MAX
+        detours spent on one leg, and this ends in the same ABORT_OBSTACLE it
+        always did, carrying the reason the reroute was refused.
         """
         st = self.state
         backend = self.backends["deadreckon"]   # docking is always local
         executed = []
+        via = []          # A* waypoints still to be passed through, in order
+        replans = 0
         while True:
-            self.check_abort()
-            pose = self.node.pose()
-            if pose is None:
-                raise MissionAbort(ABORT_LINK)
-            dx, dy = tx - pose[0], ty - pose[1]
-            dist = math.hypot(dx, dy)
-            st.distance_remaining_mm = dist
-            if dist <= ARRIVE_TOL_MM:
-                return executed
-            if dock_only and dist > DOCK_APPROACH_MM * 1.5:
-                # Nav2 was supposed to leave us within the dock approach. It did
-                # not, so say so rather than silently driving the whole way on a
-                # backend the operator did not pick.
-                raise MissionAbort(
-                    f"nav2 stopped {dist:.0f}mm short of the target, outside the "
-                    f"{DOCK_APPROACH_MM:.0f}mm dock approach")
+            cur = None
+            try:
+                # ARMED FOR THE WHOLE LOOP BODY, because the guard can trip in
+                # any of it -- the top-of-loop check, a bearing turn, or a drive
+                # -- and a detour raised anywhere else would unwind past the
+                # handler below and abort with an unmeasured segment.
+                self._detour_armed = (replans < REPLAN_MAX)
+                self.check_abort()
+                pose = self.node.pose()
+                if pose is None:
+                    raise MissionAbort(ABORT_LINK)
+                # The point being driven at RIGHT NOW: a detour waypoint while
+                # any are pending, the target itself otherwise. Everything below
+                # is the code that was already here, aimed at that point.
+                gx, gy = via[0] if via else (tx, ty)
+                final = not via
+                dx, dy = gx - pose[0], gy - pose[1]
+                dist = math.hypot(dx, dy)
+                # REMAINING IS ALWAYS MEASURED TO THE REAL TARGET, never to the
+                # waypoint. The operator asked to reach the zone; a number that
+                # jumped every time a waypoint was retired would read as the
+                # rover losing ground.
+                st.distance_remaining_mm = math.hypot(tx - pose[0], ty - pose[1])
+                if dist <= (ARRIVE_TOL_MM if final else VIA_TOL_MM):
+                    if final:
+                        return executed
+                    # A waypoint is somewhere to pass THROUGH. It is retired on
+                    # proximity, never docked at, and never held at: arriving on
+                    # it to the millimetre would spend dock bursts and settles
+                    # on a point nobody is measuring.
+                    via.pop(0)
+                    continue
+                if dock_only and final and dist > DOCK_APPROACH_MM * 1.5:
+                    # Nav2 was supposed to leave us within the dock approach. It
+                    # did not, so say so rather than silently driving the whole
+                    # way on a backend the operator did not pick.
+                    raise MissionAbort(
+                        f"nav2 stopped {dist:.0f}mm short of the target, outside "
+                        f"the {DOCK_APPROACH_MM:.0f}mm dock approach")
 
-            turn = heading_error_deg(bearing_deg(dx, dy), pose[2])
-            if abs(turn) >= BEARING_TOL_DEG:
-                executed.append(self._run_one(backend, Segment("turn", turn)))
-                continue
+                turn = heading_error_deg(bearing_deg(dx, dy), pose[2])
+                if abs(turn) >= BEARING_TOL_DEG:
+                    cur = Segment("turn", turn)
+                    executed.append(self._run_one(backend, cur))
+                    continue
 
-            legs = split_legs(dist)
-            if not legs:
-                # `split_legs` returning nothing means the remaining distance is
-                # under MIN_MOVE_MM: real, but shorter than any motion this
-                # chassis can perform. That is arrival — as close as the hardware
-                # goes — and the residual is REPORTED rather than chased with a
-                # burst that would stand still and then abort as a stall.
-                log(f"arrived within {dist:.0f}mm of the target; closer than "
-                    f"MIN_MOVE_MM ({MIN_MOVE_MM:.0f}), which is the shortest "
-                    "motion this firmware will act on")
-                st.distance_remaining_mm = dist
-                return executed
-            mm, dock = legs[0]
-            st.phase = "docking" if dock else st.phase
-            st.segments_n = max(st.segments_n, st.segment_i + len(legs))
-            st.eta_s = eta_seconds([Segment("drive", m, dock=d) for m, d in legs])
-            executed.append(self._run_one(backend, Segment("drive", mm, dock=dock)))
+                legs = split_legs(dist, dock=final)
+                if not legs:
+                    if not final:
+                        # Closer to the waypoint than this chassis can move.
+                        # That IS passing through it.
+                        via.pop(0)
+                        continue
+                    # `split_legs` returning nothing means the remaining distance
+                    # is under MIN_MOVE_MM: real, but shorter than any motion
+                    # this chassis can perform. That is arrival - as close as the
+                    # hardware goes - and the residual is REPORTED rather than
+                    # chased with a burst that would stand still and then abort
+                    # as a stall.
+                    log(f"arrived within {dist:.0f}mm of the target; closer than "
+                        f"MIN_MOVE_MM ({MIN_MOVE_MM:.0f}), which is the shortest "
+                        "motion this firmware will act on")
+                    st.distance_remaining_mm = dist
+                    return executed
+                mm, dock = legs[0]
+                st.phase = "docking" if dock else st.phase
+                st.segments_n = max(st.segments_n, st.segment_i + len(legs))
+                st.eta_s = eta_seconds([Segment("drive", m, dock=d)
+                                        for m, d in legs])
+                cur = Segment("drive", mm, dock=dock)
+                executed.append(self._run_one(backend, cur))
+            except ObstacleDetour as det:
+                # The segment measured itself BEFORE raising (see
+                # DeadReckonBackend._drive / ._turn), so it is real history: it
+                # goes into `executed` or the retrace will not give it back.
+                # `_run_one` never got to return it, so its bookkeeping is done
+                # here rather than left half applied.
+                if cur is not None and cur.executed:
+                    executed.append(cur)
+                    if cur.kind == "drive":
+                        st.distance_travelled_mm += abs(cur.measured)
+                replans += 1
+                via = self._reroute(tx, ty, det, replans)
+            finally:
+                self._detour_armed = False
 
     def _reface(self, heading_deg, start_yaw=None):
         """Re-face the start heading — a correction, not the plan.
@@ -4013,6 +4879,12 @@ def main():
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
+    log(f"planner: {PLANNER} (grid {GRID_MM:.0f}mm, robot radius "
+        f"{ROBOT_RADIUS_MM:.0f}mm, wall pad {WALL_PAD_MM:.0f}mm, occupancy TTL "
+        f"{OCC_TTL_S:.0f}s x{OCC_MIN_HITS} hits, <={REPLAN_MAX} replans/leg). "
+        "A straight line is still planned whenever the straight line is clear; "
+        "A* only runs when the grid says it is not, and an obstacle with no "
+        f"route around it still ends the mission with {ABORT_OBSTACLE!r}.")
     log(f"fpms_missions up: thing={THING} backend_default={DEFAULT_BACKEND} "
         f"cruise={CRUISE_MPS:.3f}m/s (wire {to_cmd(CRUISE_MPS):.4f}) "
         f"dock_step={DOCK_STEP_MM:.0f}mm")
