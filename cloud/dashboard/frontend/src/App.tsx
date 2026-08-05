@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, Route, Routes, useLocation } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import Layout from "./components/Layout";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import Intro from "./pages/Intro";
@@ -64,7 +64,12 @@ function NoSuchPage() {
         It may have been renamed, or the link may be out of date. Every page the
         app has is in the navigation above.
       </p>
-      <Link to="/" className="btn mt-5 inline-block">Back to Overview</Link>
+      {/* Points at the panel rather than at "/", which now redirects there
+          anyway — a button labelled "Overview" that lands somewhere else is
+          its own small lie. */}
+      <Link to="/rover2-test" className="btn mt-5 inline-block">
+        Back to Rover 2 Mission Test
+      </Link>
     </div>
   );
 }
@@ -118,7 +123,27 @@ export default function App() {
       */}
       <ErrorBoundary key={pathname} label="page">
       <Routes>
-        <Route path="/" element={<Intro />} />
+        {/*
+          THE APP OPENS ON THE THING IT IS OPENED FOR.
+
+          The launcher points a browser at "/", and "/" used to be the Overview
+          — a page nobody acts on, one click away from the panel that runs the
+          rover. The operator asked for the mission-test tab to be in front of
+          them; making it the landing page is the difference between that and a
+          tab they still have to find.
+
+          Overview keeps its content at /overview rather than being deleted, and
+          the redirect is `replace` so Back does not bounce between the two.
+
+          Public visitors are NOT redirected: /rover2-test is hqOnly and would
+          hand them the "HQ-only" notice as the first thing they ever see. They
+          get the Overview, which is what that page is for.
+        */}
+        <Route
+          path="/"
+          element={locked ? <Intro /> : <Navigate to="/rover2-test" replace />}
+        />
+        <Route path="/overview" element={<Intro />} />
         <Route
           path="/control"
           element={locked ? <NotAvailableRemotely what="Control" /> : <Control />}

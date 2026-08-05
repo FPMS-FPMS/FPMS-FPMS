@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 
 type Props = {
   health: {
@@ -20,10 +20,27 @@ type Tab = {
 };
 
 /*
-  Tabs are grouped by what the operator is trying to DO, not by when they were
-  built. Eleven undifferentiated tabs in one row is a dev tool; three named
-  groups is a console. The membership and the `hqOnly` flags are unchanged —
-  only the presentation groups them.
+  ---------------------------------------------------------------------------
+  THE NAV IS THE OPERATOR'S SURFACE ON RACE DAY, NOT AN INDEX OF THE PROJECT.
+  ---------------------------------------------------------------------------
+  This used to be thirteen tabs in three groups, which is an accurate map of
+  what has been BUILT and a poor one of what gets USED. Standing beside the
+  arena with a rover about to move, the operator touches three things: the
+  mission-test panel, the LiDAR map, and — when every panel says "waiting" —
+  something that explains the broker. Everything else is a tab to scroll past
+  while looking for one of those three.
+
+  So the front row is those three and nothing else. The rest are NOT deleted
+  and their routes are NOT removed: they are behind one "Advanced" disclosure,
+  closed by default, one click away. That distinction is deliberate. Several of
+  them (Control, Drive, Terminal) are the tools you reach for precisely when
+  something has gone wrong, and a purge would have meant re-adding them under
+  pressure. Hidden is recoverable; deleted is a commit away.
+
+  ADVANCED IS ALSO WHERE THINGS GO TO BE JUDGED. Two tabs there are pointed at
+  infrastructure that is being removed from this repo (cloud/localstack,
+  cloud/lambda, cloud/iot-core), so AWS in particular is expected to be dead
+  rather than merely unused — see the note on it below.
 
   `hqOnly` tabs can act on the HQ laptop itself rather than just showing rover
   data, so they're hidden from public visitors. The server enforces this too —
@@ -31,42 +48,49 @@ type Tab = {
 */
 const groups: { name: string; tabs: Tab[] }[] = [
   {
-    name: "Operations",
+    name: "Operate",
     tabs: [
-      { to: "/", label: "Overview", end: true, icon: IconGrid },
-      // Leads the action tabs: running a mission is the primary task. It drives
-      // the rover, so it carries the same hqOnly flag as Control and Drive.
-      { to: "/mission", label: "Mission", hqOnly: true, icon: IconTarget },
-      // The bare button panel for running rover2 beside the arena. It sits
-      // next to Mission because that is what it is a stripped-down version
-      // of, and its label names the rover so nobody presses it expecting a
-      // fleet-wide control.
+      // The primary operating surface. First, largest, and the page the app
+      // opens on — the operator should not have to navigate to the thing they
+      // opened the app to do.
       { to: "/rover2-test", label: "Rover 2 Mission Test", hqOnly: true, icon: IconRocket },
-      { to: "/control", label: "Control", hqOnly: true, icon: IconSliders },
-      { to: "/drive", label: "Drive", hqOnly: true, icon: IconSteering },
-    ],
-  },
-  {
-    name: "Sensors",
-    tabs: [
+      // The map they actually watch while it drives.
       { to: "/lidar", label: "LiDAR", icon: IconRadar },
-      { to: "/camera", label: "Camera", icon: IconCamera },
-      { to: "/thermal", label: "Thermal", icon: IconFlame },
-      { to: "/analyst", label: "Analyst", icon: IconSpark },
+      // Renamed from "Devices". It is the page that answers "why is everything
+      // saying waiting?" — it reads /api/health and surfaces mqtt.problem,
+      // which is the one diagnosis this dashboard cannot do without. The old
+      // name described its contents; this one describes its job.
+      { to: "/devices", label: "Health", hqOnly: true, icon: IconChip },
     ],
   },
-  {
-    name: "System",
-    tabs: [
-      { to: "/devices", label: "Devices", hqOnly: true, icon: IconChip },
-      // AWS and Install describe the operator's own machine — an AWS console
-      // view and a "download the desktop app" page. Neither means anything in
-      // the cloud deployment, where there is no local machine and no installer.
-      { to: "/aws", label: "AWS", hqOnly: true, icon: IconCloud },
-      { to: "/terminal", label: "Terminal", hqOnly: true, icon: IconTerminal },
-      { to: "/install", label: "Install", hqOnly: true, icon: IconDownload },
-    ],
-  },
+];
+
+/**
+ * Everything else. Reachable, one click away, closed by default.
+ *
+ * Ordered by how likely someone is to want it in an emergency rather than by
+ * category: the manual-driving pages first, the read-only sensor views next,
+ * and the machine-admin pages last.
+ */
+const advanced: Tab[] = [
+  { to: "/overview", label: "Overview", icon: IconGrid },
+  // The full mission console — arena cards, backend picker, plan-expiry rules.
+  // Superseded for running M1/M2 by the mission-test panel, kept because it is
+  // the only place that explains WHY the mission ids do not match what people
+  // say out loud.
+  { to: "/mission", label: "Mission", hqOnly: true, icon: IconTarget },
+  { to: "/control", label: "Control", hqOnly: true, icon: IconSliders },
+  { to: "/drive", label: "Drive", hqOnly: true, icon: IconSteering },
+  { to: "/camera", label: "Camera", icon: IconCamera },
+  { to: "/thermal", label: "Thermal", icon: IconFlame },
+  { to: "/analyst", label: "Analyst", icon: IconSpark },
+  { to: "/terminal", label: "Terminal", hqOnly: true, icon: IconTerminal },
+  { to: "/install", label: "Install", hqOnly: true, icon: IconDownload },
+  // Points at LocalStack and an AWS mode whose backing code is being deleted
+  // from this repo. Left reachable rather than removed so that whoever finishes
+  // that deletion can delete this in the same change, with the evidence in
+  // front of them, instead of guessing here.
+  { to: "/aws", label: "AWS", hqOnly: true, icon: IconCloud },
 ];
 
 export default function NavBar({ health, controlsDisabled = false }: Props) {
@@ -76,6 +100,27 @@ export default function NavBar({ health, controlsDisabled = false }: Props) {
       tabs: controlsDisabled ? g.tabs.filter((t) => !t.hqOnly) : g.tabs,
     }))
     .filter((g) => g.tabs.length > 0);
+
+  const visibleAdvanced = controlsDisabled
+    ? advanced.filter((t) => !t.hqOnly)
+    : advanced;
+
+  /**
+   * Advanced starts CLOSED, and re-closes on reload.
+   *
+   * Not persisted on purpose. The value of the short nav is that it is short
+   * every time the operator looks at it; a disclosure that remembered being
+   * open would quietly undo this change one session after someone went looking
+   * for the Terminal. It also opens itself when the operator is already ON one
+   * of the hidden pages, so the tab they are reading is never missing from the
+   * navigation they are reading it with.
+   */
+  const { pathname } = useLocation();
+  const onAdvancedPage = visibleAdvanced.some(
+    (t) => pathname === t.to || pathname.startsWith(`${t.to}/`),
+  );
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const advancedOpen = showAdvanced || onAdvancedPage;
 
   const mqttOn = !!health?.mqtt.connected;
   const awsOn = !!health?.aws.reachable;
@@ -170,7 +215,74 @@ export default function NavBar({ health, controlsDisabled = false }: Props) {
             ))}
           </div>
         ))}
+
+        {visibleAdvanced.length > 0 && (
+          <>
+            <span aria-hidden className="mx-1 h-5 w-px shrink-0 bg-white/[0.08]" />
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((v) => !v)}
+              aria-expanded={advancedOpen}
+              aria-controls="advanced-tabs"
+              className="nav-link shrink-0 text-slate-400"
+              title={
+                advancedOpen
+                  ? "Hide the pages that are not part of the run"
+                  : "Everything else: Mission console, Control, Drive, the sensor views, Terminal, Install, AWS. Nothing has been removed."
+              }
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className={`h-4 w-4 shrink-0 opacity-80 transition-transform ${
+                  advancedOpen ? "rotate-90" : ""
+                }`}
+                aria-hidden
+                {...S}
+              >
+                <path d="m9 6 6 6-6 6" />
+              </svg>
+              <span>Advanced</span>
+              <span className="ml-1 rounded bg-white/[0.08] px-1 text-[0.625rem] tabular-nums text-slate-400">
+                {visibleAdvanced.length}
+              </span>
+            </button>
+          </>
+        )}
       </nav>
+
+      {/*
+        The second row only exists when it is open, so the closed state costs
+        the operator nothing — not a row of greyed links, not a scroll. The
+        wording is there because "where did my tabs go" is the obvious first
+        reaction to this change and it deserves an answer on the page rather
+        than in a commit message.
+      */}
+      {advancedOpen && visibleAdvanced.length > 0 && (
+        <div
+          id="advanced-tabs"
+          className="border-t border-white/[0.05] bg-black/20"
+        >
+          <nav
+            aria-label="Advanced"
+            className="app-container no-scrollbar flex items-center gap-1 overflow-x-auto py-2"
+          >
+            <span className="nav-group-label">Not part of the run</span>
+            {visibleAdvanced.map((t) => (
+              <NavLink
+                key={t.to}
+                to={t.to}
+                end={t.end}
+                className={({ isActive }) =>
+                  `nav-link ${isActive ? "nav-link-active" : ""}`
+                }
+              >
+                <t.icon className="h-4 w-4 shrink-0 opacity-80" />
+                <span>{t.label}</span>
+              </NavLink>
+            ))}
+          </nav>
+        </div>
+      )}
     </header>
   );
 }

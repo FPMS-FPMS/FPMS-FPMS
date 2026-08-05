@@ -354,14 +354,57 @@ Add-Candidate '127.0.0.1' 'a broker on this laptop (usually empty)'
 # ---------------------------------------------------------------------------
 # Probe, in order. First one that answers wins.
 # ---------------------------------------------------------------------------
+#
+# A NAME IS RESOLVED HERE AND THE ADDRESS IS WHAT GETS PRINTED.
+#
+# Observed on the operator's laptop within a single session: the same name,
+# fpms-pi.local, resolved to IPv4 from .NET and FAILED from Python's
+# getaddrinfo minutes apart. mDNS on this machine is intermittent, and the two
+# resolvers do not agree. Printing the NAME means the launcher hands the backend
+# something this script verified with a different resolver than the one the
+# backend will use - and a name that worked at probe time can fail at connect
+# time, which is unfalsifiable from the logs and looks like a broken app.
+#
+# So the name is used for DISCOVERY, which is what makes it survive DHCP, and
+# the ADDRESS IT RESOLVED TO is what is verified and printed. Re-running at
+# every launch is what keeps that address current; nothing is cached into a file
+# the operator has to remember to edit.
+#
 $chosen = $null
 foreach ($c in $candidates) {
-    if (Test-Broker $c) { $chosen = $c; Note "OK: $c answers on $Port - using it."; break }
-    Note "no answer from $c on $Port"
+    $target = $c
+    if ($c -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+        $v4 = $null
+        try {
+            $v4 = ([Net.Dns]::GetHostAddresses($c) |
+                   Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                   Select-Object -First 1).IPAddressToString
+        } catch { $v4 = $null }
+        if (-not $v4) {
+            Note "$c does not resolve to an IPv4 address - the backend's resolver could not use it either. Skipping."
+            continue
+        }
+        $target = $v4
+        Note "$c resolves to $target - probing the address, not the name."
+    }
+    if (Test-Broker $target) {
+        $chosen = $target
+        if ($target -ne $c) { Note "OK: $c ($target) answers on $Port and is carrying fpms telemetry - using $target." }
+        else { Note "OK: $target answers on $Port and is carrying fpms telemetry - using it." }
+        break
+    }
+    Note "no usable broker at $c on $Port"
 }
 
 if (-not $chosen) {
-    $fallback = if ($Names.Count -gt 0) { $Names[0] } else { '127.0.0.1' }
+    # Fall back to the last ADDRESS that worked rather than to the name: if
+    # nothing answered, mDNS is very likely part of what is broken, and handing
+    # the backend a name it cannot resolve turns "the Pi is off" into "the
+    # dashboard is broken". The address at least fails honestly and visibly.
+    $fallback =
+        if (-not [string]::IsNullOrWhiteSpace($lastHost)) { $lastHost }
+        elseif ($Names.Count -gt 0) { $Names[0] }
+        else { '127.0.0.1' }
     Note "NOTHING answered on port $Port. Falling back to $fallback."
     Note 'The dashboard will start and report itself disconnected, which is the'
     Note 'honest outcome - it is not evidence that the app is broken. Check the'

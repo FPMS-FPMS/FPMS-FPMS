@@ -412,6 +412,16 @@ if (Test-Path -LiteralPath $existingLauncher) {
     }
 }
 
+# The install is a whole-folder swap, so anything in the old folder that is not
+# explicitly carried across is destroyed. That silently ate the operator's
+# hand-kept Start-FPMS-Dashboard.cmd.bak twice. Any .bak beside the launcher is
+# somebody's undo button; it costs nothing to keep and it is not ours to throw
+# away.
+foreach ($bak in (Get-ChildItem -LiteralPath $Dest -Filter '*.cmd.bak' -File -ErrorAction SilentlyContinue)) {
+    Copy-Item -LiteralPath $bak.FullName -Destination (Join-Path $staging $bak.Name) -Force
+    Ok "preserved $($bak.Name)"
+}
+
 $repoResolver = Join-Path $PSScriptRoot 'Resolve-Broker.ps1'
 if (Test-Path -LiteralPath $repoResolver) {
     Copy-Item -LiteralPath $repoResolver -Destination (Join-Path $staging 'Resolve-Broker.ps1') -Force
