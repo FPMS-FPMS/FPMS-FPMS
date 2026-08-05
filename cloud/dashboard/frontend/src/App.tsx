@@ -6,6 +6,7 @@ import Intro from "./pages/Intro";
 import Control from "./pages/Control";
 import Drive from "./pages/Drive";
 import Mission from "./pages/Mission";
+import Rover2Test from "./pages/Rover2Test";
 import Devices from "./pages/Devices";
 import Aws from "./pages/Aws";
 import Lidar from "./pages/Lidar";
@@ -128,6 +129,16 @@ export default function App() {
         />
         {/* Mission drives the rover, so it is HQ-only exactly like Drive. */}
         <Route path="/mission" element={locked ? <NotAvailableRemotely what="Mission" /> : <Mission />} />
+        {/*
+          The bare mission-test panel. Same hqOnly rule as Mission — it drives
+          the rover — and deliberately a SEPARATE route rather than a mode of
+          /mission, so a bookmark or a mis-click cannot land the operator on
+          the wrong one of the two while standing beside the arena.
+        */}
+        <Route
+          path="/rover2-test"
+          element={locked ? <NotAvailableRemotely what="Rover 2 Mission Test" /> : <Rover2Test />}
+        />
         <Route
           path="/devices"
           element={locked ? <NotAvailableRemotely what="Devices" /> : <Devices />}

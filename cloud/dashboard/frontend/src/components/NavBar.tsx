@@ -37,6 +37,11 @@ const groups: { name: string; tabs: Tab[] }[] = [
       // Leads the action tabs: running a mission is the primary task. It drives
       // the rover, so it carries the same hqOnly flag as Control and Drive.
       { to: "/mission", label: "Mission", hqOnly: true, icon: IconTarget },
+      // The bare button panel for running rover2 beside the arena. It sits
+      // next to Mission because that is what it is a stripped-down version
+      // of, and its label names the rover so nobody presses it expecting a
+      // fleet-wide control.
+      { to: "/rover2-test", label: "Rover 2 Mission Test", hqOnly: true, icon: IconRocket },
       { to: "/control", label: "Control", hqOnly: true, icon: IconSliders },
       { to: "/drive", label: "Drive", hqOnly: true, icon: IconSteering },
     ],
@@ -283,6 +288,19 @@ function IconTarget({ className }: { className?: string }) {
         <circle cx="12" cy="12" r="8" />
         <circle cx="12" cy="12" r="3" />
         <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+      </g>
+    </Svg>
+  );
+}
+
+/** A big round GO button — the mission-test panel is nothing but buttons. */
+function IconRocket({ className }: { className?: string }) {
+  return (
+    <Svg className={className}>
+      <g>
+        <circle cx="12" cy="12" r="9" />
+        <circle cx="12" cy="12" r="4.5" />
+        <path d="M12 3v2" />
       </g>
     </Svg>
   );
