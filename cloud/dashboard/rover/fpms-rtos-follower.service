@@ -1,0 +1,58 @@
+[Unit]
+Description=FPMS RTOS follower (fixed-rate Pi-side path follower, DRY RUN by default)
+# Deliberately NO Requires=/BindsTo=/PartOf=/After= on micro-ros-agent,
+# fpms-rover-agent, fpms-teleop or fpms-missions. Same reasoning as every other
+# FPMS unit: the micro-ROS link costs 90-225s to re-establish and must not be
+# taken down by a restart here. If the link is down this node simply sits in
+# FAULT and emits zero, which is a cleaner failure than systemd shuffling units.
+#
+# NOTE: the name refers to the RTOS-style firmware this follower is designed to
+# pair with. The ESP32 currently runs Yahboom factory firmware v2.0.0 and there
+# is no FreeRTOS control task on the board. This unit does not change that.
+After=network-online.target
+Wants=network-online.target
+
+# ---- BEFORE ENABLING THIS UNIT FOR LIVE MOTION -----------------------------
+# 1. fpms-teleop's idle control tick publishes a ZERO Twist every 0.5s. That is
+#    correct while teleop owns the wire and fatal while this node drives:
+#    interleaving 2 Hz zeros into a 20 Hz setpoint is the stall-then-lurch the
+#    firmware's encoder quantisation produces. Stop fpms-teleop for the run.
+# 2. fpms-missions must not be running a mission at the same time. Two writers
+#    on /cmd_vel is not a race this file can win or detect in time.
+# 3. The duty->angular-velocity conversion in fpms_rtos_follower.py is GEOMETRY,
+#    not a measured motor curve. The first live run is a calibration, not a
+#    repeat of B8B's measured accuracy. Watch the rover, not the odometry.
+# ----------------------------------------------------------------------------
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+# MANDATORY. On any other domain this node sees no pose and sits in FAULT.
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+# ---- THE MOTION GATE -------------------------------------------------------
+# 1 = DRY RUN. No /cmd_vel publisher object is created; the follower computes
+# and publishes the velocities it WOULD send and touches nothing else.
+# Setting it to 0 makes this process able to MOVE THE ROVER, and even then a
+# second, explicit {"cmd":"start","live":true} on
+# fpms/<thing>/control/follower is required before any non-zero Twist is sent.
+Environment=FPMS_FOLLOW_DRY_RUN=1
+# ----------------------------------------------------------------------------
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_rtos_follower.py'
+# SIGTERM lands on the python process, which latches stop, then publishes ten
+# zero Twists ONLY if it was ever out of dry run. The generous stop timeout
+# exists so shutdown is never cut short by systemd killing us mid-stop.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

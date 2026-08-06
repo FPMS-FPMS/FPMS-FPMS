@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "config": {
+    "step_lin": 0.002,
+    "cap_lin": 0.1,
+    "step_ang": 0.004,
+    "cap_ang": 0.2,
+    "hold_s": 1.5,
+    "gap_s": 1.2,
+    "sample_window_s": 0.5,
+    "batt_floor_v": 11.0,
+    "odom_timeout_s": 3.0,
+    "control_hz": 20.0,
+    "full_sweep": false
+  },
+  "created_at": 1785513700.6420991,
+  "updated_at": 1785513716.3815186,
+  "axes": {
+    "lin+": {
+      "done": false,
+      "steps": [
+        {
+          "axis": "lin",
+          "sign": 1.0,
+          "mag": 0.002,
+          "commanded": 0.002,
+          "mean_early": 0.0,
+          "std_early": 0.0,
+          "n_early": 17,
+          "mean_late": 0.0,
+          "std_late": 0.0,
+          "n_late": 17,
+          "motion": false,
+          "smooth": false,
+          "wrong_way": false,
+          "simulated": false,
+          "t": 1785513705.051788
+        },
+        {
+          "axis": "lin",
+          "sign": 1.0,
+          "mag": 0.004,
+          "commanded": 0.004,
+          "mean_early": 0.0,
+          "std_early": 0.0,
+          "n_early": 15,
+          "mean_late": 0.0,
+          "std_late": 0.0,
+          "n_late": 14,
+          "motion": false,
+          "smooth": false,
+          "wrong_way": false,
+          "simulated": false,
+          "t": 1785513707.824938
+        },
+        {
+          "axis": "lin",
+          "sign": 1.0,
+          "mag": 0.006,
+          "commanded": 0.006,
+          "mean_early": 0.0,
+          "std_early": 0.0,
+          "n_early": 18,
+          "mean_late": 0.0,
+          "std_late": 0.0,
+          "n_late": 17,
+          "motion": false,
+          "smooth": false,
+          "wrong_way": false,
+          "simulated": false,
+          "t": 1785513710.549442
+        },
+        {
+          "axis": "lin",
+          "sign": 1.0,
+          "mag": 0.008,
+          "commanded": 0.008,
+          "mean_early": 0.0,
+          "std_early": 0.0,
+          "n_early": 16,
+          "mean_late": 0.0,
+          "std_late": 0.0,
+          "n_late": 16,
+          "motion": false,
+          "smooth": false,
+          "wrong_way": false,
+          "simulated": false,
+          "t": 1785513713.2726154
+        },
+        {
+          "axis": "lin",
+          "sign": 1.0,
+          "mag": 0.01,
+          "commanded": 0.01,
+          "mean_early": 0.0,
+          "std_early": 0.0,
+          "n_early": 18,
+          "mean_late": 0.0,
+          "std_late": 0.0,
+          "n_late": 17,
+          "motion": false,
+          "smooth": false,
+          "wrong_way": false,
+          "simulated": false,
+          "t": 1785513716.0236542
+        }
+      ],
+      "first_motion": null,
+      "first_smooth": null
+    },
+    "lin-": {
+      "done": false,
+      "steps": [],
+      "first_motion": null,
+      "first_smooth": null
+    },
+    "ang+": {
+      "done": false,
+      "steps": [],
+      "first_motion": null,
+      "first_smooth": null
+    },
+    "ang-": {
+      "done": false,
+      "steps": [],
+      "first_motion": null,
+      "first_smooth": null
+    }
+  },
+  "aborted": true,
+  "abort_reason": "observed lin=-0.2973 opposite to commanded +0.0120 beyond tolerance 0.015 -- possible windup/lurch in progress"
+}

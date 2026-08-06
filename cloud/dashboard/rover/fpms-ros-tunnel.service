@@ -1,0 +1,46 @@
+[Unit]
+Description=FPMS ROS tunnel (micro-ROS topics -> MQTT, with honest link health)
+# Deliberately NO Requires=/BindsTo=/PartOf=/After= on micro-ros-agent,
+# fpms-rover-agent, fpms-teleop or fpms-missions. The micro-ROS serial link
+# costs 90-225s to re-establish, so a dependency edge here would let a restart
+# of this diagnostic take every topic on the robot down with it. The whole point
+# of this unit is to REPORT that the link is dead, which it cannot do if it is
+# coupled to the thing that died.
+#
+# network-online is the only thing worth waiting for (DDS discovery + broker).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+# MANDATORY. The board publishes on domain 20 and nowhere else; on any other
+# domain this node sees no topics and reports DEAD forever, which looks exactly
+# like dead hardware. Two sessions have already lost time to that confusion.
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+# ---- THE MOTION GATE -------------------------------------------------------
+# 0 = this service can never publish /cmd_vel; the Twist publisher object is
+# never even created. Setting it to 1 makes this process able to MOVE THE
+# ROVER. It is here, in a root-owned unit file, rather than on an MQTT topic on
+# purpose: arming should require a shell on the rover, not a broker message.
+Environment=FPMS_TUNNEL_ALLOW_CMDVEL=0
+# ----------------------------------------------------------------------------
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_ros_tunnel.py'
+# SIGTERM lands on the python process. It publishes an offline event and, only
+# if it was armed, ten zero Twists before exiting. The generous stop timeout
+# exists so shutdown is never cut short by systemd killing us mid-stop.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

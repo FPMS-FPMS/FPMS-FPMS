@@ -1,0 +1,57 @@
+[Unit]
+Description=FPMS one-shot post-boot settle (re-create the DDS participants the supervisor does not watch)
+# WHY THIS EXISTS -- measured on this rover, 2026-08-06, across two reboots.
+#
+# THE FAULT
+#   After a cold boot, fpms-lidar-ros runs perfectly by every local measure: the
+#   node is active, it logs "scans=2848 dropped=0 rate=9.55 Hz", and
+#   `ros2 topic info /scan_lidar` reports "Publisher count: 1". And yet NO
+#   subscriber created afterwards ever receives a single LaserScan. `ros2 topic
+#   hz /scan_lidar` sits silent forever. Restarting the unit fixes it instantly
+#   and reproducibly (verified twice: 9.53 Hz and 9.56 Hz immediately after a
+#   restart, NO DATA immediately before).
+#
+#   This is the worst failure mode this project has: every indicator says
+#   healthy, and the data is not there. It is the /scan_lidar twin of the
+#   micro-ROS "false alive" signature.
+#
+# WHY THE OTHER NODES DO NOT SHOW IT
+#   fpms-uros-supervisor restarts micro-ros-agent, fpms-teleop, fpms-odom-tf and
+#   fpms-missions whenever board data goes stale -- which always happens once or
+#   twice in the first minutes after a boot, because a Pi reboot leaves the
+#   ESP32 holding an XRCE session pointed at an agent that no longer exists.
+#   Those four therefore get re-created after the graph has settled, and they
+#   work. fpms-lidar-ros and fpms-tf are the only ROS publishers NOT under the
+#   supervisor, and they are exactly the two that stay broken.
+#
+# WHY A RESTART RATHER THAN A FIX AT THE SOURCE
+#   The underlying cause is DDS participant discovery on this Pi's wlan0, which
+#   is a lossy Windows-ICS link with power-save that bcmdhd re-enables every
+#   ~30s (see fpms-wifi-powersave-hold.service, which exists for the same
+#   reason). Re-creating the participant after the interface has settled is the
+#   same remedy the supervisor already applies, applied to the two units it does
+#   not cover. It is a mitigation, NOT a root-cause fix -- see the runbook.
+#   The permanent fix is to take DDS off WiFi entirely: every ROS node here runs
+#   ON the Pi, and the laptop talks over the Foxglove websocket (:8765) and
+#   MQTT, neither of which uses DDS. ROS_LOCALHOST_ONLY=1 across the stack
+#   should make discovery deterministic. That is a wider change than belonged in
+#   a deployment window, so it is written down rather than done.
+After=network-online.target fpms-lidar-ros.service fpms-tf.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Long enough that wlan0 has finished flapping and the first supervisor
+# recovery cycle has had a chance to run, short enough that the rover is usable
+# quickly. Boot-to-usable is therefore ~2 min, which the runbook states.
+ExecStartPre=/usr/local/bin/fpms-wait-net
+ExecStartPre=/bin/sleep 75
+ExecStart=/bin/systemctl restart fpms-lidar-ros.service fpms-tf.service
+# NEVER let a failure here mark the boot degraded; these are best-effort.
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

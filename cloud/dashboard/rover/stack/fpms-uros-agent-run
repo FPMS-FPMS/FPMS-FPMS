@@ -21,6 +21,17 @@ source /home/ubuntu/uros_ws/install/setup.bash
 
 /usr/bin/python3 /usr/local/bin/fpms-uros-release-reset "$DEV" 30 &
 
-# -b 921600 matches the value the board prints from its own flash config at
-# boot ("ros serial baudrate: 921600"). Do not "fix" it.
-exec ros2 run micro_ros_agent micro_ros_agent serial --dev "$DEV" -b 921600
+# -b 230400 for FPMS firmware v3. This MUST match `#define BAUDRATE` in
+# firmware_v3/fpms_config.h (230400) -- a mismatch shows up as an agent that
+# runs happily and never establishes a session, which is indistinguishable
+# from a dead board.
+#
+# It was 921600 until 2026-08-06, which was correct for the Yahboom FACTORY
+# firmware v2.0.0 (that image prints "ros serial baudrate: 921600" from its own
+# flash config). If you ever roll back to the factory image
+# (/home/ubuntu/microROS_Robot_V2.0.0.bin) you MUST put 921600 back here.
+#
+# v3 dropped to 230400 deliberately: 921600 was measured unstable on this
+# board -- the session died within 1-3 minutes, never established on cold
+# boot, and degraded further under motor load.
+exec ros2 run micro_ros_agent micro_ros_agent serial --dev "$DEV" -b 230400

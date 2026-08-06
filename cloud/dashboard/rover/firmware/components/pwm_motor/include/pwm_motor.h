@@ -90,10 +90,22 @@
 extern "C" {
 #endif
 
-/* 25 kHz carrier (inaudible) from a 10 MHz timebase => 400 ticks per period.
- * The 400-tick scale is deliberately identical to the vendor's so that every
- * number in research/R4_FIRMWARE.md, and every value the operator has in their
- * head, transfers across without conversion. */
+/* 25 kHz carrier (inaudible) from a nominal 10 MHz timebase => 400 ticks per
+ * period. The 400-tick scale is deliberately identical to the vendor's so that
+ * every number in research/R4_FIRMWARE.md, and every value the operator has in
+ * their head, transfers across without conversion.
+ *
+ * THIS IS THE COMMAND SCALE, AND IT IS PUBLIC. motor.c clamps its PID output
+ * to +/-PWM_FULL_SCALE and derives its feed-forward gain from it, and
+ * pwm_motor_last_duty() reports in it. Do not change it to suit a peripheral.
+ *
+ * The output stage is LEDC (see pwm_motor.c for why -- the previous MCPWM
+ * stage was inferred rather than evidenced, and drove nothing on hardware).
+ * LEDC resolution is a bit depth, so pwm_motor.c runs its timer at 10 bits
+ * and converts 400 command ticks -> 1024 duty ticks at the last step.
+ * 1024 > 400, so every command level survives; min_pwm_percent and
+ * pwm_eps_percent are applied BEFORE that conversion, on this 400-tick scale,
+ * and their meaning is exactly unchanged. */
 #define PWM_TIMER_RESOLUTION_HZ   10000000
 #define PWM_CARRIER_FREQ_HZ       25000
 #define PWM_FULL_SCALE            (PWM_TIMER_RESOLUTION_HZ / PWM_CARRIER_FREQ_HZ)  /* 400 */
@@ -106,7 +118,8 @@ typedef enum {
     PWM_MOTOR_COUNT = 4,
 } pwm_motor_id_t;
 
-/* Configure MCPWM and park all four bridges in coast. */
+/* Configure LEDC and park all four bridges in coast (all eight half-bridge
+ * inputs driven low) before the timer is ever started. */
 void pwm_motor_init(void);
 
 /* Apply a signed request in [-PWM_FULL_SCALE, +PWM_FULL_SCALE].
@@ -126,7 +139,7 @@ void pwm_motor_stop_all(bool brake);
 int32_t pwm_motor_last_duty(pwm_motor_id_t id);
 
 /* The mapping function, exposed so it can be reasoned about and unit
- * tested off-target without bringing up MCPWM. Pure function of its
+ * tested off-target without bringing up LEDC. Pure function of its
  * argument plus the live rover_config. */
 int32_t pwm_motor_map_min_pwm(int32_t request);
 

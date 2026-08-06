@@ -78,6 +78,14 @@ WHAT THIS PROCESS MUST NEVER DO
   stop latch, and those are different things.
 * Never arm. Never start a mission.
 * Never weaken a guard. It adds a supervisor; it removes nothing.
+* NEVER FEED ITSELF. Path (a) publishes to a topic this process is subscribed
+  to. That ring is not a hypothetical: on the first run it produced 3394
+  commands/estop, 3375 commands/stop, 6773 events/nack and 2671
+  events/stop_asserted in ten seconds, and took the micro-ROS link down.
+  Five layered guards now bound it — see "loop guards" in the config section.
+  The rule they encode: A STOP IS AN EVENT, NOT A STREAM. Anything in this
+  file that can publish in response to something it receives must be able to
+  say what bounds it.
 """
 from __future__ import annotations
 
@@ -144,6 +152,53 @@ STOP_EVIDENCE_MAX_AGE_S = float(CFG.get("FPMS_CORE_STOP_EVIDENCE_MAX_AGE_S", "2.
 # the strongest available stop on firmware v3. Default on.
 ESTOP_ROS = CFG.get("FPMS_CORE_ESTOP_ROS", "1") not in ("0", "false", "no")
 
+# ------------------------------------------------------------ loop guards ---
+#
+# WHY THESE EXIST. Path (a) re-publishes `commands/<verb>` — the exact topic
+# the stop client subscribes to. On the first run of this daemon that closed a
+# ring: relay -> own subscription -> latch -> relay, at network speed. Measured
+# 3394 commands/estop + 3375 commands/stop + 6773 events/nack +
+# 2671 events/stop_asserted in TEN SECONDS, which took the micro-ROS link down
+# with it.
+#
+# The fix is layered on purpose. Each layer alone stops the storm; together
+# they make it arithmetically impossible for any payload shape to produce an
+# unbounded stream:
+#
+#   1. SELF-ORIGIN FILTER  — drop our own relay in the hot path (bytes, no JSON).
+#   2. CMD_ID DEDUP        — a repeated cmd_id is not a new stop.
+#   3. RELAY RATE LIMIT    — our own re-publication is spaced and capped.
+#   4. LATCH CAP           — a hard ceiling on acted-on stops per window.
+#   5. RECEIPT CAP         — replies can never become a cascade.
+#
+# A stop is an EVENT, not a stream. Every ceiling below is far above what any
+# real operator action produces and far below anything that could be called a
+# flood.
+
+# Marker bytes our own relay always carries. Checked as a byte substring rather
+# than parsed, so the hot path keeps its "nothing that can block or throw before
+# the latch" property. Both markers are required so that a genuine payload that
+# merely mentions this daemon by name is not mistaken for our own relay —
+# a false positive here would DROP a real stop, which is the dangerous
+# direction, so the test is deliberately conservative.
+SELF_SOURCE = "fpms-cored"
+SELF_MARK = b"fpms-cored"
+RELAY_MARK = b'"relay"'
+
+# Hard ceiling on stops acted upon per window. A human cannot click faster than
+# this; a loop can.
+STOP_MAX_PER_WINDOW = int(CFG.get("FPMS_CORE_STOP_MAX_PER_WINDOW", "12"))
+STOP_WINDOW_S = float(CFG.get("FPMS_CORE_STOP_WINDOW_S", "10.0"))
+# Minimum spacing between two relays of the SAME verb. The relay covers a lost
+# message; repeating it faster than the executor's control loop adds traffic
+# and nothing else.
+RELAY_MIN_INTERVAL_S = float(CFG.get("FPMS_CORE_RELAY_MIN_INTERVAL_S", "1.0"))
+RELAY_MAX_PER_WINDOW = int(CFG.get("FPMS_CORE_RELAY_MAX_PER_WINDOW", "8"))
+RELAY_WINDOW_S = float(CFG.get("FPMS_CORE_RELAY_WINDOW_S", "10.0"))
+# Receipts are evidence, not telemetry.
+RECEIPT_MAX_PER_WINDOW = int(CFG.get("FPMS_CORE_RECEIPT_MAX_PER_WINDOW", "60"))
+RECEIPT_WINDOW_S = float(CFG.get("FPMS_CORE_RECEIPT_WINDOW_S", "10.0"))
+
 HEALTH_HZ = float(CFG.get("FPMS_CORE_HEALTH_HZ", "1.0"))
 # A command with no owner is answered after this long. It has to be a timeout
 # rather than an instant answer: the owning service may be mid-restart, and
@@ -175,6 +230,37 @@ def log(*a):
 
 # ------------------------------------------------------------------- state ---
 
+class RateLimit:
+    """Fixed-window counter. O(1), allocation-free, safe on the hot path.
+
+    A fixed window (rather than a token bucket or sliding window) is chosen so
+    that `allow()` is a compare and two increments with no data structure to
+    walk — it is called from the stop client's network thread, where anything
+    that can take an unbounded amount of time is a defect.
+    """
+
+    def __init__(self, limit, window_s, name=""):
+        self.limit = limit
+        self.window_s = window_s
+        self.name = name
+        self._start = 0.0
+        self._n = 0
+        self.dropped = 0
+        self.notified = False
+
+    def allow(self):
+        now = time.monotonic()
+        if now - self._start >= self.window_s:
+            self._start = now
+            self._n = 0
+            self.notified = False
+        if self._n < self.limit:
+            self._n += 1
+            return True
+        self.dropped += 1
+        return False
+
+
 class StopState:
     """The stop latch, and everything needed to prove it was honoured.
 
@@ -190,17 +276,38 @@ class StopState:
         self.count = 0
         self.escalations = 0
         self.latched = False
+        self.suppressed = 0
+        self.self_dropped = 0
+        self.limit = RateLimit(STOP_MAX_PER_WINDOW, STOP_WINDOW_S, "latch")
 
     def assert_stop(self, verb, payload, topic):
         # Everything here is O(1) and cannot block. No JSON, no locks, no I/O.
-        self.count += 1
-        self.last_stop_mono = time.monotonic()
+        #
+        # LAYER 4: the hard ceiling. Note what is and is not sacrificed when it
+        # trips. `latched` is still set and `last_stop_mono` still advances, so
+        # the rover stays STOPPED and the latch keeps reading as asserted — we
+        # decline to re-run the FAN-OUT, never the stop itself. Dropping
+        # fan-out work under a flood is safe; dropping the latch would not be.
         self.latched = True
+        self.last_stop_mono = time.monotonic()
+        if not self.limit.allow():
+            self.suppressed += 1
+            return False
+        self.count += 1
         self.pending.append((verb, payload, topic, time.time()))
         self.event.set()
+        return True
 
 
 STOP = StopState()
+
+# Loop guards, module level so `health` can report them and a test can inspect
+# them without standing up a broker.
+RELAY_LIMIT = RateLimit(RELAY_MAX_PER_WINDOW, RELAY_WINDOW_S, "relay")
+RECEIPT_LIMIT = RateLimit(RECEIPT_MAX_PER_WINDOW, RECEIPT_WINDOW_S, "receipt")
+LAST_RELAY = {}                    # verb -> monotonic of last relay published
+RECENT_STOP_IDS = collections.OrderedDict()   # cmd_id -> True, bounded
+RECENT_CMD_IDS = collections.OrderedDict()    # cmd_id -> True, bounded
 
 # Freshness bookkeeping for the health verdict.
 LAST_SEEN = {}                     # topic suffix -> monotonic
@@ -336,7 +443,31 @@ def receipt(bus, cmd_id, verb, state, **extra):
     QoS 1 on purpose. A receipt is the operator's only evidence that a click
     was seen, so it is worth the extra round trip; the volume is a handful of
     messages per command, not a stream.
+
+    LAYER 5. "A handful per command, not a stream" is an ASSERTION, so it is
+    enforced rather than assumed. An unknown or duplicated verb must never be
+    able to turn replies into a cascade — that is half of what the 6773
+    events/nack in ten seconds actually were. Past the cap we publish exactly
+    ONE suppression notice per window and then go quiet, because a flood of
+    "you are flooding" messages is still a flood.
     """
+    if not RECEIPT_LIMIT.allow():
+        if not RECEIPT_LIMIT.notified:
+            RECEIPT_LIMIT.notified = True
+            try:
+                bus.client.publish(
+                    f"fpms/{THING}/events/command_receipt",
+                    json.dumps({"svc": "cored", "state": "receipts_suppressed",
+                                "reason": "receipt rate cap hit; replies "
+                                          "suppressed to prevent a cascade",
+                                "limit": RECEIPT_MAX_PER_WINDOW,
+                                "window_s": RECEIPT_WINDOW_S,
+                                "dropped": RECEIPT_LIMIT.dropped,
+                                "ts": time.time(), "thing": THING}),
+                    qos=1)
+            except Exception:
+                pass
+        return
     p = {"cmd_id": cmd_id, "verb": verb, "state": state, "svc": "cored"}
     p.update(extra)
     bus.publish("events/command_receipt", p, qos=1)
@@ -360,8 +491,23 @@ def on_stop_message(_c, _u, msg):
     ever grows an operation that can block, the stop guarantee is gone, because
     paho runs it on the one thread that delivers stops.
     """
+    raw = msg.payload or b""
+    # LAYER 1 — THE LOOP GUARD, and the single most important line in the file.
+    #
+    # Path (a) re-publishes onto `commands/<verb>`, which is precisely what this
+    # client is subscribed to. Without this test every relay comes straight back
+    # in, is latched as a brand-new stop, and is relayed again — the ring that
+    # produced 3394 commands/estop in ten seconds.
+    #
+    # A byte substring test, NOT json.loads, so this stays allocation-free and
+    # cannot raise before the latch. That constraint is why the original
+    # `source`/`relay` guard ended up on the command bus instead of here, where
+    # it was actually needed.
+    if SELF_MARK in raw and RELAY_MARK in raw:
+        STOP.self_dropped += 1
+        return
     verb = msg.topic.rsplit("/", 1)[-1]
-    STOP.assert_stop(verb, msg.payload, msg.topic)
+    STOP.assert_stop(verb, raw, msg.topic)
 
 
 def stop_worker(bus, estop):
@@ -381,7 +527,32 @@ def stop_worker(bus, estop):
                     payload = {"value": payload}
             except Exception:
                 payload = {}
+            # LAYER 2 — belt and braces for layer 1. If a relay ever reaches
+            # here (marker stripped by a broker rewrite, a payload we did not
+            # author echoing our cmd_id back, a QoS 1 redelivery), the SAME
+            # cmd_id is not a new stop and must not be fanned out again.
+            #
+            # Note a genuine operator stop with no cmd_id gets a fresh uuid from
+            # _cmd_id_for, so real repeated clicks are still each honoured. That
+            # is the intended asymmetry: identity means "already handled",
+            # absence of identity means "assume it is new".
+            payload_had_id = any(
+                isinstance(payload.get(k), (str, int)) and str(payload.get(k)).strip()
+                for k in ("cmd_id", "id", "request_id", "correlation_id"))
             cmd_id = _cmd_id_for(payload)
+            if payload_had_id and cmd_id in RECENT_STOP_IDS:
+                STOP.self_dropped += 1
+                continue
+            RECENT_STOP_IDS[cmd_id] = True
+            while len(RECENT_STOP_IDS) > 256:
+                RECENT_STOP_IDS.popitem(last=False)
+
+            # Belt and braces for layer 1 again: if we somehow dequeued our own
+            # relay, do not treat it as a new command.
+            if payload.get("relay") and payload.get("source") == SELF_SOURCE:
+                STOP.self_dropped += 1
+                continue
+
             t0 = time.monotonic()
 
             # (c) tell the dashboard immediately — before any downstream agrees.
@@ -396,10 +567,24 @@ def stop_worker(bus, estop):
 
             # (a) re-publish at QoS 1 so a missed QoS 0 original still lands.
             #     The executor treats a repeated stop as idempotent.
-            bus.publish(f"commands/{verb}",
-                        {"source": "fpms-cored", "relay": True,
-                         "cmd_id": cmd_id, "origin_ts": wall},
-                        qos=1)
+            #
+            # LAYER 3 — spaced and capped. The relay exists to cover ONE lost
+            # message; emitting it faster than the executor's control loop buys
+            # nothing and is the raw material of a storm. Suppressing a relay
+            # never weakens the stop: paths (b) /estop, (c) stop_asserted and
+            # (d) escalation are untouched, and the executor has already been
+            # told at least once.
+            now_mono = time.monotonic()
+            spaced = (now_mono - LAST_RELAY.get(verb, -1e9)) >= RELAY_MIN_INTERVAL_S
+            if spaced and RELAY_LIMIT.allow():
+                LAST_RELAY[verb] = now_mono
+                bus.publish(f"commands/{verb}",
+                            {"source": SELF_SOURCE, "relay": True,
+                             "cmd_id": cmd_id, "origin_ts": wall},
+                            qos=1)
+            else:
+                log(f"relay for {verb} suppressed (rate limit); stop itself "
+                    f"is unaffected — /estop and escalation still ran")
 
             # (b) the independent hardware-adjacent path.
             sent = estop.assert_stop()
@@ -597,10 +782,19 @@ def _note_command(suffix, payload):
     verb = suffix.rsplit("/", 1)[-1]
     if verb in STOP_VERBS:
         return                      # the stop client already answered for these
-    if payload.get("relay") and payload.get("source") == "fpms-cored":
+    if payload.get("relay") and payload.get("source") == SELF_SOURCE:
         return                      # our own re-publish; do not receipt it twice
 
     cmd_id = _cmd_id_for(payload)
+    # A cmd_id we have already answered is a duplicate delivery, not a new
+    # command, and must not produce a second receipt. Without this, a client
+    # retrying at QoS 1 gets an answer per retry.
+    if cmd_id in RECENT_CMD_IDS:
+        return
+    RECENT_CMD_IDS[cmd_id] = True
+    while len(RECENT_CMD_IDS) > 512:
+        RECENT_CMD_IDS.popitem(last=False)
+
     owner = OWNERS.get(verb)
     rec = {"verb": verb, "mono": time.monotonic(), "closed": False,
            "state": "received", "owner": (owner or {}).get("svc")}
@@ -613,32 +807,48 @@ def _note_command(suffix, payload):
             owner=rec["owner"], known_verb=bool(owner),
             payload_echo={k: v for k, v in list(payload.items())[:12]})
 
-    # Answer for commands nobody owns, and for owned-but-silent ones, after a
-    # grace period. Without this, an unknown verb produced no reply at all.
-    threading.Thread(target=_close_out, args=(cmd_id, verb), daemon=True).start()
 
+def _close_out_reaper():
+    """Answer for unowned and owned-but-silent commands, from ONE thread.
 
-def _close_out(cmd_id, verb):
-    time.sleep(OWNER_TIMEOUT_S)
-    with PENDING_LOCK:
-        rec = PENDING.get(cmd_id)
-        if not rec or rec.get("closed"):
-            return
-        rec["closed"] = True
-        owner = OWNERS.get(verb)
-        if owner is None:
-            rec["state"] = "no_owner"
-            reason = (f"no service on this rover claims the verb {verb!r}. "
-                      f"Known verbs: {sorted(OWNERS) or 'none announced yet'}")
-        elif owner.get("silent"):
-            rec["state"] = "acted_silently"
-            reason = (f"{owner['svc']} acts on {verb!r} without replying "
-                      "(by design)")
-        else:
-            rec["state"] = "timeout"
-            reason = (f"{owner['svc']} claims {verb!r} but did not answer "
-                      f"within {OWNER_TIMEOUT_S:.1f}s")
-    receipt(BUSES["cmd"], cmd_id, verb, rec["state"], reason=reason)
+    This used to be `threading.Thread(...).start()` per command. Under the
+    storm that meant thousands of live threads, each sleeping OWNER_TIMEOUT_S
+    and then publishing — an unbounded reply cascade built out of an unbounded
+    number of threads, and the other half of the 6773 events/nack.
+
+    One reaper cannot grow, does the same job, and is bounded by the size of
+    PENDING (128) no matter how much traffic arrives.
+    """
+    while RUNNING.is_set():
+        time.sleep(0.25)
+        now = time.monotonic()
+        due = []
+        with PENDING_LOCK:
+            for cmd_id, rec in list(PENDING.items()):
+                if rec.get("closed") or now - rec["mono"] < OWNER_TIMEOUT_S:
+                    continue
+                rec["closed"] = True
+                verb = rec["verb"]
+                owner = OWNERS.get(verb)
+                if owner is None:
+                    rec["state"] = "no_owner"
+                    reason = (f"no service on this rover claims the verb "
+                              f"{verb!r}. Known verbs: "
+                              f"{sorted(OWNERS) or 'none announced yet'}")
+                elif owner.get("silent"):
+                    rec["state"] = "acted_silently"
+                    reason = (f"{owner['svc']} acts on {verb!r} without "
+                              "replying (by design)")
+                else:
+                    rec["state"] = "timeout"
+                    reason = (f"{owner['svc']} claims {verb!r} but did not "
+                              f"answer within {OWNER_TIMEOUT_S:.1f}s")
+                due.append((cmd_id, verb, rec["state"], reason))
+        bus = BUSES.get("cmd")
+        if bus is None:
+            continue
+        for cmd_id, verb, state, reason in due:
+            receipt(bus, cmd_id, verb, state, reason=reason)
 
 
 # ----------------------------------------------------------------- health ---
@@ -702,6 +912,17 @@ def health_loop(bus):
                 "since_last_s": (round(now_mono - STOP.last_stop_mono, 1)
                                  if STOP.last_stop_mono else None),
                 "escalate_after_s": STOP_ESCALATE_S if STOP_ESCALATE_ENABLED else None,
+            },
+            # Loop-guard telemetry. If any of these climb while the rover is
+            # idle, something is feeding the stop path and it is visible here
+            # BEFORE it becomes a storm — which is exactly what was missing
+            # the first time.
+            "loop_guard": {
+                "self_dropped": STOP.self_dropped,
+                "latch_suppressed": STOP.suppressed,
+                "relay_dropped": RELAY_LIMIT.dropped,
+                "receipt_dropped": RECEIPT_LIMIT.dropped,
+                "pending": len(PENDING),
             },
             "mission": dict(LAST_MISSION),
             "owners": {v: o.get("svc") for v, o in OWNERS.items()},
@@ -782,6 +1003,9 @@ def main():
 
     threading.Thread(target=health_loop, args=(cmd_bus,),
                      daemon=True, name="health").start()
+    # One reaper for every pending command, instead of a thread per command.
+    threading.Thread(target=_close_out_reaper,
+                     daemon=True, name="closeout").start()
 
     while RUNNING.is_set():
         time.sleep(0.5)

@@ -26,12 +26,28 @@ EnvironmentFile=-/etc/fpms/config.env
 Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=HOME=/home/ubuntu
+# The PID file MUST live under a directory this unit can write to. /run itself
+# is root-owned and this unit runs as `ubuntu`, so the original
+# /run/fpms-map-odom.pid failed with "Permission denied" on every start and the
+# unit never came up (measured 2026-08-06, restart-looped indefinitely).
+# RuntimeDirectory= makes systemd create /run/fpms owned by User/Group before
+# ExecStartPre runs, and clean it up on stop.
+RuntimeDirectory=fpms
+RuntimeDirectoryMode=0755
 # The map->odom anchor is the arena start pose (972, 228) mm, heading +90deg,
 # matching arena_zones.json exactly. Backgrounded so both publishers live in
 # this one unit; the launch below is the process systemd tracks.
-ExecStartPre=/bin/bash -c 'source /opt/ros/humble/setup.bash && setsid ros2 run tf2_ros static_transform_publisher --x 0.972 --y 0.228 --z 0.0 --yaw 1.5707963 --pitch 0.0 --roll 0.0 --frame-id map --child-frame-id odom >/dev/null 2>&1 & echo $! > /run/fpms-map-odom.pid'
+# ROS/DDS PARTICIPANTS MUST NOT BE CREATED DURING THE BOOT CARRIER FLAP.
+# network-online.target is reached BEFORE wlan0 settles on this Pi (measured
+# 2026-08-06: carrier gained 16:07:12, lost 16:07:12, regained 16:07:13, target
+# reached 16:07:14). A DomainParticipant created in that window binds an
+# interface set that is then invalidated: the node runs, the publisher is
+# discoverable, it logs publishes with dropped=0, and NO subscriber ever
+# receives anything. /scan_lidar was dead after every cold boot because of it.
+ExecStartPre=/usr/local/bin/fpms-wait-net
+ExecStartPre=/bin/bash -c 'source /opt/ros/humble/setup.bash && setsid ros2 run tf2_ros static_transform_publisher --x 0.972 --y 0.228 --z 0.0 --yaw 1.5707963 --pitch 0.0 --roll 0.0 --frame-id map --child-frame-id odom >/dev/null 2>&1 & echo $! > /run/fpms/map-odom.pid'
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/nav2/fpms_tf.launch.py'
-ExecStopPost=/bin/bash -c 'kill $(cat /run/fpms-map-odom.pid 2>/dev/null) 2>/dev/null || true; rm -f /run/fpms-map-odom.pid'
+ExecStopPost=/bin/bash -c 'kill $(cat /run/fpms/map-odom.pid 2>/dev/null) 2>/dev/null || true; rm -f /run/fpms/map-odom.pid'
 Restart=always
 RestartSec=5
 StandardOutput=journal

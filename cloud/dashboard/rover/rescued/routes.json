@@ -1,0 +1,61 @@
+{
+  "1": [
+    {
+      "label": "Forward 10cm",
+      "vx": 0.1,
+      "vy": 0,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Right 10 cm",
+      "vx": 0,
+      "vy": -0.1,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Forward 10cm",
+      "vx": 0.1,
+      "vy": 0,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Forward 10cm",
+      "vx": 0.1,
+      "vy": 0,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Forward 10cm",
+      "vx": 0.1,
+      "vy": 0,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Forward 10cm",
+      "vx": 0.1,
+      "vy": 0,
+      "vz": 0,
+      "duration_s": 1.0
+    },
+    {
+      "label": "Turn left 45 degrees",
+      "vx": 0,
+      "vy": 0,
+      "vz": 0.55,
+      "duration_s": 1.427996660722633
+    },
+    {
+      "label": "Turn left 45 degrees",
+      "vx": 0,
+      "vy": 0,
+      "vz": 0.55,
+      "duration_s": 1.427996660722633
+    }
+  ],
+  "2": []
+}

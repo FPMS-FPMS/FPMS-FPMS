@@ -1,0 +1,38 @@
+{
+  "_comment": "Derived from the same ARENA_MM/Z_FRAC/M_FRAC constants as the map in this directory and frontend/src/lib/arena.ts. World frame: origin bottom-left, +x right, +y up, arena.ts is the source of truth for these numbers.",
+  "arena_mm": 1200.0,
+  "zones": {
+    "zone-a": {
+      "x_mm": 48.0,
+      "y_mm": 792.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 228.0,
+      "cy_mm": 972.0
+    },
+    "zone-b": {
+      "x_mm": 792.0,
+      "y_mm": 792.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 972.0,
+      "cy_mm": 972.0
+    },
+    "water-station": {
+      "x_mm": 48.0,
+      "y_mm": 48.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 228.0,
+      "cy_mm": 228.0
+    }
+  },
+  "start_pose": {
+    "x_mm": 972.0,
+    "y_mm": 228.0,
+    "x_m": 0.972,
+    "y_m": 0.228,
+    "heading_deg": 90.0,
+    "heading_rad": 1.5707963267948966
+  }
+}
