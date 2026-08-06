@@ -1,0 +1,72 @@
+# =========================================================================
+# rosbridge_server parameters for the FPMS console.  Installed to
+#   /etc/fpms/rosbridge_params.yaml
+# and loaded by fpms-rosbridge.service with --params-file.
+#
+# WHY A FILE AND NOT `-p topics_glob:=...` ON THE COMMAND LINE
+# -------------------------------------------------------------------------
+# rosbridge declares the globs as STRING parameters whose value must look
+# like "[a,b,c]" — a list INSIDE a string. Passing that through
+# systemd -> bash -lc -> ros2's YAML argument parser needs three layers of
+# quote escaping, and getting it subtly wrong does not fail loudly: ros2
+# parses "[/estop,/fpms/*]" as a YAML *list*, the str parameter rejects it,
+# and if you instead land on an empty string the glob becomes None, which
+# means NO RESTRICTION AT ALL. A safety whitelist that fails open when you
+# mistype it is not a safety whitelist. A params file has exactly one layer
+# of quoting and is readable by the person who has to trust it.
+#
+# `/**` applies to every node started by this launch, so it does not matter
+# whether the node names itself `rosbridge_websocket` or something else.
+# =========================================================================
+/**:
+  ros__parameters:
+    port: 9090
+    address: "0.0.0.0"
+    max_message_size: 10000000
+    unregister_timeout: 10.0
+
+    # A slow service handler must not sit in front of anything else. The
+    # console's STOP is a topic publish on its own socket and does not depend
+    # on this, but PLAN M2 runs an A* search on the rover and would otherwise
+    # stall the whole protocol thread for its duration.
+    call_services_in_new_thread: true
+
+    # =====================================================================
+    # THE WHITELIST. THIS IS THE SAFETY MECHANISM. DO NOT WIDEN IT.
+    # =====================================================================
+    # rosbridge whitelists NOTHING by default: a stock server lets any
+    # browser tab publish any message on any topic, /cmd_vel and /cmd_duty
+    # included. `topics_glob` closes that and is enforced by the server in
+    # THREE places, not one — rosbridge_library/capabilities/subscribe.py,
+    # advertise.py and publish.py each check it. A browser cannot advertise a
+    # drive topic and cannot publish to one even if it somehow advertised.
+    #
+    # The drive topics are therefore ABSENT below. Not "unused by our UI" —
+    # absent, so a stray click, a bug in console.html, or somebody else's tab
+    # left open on the same URL cannot turn a wheel through this port.
+    #
+    # Permitted, and why each is safe:
+    #   /estop, /fpms/cmd/stop  the panic button. Stopping is never gated.
+    #   /clicked_point          operator marker echo; nothing on the rover
+    #                           acts on it (fpms_foxglove_cmd logs it only).
+    #   /fpms/*                 mission + residual mirrors (read), plan
+    #                           mirror (read), console keep-out state
+    #                           (recorded, not planned), and the stop verb.
+    #   sensor topics           the board is their only publisher.
+    #
+    # fnmatch semantics: `*` matches `/` too, so `/fpms/*` covers
+    # `/fpms/cmd/stop` and `/fpms/mission/x_mm` alike.
+    #
+    # VERIFY, do not trust this comment:
+    #   ros2 param get /rosbridge_websocket topics_glob
+    # then try to advertise /cmd_vel from the browser devtools console —
+    # rosbridge answers status:error and creates no publisher.
+    topics_glob: "[/estop,/fpms/*,/clicked_point,/scan_lidar,/odom_raw,/odom,/imu,/battery,/wheel_ticks,/wheel_duty,/fpms_health,/diagnostics,/rosout]"
+
+    # plan / run / arm / reset_pose / read_encoders. Each applies the ROVER's
+    # own refusals downstream; none of them is a way around one.
+    # rosbridge appends /rosapi/* to this list itself.
+    services_glob: "[/fpms/*]"
+
+    # No parameter access from the browser at all.
+    params_glob: "[]"

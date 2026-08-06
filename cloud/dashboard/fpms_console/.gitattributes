@@ -1,0 +1,26 @@
+# These files are checked out on Windows and then copied to a Linux Pi, where
+# a CRLF is fatal rather than cosmetic:
+#
+#   * a shell script with CRLF fails with `$'\r': command not found`
+#   * a systemd unit with CRLF puts a \r inside the ExecStart command line, so
+#     bash -lc receives a trailing carriage return and the whole unit dies at
+#     start with a message that names no obvious cause
+#   * a params YAML with CRLF can still parse, but the trailing \r ends up
+#     INSIDE the topics_glob string, so the last entry in the whitelist stops
+#     matching. A safety whitelist that silently loses its last entry is worse
+#     than no whitelist, because it looks correct in `cat`.
+#   * console.html is served verbatim to a browser; CRLF is harmless there but
+#     pinned anyway so a diff of the UI is never a diff of line endings
+#
+# So: force LF regardless of core.autocrlf on whoever's machine.
+*.sh          text eol=lf
+*.service     text eol=lf
+*.yaml        text eol=lf
+*.py          text eol=lf
+*.md          text eol=lf
+*.html        text eol=lf
+
+# Batch files are the exception. cmd.exe wants CRLF and misparses a bare LF in
+# some constructs, and this one never leaves Windows.
+*.cmd         text eol=crlf
+*.ps1         text eol=crlf

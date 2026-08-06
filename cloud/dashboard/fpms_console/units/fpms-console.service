@@ -1,0 +1,55 @@
+[Unit]
+Description=FPMS operator console (serves the UI on :8090 and mirrors the plan into ROS)
+Documentation=file:/home/ubuntu/fpms_console/README.md
+# ---------------------------------------------------------------------------
+# Serves ONE static page from the Pi, exactly like the phase6 :8085 app the
+# operator liked: one URL to point a browser at, nothing installed on the
+# laptop, and a phone or tablet works too.
+#
+# It also fills the two holes in the ROS topic surface that the console needs
+# and that nothing else publishes: /fpms/plan/route (the planned route, which
+# fpms_missions.py only ever put on MQTT) and /fpms/console/keepout_state.
+#
+# mosquitto IS a real dependency here, unlike for fpms-rosbridge: the plan
+# mirror's input is an MQTT subscription to the local broker. On a cold boot
+# the broker takes a moment to bind :1883 and paho would sit in its own retry
+# loop meanwhile — survivable, but it looks like a console that never draws a
+# route for ~30 s.
+#
+# There is NO edge onto fpms-rosbridge. The two are independent on purpose: if
+# the console's page server is down the operator can still point a Foxglove or
+# a script at :9090, and if rosbridge is down the page still loads and says
+# LINK DOWN in its header rather than failing to appear at all.
+# ---------------------------------------------------------------------------
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fpms_console
+
+# ===========================================================================
+# ROS_DOMAIN_ID=20 IS MANDATORY AND IT BELONGS IN THIS FILE.
+# See the long note in fpms-rosbridge.service. config.env does not set it.
+# ===========================================================================
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+Environment=FPMS_CONSOLE_PORT=8090
+Environment=FPMS_ROSBRIDGE_PORT=9090
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; echo "fpms_console starting on ROS_DOMAIN_ID=$ROS_DOMAIN_ID http :8090"; exec python3 /home/ubuntu/fpms_console/fpms_console.py'
+
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fpms-console
+
+[Install]
+WantedBy=multi-user.target

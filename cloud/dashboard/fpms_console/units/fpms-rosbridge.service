@@ -1,0 +1,72 @@
+[Unit]
+Description=FPMS rosbridge (ROS 2 <-> WebSocket on :9090; the laptop dials OUT to this)
+Documentation=file:/home/ubuntu/fpms_console/README.md
+# ---------------------------------------------------------------------------
+# THE PI LISTENS, THE LAPTOP DIALS OUT. Preserve that direction.
+#
+# Windows Firewall on the operator laptop has no inbound rule for 1883 or 9090
+# and there is no admin account to add one. An outbound TCP connection from the
+# browser to the Pi is therefore the ONLY direction that works, and it is also
+# why the UI itself is served from the Pi (fpms-console.service, :8090) rather
+# than opened as a file on the laptop.
+#
+# ---------------------------------------------------------------------------
+# WHY After= IS ALMOST EMPTY
+# ---------------------------------------------------------------------------
+# Deliberate, and inherited from the rest of this stack's reasoning: the
+# micro-ROS serial link costs 90-225 s to re-establish, so a dependency edge
+# onto micro-ros-agent would turn a trivial restart of this bridge into a
+# multi-minute outage of every topic. rosbridge needs no other service to
+# start: a WebSocket server with nothing to serve yet is correct behaviour,
+# and the console renders every absent topic as "never seen" rather than as a
+# plausible-looking lie.
+#
+# mosquitto is NOT a dependency here — nothing in this unit touches MQTT.
+# ---------------------------------------------------------------------------
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# ===========================================================================
+# ROS_DOMAIN_ID=20 IS MANDATORY AND IT BELONGS IN THIS FILE.
+# ===========================================================================
+# /etc/fpms/config.env does NOT set it and never has. The ESP32 drive board
+# publishes on domain 20 and nowhere else. Every ad-hoc `ros2 topic list` in
+# this project's history that forgot it saw an EMPTY LIST and concluded the
+# link was dead. That trap has cost this project hours. If the console ever
+# shows every feed as "never seen" while the rover is plainly alive, check
+# this line first.
+#
+# EnvironmentFile is listed BEFORE Environment= on purpose: later assignments
+# win in systemd, so the hard-coded 20 cannot be overridden by a stale value
+# in config.env. FPMS_ROS_DOMAIN_ID is re-exported inside ExecStart because
+# `bash -lc` sources the login profile, which can re-set ROS_DOMAIN_ID.
+# ===========================================================================
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# The whitelist that stops a browser publishing /cmd_vel lives in
+# /etc/fpms/rosbridge_params.yaml. Read it — it is the safety mechanism, and
+# it is a file rather than -p arguments for the reason documented at its top.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; echo "rosbridge starting on ROS_DOMAIN_ID=$ROS_DOMAIN_ID port 9090"; exec ros2 run rosbridge_server rosbridge_websocket --ros-args --params-file /etc/fpms/rosbridge_params.yaml'
+
+# Restart=always, RestartSec=3: the same contract every other unit in this
+# stack uses. A bridge that has to be started by hand is a bridge that is not
+# running at the moment somebody needs to press STOP.
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fpms-rosbridge
+
+[Install]
+WantedBy=multi-user.target

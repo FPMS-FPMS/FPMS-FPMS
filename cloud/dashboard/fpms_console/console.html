@@ -1,0 +1,837 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FPMS CONSOLE</title>
+<!--
+ ============================================================================
+ FPMS OPERATOR CONSOLE  —  direct ROS <-> ROS over rosbridge, no Foxglove.
+ ============================================================================
+ Served BY THE PI (fpms_console.py, :8090). Talks to rosbridge_server (:9090)
+ over a WebSocket the LAPTOP DIALS OUT to. Zero external assets: no CDN, no
+ npm, no fonts, no images. One file, exactly like the :8085 phase6 app that
+ the operator liked — that was deliberate then and it is deliberate now,
+ because at a competition the venue wifi may have no route to the internet.
+
+ The dark tactical look, the colour tokens, the fixed-arena bird's-eye map
+ math, the robot rectangle, the route polyline, the click-to-place markers and
+ the right-click keep-out disks are all LIFTED FROM
+   cloud/dashboard/rover/rescued/fpms_phase6_LATEST.py  (its PAGE string).
+ What changed is the data source: it was HTTP polling a Flask app that owned
+ the serial port; this is native ROS topics and ROS services over rosbridge.
+
+ ---------------------------------------------------------------------------
+ WHY THERE IS NO roslibjs HERE
+ ---------------------------------------------------------------------------
+ The rosbridge v2 protocol IS the wire: {op:"subscribe"|"advertise"|"publish"|
+ "call_service"} as JSON over a WebSocket. roslibjs is a ~200 kB convenience
+ wrapper around exactly those five messages, and vendoring it means either a
+ CDN (blocked: no internet at the venue, and a strict no-external-assets rule)
+ or a checked-in minified blob nobody in this project can read or debug at
+ 2am. `RB` below is that protocol, in ~90 lines, in the same file as the UI it
+ serves. It speaks to a stock, unmodified `rosbridge_server`.
+
+ ---------------------------------------------------------------------------
+ STALENESS IS STRUCTURAL. READ THIS BEFORE CHANGING ANY OF IT.
+ ---------------------------------------------------------------------------
+ This project has been fooled twice by frozen-but-plausible telemetry. So:
+
+   * Every value is aged forward IN THIS BROWSER from `performance.now()` at
+     the moment the WebSocket frame arrived. No payload timestamp is ever
+     trusted for freshness — a dead publisher that keeps echoing an old stamp,
+     and a clock that disagrees with the Pi's, both defeat that.
+   * `tick()` runs at 5 Hz and re-derives EVERY displayed value's age from
+     scratch. There is no code path that leaves a value on screen without
+     re-checking its age; a value is rendered by the ticker, not by the
+     message handler.
+   * Past STALE_S the value is struck through, greyed, and labelled STALE.
+   * Past STALE_S on a critical feed, RUN is DISABLED (property, not styling).
+   * A stale LiDAR is rendered ABSENT — the scan array is emptied. The map
+     never holds a frame. "No dots" is the honest picture of a dead scanner.
+   * WebSocket close is announced in the header within one frame and the
+     socket reconnects on a 1 s backoff, saying so the whole time.
+ ---------------------------------------------------------------------------
+-->
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:#040911;color:#e8f7ff;font-family:Consolas,ui-monospace,monospace;overflow:hidden}
+.top{height:64px;background:#071629;border-bottom:2px solid #ff4b70;padding:6px 12px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+h1{margin:0;color:#ff4b70;letter-spacing:4px;font-size:20px}
+.sub{font-size:11px;color:#98d4ff}
+.main{height:calc(100% - 64px);display:grid;grid-template-columns:1fr 390px;gap:8px;padding:8px}
+.panel{background:#071629;border:1px solid #28506f;border-radius:12px;padding:10px;min-height:0;display:flex;flex-direction:column}
+.right{overflow:auto}
+.h{color:#00b7ff;letter-spacing:3px;font-weight:900;font-size:12px;border-bottom:1px solid #28506f;padding-bottom:5px;margin:10px 0 7px}
+.h:first-child{margin-top:0}
+#mapbox{flex:1;position:relative;background:#020711;border:1px solid #173450;border-radius:10px;min-height:0}
+canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+button{background:#071427;border:1px solid #2e76aa;color:#e8f5ff;border-radius:9px;padding:9px;font-family:inherit;font-weight:900;font-size:12px;cursor:pointer}
+button:disabled{opacity:.32;cursor:not-allowed}
+.green{border-color:#3af07a;color:#3af07a}
+.yellow{border-color:#ffbf00;color:#ffbf00}
+.danger{border-color:#ff4b70;color:#ff4b70}
+.active{background:#241900;border-color:#ffbf00;color:#ffbf00}
+.card{background:#020711;border:1px solid #1d4163;border-radius:9px;padding:7px;margin-top:6px}
+.big{font-size:17px;color:#00b7ff;font-weight:900}
+.small{font-size:11px;color:#98d4ff}
+.tiny{font-size:10px;color:#6f9fc4;line-height:1.35}
+.ok{color:#3af07a}.bad{color:#ff4b70}.warn{color:#ffbf00}
+#events{height:120px;overflow:auto;font-size:10px;white-space:pre-wrap;line-height:1.4}
+/* ---- STOP: the biggest control on the page, and it never leaves it. ---- */
+#stopBtn{flex:0 0 300px;height:52px;font-size:26px;letter-spacing:9px;background:#3a0210;border:3px solid #ff2d55;color:#ff5c7a;border-radius:10px;font-weight:900;box-shadow:0 0 22px rgba(255,45,85,.35)}
+#stopBtn:active{background:#ff2d55;color:#fff}
+#stopBtn.fired{background:#ff2d55;color:#fff;border-color:#fff}
+/* ---- staleness: not decoration. The ticker sets these. ---- */
+.stale{text-decoration:line-through;color:#7d8fa0 !important;opacity:.75}
+.stalebadge{color:#ff4b70;font-weight:900;font-size:10px;letter-spacing:2px;margin-left:6px}
+.chip{display:inline-block;border-radius:7px;padding:3px 8px;font-size:11px;font-weight:900;letter-spacing:1px;border:1px solid}
+.chip.up{border-color:#3af07a;color:#3af07a;background:#04220f}
+.chip.down{border-color:#ff4b70;color:#ff4b70;background:#2a020a}
+.chip.wait{border-color:#ffbf00;color:#ffbf00;background:#241900}
+#overlay{position:absolute;left:10px;top:10px;z-index:10;width:250px;background:rgba(2,7,17,.88);border:1px solid #1d4163;border-radius:10px;padding:9px;font-size:12px;line-height:1.5;color:#98d4ff}
+#overlay .title{color:#00b7ff;letter-spacing:2px;font-weight:900;margin-bottom:5px}
+#overlay b{color:#e8f7ff}
+#maphint{position:absolute;right:10px;bottom:8px;z-index:10;font-size:10px;color:#6f9fc4;background:rgba(2,7,17,.85);border:1px solid #143050;border-radius:8px;padding:5px 8px}
+#lidarDead{position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);z-index:9;color:#ff4b70;font-weight:900;letter-spacing:5px;font-size:20px;text-align:center;display:none;background:rgba(2,7,17,.82);border:2px solid #ff4b70;border-radius:12px;padding:14px 20px}
+table{width:100%;border-collapse:collapse;font-size:11px}
+td{padding:2px 0;color:#98d4ff}
+td.v{text-align:right;color:#e8f7ff;font-weight:900}
+.note{border-left:3px solid #ffbf00;padding-left:7px;color:#ffbf00;font-size:10px;line-height:1.4;margin-top:6px}
+</style></head><body>
+
+<div class="top">
+  <div>
+    <h1>FPMS CONSOLE</h1>
+    <div class="sub">rosbridge ROS&#8596;ROS &bull; arena FIXED, rover moves &bull; <span id="host"></span></div>
+  </div>
+  <div style="text-align:right;font-size:11px;line-height:1.7">
+    <div><span id="linkChip" class="chip down">LINK ?</span> <span id="stopChip" class="chip wait">STOP LINK ?</span></div>
+    <div class="tiny" id="clock"></div>
+  </div>
+  <button id="stopBtn" title="Publishes /estop and /fpms/cmd/stop. Spacebar also fires it.">STOP</button>
+</div>
+
+<div class="main">
+  <!-- =============================== MAP =============================== -->
+  <div class="panel">
+    <div class="h">ARENA (FIXED) &mdash; ROVER MOVES ON IT</div>
+    <div id="mapbox">
+      <div id="overlay">
+        <div class="title">ROVER</div>
+        <div>x <b><span data-feed="x">--</span></b> mm &nbsp; y <b><span data-feed="y">--</span></b> mm</div>
+        <div>hdg <b><span data-feed="hdg">--</span></b>&deg;</div>
+        <div>front <b><span data-feed="front">--</span></b> mm</div>
+        <div>state <b><span data-feed="state">--</span></b></div>
+        <div>phase <b><span data-feed="phase">--</span></b></div>
+      </div>
+      <div id="lidarDead">LIDAR ABSENT<div style="font-size:11px;letter-spacing:1px;margin-top:6px">no frame within <span id="staleSecs">3</span>s &mdash; nothing drawn on purpose</div></div>
+      <canvas id="grid"></canvas><canvas id="dyn"></canvas>
+      <div id="maphint">LEFT-CLICK = place marker &nbsp;|&nbsp; RIGHT-CLICK = keep-out disk &nbsp;|&nbsp; SHIFT+RIGHT-CLICK = clear all</div>
+    </div>
+  </div>
+
+  <!-- ============================= CONTROLS ============================ -->
+  <div class="panel right">
+    <div class="h">COMMANDS</div>
+    <div class="grid2">
+      <button class="yellow" id="btnPlan">PLAN M2 (preview)</button>
+      <button class="green"  id="btnArm">ARM</button>
+      <button id="btnDisarm">DISARM</button>
+      <button class="green"  id="btnRun" disabled>RUN M2</button>
+      <button id="btnReset">RESET POSE 972,228</button>
+      <button id="btnEnc">READ ENCODERS</button>
+    </div>
+    <div class="card"><div class="small">LAST COMMAND</div><div id="cmdMsg" class="tiny">--</div></div>
+    <div id="runWhy" class="note">RUN is locked until you press ARM and every critical feed is fresh.</div>
+
+    <div class="h">ARM / MOTION</div>
+    <table>
+      <tr><td>rover arm latch</td><td class="v"><span data-feed="armed">--</span></td></tr>
+      <tr><td>console arm window</td><td class="v"><span id="armWin">locked</span></td></tr>
+      <tr><td>micro-ROS link</td><td class="v"><span data-feed="link">--</span></td></tr>
+      <tr><td>LiDAR ok (rover)</td><td class="v"><span data-feed="lidarok">--</span></td></tr>
+    </table>
+
+    <div class="h">RESIDUAL &mdash; commanded vs MEASURED</div>
+    <table>
+      <tr><td>this segment drive</td><td class="v"><span data-feed="res_mm">--</span> mm</td></tr>
+      <tr><td>this segment turn</td><td class="v"><span data-feed="res_deg">--</span> &deg;</td></tr>
+      <tr><td>lateral</td><td class="v"><span data-feed="res_lat">--</span> mm</td></tr>
+      <tr><td>cumulative drive</td><td class="v"><span data-feed="res_cum_mm">--</span> mm</td></tr>
+      <tr><td>cumulative turn</td><td class="v"><span data-feed="res_cum_deg">--</span> &deg;</td></tr>
+      <tr><td>leg / segment</td><td class="v"><span data-feed="leg">-</span> / <span data-feed="seg">-</span></td></tr>
+    </table>
+    <div class="tiny">Constant ratio &rarr; counts/mm scale. Constant offset &rarr; coast. Grows only on turns &rarr; gyro. (STACK.md &sect;6)</div>
+
+    <div class="h">TELEMETRY</div>
+    <table>
+      <tr><td>battery</td><td class="v"><span data-feed="batt">--</span> V</td></tr>
+      <tr><td>scan points</td><td class="v"><span data-feed="scanpts">--</span></td></tr>
+      <tr><td>scan rate (measured here)</td><td class="v"><span id="scanHz">--</span> Hz</td></tr>
+      <tr><td>front clearance</td><td class="v"><span data-feed="front2">--</span> mm</td></tr>
+      <tr><td>stop threshold</td><td class="v"><span id="frontStop">400</span> mm</td></tr>
+      <tr><td>distance remaining</td><td class="v"><span data-feed="drem">--</span> mm</td></tr>
+      <tr><td>distance travelled</td><td class="v"><span data-feed="dtrav">--</span> mm</td></tr>
+      <tr><td>wheel ticks</td><td class="v"><span data-feed="ticks">--</span></td></tr>
+      <tr><td>wheel duty applied</td><td class="v"><span data-feed="duty">--</span></td></tr>
+      <tr><td>odom_raw</td><td class="v"><span data-feed="odom">--</span></td></tr>
+      <tr><td>imu yaw rate</td><td class="v"><span data-feed="gyro">--</span> &deg;/s</td></tr>
+    </table>
+
+    <div class="h">PLANNED ROUTE</div>
+    <div id="planBox" class="tiny">no plan received &mdash; press PLAN M2 (preview)</div>
+    <div class="note" id="occNote">Occupancy: the planner publishes only <b>counts</b>, never the cells. The dots on the map are the live <code>/scan_lidar</code> returns the grid is built from &mdash; they are NOT the planner's grid.</div>
+
+    <div class="h">OPERATOR MARKERS</div>
+    <div id="markBox" class="tiny">none</div>
+    <div class="note"><b>Keep-out disks are NOT consumed by the planner.</b> There is no keep-out verb anywhere in <code>fpms_missions.py</code>; its occupancy grid is built from LiDAR returns only. They are drawn, published on <code>/fpms/console/keepout</code> and logged on the Pi, so the operator and the planner cannot silently disagree.</div>
+    <div class="grid2" style="margin-top:6px"><button id="btnClearMarks">CLEAR MARKERS</button><button id="btnClearKeep" class="danger">CLEAR KEEP-OUTS</button></div>
+
+    <div class="h">FEED AGES (aged in this browser)</div>
+    <div id="ages" class="tiny"></div>
+
+    <div class="h">EVENTS</div>
+    <div id="events" class="card"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ======================================================================
+   0. CONSTANTS — arena geometry is DERIVED the same way fpms_missions.py
+      derives it (ARENA_MM, ZONE_FRAC, MARGIN_FRAC), so a rescale is one
+      number here as well as there.
+   ====================================================================== */
+const ARENA_MM = 1200.0, ZONE_FRAC = 0.30, MARGIN_FRAC = 0.04;
+const ZONE = ZONE_FRAC * ARENA_MM, MARGIN = MARGIN_FRAC * ARENA_MM;
+const ZONES = [
+  {id:"zone-a", label:"M1 / ZONE A (top-LEFT)",  x:MARGIN,                 y:ARENA_MM-MARGIN-ZONE, c:"#ff4b70"},
+  {id:"zone-b", label:"M2 / ZONE B (top-RIGHT)", x:ARENA_MM-MARGIN-ZONE,   y:ARENA_MM-MARGIN-ZONE, c:"#ffbf00"},
+  {id:"water",  label:"WATER (bottom-LEFT)",     x:MARGIN,                 y:MARGIN,               c:"#00b7ff"},
+];
+const HOME = {x: ARENA_MM-MARGIN-ZONE/2, y: MARGIN+ZONE/2, hdg: 90};   // = 972,228
+const VIEW_MIN = -180, VIEW_MAX = ARENA_MM + 180;
+const ROBOT_W = 230, ROBOT_NOSE = 160, ROBOT_TAIL = -80;               // phase6 numbers
+const FRONT_STOP_MM = 400;                                             // config.env FPMS_MISSION_FRONT_STOP_MM
+const STALE_S = 3.0;                                                   // the whole staleness contract
+const KEEPOUT_R = 120;                                                 // phase6 right-click disk radius
+
+/* Which feeds must be FRESH for RUN to be permitted.
+   Deliberately TWO, and deliberately these two:
+
+     scan  /scan_lidar          ~10 Hz. If it is stale the rover is blind,
+                                and the obstacle guard fails OPEN on absent
+                                data (STACK.md risk 7) — so blind is the one
+                                state where RUN must not be available.
+     x     /fpms/mission/x_mm   ~1 Hz. THE POSE THE MAP IS DRAWING. Gating on
+                                the number the operator is actually looking at
+                                is the point: if the rectangle on screen is not
+                                where the rover is, RUN is not safe to press.
+
+   /odom_raw is displayed but does NOT gate. It is upstream of x_mm, so a dead
+   odometry chain already shows up here; adding it would only add a third way
+   for the button to lock itself at a competition without adding information.
+   A RUN button that is disabled for a reason nobody can find is its own
+   hazard. */
+const RUN_CRITICAL = ["scan", "x"];
+
+document.getElementById("host").textContent = location.host;
+document.getElementById("staleSecs").textContent = STALE_S;
+document.getElementById("frontStop").textContent = FRONT_STOP_MM;
+
+/* ======================================================================
+   1. FEED REGISTRY — the staleness mechanism.
+
+   `mark(key, value)` records the value AND the local arrival instant.
+   NOTHING ELSE writes to the DOM for a feed. The 5 Hz ticker is the only
+   renderer, and it re-derives age every time, so a value physically
+   cannot stay on screen unaged.
+   ====================================================================== */
+const feeds = {};                 // key -> {t: perf-ms at arrival, v: display string, raw: any}
+const rates = {};                 // key -> {last, hz}  measured HERE, from arrivals
+
+function mark(key, value, raw){
+  const now = performance.now();
+  const r = rates[key] || (rates[key] = {last:0, hz:0});
+  if (r.last){ const dt = (now - r.last)/1000; if (dt > 1e-4){
+      const inst = 1/dt;
+      /* Same rule as the rover agent: a single long gap must move the
+         number a lot. A smooth average stays plausible after death. */
+      r.hz = r.hz <= 0 ? inst : (0.6*r.hz + 0.4*inst);
+  }}
+  r.last = now;
+  feeds[key] = {t: now, v: value, raw: raw};
+}
+function ageOf(key){
+  const f = feeds[key];
+  if (!f) return Infinity;
+  return (performance.now() - f.t)/1000;
+}
+function isStale(key){ return ageOf(key) > STALE_S; }
+
+/* ======================================================================
+   2. RB — the rosbridge v2 protocol. This is the whole client.
+
+   op: subscribe / unsubscribe / advertise / unadvertise / publish /
+       call_service.  That is the entire surface rosbridge exposes and the
+       entire surface this console needs.
+   ====================================================================== */
+function RB(url, opts){
+  opts = opts || {};
+  const self = {ws:null, open:false, url:url, subs:[], advs:[], onopen:opts.onopen,
+                onclose:opts.onclose, handlers:{}, svcCbs:{}, svcId:0, label:opts.label||"main"};
+  let backoff = 500;
+
+  function connect(){
+    let ws;
+    try { ws = new WebSocket(url); } catch(e){ setTimeout(connect, backoff); return; }
+    self.ws = ws;
+    ws.onopen = () => {
+      self.open = true; backoff = 500;
+      /* Re-advertise then re-subscribe on EVERY connect, including
+         reconnects. rosbridge keeps no state across a dropped socket. */
+      self.advs.forEach(a => send({op:"advertise", topic:a.topic, type:a.type}));
+      self.subs.forEach(s => send(Object.assign({op:"subscribe"}, s)));
+      if (self.onopen) self.onopen();
+    };
+    ws.onclose = () => {
+      self.open = false;
+      if (self.onclose) self.onclose();
+      backoff = Math.min(backoff*1.6, 4000);
+      setTimeout(connect, backoff);
+    };
+    ws.onerror = () => { try{ ws.close(); }catch(e){} };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch(e){ return; }
+      if (m.op === "publish"){
+        const h = self.handlers[m.topic];
+        if (h) { try { h(m.msg); } catch(e){ logEvent("render error "+m.topic+": "+e, "bad"); } }
+      } else if (m.op === "service_response"){
+        const cb = self.svcCbs[m.id]; delete self.svcCbs[m.id];
+        if (cb) cb(m.result !== false, (m.values && m.values.message) || m.values || "");
+      } else if (m.op === "status" && (m.level === "error" || m.level === "warning")){
+        logEvent("rosbridge "+m.level+": "+m.msg, m.level === "error" ? "bad" : "warn");
+      }
+    };
+  }
+  function send(o){
+    if (self.ws && self.ws.readyState === 1){ self.ws.send(JSON.stringify(o)); return true; }
+    return false;
+  }
+  self.send = send;
+  self.subscribe = (topic, type, cb, throttle) => {
+    const s = {topic: topic, queue_length: 1};
+    if (type) s.type = type;
+    if (throttle) s.throttle_rate = throttle;
+    self.subs.push(s); self.handlers[topic] = cb;
+    if (self.open) send(Object.assign({op:"subscribe"}, s));
+  };
+  self.advertise = (topic, type) => {
+    self.advs.push({topic:topic, type:type});
+    if (self.open) send({op:"advertise", topic:topic, type:type});
+  };
+  self.publish = (topic, msg) => send({op:"publish", topic:topic, msg:msg});
+  self.call = (service, args, cb) => {
+    const id = self.label+"-svc-"+(++self.svcId);
+    if (cb) self.svcCbs[id] = cb;
+    if (!send({op:"call_service", service:service, args:args||{}, id:id})){
+      delete self.svcCbs[id];
+      if (cb) cb(false, "NOT SENT — rosbridge link is down");
+    }
+  };
+  connect();
+  return self;
+}
+
+const WS_URL = "ws://" + location.hostname + ":9090";
+
+/* ======================================================================
+   3. STOP — its own socket, which does nothing else.
+
+   Requirement, verbatim: "a panic button that can be busy is not a panic
+   button". So:
+     * it is a TOPIC PUBLISH, never a service call. No request id, no
+       pending state, no server needed to answer, no timeout;
+     * it is on a SECOND WebSocket that subscribes to NOTHING. The main
+       socket carries a 10 Hz LaserScan; a browser WebSocket send() queues
+       behind whatever is already in that socket's send buffer. This one's
+       buffer is empty by construction;
+     * it publishes BOTH verbs: /estop (std_msgs/Bool true) which the
+       firmware-v3 control task and fpms-cored honour, and /fpms/cmd/stop
+       (std_msgs/Empty) which the Pi-side command bridge fans out to the
+       MQTT stop/estop verbs at QoS 1;
+     * if the dedicated socket happens to be down it falls back to the main
+       one AND says which path it used. It never silently does nothing.
+   ====================================================================== */
+const stopLink = RB(WS_URL, {label:"stop",
+  onopen:  () => { setChip("stopChip","up","STOP LINK UP"); },
+  onclose: () => { setChip("stopChip","down","STOP LINK DOWN"); }});
+stopLink.advertise("/estop", "std_msgs/Bool");
+stopLink.advertise("/fpms/cmd/stop", "std_msgs/Empty");
+
+let stopCount = 0;
+function fireStop(why){
+  stopCount++;
+  const a = stopLink.publish("/estop", {data:true});
+  const b = stopLink.publish("/fpms/cmd/stop", {});
+  let path = "stop-link";
+  let ok = a && b;
+  if (!ok){
+    /* Fallback: the main socket. Slower in the worst case, but "slower"
+       beats "nothing" and the operator is told which one carried it. */
+    const c = ros.publish("/estop", {data:true});
+    const d = ros.publish("/fpms/cmd/stop", {});
+    ok = ok || c || d; path = "MAIN link (stop link was down)";
+  }
+  /* Any stop revokes the console's arm window immediately, locally, with no
+     round trip. The rover disarms itself too; this makes the UI agree at
+     once instead of after the next telemetry frame. */
+  armedAt = 0;
+  const btn = document.getElementById("stopBtn");
+  btn.classList.add("fired"); setTimeout(()=>btn.classList.remove("fired"), 900);
+  logEvent("STOP #"+stopCount+" ("+why+") via "+path+(ok?"":" — PUBLISH FAILED, GET TO THE ROVER"), ok?"warn":"bad");
+}
+document.getElementById("stopBtn").addEventListener("click", () => fireStop("button"));
+/* Spacebar, anywhere, unless typing. One key, no modifier, no confirm. */
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" && !/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)){
+    e.preventDefault(); fireStop("spacebar");
+  }
+});
+
+/* ======================================================================
+   4. MAIN LINK — every subscription, and only the four safe advertises.
+
+   Note what is NOT here: /cmd_vel, /cmd_duty, /cmd_enable. They are also
+   absent from rosbridge's topics_glob (see units/fpms-rosbridge.service),
+   so the server would refuse them even if this file asked. Two independent
+   layers, neither relying on the other being careful.
+   ====================================================================== */
+const ros = RB(WS_URL, {label:"main",
+  onopen:  () => { setChip("linkChip","up","LINK UP"); logEvent("rosbridge connected "+WS_URL, "ok"); },
+  onclose: () => { setChip("linkChip","down","LINK DOWN"); logEvent("rosbridge DISCONNECTED — reconnecting", "bad"); }});
+
+ros.advertise("/clicked_point", "geometry_msgs/PointStamped");   // operator marker, echoed+logged on the Pi
+ros.advertise("/fpms/console/keepout", "std_msgs/String");       // keep-out disks (display only — see the note)
+
+let scan = null;           // {ranges, angle_min, angle_increment} or null. NEVER a stale frame.
+let pose = null;           // {x,y,hdg} arena mm/deg
+let route = [];            // planned waypoints (arena mm)
+let plan = null;
+let markers = [];          // operator click-to-place
+let keepouts = [];         // operator right-click disks
+
+/* ---- sensors -------------------------------------------------------- */
+ros.subscribe("/scan_lidar", "sensor_msgs/LaserScan", (m) => {
+  scan = m; mark("scan", (m.ranges||[]).length, m);
+}, 100);
+ros.subscribe("/odom_raw", "nav_msgs/Odometry", (m) => {
+  const p = m.pose.pose.position;
+  mark("odom", (p.x).toFixed(3)+", "+(p.y).toFixed(3)+" m", m);
+}, 200);
+ros.subscribe("/imu", "sensor_msgs/Imu", (m) => {
+  mark("gyro", (m.angular_velocity.z*180/Math.PI).toFixed(1), m);
+}, 250);
+/* /battery is BatteryState (volts) on firmware v3 and UInt16 (decivolts) on
+   the Yahboom stock image. No `type` is given so rosbridge resolves whatever
+   is actually publishing, and both shapes are read below. Guessing wrong
+   here would show a plausible number in the wrong units. */
+ros.subscribe("/battery", null, (m) => {
+  let v = null;
+  if (m && typeof m.voltage === "number") v = m.voltage;
+  else if (m && typeof m.data === "number") v = m.data / 10.0;
+  mark("batt", v === null ? "?" : v.toFixed(2), m);
+}, 500);
+ros.subscribe("/wheel_ticks", "std_msgs/Int32MultiArray", (m) => {
+  mark("ticks", (m.data||[]).join(" "), m);
+}, 250);
+ros.subscribe("/wheel_duty", "std_msgs/Int32MultiArray", (m) => {
+  mark("duty", (m.data||[]).join(" "), m);
+}, 250);
+ros.subscribe("/fpms_health", "std_msgs/Int32MultiArray", (m) => {
+  mark("health", (m.data||[]).join(" "), m);
+}, 1000);
+ros.subscribe("/diagnostics", "diagnostic_msgs/DiagnosticArray", (m) => {
+  mark("diag", (m.status||[]).length + " status", m);
+}, 1000);
+
+/* ---- mission mirror (published by the Pi-side command bridge) -------- */
+const f32 = (k, fx) => (m) => mark(k, m.data.toFixed(fx === undefined ? 1 : fx), m.data);
+ros.subscribe("/fpms/mission/x_mm",  "std_msgs/Float32", f32("x"));
+ros.subscribe("/fpms/mission/y_mm",  "std_msgs/Float32", f32("y"));
+ros.subscribe("/fpms/mission/heading_deg", "std_msgs/Float32", f32("hdg"));
+ros.subscribe("/fpms/mission/front_mm", "std_msgs/Float32", (m)=>{ mark("front", m.data.toFixed(0), m.data); mark("front2", m.data.toFixed(0), m.data); });
+/* Fallback battery source. Used when /battery has not arrived OR has gone
+   stale — not merely when it has never arrived, because "we saw a voltage
+   once, an hour ago" is exactly the frozen-but-plausible reading this
+   console exists to stop showing. */
+ros.subscribe("/fpms/mission/batt_v", "std_msgs/Float32", (m)=>{
+  if (!feeds.batt || isStale("batt")) mark("batt", m.data.toFixed(2), m.data);
+});
+ros.subscribe("/fpms/mission/distance_remaining_mm", "std_msgs/Float32", f32("drem", 0));
+ros.subscribe("/fpms/mission/distance_travelled_mm", "std_msgs/Float32", f32("dtrav", 0));
+ros.subscribe("/fpms/mission/state", "std_msgs/String", (m)=>mark("state", m.data, m.data));
+ros.subscribe("/fpms/mission/phase", "std_msgs/String", (m)=>mark("phase", m.data, m.data));
+ros.subscribe("/fpms/mission/armed", "std_msgs/Bool", (m)=>mark("armed", m.data?"ARMED":"disarmed", m.data));
+ros.subscribe("/fpms/mission/link_ok", "std_msgs/Bool", (m)=>mark("link", m.data?"ok":"DOWN", m.data));
+ros.subscribe("/fpms/mission/lidar_ok", "std_msgs/Bool", (m)=>mark("lidarok", m.data?"ok":"NOT OK", m.data));
+ros.subscribe("/fpms/mission/leg_i", "std_msgs/Int32", (m)=>mark("leg", String(m.data), m.data));
+ros.subscribe("/fpms/mission/segment_i", "std_msgs/Int32", (m)=>mark("seg", String(m.data), m.data));
+
+/* ---- residual: the most diagnostic number this rover produces -------- */
+ros.subscribe("/fpms/residual/drive_mm", "std_msgs/Float32", f32("res_mm"));
+ros.subscribe("/fpms/residual/turn_deg", "std_msgs/Float32", f32("res_deg"));
+ros.subscribe("/fpms/residual/lateral_mm", "std_msgs/Float32", f32("res_lat"));
+ros.subscribe("/fpms/residual/cumulative_drive_mm", "std_msgs/Float32", f32("res_cum_mm"));
+ros.subscribe("/fpms/residual/cumulative_turn_deg", "std_msgs/Float32", f32("res_cum_deg"));
+
+/* ---- events + the plan mirror (fpms_console.py) ----------------------
+   THROTTLED ON PURPOSE, and this is not cosmetic. Measured on the running
+   rover, /fpms/events burst to ~330 Hz during a plan. rosbridge serialises
+   every subscription onto one protocol thread and one WebSocket, so an
+   event storm does not just fill the log — it starves /odom_raw and
+   /scan_lidar on the SAME socket, and a frozen map with a scrolling log is
+   the exact failure this console exists to prevent. 10 Hz is a readable
+   log; the Pi's journal keeps the ones that are dropped. */
+ros.subscribe("/fpms/events", "std_msgs/String", (m) => {
+  mark("events", "1", m);
+  let txt = m.data;
+  try { const j = JSON.parse(m.data); txt = JSON.stringify(j); } catch(e){}
+  logEvent(txt, /nack|refus|fail|abort|error/i.test(txt) ? "bad" : "");
+}, 100);
+ros.subscribe("/fpms/plan/route", "std_msgs/String", (m) => {
+  let j; try { j = JSON.parse(m.data); } catch(e){ return; }
+  plan = j;
+  route = (j.waypoints||[]).map(w => ({x:w.x_mm, y:w.y_mm, kind:w.kind, wp:w.waypoint}));
+  mark("plan", (route.length)+" pts", j);
+  renderPlan();
+});
+ros.subscribe("/fpms/console/keepout_state", "std_msgs/String", (m) => {
+  let j; try { j = JSON.parse(m.data); } catch(e){ return; }
+  keepouts = j.keepouts || [];
+  mark("keepout", keepouts.length+"", j);
+  renderMarks();
+});
+
+/* ======================================================================
+   5. COMMANDS — services on the Pi-side bridge. All refusals are the
+      ROVER's; this file adds one extra lock (the arm window) and never
+      removes one.
+   ====================================================================== */
+const ARM_WINDOW_S = 60;
+let armedAt = 0;
+
+function cmd(msg, cls){ const e = document.getElementById("cmdMsg"); e.textContent = msg; e.className = "tiny "+(cls||""); }
+function svc(name, args, label){
+  cmd(label+" ... sent, waiting for the rover", "warn");
+  ros.call(name, args, (ok, message) => {
+    cmd(label+": "+(ok?"OK":"REFUSED")+" — "+message, ok?"ok":"bad");
+    logEvent(label+" -> "+(ok?"ok":"REFUSED")+": "+message, ok?"":"bad");
+  });
+}
+document.getElementById("btnPlan").onclick  = () => svc("/fpms/plan_m2", {}, "PLAN M2 (preview, cannot move)");
+document.getElementById("btnReset").onclick = () => svc("/fpms/reset_pose", {}, "RESET POSE 972,228");
+document.getElementById("btnEnc").onclick   = () => svc("/fpms/read_encoders", {}, "READ ENCODERS");
+document.getElementById("btnArm").onclick   = () => { armedAt = performance.now(); svc("/fpms/arm", {data:true}, "ARM"); };
+document.getElementById("btnDisarm").onclick= () => { armedAt = 0; svc("/fpms/arm", {data:false}, "DISARM"); };
+document.getElementById("btnRun").onclick   = () => {
+  if (!runAllowed().ok) return;                 // belt: the button is also disabled
+  armedAt = 0;                                  // one ARM buys exactly one RUN
+  svc("/fpms/run_m2", {}, "RUN M2");
+};
+
+function runAllowed(){
+  if (!ros.open) return {ok:false, why:"rosbridge link is DOWN."};
+  const stales = RUN_CRITICAL.filter(isStale);
+  if (stales.length) return {ok:false, why:"STALE: "+stales.join(", ")+" older than "+STALE_S+"s. RUN is disabled until they are live."};
+  if (!armedAt) return {ok:false, why:"Not armed. Press ARM, then RUN — two deliberate actions."};
+  const age = (performance.now()-armedAt)/1000;
+  if (age > ARM_WINDOW_S){ armedAt = 0; return {ok:false, why:"Arm window expired. Press ARM again."}; }
+  return {ok:true, why:"ARMED — "+(ARM_WINDOW_S-age).toFixed(0)+"s left. RUN will start the mission."};
+}
+
+/* ======================================================================
+   6. THE TICKER — the only renderer of values, at 5 Hz.
+   ====================================================================== */
+const feedEls = Array.from(document.querySelectorAll("[data-feed]"));
+function setChip(id, cls, text){ const e = document.getElementById(id); e.className = "chip "+cls; e.textContent = text; }
+
+function tick(){
+  const now = new Date();
+  document.getElementById("clock").textContent = now.toTimeString().slice(0,8);
+
+  /* Every displayed value, re-aged from its arrival instant. */
+  for (const el of feedEls){
+    const k = el.getAttribute("data-feed");
+    const f = feeds[k];
+    if (!f){ el.textContent = "--"; el.className = ""; continue; }
+    const stale = isStale(k);
+    el.textContent = String(f.v);
+    el.className = stale ? "stale" : "";
+    if (stale){
+      let b = el.nextElementSibling;
+      if (!b || !b.classList || !b.classList.contains("stalebadge")){
+        b = document.createElement("span"); b.className = "stalebadge"; el.after(b);
+      }
+      b.textContent = "STALE " + ageOf(k).toFixed(0) + "s";
+    } else {
+      const b = el.nextElementSibling;
+      if (b && b.classList && b.classList.contains("stalebadge")) b.remove();
+    }
+  }
+
+  /* A stale LiDAR is ABSENT, not frozen. The frame is dropped here, so the
+     renderer has nothing to draw even if it wanted to. */
+  if (isStale("scan")) scan = null;
+  document.getElementById("lidarDead").style.display = (isStale("scan") ? "block" : "none");
+  document.getElementById("scanHz").textContent = isStale("scan") ? "0.0" : ((rates.scan && rates.scan.hz)||0).toFixed(1);
+
+  /* Pose: only from FRESH mission mirror values. A stale pose is no pose,
+     and the rover is then drawn where it was with a loud STALE badge
+     rather than being silently believed. */
+  const px = feeds.x, py = feeds.y, ph = feeds.hdg;
+  if (px && py && ph) pose = {x: +px.raw, y: +py.raw, hdg: +ph.raw,
+                              stale: isStale("x")||isStale("y")||isStale("hdg")};
+
+  /* RUN gating — a property, not a class. */
+  const allow = runAllowed();
+  document.getElementById("btnRun").disabled = !allow.ok;
+  const why = document.getElementById("runWhy");
+  why.textContent = allow.why;
+  why.style.borderLeftColor = allow.ok ? "#3af07a" : "#ffbf00";
+  why.style.color = allow.ok ? "#3af07a" : "#ffbf00";
+  document.getElementById("armWin").textContent =
+     armedAt ? Math.max(0, ARM_WINDOW_S-(performance.now()-armedAt)/1000).toFixed(0)+"s" : "locked";
+
+  /* Feed age table — the raw mechanism, visible. */
+  const keys = ["scan","odom","imu","batt","ticks","duty","health","diag","state","phase","x","front","res_mm","plan","events"];
+  document.getElementById("ages").innerHTML = keys.map(k => {
+    const a = ageOf(k);
+    if (!isFinite(a)) return "<div>"+k+" <span class='bad'>never seen</span></div>";
+    const c = a > STALE_S ? "bad" : (a > STALE_S/2 ? "warn" : "ok");
+    return "<div>"+k+" <span class='"+c+"'>"+a.toFixed(1)+"s</span></div>";
+  }).join("");
+}
+setInterval(tick, 200);
+
+/* ======================================================================
+   7. MAP — "Tesla configuration": the ARENA IS FIXED, the ROVER MOVES.
+      Nothing here ever rotates the world under the robot.
+   ====================================================================== */
+const gridC = document.getElementById("grid"), dynC = document.getElementById("dyn");
+const box = document.getElementById("mapbox");
+const g = gridC.getContext("2d"), d = dynC.getContext("2d");
+let scale = 1, ox = 0, oy = 0;
+
+function mmToPix(x,y){ return [ox + x*scale, oy - y*scale]; }
+function pixToMm(px,py){ return [(px-ox)/scale, (oy-py)/scale]; }
+/* robot frame (forward, left) -> arena mm. This is the ONLY place a heading
+   is applied to geometry. */
+function robotToWorld(fwd, left){
+  if (!pose) return null;
+  const h = pose.hdg * Math.PI/180, c = Math.cos(h), s = Math.sin(h);
+  return [pose.x + fwd*c - left*s, pose.y + fwd*s + left*c];
+}
+
+function resize(){
+  const r = box.getBoundingClientRect();
+  gridC.width = dynC.width = Math.max(1, Math.floor(r.width));
+  gridC.height = dynC.height = Math.max(1, Math.floor(r.height));
+  const span = VIEW_MAX - VIEW_MIN;
+  scale = Math.min(gridC.width/span, gridC.height/span) * 0.96;
+  ox = gridC.width/2 - (VIEW_MIN+VIEW_MAX)/2*scale;
+  oy = gridC.height/2 + (VIEW_MIN+VIEW_MAX)/2*scale;
+  drawGrid();
+}
+window.addEventListener("resize", resize);
+
+function drawGrid(){
+  g.clearRect(0,0,gridC.width,gridC.height);
+  const [x0,yt] = mmToPix(VIEW_MIN, VIEW_MAX), [x1,yb] = mmToPix(VIEW_MAX, VIEW_MIN);
+  g.fillStyle = "rgba(0,55,28,.16)"; g.fillRect(x0,yt,x1-x0,yb-yt);
+  for (let v=Math.ceil(VIEW_MIN/100)*100; v<=VIEW_MAX; v+=100){
+    const [pxv] = mmToPix(v,0), [,pyv] = mmToPix(0,v);
+    g.strokeStyle = (v%500) ? "rgba(80,190,255,.13)" : "rgba(80,190,255,.32)";
+    g.beginPath(); g.moveTo(pxv,yt); g.lineTo(pxv,yb); g.stroke();
+    g.beginPath(); g.moveTo(x0,pyv); g.lineTo(x1,pyv); g.stroke();
+  }
+  // arena boundary
+  const [ax0,ay0] = mmToPix(0, ARENA_MM), [ax1,ay1] = mmToPix(ARENA_MM, 0);
+  g.strokeStyle = "#00ff88"; g.lineWidth = 3; g.strokeRect(ax0,ay0,ax1-ax0,ay1-ay0);
+  g.fillStyle = "rgba(0,255,136,.05)"; g.fillRect(ax0,ay0,ax1-ax0,ay1-ay0);
+  g.fillStyle = "#00ff88"; g.font = "bold 11px Consolas"; g.textAlign = "center";
+  g.fillText(ARENA_MM+" mm", (ax0+ax1)/2, ay1+15);
+  // zones
+  g.font = "bold 10px Consolas";
+  for (const z of ZONES){
+    const [zx0,zy0] = mmToPix(z.x, z.y+ZONE), [zx1,zy1] = mmToPix(z.x+ZONE, z.y);
+    g.strokeStyle = z.c; g.lineWidth = 2; g.setLineDash([6,5]);
+    g.strokeRect(zx0,zy0,zx1-zx0,zy1-zy0); g.setLineDash([]);
+    g.fillStyle = z.c; g.fillText(z.label, (zx0+zx1)/2, zy0-5);
+  }
+  // home / start box
+  const [hx,hy] = mmToPix(HOME.x, HOME.y);
+  g.strokeStyle = "#3af07a"; g.lineWidth = 2;
+  g.beginPath(); g.arc(hx,hy,13,0,Math.PI*2); g.stroke();
+  g.fillStyle = "#3af07a"; g.fillText("HOME 972,228", hx, hy-18);
+  g.textAlign = "left";
+}
+
+function drawDyn(){
+  d.clearRect(0,0,dynC.width,dynC.height);
+
+  // --- planned route (drawn under everything the rover might cover) ---
+  if (route.length > 1){
+    d.lineJoin = d.lineCap = "round";
+    d.beginPath();
+    route.forEach((p,i) => { const [px,py] = mmToPix(p.x,p.y); i ? d.lineTo(px,py) : d.moveTo(px,py); });
+    d.strokeStyle = "rgba(58,240,122,.16)"; d.lineWidth = Math.max(2, 185*2*scale); d.stroke();
+    d.beginPath();
+    route.forEach((p,i) => { const [px,py] = mmToPix(p.x,p.y); i ? d.lineTo(px,py) : d.moveTo(px,py); });
+    d.strokeStyle = "#3af07a"; d.lineWidth = 3; d.stroke();
+    for (const p of route){
+      if (!p.wp) continue;
+      const [px,py] = mmToPix(p.x,p.y);
+      d.strokeStyle = "#3af07a"; d.lineWidth = 2;
+      d.beginPath(); d.arc(px,py,7,0,Math.PI*2); d.stroke();
+      d.fillStyle = "#3af07a"; d.font = "bold 10px Consolas"; d.fillText(p.wp, px+10, py-8);
+    }
+  }
+
+  // --- keep-out disks (DISPLAY ONLY — the planner does not consume them) ---
+  for (const k of keepouts){
+    const [px,py] = mmToPix(k.x_mm, k.y_mm), rp = (k.r_mm||KEEPOUT_R)*scale;
+    d.fillStyle = "rgba(255,75,112,.22)"; d.strokeStyle = "#ff4b70"; d.lineWidth = 2;
+    d.beginPath(); d.arc(px,py,rp,0,Math.PI*2); d.fill(); d.stroke();
+    d.setLineDash([4,4]); d.strokeStyle = "rgba(255,75,112,.6)"; d.stroke(); d.setLineDash([]);
+    d.fillStyle = "#ff4b70"; d.font = "bold 10px Consolas"; d.textAlign = "center";
+    d.fillText("NO-GO (not planned)", px, py-rp-4); d.textAlign = "left";
+  }
+
+  // --- operator markers ---
+  for (const m of markers){
+    const [px,py] = mmToPix(m.x_mm, m.y_mm);
+    d.strokeStyle = "#00b7ff"; d.lineWidth = 2;
+    d.beginPath(); d.moveTo(px-9,py); d.lineTo(px+9,py); d.moveTo(px,py-9); d.lineTo(px,py+9); d.stroke();
+    d.beginPath(); d.arc(px,py,9,0,Math.PI*2); d.stroke();
+    d.fillStyle = "#00b7ff"; d.font = "bold 10px Consolas"; d.textAlign = "center";
+    d.fillText(Math.round(m.x_mm)+","+Math.round(m.y_mm), px, py-13); d.textAlign = "left";
+  }
+
+  // --- LiDAR returns. `scan` is null the moment it goes stale. ---
+  if (scan && pose){
+    const R = scan.ranges || [], a0 = scan.angle_min, ai = scan.angle_increment;
+    const rmax = scan.range_max || 12.0;
+    d.fillStyle = pose.stale ? "rgba(160,160,170,.5)" : "rgb(240,210,255)";
+    for (let i=0;i<R.length;i++){
+      const r = R[i];
+      if (!(r > 0.02) || r > rmax || !isFinite(r)) continue;   // 0/inf = no return, not a wall
+      const th = a0 + i*ai;
+      const w = robotToWorld(r*1000*Math.cos(th), r*1000*Math.sin(th));
+      if (!w) continue;
+      const [px,py] = mmToPix(w[0], w[1]);
+      d.fillRect(px-1.5, py-1.5, 3, 3);
+    }
+  }
+
+  if (!pose) { return; }
+
+  // --- front clearance: WHY it stopped ---
+  const fr = feeds.front && !isStale("front") ? +feeds.front.raw : null;
+  const drawRing = (mm, col, dash, label) => {
+    const w = robotToWorld(mm, 0); if (!w) return;
+    const [cx,cy] = mmToPix(pose.x, pose.y), [ex,ey] = mmToPix(w[0], w[1]);
+    const h = pose.hdg*Math.PI/180;
+    d.strokeStyle = col; d.lineWidth = 2; d.setLineDash(dash);
+    d.beginPath(); d.arc(cx, cy, Math.hypot(ex-cx, ey-cy), -h-0.45, -h+0.45); d.stroke();
+    d.setLineDash([]);
+    d.fillStyle = col; d.font = "bold 10px Consolas";
+    d.fillText(label, ex+6, ey);
+  };
+  drawRing(FRONT_STOP_MM, "#ffbf00", [7,6], "STOP @"+FRONT_STOP_MM);
+  if (fr !== null && fr > 0 && fr < 4000) drawRing(fr, fr <= FRONT_STOP_MM ? "#ff4b70" : "#00b7ff", [], "front "+fr.toFixed(0));
+
+  // --- the rover ---
+  const body = [[ROBOT_NOSE, ROBOT_W/2],[ROBOT_NOSE,-ROBOT_W/2],[ROBOT_TAIL,-ROBOT_W/2],[ROBOT_TAIL,ROBOT_W/2]];
+  d.beginPath();
+  body.forEach((v,i) => { const w = robotToWorld(v[0],v[1]); const [px,py] = mmToPix(w[0],w[1]); i?d.lineTo(px,py):d.moveTo(px,py); });
+  d.closePath();
+  d.fillStyle = pose.stale ? "rgba(120,130,140,.35)" : "rgba(0,183,255,.32)";
+  d.strokeStyle = pose.stale ? "#7d8fa0" : "#00b7ff"; d.lineWidth = 2; d.fill(); d.stroke();
+  const nose = robotToWorld(ROBOT_NOSE+55, 0), ctr = robotToWorld(0,0);
+  const [nx,ny] = mmToPix(nose[0],nose[1]), [cx2,cy2] = mmToPix(ctr[0],ctr[1]);
+  d.beginPath(); d.moveTo(cx2,cy2); d.lineTo(nx,ny);
+  d.strokeStyle = pose.stale ? "#7d8fa0" : "#ff4b70"; d.lineWidth = 3; d.stroke();
+  if (pose.stale){
+    d.fillStyle = "#ff4b70"; d.font = "bold 12px Consolas"; d.textAlign = "center";
+    d.fillText("POSE STALE", cx2, cy2-ROBOT_W*scale); d.textAlign = "left";
+  }
+}
+function frame(){ drawDyn(); requestAnimationFrame(frame); }
+
+/* ---- clicks: LEFT places a marker, RIGHT drops a keep-out disk ------- */
+dynC.addEventListener("click", (e) => {
+  const r = dynC.getBoundingClientRect();
+  const [x,y] = pixToMm(e.clientX-r.left, e.clientY-r.top);
+  markers.push({x_mm:x, y_mm:y});
+  /* Published as PointStamped on /clicked_point — the existing operator-click
+     contract on this rover. The Pi-side bridge logs it and echoes it to MQTT
+     control/operator_point. NOTHING ON THE ROVER ACTS ON IT. */
+  ros.publish("/clicked_point", {
+    header:{stamp:{sec:0,nanosec:0}, frame_id:"map"},
+    point:{x:x/1000.0, y:y/1000.0, z:0.0}});
+  logEvent("marker placed "+x.toFixed(0)+","+y.toFixed(0)+" mm (display only)", "");
+  renderMarks();
+});
+dynC.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  if (e.shiftKey){ keepouts = []; pushKeepouts(); return; }
+  const r = dynC.getBoundingClientRect();
+  const [x,y] = pixToMm(e.clientX-r.left, e.clientY-r.top);
+  keepouts.push({x_mm:x, y_mm:y, r_mm:KEEPOUT_R});
+  pushKeepouts();
+});
+function pushKeepouts(){
+  ros.publish("/fpms/console/keepout", {data: JSON.stringify({keepouts: keepouts, ts: Date.now()/1000})});
+  renderMarks();
+  logEvent("keep-out set now "+keepouts.length+" disc(s) — RECORDED, NOT PLANNED", "warn");
+}
+document.getElementById("btnClearMarks").onclick = () => { markers = []; renderMarks(); };
+document.getElementById("btnClearKeep").onclick  = () => { keepouts = []; pushKeepouts(); };
+
+function renderMarks(){
+  const parts = [];
+  parts.push(markers.length ? markers.map(m=>"marker "+m.x_mm.toFixed(0)+","+m.y_mm.toFixed(0)).join("<br>") : "no markers");
+  parts.push(keepouts.length ? "<span class='bad'>"+keepouts.map(k=>"keep-out "+k.x_mm.toFixed(0)+","+k.y_mm.toFixed(0)+" r"+(k.r_mm||KEEPOUT_R)).join("<br>")+"</span>" : "no keep-outs");
+  document.getElementById("markBox").innerHTML = parts.join("<br>");
+}
+function renderPlan(){
+  if (!plan){ return; }
+  const o = plan.occupancy || {};
+  document.getElementById("planBox").innerHTML =
+    "<b>"+(plan.mission||"?")+"</b> via <b>"+(plan.planner||plan.backend||"?")+"</b>"+
+    (plan.committed ? " <span class='bad'>COMMITTED (about to drive)</span>" : " <span class='warn'>PREVIEW — cannot move</span>")+
+    "<br>"+(plan.route||"")+
+    "<br>distance <b>"+(plan.distance_mm!=null?plan.distance_mm.toFixed(0):"?")+"</b> mm &nbsp; eta <b>"+(plan.eta_s!=null?plan.eta_s.toFixed(0):"?")+"</b> s"+
+    "<br>segments "+((plan.segments||[]).length)+" &nbsp; waypoints "+route.length+
+    "<br>pose source <b>"+(plan.pose_source||"?")+"</b>"+(plan.pose_assumed?" <span class='bad'>ASSUMED</span>":"")+
+    "<br>occupancy cells <b>"+(o.cells!=null?o.cells:"?")+"</b> (walls "+(o.wall_cells!=null?o.wall_cells:"?")+", obstacles "+(o.obstacle_cells!=null?o.obstacle_cells:"?")+")"+
+    (plan.planner_note ? "<br><span class='warn'>"+plan.planner_note+"</span>" : "");
+}
+
+/* ---- event log ------------------------------------------------------ */
+const evBox = document.getElementById("events");
+function logEvent(text, cls){
+  const t = new Date().toTimeString().slice(0,8);
+  const div = document.createElement("div");
+  div.className = cls||"";
+  div.textContent = t+"  "+text;
+  evBox.appendChild(div);
+  while (evBox.childNodes.length > 250) evBox.removeChild(evBox.firstChild);
+  evBox.scrollTop = evBox.scrollHeight;
+}
+
+resize(); renderMarks(); frame(); tick();
+logEvent("console loaded — STOP is the big red button and the spacebar", "ok");
+</script></body></html>
