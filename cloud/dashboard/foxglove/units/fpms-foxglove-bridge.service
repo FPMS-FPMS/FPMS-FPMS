@@ -1,0 +1,140 @@
+[Unit]
+Description=FPMS Foxglove Bridge (ROS 2 -> WebSocket on :8765; the laptop dials OUT to this)
+Documentation=https://github.com/foxglove/ros-foxglove-bridge
+# ---------------------------------------------------------------------------
+# WHY THIS UNIT DEPENDS ON ALMOST NOTHING
+#
+# This is the observability layer. It must be the LAST thing on the rover to
+# fail, because the moment somebody needs it most is the moment something else
+# is broken. So: no After= on micro-ros-agent, no After= on mosquitto, no
+# After= on any fpms-* unit. It reads DDS, which needs no start-up ordering —
+# discovery is continuous and a topic that appears later simply appears in
+# Foxglove later. network-online is the only real wait, because the socket has
+# to bind and mDNS has to be answerable.
+#
+# WHY IT LISTENS AND THE LAPTOP DIALS OUT (do not "improve" this)
+#
+# Windows Firewall on the operator's laptop has no inbound rule for anything,
+# and there is no admin account to add one. Any design where the Pi CONNECTS TO
+# the laptop is dead on arrival — that is exactly what killed the MQTT bridge
+# in the Pi->laptop direction. foxglove_bridge LISTENS here; Foxglove Studio on
+# the laptop makes an OUTBOUND TCP connection, which Windows allows by default
+# and needs no privilege at all. Keep this direction.
+#
+# WHY THIS REPLACED A QoS 0 MQTT BRIDGE
+#
+# Measured: the Pi published LiDAR at 9.52 Hz and the laptop received ONE
+# message in 15 s under WiFi saturation — a ~99% loss, silent, because MQTT
+# QoS 0 has no delivery guarantee and mosquitto's bridge had no backpressure.
+# This is a WebSocket over TCP: it retransmits, it applies backpressure, and
+# when it genuinely cannot keep up the bridge drops messages LOUDLY (see
+# send_buffer_limit below) instead of pretending.
+# ---------------------------------------------------------------------------
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# ---------------------------------------------------------------------------
+# ROS_DOMAIN_ID=20 IS MANDATORY AND IT BELONGS HERE, NOT IN config.env.
+#
+# The ESP32 drive board stores its own domain id of 20 and publishes on that
+# domain and nowhere else. Every existing fpms-*.service sets this in the unit;
+# /etc/fpms/config.env does NOT set it. Every ad-hoc `ros2 topic list` in this
+# project's history that forgot it saw an empty list and was read as a dead
+# link. That single trap has cost this project hours.
+#
+# It is set TWICE on purpose. Environment= covers anything that reads the
+# variable directly, and FPMS_ROS_DOMAIN_ID is re-exported inside ExecStart
+# AFTER the login shell has run, because `bash -lc` sources the user's profile
+# and a stray `export ROS_DOMAIN_ID=0` in ~/.bashrc would otherwise silently
+# win over systemd. EnvironmentFile is listed first so it can never override
+# either.
+# ---------------------------------------------------------------------------
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=HOME=/home/ubuntu
+
+# ---------------------------------------------------------------------------
+# THE PARAMETERS, AND WHY EACH ONE IS NOT THE DEFAULT
+#
+#  port:=8765          the Foxglove WebSocket default. Documented in the README
+#                      and in the laptop launcher. Nothing else on this Pi
+#                      binds it (8000 = old dashboard, 8085 = phase6 Flask,
+#                      1883 = mosquitto, 8089 = teach-in).
+#
+#  address:=0.0.0.0    bind on every interface. The Pi's DHCP address has moved
+#                      7+ times and it lives on the laptop's Mobile Hotspot
+#                      subnet; binding to one address would break on the next
+#                      lease. The laptop always addresses it as
+#                      fpms-pi.local, never an IP.
+#
+#  client_topic_whitelist   *** THE SAFETY INTERLOCK ***
+#                      These are REGEX (the package's own default is ".*"), and
+#                      they restrict what a CONNECTED CLIENT may publish. With
+#                      this list, the WebSocket is PHYSICALLY INCAPABLE of
+#                      publishing /cmd_vel or /cmd_duty. A stray click in
+#                      Foxglove cannot drive the rover, not because a panel is
+#                      careful but because there is no wire. Widen this only
+#                      with a reason you would say out loud.
+#
+#  service_whitelist:=/fpms/.*   only this project's own command services are
+#                      callable. Without it, every node's automatically
+#                      generated /set_parameters, /describe_parameters etc. is
+#                      one click away, and set_parameters on a live mission
+#                      node is not a thing an operator should be able to do by
+#                      accident.
+#
+#  send_buffer_limit   10 MB (the default, stated explicitly so it is a
+#                      decision). When a client falls this far behind, the
+#                      bridge drops that client's queued messages and LOGS it.
+#                      That is the honest behaviour we came here for: visible
+#                      loss beats silent loss.
+#
+#  use_compression:=false   default, and left alone deliberately for a
+#                      pre-competition deploy. If LiDAR still saturates the
+#                      link, this is the FIRST knob to try — set it to true and
+#                      restart; Studio negotiates permessage-deflate and the
+#                      RK3588 has the CPU to spare.
+#
+#  num_threads:=0      = hardware concurrency.
+# ---------------------------------------------------------------------------
+# `;` between the sources, not `&&`: the optional source-built overlay must be
+# allowed to be absent without aborting the chain. exec so SIGTERM lands on the
+# bridge and not on the shell wrapping it.
+# The array parameters are DOUBLE-QUOTED inside the outer single quotes so
+# bash cannot treat `[...]` as a glob character class. systemd strips the outer
+# quotes and hands the rest to bash verbatim; bash strips the inner ones.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; [ -f /home/ubuntu/fox_ws/install/setup.bash ] && source /home/ubuntu/fox_ws/install/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; echo "foxglove_bridge starting on ROS_DOMAIN_ID=$ROS_DOMAIN_ID port 8765"; exec ros2 run foxglove_bridge foxglove_bridge --ros-args -p port:=8765 -p address:=0.0.0.0 -p send_buffer_limit:=10000000 -p use_compression:=false -p num_threads:=0 -p "capabilities:=[clientPublish,services,connectionGraph,assets]" -p "client_topic_whitelist:=[/estop,/fpms/cmd/.*,/clicked_point]" -p "service_whitelist:=[/fpms/.*]" -p "topic_whitelist:=[.*]"'
+
+# ---------------------------------------------------------------------------
+# FALLBACK, IF AND ONLY IF THE BRIDGE REFUSES TO START ON A PARAMETER NAME.
+# ros2 rejects `-p name:=value` for a parameter a node does not declare, so a
+# version skew in foxglove_bridge shows up as a unit that will not start and a
+# journal line naming the parameter. If that happens minutes before a run,
+# comment out the ExecStart above and uncomment this one — it uses only `port`
+# and `address`, which have existed in every release.
+#
+# YOU LOSE THE CLIENT PUBLISH WHITELIST BY DOING THIS. That is the interlock
+# that makes /cmd_vel unreachable from Foxglove. With the fallback in place,
+# the ONLY thing stopping a Publish panel from driving the rover is that no
+# such panel exists in the saved layout. Do not hand the laptop to anyone else
+# while running this way.
+# ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; [ -f /home/ubuntu/fox_ws/install/setup.bash ] && source /home/ubuntu/fox_ws/install/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; exec ros2 run foxglove_bridge foxglove_bridge --ros-args -p port:=8765 -p address:=0.0.0.0'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

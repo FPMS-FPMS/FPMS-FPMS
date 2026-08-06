@@ -1,0 +1,619 @@
+{
+  "configById": {
+    "Publish!stop": {
+      "topicName": "/estop",
+      "datatype": "std_msgs/msg/Bool",
+      "buttonText": "■  S T O P",
+      "buttonTooltip": "PANIC BUTTON. Publishes /estop true. This is a topic publish, not a service call: it cannot be busy, cannot be refused, and needs no reply to have worked. It fans out to the firmware estop latch, the MQTT stop verbs (QoS 1) and fpms-cored's escalation.",
+      "buttonColor": "#c62828",
+      "advancedView": false,
+      "value": "{\n  \"data\": true\n}"
+    },
+    "Publish!clearstop": {
+      "topicName": "/estop",
+      "datatype": "std_msgs/msg/Bool",
+      "buttonText": "clear e-stop latch",
+      "buttonTooltip": "Publishes /estop false. Only firmware v3 latches, so on the current Yahboom stock firmware this does nothing at all. It never un-stops the mission executor: there is deliberately no un-stop MQTT verb.",
+      "buttonColor": "#5c5c5c",
+      "advancedView": false,
+      "value": "{\n  \"data\": false\n}"
+    },
+    "Indicator!armed": {
+      "path": "/fpms/mission/armed.data",
+      "style": "background",
+      "fallbackColor": "#4a4a4a",
+      "fallbackLabel": "ARM STATE UNKNOWN",
+      "rules": [
+        {
+          "rawValue": "true",
+          "operator": "=",
+          "color": "#c62828",
+          "label": "ARMED - IT CAN MOVE"
+        },
+        {
+          "rawValue": "false",
+          "operator": "=",
+          "color": "#2e7d32",
+          "label": "SAFE (disarmed)"
+        }
+      ]
+    },
+    "Indicator!linkok": {
+      "path": "/fpms/mission/link_ok.data",
+      "style": "background",
+      "fallbackColor": "#4a4a4a",
+      "fallbackLabel": "NO MISSION TELEMETRY",
+      "rules": [
+        {
+          "rawValue": "true",
+          "operator": "=",
+          "color": "#2e7d32",
+          "label": "odometry link OK"
+        },
+        {
+          "rawValue": "false",
+          "operator": "=",
+          "color": "#ef6c00",
+          "label": "ODOMETRY LINK DOWN"
+        }
+      ]
+    },
+    "RawMessages!events": {
+      "topicPath": "/fpms/events.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 11
+    },
+    "3D!arena": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 2.2,
+        "phi": 0,
+        "thetaOffset": 0,
+        "target": [0, 0, 0],
+        "targetOffset": [0.6, 0.6, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "fovy": 45,
+        "near": 0.01,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.12
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/scan_lidar": {
+          "visible": true,
+          "pointSize": 5,
+          "colorMode": "flat",
+          "flatColor": "#ff4d4dff"
+        },
+        "/scan": {
+          "visible": false,
+          "pointSize": 3,
+          "colorMode": "flat",
+          "flatColor": "#7a7a7aff"
+        },
+        "/odom": {
+          "visible": true
+        },
+        "/odom_raw": {
+          "visible": false
+        }
+      },
+      "layers": {
+        "arena-grid": {
+          "instanceId": "arena-grid",
+          "layerId": "foxglove.Grid",
+          "label": "arena 1200 x 1200 mm",
+          "visible": true,
+          "frameId": "map",
+          "frameLocked": true,
+          "size": 1.2,
+          "divisions": 12,
+          "lineWidth": 1,
+          "color": "#4a7ab5aa",
+          "position": [0.6, 0.6, 0],
+          "rotation": [0, 0, 0],
+          "order": 1
+        }
+      },
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {}
+    },
+    "Plot!pose": {
+      "paths": [
+        {
+          "value": "/fpms/mission/x_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "x (mm)"
+        },
+        {
+          "value": "/fpms/mission/y_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "y (mm)"
+        },
+        {
+          "value": "/fpms/mission/heading_deg.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "heading (deg)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "StateTransitions!phase": {
+      "paths": [
+        {
+          "value": "/fpms/mission/phase.data",
+          "timestampMethod": "receiveTime",
+          "label": "mission phase"
+        }
+      ],
+      "isSynced": true
+    },
+    "CallService!plan": {
+      "serviceName": "/fpms/plan_m2",
+      "requestPayload": "{}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "1.  PLAN M2   (preview only)",
+      "buttonTooltip": "Sends {\"name\":\"m2\",\"preview\":true}. fpms_missions returns from the preview branch before any of the motion path, so this CANNOT move the rover. The planned route appears on telemetry/mission_plan.",
+      "buttonColor": "#1565c0"
+    },
+    "CallService!arm": {
+      "serviceName": "/fpms/arm",
+      "requestPayload": "{\n  \"data\": true\n}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "2.  ARM   (unlocks RUN for 60 s)",
+      "buttonTooltip": "Sends {\"arm\":true}. The rover has its own arm latch (the real interlock, 120 s, auto-clears on any stop or abort). This ALSO opens the bridge's own 60 s window, which is what makes RUN a deliberate second action.",
+      "buttonColor": "#ef6c00"
+    },
+    "CallService!run": {
+      "serviceName": "/fpms/run_m2",
+      "requestPayload": "{}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "3.  RUN M2   (THE ROVER WILL MOVE)",
+      "buttonTooltip": "REFUSED unless ARM was pressed within the last 60 s, and one ARM buys exactly one RUN. The rover then applies its own refusals on top: arm latch, odometry link, battery, LiDAR freshness and arena bounds. Read the reply.",
+      "buttonColor": "#ad1457"
+    },
+    "CallService!disarm": {
+      "serviceName": "/fpms/arm",
+      "requestPayload": "{\n  \"data\": false\n}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "DISARM",
+      "buttonTooltip": "Sends {\"arm\":false} and clears the bridge's RUN window. Not a stop - it prevents the NEXT mission, it does not halt one already running. Use STOP for that.",
+      "buttonColor": "#2e7d32"
+    },
+    "CallService!resetpose": {
+      "serviceName": "/fpms/reset_pose",
+      "requestPayload": "{}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "RESET POSE  ->  (972, 228) mm",
+      "buttonTooltip": "Sends set_coordinate {\"x_mm\":972,\"y_mm\":228} - the arena start pose from arena_zones.json. This DECLARES where the rover is; it does not move it. Physically place the rover on the start square FIRST.",
+      "buttonColor": "#00838f"
+    },
+    "CallService!encoders": {
+      "serviceName": "/fpms/read_encoders",
+      "requestPayload": "{}",
+      "layout": "vertical",
+      "editingMode": false,
+      "buttonText": "READ ENCODERS",
+      "buttonTooltip": "Sends read_encoders. fpms_teleop answers on events/encoders, which is mirrored into /fpms/events - watch the receipts panel on the right.",
+      "buttonColor": "#455a64"
+    },
+    "RawMessages!missionstate": {
+      "topicPath": "/fpms/mission/state.data",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 11
+    },
+    "Plot!residual": {
+      "paths": [
+        {
+          "value": "/fpms/residual/drive_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "leg residual (mm)"
+        },
+        {
+          "value": "/fpms/residual/cumulative_drive_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "cumulative drive residual (mm)"
+        },
+        {
+          "value": "/fpms/residual/lateral_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "lateral (mm)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "Plot!residualturn": {
+      "paths": [
+        {
+          "value": "/fpms/residual/turn_deg.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "leg residual (deg)"
+        },
+        {
+          "value": "/fpms/residual/cumulative_turn_deg.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "cumulative turn residual (deg)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "Plot!progress": {
+      "paths": [
+        {
+          "value": "/fpms/mission/distance_remaining_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "remaining (mm)"
+        },
+        {
+          "value": "/fpms/mission/distance_travelled_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "travelled (mm)"
+        },
+        {
+          "value": "/fpms/mission/front_mm.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "front clearance (mm)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "DiagnosticSummary!health": {
+      "minLevel": 0,
+      "pinnedIds": [],
+      "topicToRender": "/diagnostics",
+      "hardwareIdFilter": "",
+      "sortByLevel": true
+    },
+    "Plot!freshness": {
+      "paths": [
+        {
+          "value": "/scan_lidar.header.stamp.sec",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "/scan_lidar stamp"
+        },
+        {
+          "value": "/odom_raw.header.stamp.sec",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "/odom_raw stamp"
+        },
+        {
+          "value": "/imu.header.stamp.sec",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "/imu stamp"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 260
+    },
+    "Gauge!battery": {
+      "path": "/fpms/mission/batt_v.data",
+      "minValue": 9.5,
+      "maxValue": 12.6,
+      "colorMode": "colormap",
+      "colorMap": "red-yellow-green",
+      "gradient": ["#0000ff", "#ff00ff"],
+      "reverse": false
+    },
+    "SourceInfo!conn": {},
+    "Log!rosout": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "topicToRender": "/rosout"
+    },
+    "Plot!imu": {
+      "paths": [
+        {
+          "value": "/imu.angular_velocity.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "gyro z (rad/s)"
+        },
+        {
+          "value": "/imu.linear_acceleration.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "accel x (m/s2)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "Plot!ticks": {
+      "paths": [
+        {
+          "value": "/wheel_ticks.data[0]",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "front-left"
+        },
+        {
+          "value": "/wheel_ticks.data[1]",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "front-right"
+        },
+        {
+          "value": "/wheel_ticks.data[2]",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "rear-left"
+        },
+        {
+          "value": "/wheel_ticks.data[3]",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "rear-right"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 240
+    },
+    "Plot!odomraw": {
+      "paths": [
+        {
+          "value": "/odom_raw.pose.pose.position.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "pose.x (TRUST THIS)"
+        },
+        {
+          "value": "/odom_raw.pose.pose.position.y",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "pose.y (TRUST THIS)"
+        },
+        {
+          "value": "/odom_raw.twist.twist.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "twist.x (SIGN IS INVERTED - DO NOT TRUST)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "top",
+      "showPlotValuesInLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "sidebarDimension": 300
+    },
+    "RawMessages!battery": {
+      "topicPath": "/battery",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "fontSize": 12
+    },
+    "Tab!main": {
+      "activeTabIdx": 0,
+      "tabs": [
+        {
+          "title": "ARENA",
+          "layout": {
+            "direction": "column",
+            "first": "3D!arena",
+            "second": {
+              "direction": "row",
+              "first": "Plot!pose",
+              "second": "StateTransitions!phase",
+              "splitPercentage": 58
+            },
+            "splitPercentage": 64
+          }
+        },
+        {
+          "title": "MISSION",
+          "layout": {
+            "direction": "row",
+            "first": {
+              "direction": "column",
+              "first": "CallService!plan",
+              "second": {
+                "direction": "column",
+                "first": "CallService!arm",
+                "second": {
+                  "direction": "column",
+                  "first": "CallService!run",
+                  "second": {
+                    "direction": "column",
+                    "first": "CallService!disarm",
+                    "second": {
+                      "direction": "column",
+                      "first": "CallService!resetpose",
+                      "second": "CallService!encoders",
+                      "splitPercentage": 50
+                    },
+                    "splitPercentage": 33
+                  },
+                  "splitPercentage": 25
+                },
+                "splitPercentage": 20
+              },
+              "splitPercentage": 17
+            },
+            "second": {
+              "direction": "column",
+              "first": "RawMessages!missionstate",
+              "second": {
+                "direction": "column",
+                "first": "Plot!progress",
+                "second": {
+                  "direction": "row",
+                  "first": "Plot!residual",
+                  "second": "Plot!residualturn",
+                  "splitPercentage": 55
+                },
+                "splitPercentage": 45
+              },
+              "splitPercentage": 34
+            },
+            "splitPercentage": 30
+          }
+        },
+        {
+          "title": "HEALTH",
+          "layout": {
+            "direction": "row",
+            "first": {
+              "direction": "column",
+              "first": "DiagnosticSummary!health",
+              "second": "Gauge!battery",
+              "splitPercentage": 68
+            },
+            "second": {
+              "direction": "column",
+              "first": "Plot!freshness",
+              "second": {
+                "direction": "column",
+                "first": "SourceInfo!conn",
+                "second": "Log!rosout",
+                "splitPercentage": 45
+              },
+              "splitPercentage": 45
+            },
+            "splitPercentage": 40
+          }
+        },
+        {
+          "title": "SENSORS",
+          "layout": {
+            "direction": "row",
+            "first": {
+              "direction": "column",
+              "first": "Plot!odomraw",
+              "second": "Plot!imu",
+              "splitPercentage": 55
+            },
+            "second": {
+              "direction": "column",
+              "first": "Plot!ticks",
+              "second": "RawMessages!battery",
+              "splitPercentage": 60
+            },
+            "splitPercentage": 55
+          }
+        }
+      ]
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "row",
+    "first": "Tab!main",
+    "second": {
+      "direction": "column",
+      "first": "Publish!stop",
+      "second": {
+        "direction": "column",
+        "first": "Publish!clearstop",
+        "second": {
+          "direction": "column",
+          "first": "Indicator!armed",
+          "second": {
+            "direction": "column",
+            "first": "Indicator!linkok",
+            "second": "RawMessages!events",
+            "splitPercentage": 22
+          },
+          "splitPercentage": 22
+        },
+        "splitPercentage": 16
+      },
+      "splitPercentage": 30
+    },
+    "splitPercentage": 76
+  }
+}

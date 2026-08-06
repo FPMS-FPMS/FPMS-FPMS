@@ -1,0 +1,65 @@
+[Unit]
+Description=FPMS Foxglove command bridge (ROS topics/services <-> the existing MQTT command verbs)
+Documentation=file:/home/ubuntu/fpms_foxglove_cmd.py
+# ---------------------------------------------------------------------------
+# This is the node that lets Foxglove's buttons reach a rover whose command
+# surface is MQTT. It publishes MQTT command verbs and NOTHING else — it has
+# zero publishers on /cmd_vel, /cmd_duty, /cmd_enable or /estop, and it aborts
+# at startup if one is ever added.
+#
+# mosquitto is a real dependency here, unlike for fpms-foxglove-bridge: this
+# node's entire output is MQTT publishes to the LOCAL broker. On a cold boot
+# the broker takes a moment to bind :1883, and paho would sit in its own retry
+# loop meanwhile — which is survivable but looks like dead buttons for ~30 s.
+#
+# After=fpms-cored so the STOP AUTHORITY IS LISTENING BEFORE THE THING THAT
+# CAN SEND STOPS EXISTS. Same reasoning as fpms-cored's own
+# `Before=fpms-missions`, and Wants= rather than Requires= for the same reason:
+# if cored is down this node must still start, because fpms_missions and
+# fpms_teleop also act on the stop verbs and a rover you cannot command at all
+# is not safer than one you can stop.
+# ---------------------------------------------------------------------------
+After=network-online.target mosquitto.service fpms-cored.service
+Wants=network-online.target mosquitto.service fpms-cored.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# MANDATORY, and it belongs in the unit — see the long note in
+# fpms-foxglove-bridge.service. The board publishes on domain 20 and nowhere
+# else; /etc/fpms/config.env does not set this and never has.
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# How long a Foxglove ARM unlocks the Foxglove RUN button for. This is the
+# bridge's own interlock and is SEPARATE from fpms_missions' arm latch, which
+# is the real one and is longer (120 s).
+Environment=FPMS_FOXGLOVE_ARM_WINDOW_S=60
+
+# The arena start pose that the Reset Pose button declares — (972, 228) mm,
+# from arena_zones.json and the map->odom anchor in fpms-tf.service. Changing
+# it here changes only what the button sends.
+Environment=FPMS_RESET_X_MM=972
+Environment=FPMS_RESET_Y_MM=228
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; exec python3 /home/ubuntu/fpms_foxglove_cmd.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+# Short, like fpms-cored's. Every second this is down is a second the operator
+# has a STOP button in front of them that does nothing.
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
