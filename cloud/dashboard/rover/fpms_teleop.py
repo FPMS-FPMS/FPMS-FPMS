@@ -1089,7 +1089,15 @@ class TeleopNode(Node):
         # lists publishers, the topic looks alive, and battery_v just stays None
         # forever. It presented as "the dashboard shows no battery" both times.
         # _on_battery accepts either message shape, so only this line matters.
-        self.create_subscription(UInt16, "/battery", self._on_battery, qos)
+        #
+        # 2026-08-06: flipped to BatteryState again, and this time it is not a
+        # guess. Firmware v3 publishes it — `fpms_main.cpp:835` inits the
+        # publisher as sensor_msgs/BatteryState with .voltage in VOLTS — and
+        # `ros2 topic info /battery -v` on the rover shows the single PUBLISHER
+        # as BatteryState with fpms_teleop and fpms_missions both subscribing as
+        # BatteryState. The "going back to factory firmware flips it back" note
+        # above no longer applies: the board does not run factory firmware.
+        self.create_subscription(BatteryState, "/battery", self._on_battery, qos)
         # /scan is deliberately NOT subscribed: every range on this board reads
         # 0.0, so a subscription would only produce a plausible-looking stream of
         # "obstacle at 0m" that some future guard would act on.

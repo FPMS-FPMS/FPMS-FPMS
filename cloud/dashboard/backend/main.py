@@ -39,6 +39,7 @@ from . import analyst, aws, auth, cloud_forwarder, discovery, downloads, email_a
 from .config import settings
 from .hub import hub
 from .mqtt_bridge import get_bridge, start_bridge
+from . import ros_bridge
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,11 +52,24 @@ log = logging.getLogger("fpms.dashboard")
 async def lifespan(_app: FastAPI):
     loop = asyncio.get_running_loop()
     start_bridge(loop)
+    # Additive and OFF by default (FPMS_ROS_ENABLED=1 turns it on). Guarded
+    # because a failure to reach the Pi's rosbridge must never stop the
+    # dashboard from booting — the MQTT path is unaffected either way.
+    try:
+        ros_bridge.start_bridge(loop)
+    except Exception:  # noqa: BLE001
+        log.exception("ROS bridge failed to start; continuing on MQTT only")
     log.info("MQTT bridge started; dashboard ready on %s:%s", settings.bind_host, settings.bind_port)
     yield
     bridge = get_bridge()
     if bridge:
         bridge.stop()
+    try:
+        rb = ros_bridge.get_bridge()
+        if rb:
+            rb.stop()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(title="FPMS Dashboard", version="1.0.0", lifespan=lifespan)
@@ -133,10 +147,25 @@ def health() -> dict[str, Any]:
     # "ok" used to be a hardcoded True, which made it useless: the dashboard
     # reported ok:true while the broker was refusing every connection and no
     # rover data could possibly arrive.
+    # The ROS path reports alongside MQTT rather than replacing it in this
+    # field, so `/api/health` answers "which source is drawing which panel" in
+    # one request — the question that took a source read to answer while two
+    # bridges were being run side by side.
+    _rb = ros_bridge.get_bridge()
+    ros = _rb.status() if _rb else {
+        "enabled": ros_bridge.ROS_ENABLED,
+        "connected": False,
+        "problem": None if not ros_bridge.ROS_ENABLED else
+                   "ROS bridge is enabled but never started — check launch.log.",
+    }
+    # `ok` stays keyed on MQTT alone: the ROS bridge is additive and off by
+    # default, so letting it flip the top-level health bit would change what a
+    # green dashboard means for every existing install.
     return {
         "ok": bool(mqtt.get("connected")),
-        "problems": [p for p in (mqtt.get("problem"),) if p],
+        "problems": [p for p in (mqtt.get("problem"), ros.get("problem")) if p],
         "mqtt": mqtt,
+        "ros": ros,
         "frontend": _frontend_status(),
         "channels": hub.channels(),
         "aws": {

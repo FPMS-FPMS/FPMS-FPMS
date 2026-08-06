@@ -31,6 +31,31 @@ from .thermal_analysis import analyzer
 
 log = logging.getLogger("fpms.mqtt")
 
+
+# ---- ROS bridge interop ---------------------------------------------------
+# Both helpers are deliberately total: they swallow everything, including an
+# ImportError, so that a fault in the newer ROS path can never take down the
+# MQTT feed that every panel still depends on. An empty claim set means "MQTT
+# owns everything", which is exactly the behaviour before the ROS bridge
+# existed — so the failure mode of this integration is the old behaviour, not a
+# dark dashboard.
+def _ros_claimed_channels() -> set[str]:
+    try:
+        from . import ros_bridge
+        return ros_bridge.claimed_channels()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _ros_note_suppressed(channel: str, payload: dict[str, Any]) -> None:
+    try:
+        from . import ros_bridge
+        b = ros_bridge.get_bridge()
+        if b is not None:
+            b.note_suppressed(channel, payload)
+    except Exception:  # noqa: BLE001
+        pass
+
 TOPIC_FILTERS = [
     ("fpms/+/telemetry/lidar", 0),
     ("fpms/+/telemetry/camera", 0),
@@ -584,7 +609,22 @@ class Bridge:
     def _dispatch_telemetry(self, thing: str, subtype: str, payload: dict[str, Any]) -> None:
         channel = f"{subtype}:{thing}"
         envelope = {"thing": thing, "subtype": subtype, "ts": self.last_message_at, "data": payload}
-        self._broadcast(channel, envelope)
+        # A channel has exactly one owner. While the ROS bridge is genuinely
+        # publishing this channel it owns it, and broadcasting the MQTT copy too
+        # would make the panel alternate between two sources — for `pose:` that
+        # is a glyph flipping between MEASURED and ASSUMED every heartbeat,
+        # which reads as a rendering bug. The claim is live-gated on the ROS
+        # side, so if that link goes quiet this path resumes on its own.
+        #
+        # The payload is handed over rather than dropped: it is the only source
+        # of the agent heartbeat fields, and taking a panel over must not cost
+        # it data. The cloud uplink below is deliberately left running either
+        # way — it archives telemetry and has nothing to do with which source
+        # draws the panel.
+        if channel in _ros_claimed_channels():
+            _ros_note_suppressed(channel, payload)
+        else:
+            self._broadcast(channel, envelope)
         # Throttled copy to the cloud app. The local dashboard always sees the
         # full rate; only the uplink is rate-limited.
         #
