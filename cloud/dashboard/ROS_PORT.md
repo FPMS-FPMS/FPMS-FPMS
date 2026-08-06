@@ -185,11 +185,28 @@ restart fpms-rosbridge` fixed it instantly (0 → 280 msgs in 18 s).
 While wedged, the operator console on :8090 has no live data either, since every
 value it renders comes through this service.
 
-Root cause is **not established**. The obvious theory — that the mass service
-restart in `deploy_stack.sh` orphaned rosbridge's DDS readers, since
-`fpms-rosbridge`, `fpms-console` and the two foxglove units are absent from that
-script's `UNITS` list — was tested and **disproved**: restarting `fpms-odom-tf`
-mid-stream caused only a brief dip and full recovery.
+**ROOT CAUSE (established on the second occurrence, reproduced three times):**
+
+> **rosbridge only delivers topics whose PUBLISHER already existed when
+> rosbridge started.** A publisher created afterwards is never discovered, and
+> the client subscription asking for it is accepted and then silent forever.
+
+Evidence, after a Pi reboot: `fpms-rosbridge` started 22:26:33 and
+`fpms-odom-tf` 22:45:45 — 19 minutes later — and `/odom` delivered 0 messages
+while publishing healthily at 6.6 Hz. Restarting rosbridge gave 53 msgs in 8 s
+immediately. Two fresh publishers started *after* that restart were invisible;
+the same two started *before* a restart arrived at once.
+
+An earlier note here said the deploy theory was "disproved" because restarting
+`fpms-odom-tf` under a live subscription recovers fine. That is a different
+case and does not contradict the rule: an **already-matched** reader re-matches,
+a reader **created later** never matches at all.
+
+**Fix, now in `deploy_stack.sh`:** the four ROS consumers (`fpms-rosbridge`,
+both foxglove units, `fpms-console`) are restarted in a block *after* every
+publisher. They stay out of `UNITS` deliberately — that is the boot/enable set,
+and putting them there would restart them mid-sequence, which is the exact
+ordering this exists to avoid.
 
 What to remember is the symptom, because it is the worst kind: **connected,
 subscribed, silent — no error anywhere.** If the console or this bridge shows a

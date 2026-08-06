@@ -64,7 +64,20 @@ stop and fix it rather than driving.
 `ROS_DOMAIN_ID=20 python3 ~/fpms_drive.py straight 800`. It has still never been
 executed. Judge the result by tape measure and by eye, never by odometry.
 
-## 3. Fix the deploy properly — the Pi is running an OLD `fpms_cored.py`
+## 3. ~~Fix the deploy~~ — DONE 2026-08-06, keep the background
+
+**Done:** the guarded 1027-line `fpms_cored.py` is installed on the Pi and in
+`~/deploy_v3`, verified (`grep -c "NEVER FEED ITSELF"` = 1) and tested — one
+STOP now produces exactly **one** receipt and one `STOP asserted`, no storm.
+Backup of the old copy is at `~/fpms_cored.py.bak_before_guarded_*`.
+
+`deploy_stack.sh` also now restarts the four ROS consumers LAST (see §4) and
+that fix is on the Pi too. **Still NOT synced: `fpms_missions.py`** — the repo
+copy is 6315 lines and the Pi's live one is 6287, and the direction of that
+28-line divergence was never established. Diff them before deciding; the live
+planner has gate-verified work in it and must not be clobbered.
+
+Original context, kept because it explains why this mattered:
 
 This is the highest-value software task and it is not what it looks like.
 
@@ -106,10 +119,13 @@ decision, the channel table and the reason for each remaining choice.
 **Increment 2 landed 2026-08-06** (same session, after the Pi was shut down):
 `mission:` ← `/fpms/mission/state` and `mission_plan:` ← `/fpms/plan/route`.
 Both are **exact passthroughs** — those topics carry the whole original MQTT
-payload as JSON, so no field-by-field reassembly is needed. Offline 24/24.
-**Live verification is outstanding** — run `verify_ros_bridge.py --live` plus a
-real `m2` preview once the rover is powered up, since `pose:` is the only
-channel proven against hardware so far.
+payload as JSON, so no field-by-field reassembly is needed.
+
+**Verified 25/25, offline AND live** (the rover was powered back up the same
+evening). `mission:rover2` arrived carrying `{armed, leg_i, phase, x_mm}` and
+`mission_plan:rover2` carrying `{legs, total_mm}`, both end to end through
+rosbridge. All three ROS channels — `pose:`, `mission:`, `mission_plan:` — are
+now proven against real hardware.
 
 **Correction to an earlier version of this plan: do NOT port `events` next.**
 It looks cheapest and is a trap. `fpms_foxglove_cmd.py:279` mirrors

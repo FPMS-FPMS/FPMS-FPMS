@@ -244,6 +244,38 @@ if [ "$RESTART" = 1 ]; then
     say "restarted: $u"
     sleep 1
   done
+
+  # --- and these MUST go last. Measured 2026-08-06, reproduced three times ----
+  #
+  # rosbridge only ever delivers topics whose PUBLISHER ALREADY EXISTED WHEN
+  # ROSBRIDGE STARTED. A publisher created after it is never discovered, and the
+  # client subscription asking for it is accepted and then stays silent forever
+  # — no error, no refusal, "Subscribed to /odom" in its log and nothing on the
+  # socket. The loop above restarts every publisher on the rover, so without
+  # this block a deploy leaves rosbridge stale and the operator console on :8090
+  # (and the dashboard's ROS path) silently dead with a healthy-looking link.
+  #
+  # Evidence: after a reboot, rosbridge started 19 min before fpms-odom-tf and
+  # delivered 0 of a healthy 6.6 Hz /odom; restarting it gave 53 msgs in 8 s.
+  # Publishers started after that restart were invisible; the same publishers
+  # started BEFORE a restart arrived immediately.
+  #
+  # These are consumers only — they cannot move the rover — so restarting them
+  # is cheap and safe. They are deliberately NOT in UNITS: that list is the
+  # boot/enable set, and inserting them there would restart them mid-sequence,
+  # which is the very ordering this exists to avoid.
+  head_ "restart ROS consumers LAST (see comment: rosbridge discovery ordering)"
+  for u in fpms-rosbridge.service fpms-foxglove-bridge.service \
+           fpms-foxglove-cmd.service fpms-console.service; do
+    if systemctl list-unit-files "$u" >/dev/null 2>&1 && \
+       [ -f "$UNIT_DIR/$u" ]; then
+      run "systemctl restart '$u' || true"
+      say "restarted (last): $u"
+      sleep 1
+    else
+      say "absent, skipped: $u"
+    fi
+  done
 else
   head_ "restart skipped (--no-restart)"
 fi
