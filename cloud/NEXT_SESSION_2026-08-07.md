@@ -103,16 +103,27 @@ Increment 1 is landed, verified 18/18, and **off by default**. Read
 `cloud/dashboard/ROS_PORT.md` before touching it — it has the architecture
 decision, the channel table and the reason for each remaining choice.
 
-Do them in this order, cheapest first:
+**Increment 2 landed 2026-08-06** (same session, after the Pi was shut down):
+`mission:` ← `/fpms/mission/state` and `mission_plan:` ← `/fpms/plan/route`.
+Both are **exact passthroughs** — those topics carry the whole original MQTT
+payload as JSON, so no field-by-field reassembly is needed. Offline 24/24.
+**Live verification is outstanding** — run `verify_ros_bridge.py --live` plus a
+real `m2` preview once the rover is powered up, since `pose:` is the only
+channel proven against hardware so far.
 
-1. **`events`** ← `/fpms/events` (`std_msgs/String` of JSON). Nearly direct;
-   held back only so increment 1 changed one behaviour, not two.
-2. **`mission:`** ← `/fpms/mission/{state,phase,leg_i,segment_i,distance_*}`.
-   Same collect-then-emit pattern as pose.
-3. **`drive:`** ← `/fpms_health` + `/battery`. Partial port only — the panel also
+**Correction to an earlier version of this plan: do NOT port `events` next.**
+It looks cheapest and is a trap. `fpms_foxglove_cmd.py:279` mirrors
+`fpms/<thing>/events/+` — a single level, per-thing — whereas the dashboard
+subscribes `fpms/+/events/#`, any depth, fleet-wide. Claiming that channel would
+silently drop nested event subtopics *and* all of rover1's events. It needs the
+rover-side mirror widened to `events/#` and made per-thing first.
+
+Remaining, cheapest first:
+
+1. **`drive:`** ← `/fpms_health` + `/battery`. Partial port only — the panel also
    reads teleop-only fields (measured topic rates, micro-ROS link state) that do
    not exist on the ROS graph.
-4. **`lidar:`** ← `/scan_lidar`. Needs care: `LaserScan` carries none of the
+2. **`lidar:`** ← `/scan_lidar`. Needs care: `LaserScan` carries none of the
    health/staleness fields the panel consumes, and a careless mapping would
    replace a feed that is currently honest about going stale with one that is
    not.

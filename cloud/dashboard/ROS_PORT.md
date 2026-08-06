@@ -127,13 +127,53 @@ archives telemetry and has nothing to do with which source draws a panel.
 
 | Channel | ROS source | State |
 |---|---|---|
-| `pose:` | `/fpms/mission/{x_mm,y_mm,heading_deg}` | **DONE** |
-| `events` | `/fpms/events` (`std_msgs/String` of JSON) | Nearly direct. Held back only so increment 1 changed one behaviour, not two. Do this next — it is the cheapest. |
+| `pose:` | `/fpms/mission/{x_mm,y_mm,heading_deg}` | **DONE** (increment 1) |
+| `mission:` | `/fpms/mission/state` | **DONE** (increment 2) — exact passthrough, see below |
+| `mission_plan:` | `/fpms/plan/route` | **DONE** (increment 2) — exact passthrough, latched |
+| `events` | `/fpms/events` | **DO NOT PORT YET.** Needs a rover change first — see below. |
 | `drive:` | `/fpms_health` + `/battery` | `/fpms_health` is an `Int32MultiArray` whose meaning is the 12-field table in `fpms_main.cpp` (keep them in sync). Note the panel also reads teleop-only fields — measured topic rates, micro-ROS link state — that are **not on the ROS graph at all**, so this is a partial port, not a swap. |
 | `lidar:` | `/scan_lidar` (`LaserScan`) | Needs care. The panel consumes the agent's shape (`ranges_m`, `health`, `hz`, `scan_age_s`, `seq`); `LaserScan` carries none of the health/staleness fields, which the agent derives from scanner timing. Doing this badly replaces a feed that is currently **honest about going stale** with one that is not. Its own increment. |
 | `mission:` | `/fpms/mission/{state,phase,leg_i,segment_i,distance_*}` | Straightforward; several topics to assemble into one envelope, same collect-then-emit pattern as pose. |
 | `mission_plan:` | `/fpms/plan/route` | Already mirrored into ROS by `fpms_console.PlanMirror`. |
 | `camera:` / `thermal:` | — | **NOT PORTABLE.** No ROS publisher exists; the agent sends frames straight to MQTT. These need new rover-side publishers — a rover change, not a dashboard one. Do not plan the port as if all 11 tabs can move. |
+
+### Increment 2 (2026-08-06): `mission:` and `mission_plan:`
+
+Both turned out to be **exact passthroughs**, not reconstructions — worth knowing
+before anyone assembles them field by field from the Float32 topics:
+
+- `fpms_foxglove_cmd._mirror_mission` publishes `self._s(self.p_state, p)` — the
+  **entire** MQTT `telemetry/mission` dict, as JSON, on `/fpms/mission/state`.
+  The Float32 topics beside it are extras for Foxglove plots, not the source.
+- `fpms_console.PlanMirror` forwards `telemetry/mission_plan` verbatim onto
+  `/fpms/plan/route`, **latched**, so a subscriber gets the current route
+  immediately on connect instead of waiting for the next preview.
+
+Both emit with the suppressed-MQTT merge **off** (`merge_suppressed=False`). The
+merge exists for `pose:`, whose ROS payload is partial and needs the heartbeat's
+fields underneath. On a whole-payload channel it would let a key from an older
+MQTT message survive into a newer ROS one that legitimately dropped it.
+
+Offline verification: 24/24. **Live verification is still outstanding** — the
+rover was powered off when this landed, so `mission:`/`mission_plan:` have not
+yet been seen end to end against real hardware the way `pose:` was. Run
+`verify_ros_bridge.py --live` and a real `m2` preview when the Pi is back.
+
+### Why `events` is NOT ported — it is not the cheap one
+
+It looks like the cheapest port. It is a trap: the ROS mirror is **narrower than
+the MQTT feed in two independent ways**.
+
+1. `fpms_foxglove_cmd.py:279` subscribes `fpms/<thing>/events/+` — a **single**
+   level. The dashboard subscribes `fpms/+/events/#` — **any** depth. Every
+   nested event subtopic exists on MQTT and never reaches ROS.
+2. That mirror is **per-THING**, but `events` is the one **fleet-wide** channel
+   in the dashboard (`mqtt_bridge` fans `fpms/+/events/#` into a single
+   `events`). Claim it for rover2 and rover1's events vanish from the log.
+
+An events log that quietly omits entries is worse than one on the older
+transport. Porting it needs the rover-side mirror widened to `events/#` and made
+per-thing first — a rover change, not a dashboard one.
 
 ## Operational note found while building this — rosbridge can wedge silently
 

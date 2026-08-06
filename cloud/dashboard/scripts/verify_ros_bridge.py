@@ -72,9 +72,14 @@ def offline_checks() -> None:
     rb.asyncio.run_coroutine_threadsafe = fake_run_coroutine_threadsafe
 
     class CapturingBridge(rb.RosBridge):
-        def _emit(self, subtype, data):  # type: ignore[override]
+        # Signature must track RosBridge._emit exactly. It did not once, and the
+        # resulting TypeError was swallowed by _on_raw's catch-all, so three
+        # checks failed as "emitted nothing" with no error shown — which looks
+        # exactly like a broken mapping. Keep them in step.
+        def _emit(self, subtype, data, merge_suppressed=True):  # type: ignore[override]
             channel = f"{subtype}:{rb.ROS_THING}"
-            merged = {**self._suppressed.get(channel, {}), **data}
+            merged = ({**self._suppressed.get(channel, {}), **data}
+                      if merge_suppressed else dict(data))
             with self._claims_lock:
                 self._claims[channel] = time.monotonic()
             captured.append((channel, merged))
@@ -161,6 +166,69 @@ def offline_checks() -> None:
     b._on_raw(frame("/fpms/mission/y_mm", 1.0))
     check("an infinite x is rejected, not drawn", captured == [],
           f"emitted {len(captured)}")
+
+    # ---- increment 2: whole-payload JSON String channels -----------------
+    print("\n== offline: mission / mission_plan passthrough ==")
+
+    def sframe(topic: str, payload) -> str:
+        return json.dumps({"op": "publish", "topic": topic,
+                           "msg": {"data": json.dumps(payload)}})
+
+    captured.clear()
+    b._on_raw(sframe("/fpms/mission/state",
+                     {"phase": "drive", "leg_i": 2, "distance_remaining_mm": 431.0,
+                      "armed": True, "x_mm": 972.0}))
+    check("mission:rover2 emitted from /fpms/mission/state",
+          len(captured) == 1 and captured[-1][0] == "mission:rover2",
+          captured[-1][0] if captured else "nothing")
+    if captured:
+        d = captured[-1][1]
+        check("the WHOLE mission payload passes through untouched",
+              d.get("phase") == "drive" and d.get("leg_i") == 2
+              and d.get("distance_remaining_mm") == 431.0 and d.get("armed") is True,
+              repr({k: d.get(k) for k in ("phase", "leg_i", "armed")}))
+
+    captured.clear()
+    b._on_raw(sframe("/fpms/plan/route", {"legs": [{"name": "m2"}], "total_mm": 744.0}))
+    check("mission_plan:rover2 emitted from /fpms/plan/route",
+          len(captured) == 1 and captured[-1][0] == "mission_plan:rover2",
+          captured[-1][0] if captured else "nothing")
+    if captured:
+        check("plan payload passes through (total_mm 744)",
+              captured[-1][1].get("total_mm") == 744.0,
+              repr(captured[-1][1].get("total_mm")))
+
+    # A whole-payload channel must NOT merge a displaced MQTT message, or a key
+    # the newer ROS payload legitimately dropped would come back from the dead.
+    captured.clear()
+    b.note_suppressed("mission:rover2", {"phase": "STALE", "ghost_key": 1})
+    b._on_raw(sframe("/fpms/mission/state", {"phase": "idle"}))
+    if captured:
+        d = captured[-1][1]
+        check("no suppressed-merge on a whole-payload channel (no ghost keys)",
+              d.get("phase") == "idle" and "ghost_key" not in d, repr(d))
+    else:
+        check("no suppressed-merge on a whole-payload channel (no ghost keys)",
+              False, "no emit")
+
+    # Malformed JSON strings must be dropped, not raise and not emit.
+    captured.clear()
+    for bad in [json.dumps({"op": "publish", "topic": "/fpms/mission/state",
+                            "msg": {"data": "{not json"}}),
+                json.dumps({"op": "publish", "topic": "/fpms/mission/state",
+                            "msg": {"data": "[1,2,3]"}}),      # JSON, but not a dict
+                json.dumps({"op": "publish", "topic": "/fpms/mission/state",
+                            "msg": {"data": ""}}),
+                json.dumps({"op": "publish", "topic": "/fpms/mission/state",
+                            "msg": {}})]:
+        b._on_raw(bad)
+    check("4 malformed String payloads emitted nothing and did not raise",
+          captured == [], f"emitted {len(captured)}")
+
+    # events must stay on MQTT — the ROS mirror is narrower (events/+ and
+    # per-thing) and claiming it would drop nested subtopics and rover1.
+    check("events is NOT subscribed (must stay on MQTT)",
+          not any(t == "/fpms/events" for t, _, _ in b._topics))
 
     rb.asyncio.run_coroutine_threadsafe = real
 

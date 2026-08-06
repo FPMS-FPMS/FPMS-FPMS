@@ -222,9 +222,21 @@ class RosBridge:
         #                   the panel also reads teleop-only fields (measured
         #                   topic rates, micro-ROS link state) that are not on
         #                   the ROS graph at all.
-        #   events          /fpms/events is a String of JSON and maps almost
-        #                   directly; held back only so this increment lands
-        #                   with one behaviour change, not two.
+        #   events          DELIBERATELY NOT PORTED, and not for effort. The
+        #                   ROS mirror is NARROWER than the MQTT feed in two
+        #                   ways, and claiming the channel would silently lose
+        #                   the difference:
+        #                     * `fpms_foxglove_cmd.py:279` subscribes
+        #                       `fpms/<thing>/events/+` — ONE level. The
+        #                       dashboard subscribes `fpms/+/events/#` — any
+        #                       depth. Any nested event subtopic exists on MQTT
+        #                       and never reaches ROS.
+        #                     * That mirror is per-THING, but `events` is the
+        #                       one FLEET-WIDE channel in the dashboard. Claim
+        #                       it for rover2 and rover1's events vanish.
+        #                   Porting this needs the rover-side mirror widened to
+        #                   `events/#` first, and a per-thing events topic — a
+        #                   rover change. Until then MQTT must keep this one.
         #   camera:/thermal: NOT AVAILABLE ON ROS AT ALL. The agent publishes
         #                   frames straight to MQTT and there is no ROS
         #                   publisher for either. These two tabs cannot be
@@ -237,6 +249,15 @@ class RosBridge:
              lambda m: self._on_pose_part("y_mm", m)),
             ("/fpms/mission/heading_deg", "std_msgs/msg/Float32",
              lambda m: self._on_pose_part("heading_deg", m)),
+            # Increment 2. Both are whole-payload JSON strings, so they are
+            # exact passthroughs rather than reconstructions, and both are
+            # PER-THING on the rover side — which is what makes them safe to
+            # claim. See the `events` note above for the channel where that is
+            # NOT true.
+            ("/fpms/mission/state", "std_msgs/msg/String",
+             lambda m: self._on_json_string("mission", m)),
+            ("/fpms/plan/route", "std_msgs/msg/String",
+             lambda m: self._on_json_string("mission_plan", m)),
         ]
 
     # ---- lifecycle -------------------------------------------------------
@@ -412,13 +433,40 @@ class RosBridge:
         except Exception:  # noqa: BLE001
             pass
 
-    def _emit(self, subtype: str, data: dict[str, Any]) -> None:
+    def _on_json_string(self, subtype: str, msg: dict[str, Any]) -> None:
+        """A `std_msgs/String` whose `data` is a whole JSON payload.
+
+        `/fpms/mission/state` and `/fpms/plan/route` each carry the ENTIRE
+        original MQTT payload, not a field of it — `fpms_foxglove_cmd._mirror_
+        mission` publishes `self._s(self.p_state, p)` with the whole dict, and
+        `fpms_console.PlanMirror` forwards `telemetry/mission_plan` verbatim.
+        So these are exact passthroughs and need no reassembly from the
+        individual Float32 topics next to them.
+
+        Emitted WITHOUT the suppressed-MQTT merge: these payloads are complete
+        in themselves, and merging would let a key from an older MQTT message
+        survive into a newer ROS one that legitimately dropped it.
+        """
+        raw = msg.get("data")
+        if not isinstance(raw, str) or not raw:
+            return
+        try:
+            payload = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(payload, dict):
+            self._emit(subtype, payload, merge_suppressed=False)
+
+    def _emit(self, subtype: str, data: dict[str, Any],
+              merge_suppressed: bool = True) -> None:
         """Broadcast one envelope, in exactly mqtt_bridge's shape."""
         channel = f"{subtype}:{ROS_THING}"
         # ROS values win; the displaced MQTT heartbeat fills in everything it
         # was carrying that ROS has no equivalent for. Ordering matters — a
-        # heartbeat must never overwrite a real coordinate.
-        merged = {**self._suppressed.get(channel, {}), **data}
+        # heartbeat must never overwrite a real coordinate. Only channels whose
+        # ROS payload is PARTIAL want this — see _on_json_string.
+        merged = ({**self._suppressed.get(channel, {}), **data}
+                  if merge_suppressed else dict(data))
         envelope = {"thing": ROS_THING, "subtype": subtype,
                     "ts": self.last_message_at or time.time(), "data": merged}
         with self._claims_lock:
