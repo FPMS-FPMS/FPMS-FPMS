@@ -312,6 +312,9 @@ class LidarBridge(Node):
         self._published = 0
         self._dropped = 0
         self._warned_bins = False
+        self._warned_stale = False
+        self._warned_never = False
+        self._started = time.time()
         self._alive = False
 
         self.create_timer(1.0, self._watchdog)
@@ -335,6 +338,35 @@ class LidarBridge(Node):
         if not isinstance(ranges_m, list) or not ranges_m:
             self._dropped += 1
             return
+
+        # --- THE STALE CONTRACT -------------------------------------------
+        # The agent now publishes on a fixed cadence WHETHER OR NOT it has data,
+        # so that a dead scanner is visible as a declared fault instead of as
+        # silence the dashboard renders as a frozen last frame. The cost of that
+        # guarantee is that arrival no longer implies freshness, and this node
+        # must say so out loud.
+        #
+        # A dead payload carries ranges of all-zero, and zero converts to `inf`
+        # below - "no return in that direction". Published as a LaserScan that
+        # reads as a completely clear 360 degrees. Nav2 and every cone guard
+        # downstream would take that as positive evidence of open space, which
+        # is the most dangerous possible reading of "the sensor is broken".
+        #
+        # So: drop it, and let _watchdog see the feed go quiet exactly as it
+        # would if the agent had died. Absence is a failure mode ROS already
+        # handles correctly. A confident empty scan is not.
+        #
+        # `stale` is additive and absent on older agents; treat a missing key as
+        # fresh so this node keeps working against an un-upgraded agent.
+        if data.get("stale") is True:
+            self._dropped += 1
+            if not self._warned_stale:
+                self._warned_stale = True
+                log("agent reports lidar health=%r (age=%ss) - NOT publishing "
+                    "LaserScan. A stale scan renders as clear space; absence "
+                    "does not." % (data.get("health"), data.get("scan_age_s")))
+            return
+        self._warned_stale = False
 
         if len(ranges_m) != EXPECTED_BINS and not self._warned_bins:
             # Not fatal - the conversion indexes defensively - but the geometry
@@ -406,6 +438,17 @@ class LidarBridge(Node):
         with self._lock:
             last = self._last_rx
         if not last:
+            # Nothing has EVER arrived. This used to return in silence, which
+            # made the worst case - agent dead at boot, so no scan ever reaches
+            # Nav2 - the only one that produced no log line at all. Say it, on
+            # a slow cadence so it does not flood the journal.
+            waited = time.time() - self._started
+            if waited > SCAN_STALE_SEC * 10 and not self._warned_never:
+                self._warned_never = True
+                log("no lidar payload has EVER arrived on %s after %.0fs. "
+                    "Check fpms-rover-agent is running and publishing, and "
+                    "that FPMS_THING_NAME matches on both sides."
+                    % (self.topic_in, waited))
             return
         age = time.time() - last
         if age > SCAN_STALE_SEC and self._alive:

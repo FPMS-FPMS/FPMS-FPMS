@@ -13,14 +13,20 @@ Description=FPMS odometry + TF for Nav2 (/odom_raw + /imu -> /odom, odom->base_f
 # service can be started, stopped and restarted at any time in any order.
 #
 # network-online is the only thing worth waiting for (DDS discovery).
-After=network-online.target
-Wants=network-online.target
+# mosquitto is now an explicit dependency. It was missing from every unit in
+# this stack, and on a cold boot that is a real race: the broker takes a moment
+# to bind :1883, and a client that tried first sat in its own retry loop while
+# the dashboard showed nothing. paho's reconnect covers it eventually, but
+# "eventually" at a competition is a service that looks broken for 30 seconds.
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
 
 [Service]
 Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/fpms/config.env
 Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=PYTHONUNBUFFERED=1

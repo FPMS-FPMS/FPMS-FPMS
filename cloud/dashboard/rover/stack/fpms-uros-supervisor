@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Keep the micro-ROS link to the ESP32-S3 alive without a human.
+
+WHY THIS EXISTS
+---------------
+Three watchdogs already sit under this one and none of them can see the fault
+that actually takes the rover down:
+
+  * systemd only knows whether micro_ros_agent is *running*. The failure mode
+    here is a running agent, NRestarts=0, no dmesg disconnect, and a board that
+    has gone quiet underneath a perfectly healthy file descriptor.
+  * fpms-uros-release-reset watches the agent's /proc/<pid>/io rchar counter and
+    the device node. That catches a re-enumerated or vanished CP2102 and a
+    read() that has stopped returning bytes, but the board can stop producing
+    *useful* messages while the transport still trickles, and it cannot see the
+    other half of the fault at all (below).
+  * The ROS nodes themselves have per-topic watchdogs, but nothing restarts them.
+
+And there is a second half to the fault that no single-process watchdog can fix:
+when the micro-ROS participant is replaced, the XRCE subscriptions in fpms-teleop
+/ fpms-odom-tf / fpms-missions do NOT re-match. Restarting the agent alone leaves
+those three subscribed to a participant that no longer exists, so the rover stays
+blind even though the link is technically back. The only recovery proven on this
+rover is the operator's manual sequence, which this daemon automates verbatim:
+
+    restart micro-ros-agent   (its wrapper fires the sequenced EN reset pulse)
+    wait ~18s                 (board boots, session establishes)
+    restart the subscribers   (so their subscriptions re-match)
+
+HOW LIVENESS IS DECIDED - AND WHAT NOT TO TRUST
+-----------------------------------------------
+From DATA, never from process state, and never from a published rate.
+
+odom_hz/imu_hz in the drive telemetry are computed from a ring buffer of arrival
+times. When the topic dies the buffer stops being appended to but its contents
+still span the same interval, so the reported rate sits at a plausible ~11 Hz
+FOREVER after the data has stopped. That exact false-alive signature has fooled
+this project twice. Those fields are deliberately never read here.
+
+The proven test is an EDGE, not a level:
+
+  battery_age_s is the age of the newest battery message from the board. The
+  board sends battery at 1 Hz, so on a live link this value sawtooths - it climbs
+  and then RESETS. A decrease is proof that a fresh message crossed the wire
+  inside the sampling window; no synthetic or cached value can produce one.
+  On a dead link it climbs monotonically and never comes back down.
+
+  uros_session is published by fpms_teleop from the freshness of /odom_raw and
+  /imu, i.e. it is itself data-derived rather than a handle on the agent.
+
+So the link is UP iff battery_age_s has decreased recently, uros_session is true,
+and the newest battery message is younger than a few seconds. Any of those going
+away is a fault. The absence of drive telemetry altogether is also a fault: it
+means the publisher is gone, which is just as fatal to the operator.
+
+Sampling is done with mosquitto_sub, deliberately. Spawning `ros2 topic echo`
+would create a DDS participant, and on this rover participant teardown has
+killed the board outright. This daemon is not a ROS participant, never opens the
+serial device, and never writes a byte to the board.
+
+SAFETY
+------
+This process cannot move the rover. It publishes no /cmd_vel, runs no mission,
+opens no serial port and injects no odometry. Its entire effect on the world is
+`systemctl restart` on a fixed, configured list of units plus one MQTT status
+topic.
+"""
+import errno
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+CONFIG_ENV = "/etc/fpms/config.env"
+OVERRIDE_ENV = "/etc/fpms/uros-supervisor.env"
+STATE_FILE = "/var/lib/fpms/uros-supervisor.json"
+
+
+def log(msg):
+    """Every action this daemon takes is logged with its reason, to journal."""
+    sys.stdout.write("uros-supervisor: %s\n" % msg)
+    sys.stdout.flush()
+
+
+def read_env(path):
+    """Minimal KEY=VALUE reader. Credentials stay in the file; never hard-coded."""
+    out = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+CFG = read_env(CONFIG_ENV)
+CFG.update(read_env(OVERRIDE_ENV))
+
+
+def cfg(key, default):
+    return CFG.get(key, default)
+
+
+def cfgf(key, default):
+    try:
+        return float(CFG[key])
+    except (KeyError, ValueError, TypeError):
+        return float(default)
+
+
+THING = cfg("FPMS_THING_NAME", "rover2")
+MQTT_HOST = cfg("FPMS_MQTT_HOST", "127.0.0.1")
+MQTT_PORT = cfg("FPMS_MQTT_PORT", "1883")
+MQTT_USER = cfg("FPMS_MQTT_USER", "")
+MQTT_PASS = cfg("FPMS_MQTT_PASS", "")
+
+DRIVE_TOPIC = "fpms/%s/telemetry/drive" % THING
+HEALTH_TOPIC = "fpms/%s/telemetry/uros_health" % THING
+
+AGENT_UNIT = cfg("FPMS_UROS_AGENT_UNIT", "micro-ros-agent")
+# The subscribers whose XRCE matching does not survive a participant swap. This
+# is a config knob purely so a recovery can be rehearsed without touching a unit
+# somebody else is mid-edit on; the shipped default is the operator's full list.
+SUBSCRIBERS = cfg("FPMS_UROS_SUBSCRIBERS",
+                  "fpms-teleop fpms-odom-tf fpms-missions").split()
+
+# --- detection thresholds (seconds) ---------------------------------------
+# Board sends battery at 1 Hz and drive telemetry is published every ~2.5s, so a
+# newest-battery-message older than this cannot happen on a live link.
+STALE_AGE_S = cfgf("FPMS_UROS_STALE_AGE_S", 8.0)
+# Backstop against a *frozen* age value: on a live link the sawtooth resets about
+# every other sample, so 40s without a single decrease is far outside jitter.
+NO_DECREASE_S = cfgf("FPMS_UROS_NO_DECREASE_S", 40.0)
+# uros_session is teleop's own data-derived verdict; trust it, but let it flap.
+SESSION_BAD_S = cfgf("FPMS_UROS_SESSION_BAD_S", 20.0)
+# No drive telemetry at all - publisher gone. Also fatal to the operator.
+NO_DATA_S = cfgf("FPMS_UROS_NO_DATA_S", 25.0)
+
+# --- recovery timing -------------------------------------------------------
+# Time from daemon start (or boot) before a fault may be declared. Long enough
+# for a cold boot to bring up mosquitto, the agent, the board and teleop.
+GRACE_S = cfgf("FPMS_UROS_GRACE_S", 60.0)
+# The operator's measured wait between the agent restart and the subscriber
+# restarts. Shorter and the subscribers re-match against a participant that is
+# still being rebuilt.
+AGENT_SETTLE_S = cfgf("FPMS_UROS_AGENT_SETTLE_S", 18.0)
+# How long to wait for live data after a recovery before calling it failed.
+VERIFY_S = cfgf("FPMS_UROS_VERIFY_S", 75.0)
+# Quiet window after a recovery during which faults are not evaluated, so the
+# subscribers' own startup silence cannot trigger a second recovery.
+SETTLE_AFTER_S = cfgf("FPMS_UROS_SETTLE_AFTER_S", 25.0)
+# Floor on the interval between recovery *starts*, and the exponential backoff
+# applied on top of it after consecutive failures. This is what makes a tight
+# restart loop impossible: even in the worst case the agent is restarted at most
+# once per COOLDOWN_S, and repeated failure stretches that towards MAX_COOLDOWN.
+COOLDOWN_S = cfgf("FPMS_UROS_COOLDOWN_S", 60.0)
+MAX_COOLDOWN_S = cfgf("FPMS_UROS_MAX_COOLDOWN_S", 300.0)
+# Slack allowed when deciding whether the agent restarted AFTER the link was
+# last known good - see the fast path in recover().
+AGENT_FRESH_SLACK_S = cfgf("FPMS_UROS_AGENT_FRESH_SLACK_S", 10.0)
+
+HEALTH_PERIOD_S = cfgf("FPMS_UROS_HEALTH_PERIOD_S", 5.0)
+
+
+def mqtt_auth():
+    a = ["-h", MQTT_HOST, "-p", str(MQTT_PORT)]
+    if MQTT_USER:
+        a += ["-u", MQTT_USER]
+    if MQTT_PASS:
+        a += ["-P", MQTT_PASS]
+    return a
+
+
+class Telemetry(object):
+    """Passive MQTT view of the rover's drive telemetry.
+
+    Runs mosquitto_sub in a thread so the state machine can sleep through a
+    recovery and still be looking at fresh data when it wakes up.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.stop = False
+        # All timing is on CLOCK_MONOTONIC. This Pi has no RTC: it boots with a
+        # stale clock and NTP steps it by hours a minute later, which would make
+        # any wall-clock interval arithmetic here nonsense at exactly the moment
+        # it matters most (cold boot).
+        now = time.monotonic()
+        self.last_msg = None
+        self.last_decrease = None
+        self.last_session_ok = None
+        self.last_age = None
+        self.session = None
+        self.started = now
+        self.msgs = 0
+        self.sub_alive_since = None
+        self.reset(now)
+
+    def reset(self, now=None):
+        """Forget history - used after a recovery so the settle window starts clean."""
+        now = now or time.monotonic()
+        with self.lock:
+            self.last_msg = None
+            self.last_decrease = None
+            self.last_session_ok = None
+            self.last_age = None
+            self.session = None
+            self.started = now
+
+    def run(self):
+        while not self.stop:
+            cmd = ["mosquitto_sub"] + mqtt_auth() + [
+                "-t", DRIVE_TOPIC, "-q", "0", "-k", "20"]
+            try:
+                self.proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    bufsize=1, universal_newlines=True)
+            except OSError as e:
+                log("mosquitto_sub spawn failed: %s" % e)
+                time.sleep(5)
+                continue
+            self.sub_alive_since = time.monotonic()
+            for line in self.proc.stdout:
+                if self.stop:
+                    break
+                self._ingest(line)
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+            if not self.stop:
+                # Broker restart, auth change, whatever. Reconnect, but slowly
+                # enough that a broken broker does not become a busy loop.
+                log("mosquitto_sub exited (rc=%s), resubscribing in 5s"
+                    % (self.proc.returncode if self.proc else "?"))
+                self.sub_alive_since = None
+                time.sleep(5)
+
+    def _ingest(self, line):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            return
+        try:
+            d = json.loads(line)
+        except ValueError:
+            return
+        now = time.monotonic()
+        age = d.get("battery_age_s")
+        sess = bool(d.get("uros_session"))
+        with self.lock:
+            self.msgs += 1
+            self.last_msg = now
+            if sess:
+                self.last_session_ok = now
+            self.session = sess
+            if isinstance(age, (int, float)):
+                # THE liveness edge. A decrease means a battery message crossed
+                # the serial link between these two samples. Nothing cached and
+                # nothing synthetic can make this number go down.
+                if self.last_age is not None and age < self.last_age - 1e-9:
+                    self.last_decrease = now
+                self.last_age = float(age)
+            else:
+                # null age = teleop has never seen a battery message at all.
+                self.last_age = None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(last_msg=self.last_msg, last_decrease=self.last_decrease,
+                        last_session_ok=self.last_session_ok, last_age=self.last_age,
+                        session=self.session, started=self.started, msgs=self.msgs,
+                        sub_alive_since=self.sub_alive_since)
+
+
+def systemctl(*args, timeout=120):
+    cmd = ["systemctl"] + list(args)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except OSError as e:
+        return 127, str(e)
+
+
+def unit_active(unit):
+    rc, out = systemctl("is-active", unit, timeout=15)
+    return out == "active"
+
+
+def agent_started_ago():
+    """Seconds since the agent unit's main process started, on the monotonic clock.
+
+    Monotonic on purpose - see the note in Telemetry about this Pi's clock being
+    stepped by NTP shortly after boot.
+    """
+    rc, out = systemctl("show", AGENT_UNIT, "-p",
+                        "ExecMainStartTimestampMonotonic", timeout=15)
+    try:
+        us = int(out.split("=", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    if us <= 0:
+        return None
+    return max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - us / 1e6)
+
+
+class Supervisor(object):
+    def __init__(self):
+        self.tel = Telemetry()
+        self.state = "starting"
+        self.reason = "waiting for first telemetry"
+        self.recoveries_total = 0
+        self.last_recovery_ts = None
+        self.last_recovery_result = None
+        self.last_recovery_s = None
+        self.consecutive_failures = 0
+        self.last_recovery_mono = None
+        # Monotonic time of the last moment the link was proven live. None means
+        # "never seen good data since this daemon started" - which on a cold boot
+        # is the difference between a stale-subscriber fault and a board that
+        # never booted at all, and they need different recoveries.
+        self.last_good_mono = None
+        self.settle_until = 0.0
+        self.boot_mono = time.clock_gettime(time.CLOCK_MONOTONIC)
+        self.start_mono = time.monotonic()
+        self.last_health = 0.0
+        self._load()
+
+    # ---- persistent counters (so the dashboard's totals survive a restart) --
+    def _load(self):
+        try:
+            with open(STATE_FILE) as fh:
+                d = json.load(fh)
+            self.recoveries_total = int(d.get("recoveries_total", 0))
+            self.last_recovery_ts = d.get("last_recovery_ts")
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"recoveries_total": self.recoveries_total,
+                           "last_recovery_ts": self.last_recovery_ts}, fh)
+            os.replace(tmp, STATE_FILE)
+        except OSError as e:
+            log("could not persist state: %s" % e)
+
+    # ---- MQTT status ------------------------------------------------------
+    def publish_health(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_health < HEALTH_PERIOD_S:
+            return
+        self.last_health = now
+        s = self.tel.snapshot()
+        payload = {
+            "state": self.state,
+            "reason": self.reason,
+            "last_recovery_ts": self.last_recovery_ts,
+            "recoveries_total": self.recoveries_total,
+            "last_recovery_result": self.last_recovery_result,
+            "last_recovery_duration_s": self.last_recovery_s,
+            "consecutive_failures": self.consecutive_failures,
+            "battery_age_s": s["last_age"],
+            "uros_session": s["session"],
+            "data_age_s": round(now - s["last_msg"], 2) if s["last_msg"] else None,
+            "decrease_age_s": (round(now - s["last_decrease"], 2)
+                               if s["last_decrease"] else None),
+            "agent_unit": AGENT_UNIT,
+            "subscribers": SUBSCRIBERS,
+            "supervisor_uptime_s": round(now - self.start_mono, 1),
+            "ts": time.time(),
+        }
+        cmd = (["mosquitto_pub"] + mqtt_auth() +
+               ["-t", HEALTH_TOPIC, "-r", "-q", "0", "-m", json.dumps(payload)])
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        except Exception:
+            pass
+
+    # ---- liveness ---------------------------------------------------------
+    def evaluate(self):
+        """Return None if the link is live, else a human reason string.
+
+        Reads only edge/age evidence. Never odom_hz, imu_hz or batt_hz - those
+        are ring-buffer rates that keep reporting a healthy number long after
+        the topic has died.
+        """
+        now = time.monotonic()
+        s = self.tel.snapshot()
+        ref = s["started"]
+
+        if s["last_msg"] is None:
+            if now - ref > NO_DATA_S:
+                return ("no drive telemetry on %s for %.0fs"
+                        % (DRIVE_TOPIC, now - ref))
+            return None
+
+        if now - s["last_msg"] > NO_DATA_S:
+            return ("drive telemetry stopped %.0fs ago (publisher gone)"
+                    % (now - s["last_msg"]))
+
+        age = s["last_age"]
+        if age is None:
+            return "teleop reports no battery message from the board at all"
+        if age > STALE_AGE_S:
+            return ("newest battery message from the board is %.1fs old "
+                    "(board silent)" % age)
+
+        dec = s["last_decrease"] or ref
+        if now - dec > NO_DECREASE_S:
+            return ("battery_age_s has not decreased for %.0fs (no fresh "
+                    "message has crossed the link)" % (now - dec))
+
+        sess = s["last_session_ok"] or ref
+        if now - sess > SESSION_BAD_S:
+            return "uros_session has been false for %.0fs" % (now - sess)
+
+        return None
+
+    def wait_healthy(self, budget_s):
+        """Block until liveness is proven by fresh data, or the budget expires.
+
+        Proof is positive evidence only: a battery_age_s decrease observed AFTER
+        this call started, plus uros_session true and a young battery message.
+        A stale 'it looked fine before' cannot satisfy this.
+        """
+        t0 = time.monotonic()
+        self.tel.reset(t0)
+        while time.monotonic() - t0 < budget_s:
+            s = self.tel.snapshot()
+            if (s["last_decrease"] is not None and s["last_decrease"] > t0
+                    and s["session"] and s["last_age"] is not None
+                    and s["last_age"] <= STALE_AGE_S):
+                return time.monotonic() - t0
+            self.publish_health()
+            time.sleep(1.0)
+        return None
+
+    # ---- recovery ---------------------------------------------------------
+    def recover(self, reason):
+        t0 = time.monotonic()
+        self.recoveries_total += 1
+        self.last_recovery_ts = time.time()
+        self.last_recovery_mono = t0
+        self.state = "recovering"
+        self.reason = reason
+        self._save()
+        self.publish_health(force=True)
+
+        # Fast path. If the agent unit restarted AFTER the last moment we had
+        # live data, the participant is already new - somebody else (the
+        # release-reset watchdog, systemd's Restart=always, a human) has already
+        # pulsed the board - and the only thing left stale is the subscribers'
+        # XRCE matching. Restarting the agent again would cost another ~18s and
+        # another board reboot for nothing.
+        #
+        # The test is deliberately "newer than the last good data", not merely
+        # "started recently". On a cold boot the agent is always recently
+        # started and there has never been good data, and in that case the board
+        # itself is what failed to come up - so the full sequence, including the
+        # EN reset pulse, is exactly what is needed. Gating on "recent" alone
+        # would burn the first recovery attempt plus a full backoff interval on
+        # the one case this whole daemon exists for.
+        fresh = agent_started_ago()
+        skip_agent = (self.consecutive_failures == 0
+                      and self.last_good_mono is not None
+                      and fresh is not None
+                      and fresh < (t0 - self.last_good_mono) + AGENT_FRESH_SLACK_S)
+
+        if skip_agent:
+            log("RECOVERY #%d start - reason: %s | %s (re)started %.0fs ago, "
+                "which is after the last live data %.0fs ago, so the participant "
+                "is already fresh; re-matching subscribers only"
+                % (self.recoveries_total, reason, AGENT_UNIT, fresh,
+                   t0 - self.last_good_mono))
+        else:
+            log("RECOVERY #%d start - reason: %s | restarting %s (its wrapper "
+                "fires the sequenced EN reset), settling %.0fs, then re-matching %s"
+                % (self.recoveries_total, reason, AGENT_UNIT, AGENT_SETTLE_S,
+                   " ".join(SUBSCRIBERS)))
+            rc, out = systemctl("restart", AGENT_UNIT)
+            log("systemctl restart %s -> rc=%d %s" % (AGENT_UNIT, rc, out))
+            # The board needs this long to reboot and re-establish the XRCE
+            # session. Restarting the subscribers earlier makes them re-match
+            # against a half-built participant and the link comes back dead.
+            deadline = time.monotonic() + AGENT_SETTLE_S
+            while time.monotonic() < deadline:
+                self.publish_health()
+                time.sleep(1.0)
+
+        for unit in SUBSCRIBERS:
+            rc, out = systemctl("restart", unit)
+            log("systemctl restart %s -> rc=%d %s" % (unit, rc, out))
+
+        took = self.wait_healthy(VERIFY_S)
+        total = time.monotonic() - t0
+        self.last_recovery_s = round(total, 1)
+        self.settle_until = time.monotonic() + SETTLE_AFTER_S
+
+        if took is not None:
+            self.last_good_mono = time.monotonic()
+            self.consecutive_failures = 0
+            self.last_recovery_result = "ok"
+            self.state = "up"
+            self.reason = ("recovered in %.0fs (link proven live: battery_age_s "
+                           "decreasing, uros_session true)" % total)
+            log("RECOVERY #%d OK - link live again after %.0fs (%.0fs of that "
+                "waiting for proof)" % (self.recoveries_total, total, took))
+        else:
+            self.consecutive_failures += 1
+            self.last_recovery_result = "failed"
+            self.state = "down"
+            self.reason = ("recovery #%d did not restore the link within %.0fs "
+                           "(consecutive failures: %d)"
+                           % (self.recoveries_total, VERIFY_S,
+                              self.consecutive_failures))
+            log("RECOVERY #%d FAILED - no live data within %.0fs; backing off "
+                "(consecutive failures %d)"
+                % (self.recoveries_total, VERIFY_S, self.consecutive_failures))
+        self._save()
+        self.publish_health(force=True)
+
+    def cooldown(self):
+        """Exponential backoff on top of a hard floor between recovery starts."""
+        return min(MAX_COOLDOWN_S, COOLDOWN_S * (2 ** min(self.consecutive_failures, 4)))
+
+    # ---- main loop --------------------------------------------------------
+    def run(self):
+        t = threading.Thread(target=self.tel.run, daemon=True)
+        t.start()
+        log("started - watching %s, publishing %s, agent unit %s, subscribers %s"
+            % (DRIVE_TOPIC, HEALTH_TOPIC, AGENT_UNIT, " ".join(SUBSCRIBERS)))
+        log("thresholds: stale_age=%.0fs no_decrease=%.0fs session_bad=%.0fs "
+            "no_data=%.0fs grace=%.0fs cooldown=%.0fs"
+            % (STALE_AGE_S, NO_DECREASE_S, SESSION_BAD_S, NO_DATA_S, GRACE_S,
+               COOLDOWN_S))
+
+        while True:
+            now = time.monotonic()
+            fault = None
+
+            if now - self.start_mono < GRACE_S:
+                # Cold boot: mosquitto, the agent, the board and teleop all need
+                # to arrive before a verdict means anything.
+                self.state = "starting"
+                self.reason = ("grace period, %.0fs left"
+                               % (GRACE_S - (now - self.start_mono)))
+            elif now < self.settle_until:
+                self.state = "settling"
+                self.reason = ("post-recovery settle, %.0fs left"
+                               % (self.settle_until - now))
+            else:
+                fault = self.evaluate()
+                if fault is None:
+                    self.last_good_mono = now
+                    if self.state != "up":
+                        log("link is live (%s)"
+                            % ("first good data" if self.state == "starting"
+                               else "recovered"))
+                    self.state = "up"
+                    self.reason = "battery_age_s decreasing, uros_session true"
+                else:
+                    # Do not restart anything if the broker itself is the
+                    # problem: no amount of agent restarting fixes a dead
+                    # mosquitto, and trying would be a pointless restart loop
+                    # that takes the rover down harder than the fault did.
+                    if not unit_active("mosquitto"):
+                        self.state = "no_broker"
+                        self.reason = ("mosquitto is not active - cannot observe "
+                                       "the link; not restarting anything")
+                        fault = None
+                    else:
+                        since = (now - self.last_recovery_mono
+                                 if self.last_recovery_mono else None)
+                        cd = self.cooldown()
+                        if since is not None and since < cd:
+                            self.state = "suspect"
+                            self.reason = ("%s | holding off %.0fs more (backoff)"
+                                           % (fault, cd - since))
+                            fault = None
+
+            self.publish_health()
+
+            if fault:
+                self.recover(fault)
+
+            time.sleep(1.0)
+
+
+def main():
+    def bye(sig, frm):
+        log("exiting on signal %d" % sig)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    Supervisor().run()
+
+
+if __name__ == "__main__":
+    main()

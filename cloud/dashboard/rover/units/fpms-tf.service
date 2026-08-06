@@ -1,16 +1,41 @@
 [Unit]
-Description=FPMS static TF tree (base_footprint->base_link->laser_frame/imu_frame)
+Description=FPMS static TF tree (map->odom anchor + base_footprint->base_link->laser_frame/imu_frame)
+# MERGED 2026-08-06: this unit previously had a sibling, fpms-map-odom.service,
+# publishing the single static map->odom transform. Two units for two static
+# transforms bought nothing and cost a boot-order question that had no answer
+# (neither depends on the other, but an operator reading the tree had to work
+# that out). One unit, one TF owner, one thing to enable.
+#
+# TF_TREE.md's rule still holds and is the reason this is static: exactly ONE
+# publisher per edge. odom->base_footprint belongs to fpms-odom-tf and must
+# never be published here.
+#
+# NOTE, UNRESOLVED: fpms_tf.launch.py's laser mount offsets are all
+# `MEASURE ME` placeholders and this unit launches it with no arguments, so
+# 0.0 is what gets published. By the file's own arithmetic 1 degree of
+# unmodelled mount yaw is ~10.5 mm of position error. Measure it before
+# trusting any LiDAR/odometry fusion.
 After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
 User=ubuntu
+Group=ubuntu
+EnvironmentFile=-/etc/fpms/config.env
 Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=HOME=/home/ubuntu
+# The map->odom anchor is the arena start pose (972, 228) mm, heading +90deg,
+# matching arena_zones.json exactly. Backgrounded so both publishers live in
+# this one unit; the launch below is the process systemd tracks.
+ExecStartPre=/bin/bash -c 'source /opt/ros/humble/setup.bash && setsid ros2 run tf2_ros static_transform_publisher --x 0.972 --y 0.228 --z 0.0 --yaw 1.5707963 --pitch 0.0 --roll 0.0 --frame-id map --child-frame-id odom >/dev/null 2>&1 & echo $! > /run/fpms-map-odom.pid'
 ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/nav2/fpms_tf.launch.py'
+ExecStopPost=/bin/bash -c 'kill $(cat /run/fpms-map-odom.pid 2>/dev/null) 2>/dev/null || true; rm -f /run/fpms-map-odom.pid'
 Restart=always
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,57 @@
+[Unit]
+Description=FPMS core — STOP authority, command receipts, stack health
+Documentation=file:/home/ubuntu/STACK.md
+# ---------------------------------------------------------------------------
+# THIS UNIT STARTS BEFORE ANYTHING THAT CAN MOVE THE ROVER.
+#
+# `Before=fpms-missions.service` is the one ordering edge in this stack that is
+# a safety property rather than a convenience. fpms-cored is the process that
+# turns an operator pressing STOP into wheels at zero, and there must be no
+# window at boot in which the mission executor is accepting commands while the
+# stop authority is not yet listening.
+#
+# It is Before= and Wants=, NOT Requires=: if cored fails to start, missions
+# must still come up. A rover you cannot drive is not safer than a rover you
+# can stop — missions has its own stop handling, and cored is defence in depth
+# on top of it, not a replacement for it.
+# ---------------------------------------------------------------------------
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+Before=fpms-missions.service fpms-teleop.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+# ---- ESCALATION GATE ------------------------------------------------------
+# 1 = if the executor still reports a driving phase 3s after a STOP, cored
+# SIGTERMs fpms-missions. That handler aborts the mission and publishes ten
+# zero Twists before exiting, and Restart=always brings it straight back.
+# This is the ONLY answer to a wedged executor under a moving rover. Setting it
+# to 0 removes that last resort.
+Environment=FPMS_CORE_STOP_ESCALATE=1
+Environment=FPMS_CORE_STOP_ESCALATE_S=3.0
+# ---------------------------------------------------------------------------
+# systemctl kill needs privilege that `ubuntu` does not have by default. See
+# deploy_stack.sh, which installs a single tightly-scoped polkit/sudoers rule
+# for exactly this one command. Without it, escalation logs a failure and the
+# other three stop paths still work.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash 2>/dev/null || true; exec python3 /home/ubuntu/fpms_cored.py'
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+# Short: this is the stop path. Every second it is down is a second an operator
+# has no receipt and no escalation.
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

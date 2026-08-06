@@ -1,0 +1,31 @@
+[Unit]
+Description=FPMS micro-ROS link supervisor (data-liveness watchdog + auto-recovery)
+Documentation=file:/usr/local/bin/fpms-uros-supervisor
+# Ordering only. Deliberately NO Requires=/BindsTo=/PartOf= on anything: this
+# unit exists to RESTART those services, so a dependency edge that could stop it
+# when they stop would disarm the supervision at exactly the moment it is needed.
+After=network-online.target mosquitto.service micro-ros-agent.service fpms-teleop.service fpms-odom-tf.service
+# Wants (not Requires) so that enabling the supervisor is enough to guarantee the
+# link on a cold boot even if something else forgot to pull the agent in, while
+# a failure of those units still leaves the supervisor running to fix them.
+Wants=network-online.target mosquitto.service micro-ros-agent.service
+# Never let systemd give up on the supervisor. The default start limiter would
+# put it in a failed state after a few rapid crashes and leave the rover with no
+# link watchdog at all - the exact outage this unit exists to prevent.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Root: the only privileged thing it does is `systemctl restart` on the agent and
+# the three XRCE subscribers. It opens no serial device and joins no ROS graph.
+User=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/bin/fpms-uros-supervisor
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

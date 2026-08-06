@@ -4,14 +4,20 @@ Description=FPMS teleop bridge (MQTT -> /cmd_vel)
 # fpms-rover-agent. Those two are long-lived and expensive to restart (the
 # micro-ROS link costs 90-225s to re-establish); a dependency here would let a
 # teleop restart take them down with it. network-online is the only wait.
-After=network-online.target
-Wants=network-online.target
+# mosquitto is now an explicit dependency. It was missing from every unit in
+# this stack, and on a cold boot that is a real race: the broker takes a moment
+# to bind :1883, and a client that tried first sat in its own retry loop while
+# the dashboard showed nothing. paho's reconnect covers it eventually, but
+# "eventually" at a competition is a service that looks broken for 30 seconds.
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
 
 [Service]
 Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/fpms/config.env
 Environment=ROS_DOMAIN_ID=20
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/ubuntu

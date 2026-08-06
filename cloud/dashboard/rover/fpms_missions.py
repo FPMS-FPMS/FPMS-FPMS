@@ -771,6 +771,152 @@ HEADING_CORR_MAX_RADPS = 0.25
 TURN_WIRE_SIGN = _cfg_sign("FPMS_MISSION_TURN_WIRE_SIGN", -1)
 TURN_WIRE_SIGN_MEASURED = False     # flip this ONLY after a real turn confirms it
 
+
+# ============================================================================
+# THE MEASURED CALIBRATION PROFILE
+# ============================================================================
+# Written by `stack/fpms_charact.py` after an operator joystick run, read here.
+# It is the mechanism by which a number the OPERATOR measured beats a number
+# somebody DERIVED, without anyone editing this file.
+#
+# Only one field is consumed today, and it is the important one:
+#
+#   odom_scale   true_mm / odom_reported_mm.
+#
+# WHY A SCALE FACTOR IS THE RIGHT LEVER, AND WHY IT NEEDS NO REFLASH
+#   /odom_raw arrives in METRES, already integrated on the board using its
+#   COUNTS_PER_REV. If that constant is wrong, every distance this node
+#   measures is wrong by the same ratio — and counts/mm is the longest-running
+#   unresolved number in this project: 6.00 derived (11 lines x 30:1 x4) vs
+#   14.8 tape-measured over 800 mm vs a 0.743x hand-push reading, plus a
+#   possible factor of 2 from attachHalfQuad. 14.8/6.00 = 2.467 = exactly
+#   74/30, i.e. a 74:1 gearbox where 30:1 was assumed.
+#   Multiplying the reported position by a measured ratio corrects all of it at
+#   the boundary, and can be re-derived from a tape measure in a minute.
+#
+# DEFAULT IS 1.0 — NO CORRECTION. An absent or unparseable profile changes
+# nothing, so this is safe to ship before anyone has run a characterisation.
+# A profile is only ever ADOPTED when it carries `measured: true`, so a
+# half-finished run cannot quietly rescale the rover.
+CALIB_FILE = os.environ.get("FPMS_CALIB_FILE", "/etc/fpms/calibration.json")
+
+
+def load_calibration(path=CALIB_FILE):
+    """Load the operator-measured profile. Never raises; never guesses."""
+    prof = {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        if not data.get("measured"):
+            CFG_NOTES.append(
+                f"calibration {path} exists but is not marked measured:true — "
+                "IGNORED. Finish the characterisation run before trusting it.")
+            return {}
+        prof = data
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        CFG_NOTES.append(f"calibration {path} unreadable ({e}); using defaults")
+        return {}
+    return prof
+
+
+CALIB = load_calibration()
+
+
+def _calib_float(key, default, lo, hi):
+    """Adopt a measured constant, or say why it was refused. Never silently."""
+    raw = CALIB.get(key)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except Exception:
+        CFG_NOTES.append(f"calibration {key}={raw!r} is not a number; "
+                         f"using {default:g}")
+        return default
+    if not (lo <= v <= hi):
+        # A calibration far outside plausibility is far more likely to be a
+        # botched run than a discovery. Refuse it and keep driving on the
+        # default rather than acting on it.
+        CFG_NOTES.append(f"calibration {key}={v:g} is outside [{lo:g}, {hi:g}] "
+                         f"and was REFUSED; using {default:g}")
+        return default
+    CFG_NOTES.append(f"calibration {key}={v:g} ADOPTED (measured "
+                     f"{CALIB.get('measured_at', 'date unknown')})")
+    return v
+
+
+# Bounds are deliberately wide enough to admit the real contested values
+# (2.467 is the 74/30 gearbox ratio; 0.405 is its reciprocal) and narrow enough
+# to reject a decimal-point slip.
+ODOM_SCALE = _calib_float("odom_scale", 1.0, 0.2, 5.0)
+
+
+# ============================================================================
+# ODOM POSE SIGN — THE ONE SWITCH THAT MUST CHANGE WHEN THE FIRMWARE CHANGES
+# ============================================================================
+# WHAT IT DOES
+#   Multiplies the x/y POSITION arriving on /odom_raw (and /odom). It does not
+#   touch twist, heading, the gyro, or the commanded direction. It exists for
+#   exactly one reason: to correct a firmware that integrates position with the
+#   wrong sign.
+#
+# WHAT TO SET IT TO
+#   -1  Yahboom FACTORY firmware v2.0.0 (what is on the board TODAY, 2026-08-06).
+#       Confirmed 5/5 against operator observation: the rover drove forward and
+#       the reported position went backwards.
+#   +1  FPMS firmware v3 (firmware_v3/fpms_config.h). Its header states plainly:
+#       "This firmware integrates with the CORRECT sign, so that compensation
+#       must be set back to +1."
+#
+# WHY IT IS DECLARED HERE, ONCE, RATHER THAN FIXED AT EACH USE SITE
+#   Before this existed the compensation was NOT IMPLEMENTED AT ALL on the Pi,
+#   while firmware_v3/fpms_config.h:28-31 asserted that the Pi was applying it.
+#   Two documents, one of them a header comment nobody executes, disagreeing
+#   about a sign — and the disagreement is invisible until the rover drives the
+#   wrong way. Making it one named constant, applied at ONE place
+#   (`MissionNode._take_odom`), means the contradiction can be read off in a
+#   single grep instead of inferred from behaviour.
+#
+# GETTING IT WRONG IS SILENT AND TOTAL
+#   Every displacement measurement in this file comes from differencing pose.
+#   With the sign inverted, a forward burst measures as reverse travel, the
+#   residual correction pushes the wrong way, and the retrace home replays the
+#   whole error a second time. It does NOT look like a sign bug from the
+#   dashboard; it looks like the rover is possessed. If motion and odometry
+#   disagree about direction, CHECK THIS FIRST.
+#
+# HOW TO CHECK IT WITHOUT DRIVING (costs no battery, takes 30 seconds)
+#   Power the board, leave the motors idle, and PUSH the rover forward by hand
+#   along a tape measure while watching /odom_raw x (or run
+#   `stack/fpms_charact.py --push-check`). Pushed FORWARD, x must INCREASE.
+#   If it decreases, flip this constant. That test involves no actuation and is
+#   the only honest way to settle it — this rover's odometry has reported clean
+#   travel for a chassis that was spinning in place.
+# CHANGING THIS INVALIDATES THE SAVED ANCHOR. MUST RE-ZERO.
+#   `.fpms_teleop_origin.json` records a PAIR — "odom was at (ref_x, ref_y),
+#   the arena was at (x_mm, y_mm)". `ref_x/ref_y` were captured through
+#   whatever sign was active at the time, so flipping the sign silently
+#   reflects the anchor through the origin and every arena coordinate derived
+#   from it is wrong by twice the offset. There is no way to detect this from
+#   the file alone, because both conventions produce a perfectly plausible
+#   number.
+#   So: after changing this constant, issue `set_coordinate` (re-zero) BEFORE
+#   the next mission. The stale-anchor refusal below catches the reboot case
+#   but NOT this one — a sign change without a reboot leaves a same-boot anchor
+#   that looks valid and is not.
+ODOM_POSE_SIGN = _cfg_sign("FPMS_MISSION_ODOM_POSE_SIGN", -1)
+ODOM_POSE_SIGN_MEASURED = False   # set True only after the hand-push check
+if ODOM_POSE_SIGN != -1:
+    CFG_NOTES.append(
+        f"FPMS_MISSION_ODOM_POSE_SIGN={ODOM_POSE_SIGN:+d} (factory firmware "
+        "wants -1, FPMS firmware v3 wants +1). RE-ZERO with set_coordinate "
+        "before the next mission: the saved teleop origin was captured under "
+        "the other sign.")
+
 # How far a turn may rotate the WRONG way before it is called wrong rather than
 # noisy. Comfortably above gyro noise over a couple of seconds and well below any
 # turn the planner emits, so it can only fire on a genuine polarity error.
@@ -1543,6 +1689,38 @@ def min_clearance_mm(ranges_m, range_max_m=6.0):
 # segment, which is what the m2 preview regression (744 mm, 10 segments, 11
 # waypoints from (972, 228)) actually checks.
 #
+# WHAT WAS EVALUATED AND DELIBERATELY NOT BUILT
+# ---------------------------------------------
+# All four are the standard answers to "make the planner better", all four are
+# in the literature, and all four are wrong for a 24 x 24 grid on this rover.
+# Recorded with the numbers, because the next person to read this will be told
+# to add them and deserves the measurement rather than an opinion.
+#
+#   D* LITE / incremental replanning. The usual answer for live rerouting, and
+#     it optimises the wrong half. MEASURED ON THIS PI: a full worst-case A* over
+#     this grid is 1.2 ms, and the costmap rebuild that must happen anyway when
+#     the occupancy grid changes is 1.2 ms. D* Lite would save part of the first
+#     number and none of the second, in exchange for ~200 lines of incremental
+#     bookkeeping with three well-known silent-corruption traps (exact float
+#     comparison on rhs values with sqrt(2) costs; priority-queue membership
+#     semantics that the usual lazy-deletion idiom breaks; the underconsistent
+#     Pred(u) + {u} branch). It pays off at a few hundred times this many cells.
+#     A search that is re-derived from scratch every time also cannot carry a
+#     stale belief across a replan, which on a rover whose pose is dead
+#     reckoning is worth more than the millisecond.
+#   LAZY THETA*. Defers the line-of-sight check to expansion. Its published
+#     speed-up is 1.3-1.7x on 26-neighbour 3D grids; on 8-neighbour 2D at this
+#     size the saving is noise, and it adds a repair path (SetVertex) that can
+#     only be wrong. `theta_star` memoises line-of-sight instead, which gets most
+#     of the same win with no new failure mode.
+#   FIELD D* / interpolated costs. Solves a problem this rover does not have:
+#     its legs are already any-angle, and the residual is far below the +/-1-4
+#     degrees each real turn costs.
+#   A FULL FOOTPRINT CHECK instead of a radius. Correct for a long chassis on a
+#     grid with fixed headings. Here the path is any-angle and the heading
+#     changes along it, so the circumscribed radius is both simpler and never
+#     optimistic -- and being never optimistic is the only property that matters.
+#
 # WHY A GRID AND NOT A POLYGON WORLD. The only obstacle sensor on this rover is
 # a 360-bin LiDAR arriving over MQTT, whose mount yaw and rotation sign are
 # still UNVERIFIED (fpms_lidar_ros.py:164-168). Fitting shapes to returns of
@@ -1550,13 +1728,26 @@ def min_clearance_mm(ranges_m, range_max_m=6.0):
 # says no more than the sensor does: "something was seen in this 50 mm square".
 
 # The planner is switchable because a competition morning is not the time to
-# discover a new code path. `straight` restores the pre-A* behaviour exactly:
-# no grid consulted, no detour possible, obstacle means abort.
-PLANNER = str(CFG.get("FPMS_MISSION_PLANNER", "astar")).strip().lower()
-if PLANNER not in ("astar", "straight"):
-    CFG_NOTES.append("FPMS_MISSION_PLANNER=%r is not 'astar' or 'straight'; "
-                     "using 'astar'" % PLANNER)
-    PLANNER = "astar"
+# discover a new code path. Three settings, in increasing order of how much they
+# are allowed to do:
+#
+#   straight  the pre-A* behaviour, exactly: no grid consulted, no detour
+#             possible, obstacle means abort. The bail-out switch.
+#   astar     8-connected grid A* with the string-puller, as first shipped.
+#   theta     ANY-ANGLE search (Theta*). The default, and the reason is on this
+#             chassis rather than in the literature -- see `turn_cost_mm`: one
+#             90 degree turn costs this rover about as much time as 375 mm of
+#             driving, so a planner that can only turn in 45 degree steps is
+#             paying the most expensive thing it owns for the privilege of
+#             staying on the grid. `theta` lets a leg point anywhere.
+#
+# `astar` is kept as a first-class setting, not as dead code: it is the fallback
+# if `theta` ever misbehaves on the field, and both are tested.
+PLANNER = str(CFG.get("FPMS_MISSION_PLANNER", "theta")).strip().lower()
+if PLANNER not in ("theta", "astar", "straight"):
+    CFG_NOTES.append("FPMS_MISSION_PLANNER=%r is not 'theta', 'astar' or "
+                     "'straight'; using 'theta'" % PLANNER)
+    PLANNER = "theta"
 
 # PER LEG, not per mission. A leg that has had to route around five things is
 # not making progress towards its target any more, and the honest report is the
@@ -1610,6 +1801,203 @@ NEIGHBOURS = ((1, 0), (0, 1), (-1, 0), (0, -1),
               (1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
+# ------------------------------------------------- WHAT A TURN ACTUALLY COSTS
+# THE ONE NUMBER THAT MAKES THIS ROVER DIFFERENT FROM A TEXTBOOK GRID.
+#
+# Every A* on a grid minimises DISTANCE, because on paper a turn is free. On a
+# skid-steer with a minimum pulse it is the most expensive motion there is, and
+# the constants to prove it are already in this file:
+#
+#     a 90 deg turn = (pi/2) / TURN_RADPS      = 3.49 s of rotation
+#                   + TURN_SETTLE_S            = 1.20 s of standing still
+#                                              = 4.69 s
+#
+# THE SPEED THAT CONVERTS THAT TIME INTO MILLIMETRES IS NOT CRUISE_MPS, AND
+# GETTING THIS WRONG COSTS A FACTOR OF TWO. This rover never cruises: it drives
+# one MAX_LEG_MM leg, STOPS, and settles for STOP_SETTLE_S before the next one
+# (that stop is the speed control on this firmware -- see the SPEEDS section).
+# At the live 70 mm legs that is 0.39 s of driving for every 0.45 s of standing
+# still, so the rover covers ground at 83 mm/s, not the 180 mm/s CRUISE_MPS
+# claims. Pricing a turn against CRUISE_MPS values it at 844 mm; against the
+# speed the rover actually makes good it is 391 mm. The second number is the
+# real trade, because the question the planner is asking is "how much EXTRA
+# PATH is this turn worth", and extra path is bought at the effective rate.
+#
+# So: a planner that saves 100 mm by adding one right-angle turn has made the
+# mission ~290 mm worse, and it would do that every time unless told. It is also
+# worse than the time alone says -- the +/-1-4 deg measured on every real turn
+# is heading error that every later leg inherits and the retrace must give back.
+# That part is NOT in this number; TURN_COST_WEIGHT above 1.0 is where an
+# operator says how much they care about it.
+#
+# DERIVED, NEVER TYPED. Re-measure TURN_RADPS, change CRUISE_MPS, or shorten the
+# legs, and all of this follows -- the same discipline that makes MIN_MOVE_MM a
+# function of MIN_PULSE_S. A magic "turn penalty = 200" would silently become
+# wrong the next time the chassis is re-calibrated.
+LEG_EFFECTIVE_MM_S = MAX_LEG_MM / (MAX_LEG_MM / 1000.0 / CRUISE_MPS
+                                   + STOP_SETTLE_S)
+TURN_COST_MM_PER_RAD = LEG_EFFECTIVE_MM_S / TURN_RADPS
+TURN_COST_MM_FIXED = TURN_SETTLE_S * LEG_EFFECTIVE_MM_S
+
+# A dial rather than a constant, because the derivation above prices a turn in
+# TIME and the real objection to a turn on this rover is ACCURACY. 1.0 is the
+# honest time-equivalent; above 1.0 says "I care about heading error more than
+# the clock", which on dead reckoning is usually true. 0.0 restores a pure
+# shortest-distance planner for comparison, which is what the `astar` setting
+# was before this existed.
+TURN_COST_WEIGHT = _cfg_float("FPMS_MISSION_TURN_COST_W", 1.0, 0.0, 5.0)
+
+# Turns below this are noise the follower would not even command
+# (BEARING_TOL_DEG), so charging for them would price a rounding error.
+TURN_COST_DEADBAND_DEG = BEARING_TOL_DEG
+
+
+def turn_cost_mm(delta_rad):
+    """What changing heading by `delta_rad` costs, in millimetres of driving.
+
+    Millimetres because that is the unit the rest of the search is in, and
+    mixing units inside a cost function is how a planner ends up minimising
+    something nobody chose. Both terms are real: the rotation itself, and the
+    fixed settle that happens once per turn however small the turn is. The fixed
+    term is what stops the planner preferring five 18 degree turns to one 90.
+    """
+    d = abs(float(delta_rad))
+    if not math.isfinite(d) or d < math.radians(TURN_COST_DEADBAND_DEG):
+        return 0.0
+    return TURN_COST_WEIGHT * (d * TURN_COST_MM_PER_RAD + TURN_COST_MM_FIXED)
+
+
+# --------------------------------------------- KEEPING OFF THE INFLATED EDGE
+# Blocked/free is a cliff, and A* is happy to drive along the very lip of it: a
+# path that is legal by one millimetre is exactly as good as one down the middle
+# of the corridor, so the tie-break picks whichever the heap pops first. On a
+# rover whose position is dead reckoning from an ASSUMED origin, that is the
+# worst possible place to be -- the inflation radius is the entire budget for
+# pose error, and a path that spends all of it before the rover has moved has no
+# budget left.
+#
+# This is Nav2's inflation layer idea, and only that idea: a cost that DECAYS
+# with distance from the nearest obstacle, added to the length of the path so
+# the search prefers open space when open space is nearly free. Nav2 uses
+#     cost = (LETHAL-1) * exp(-scale * (d - inscribed))
+# in its own 0-254 units; here it is expressed directly in millimetres of
+# equivalent detour so it can be added to a distance without a conversion
+# nobody can check.
+#
+# WHY IT MUST STAY SMALL, AND HOW SMALL IS CHECKABLE. This weight is a bribe to
+# leave the wall, and a bribe big enough to buy a whole extra turn would make
+# the planner take a longer, turnier route to avoid a squeeze it could safely
+# drive -- which is worse than the hugging it was trying to fix.
+#
+# DIMENSIONLESS, and charged per millimetre travelled: 0.25 means "a metre
+# driven hard against an obstacle costs what 1.25 m in the open costs". So the
+# arithmetic that bounds it is one line: buying a single 90 degree turn
+# (375 mm, see turn_cost_mm) would take 1.5 m of continuous hugging, and this
+# arena is 1.2 m across. It CANNOT justify a detour here. It can only choose
+# between routes that were already about equally good, which is exactly the job.
+CLEARANCE_COST_W = _cfg_float("FPMS_MISSION_CLEARANCE_COST_W", 0.25, 0.0, 3.0)
+
+# How fast the bribe decays with distance from the obstacle. Expressed as the
+# distance over which it falls by 1/e, in millimetres, rather than as Nav2's
+# reciprocal `cost_scaling_factor`, because "influence dies off over 250 mm" is
+# checkable against an arena and "scaling factor 4.0" is not.
+CLEARANCE_DECAY_MM = _cfg_float("FPMS_MISSION_CLEARANCE_DECAY_MM", 250.0,
+                                10.0, 2000.0)
+
+
+# ------------------------------------------------ THE ARENA WALL IS NOT A BOX
+# THE BUG THIS FIXES, MEASURED 2026-08-04 ON THE LIVE FILE.
+#
+# The m2 corridor runs up x = 972 with the right wall at x = 1200: 228 mm of
+# clearance for a 170 mm radius, so 58 mm of real margin. The rover can drive
+# it. The planner could barely agree, and with a real wall in front of a real
+# LiDAR it stopped agreeing altogether:
+#
+#     wall measured perfectly       -> corridor clear by 28 mm
+#     wall measured 60 mm too near  -> corridor BLOCKED, A* detours around the
+#                                      corridor it is supposed to drive
+#
+# 60 mm is nothing. It is LiDAR range noise plus a little dead-reckoning pose
+# error, and it turned the one leg that needs no turn at all into a detour.
+#
+# THE CAUSE IS THREE PESSIMISMS STACKED ON THE SAME 228 mm, two of which are the
+# same pessimism counted twice:
+#
+#   1. the wall's true surface is thrown away and replaced by its CELL CENTRE,
+#      up to 25 mm further inside the arena than the wall really is;
+#   2. inflation then adds HALF A CELL (25 mm) on top -- a fudge that exists to
+#      cover exactly the error introduced in (1);
+#   3. the driven line is itself tested by which cell it falls in, so the rover
+#      at x = 972 is judged as if it were at the cell centre 975.
+#
+# LOWERING THE NUMBER WOULD BE THE WRONG FIX. 170 mm is the rover's half-width;
+# it is not negotiable and cutting it buys margin by lying about the chassis.
+# The fix is to stop throwing the measurement away:
+#
+#   * `OccupancyGrid` now keeps the CENTROID of the returns folded into each
+#     cell, so a wall at 1200 is remembered at 1200 and not at 1175. That
+#     deletes (1), and with it the reason for (2);
+#   * clearance is measured as a real distance from that centroid, so (3) goes
+#     too -- the line at x = 972 is judged at x = 972.
+#
+# and, separately, the arena boundary is known A PRIORI. A return that is
+# consistent with being the wall does not need to be re-derived from a noisy
+# range at all: `WALL_PAD_MM` already models that boundary exactly, and
+# inflating the measurement as well double-counts a thing we already know.
+#
+# WHY ABSORBING WALL RETURNS IS SAFE, which is the only part that could bite:
+# a return within WALL_BAND_MM of the boundary is folded into the wall layer
+# instead of the obstacle layer. If it was really a small obstacle pushed up
+# against the wall, the strip it occupies is narrower than WALL_BAND_MM -- and
+# the rover is 2 * ROBOT_RADIUS_MM = 340 mm wide, so no route ever ran through
+# that strip in the first place. Absorbing it removes nothing the rover could
+# have driven. That argument is why the band is CLAMPED at ROBOT_RADIUS_MM
+# below: any wider and it could start swallowing a gap the rover really fits
+# through, and the argument stops holding.
+WALL_BAND_MM = _cfg_float("FPMS_MISSION_WALL_BAND_MM", 80.0, 0.0,
+                          ROBOT_RADIUS_MM)
+
+# The measurement error that survives keeping the centroid: LiDAR range noise
+# and the pose the scan was folded through. This REPLACES the half-cell fudge,
+# and it is smaller than it because it is a sensor spec rather than a
+# quantisation artefact. Kept explicit so that "how much do we not trust a
+# return" is one number an operator can raise on a bad-looking field.
+OCC_POINT_PAD_MM = _cfg_float("FPMS_MISSION_OCC_POINT_PAD_MM", 25.0, 0.0, 200.0)
+
+# THE FALLBACK LADDER. Aborting the instant the search fails at full padding
+# throws away the difference between "there is no way through" and "there is no
+# way through AT FULL MARGIN". Those are different answers and the operator
+# deserves the second one: a route that exists with the wall pad relaxed is
+# still a route, and the alternative on offer is stopping the mission.
+#
+# Each rung is REPORTED, never silent. A path that only exists because the
+# margin was cut is not the same answer as one that exists at full margin, and
+# the note and telemetry both say which rung produced the line that was drawn.
+#
+# The obstacle radius is relaxed LAST and LEAST. The wall pad is a policy about
+# a boundary that is known and static; the obstacle radius is the rover's actual
+# half-width and cutting it is the only rung that can put the chassis into
+# something. It is floored at RELAX_RADIUS_FLOOR so it can never go far.
+PLAN_RELAX = CFG.get("FPMS_MISSION_PLAN_RELAX", "1") not in ("0", "false", "no")
+RELAX_RADIUS_FRAC = _cfg_float("FPMS_MISSION_RELAX_RADIUS_FRAC", 0.85, 0.5, 1.0)
+
+# HYSTERESIS. The occupancy grid flickers -- OCC_MIN_HITS and OCC_TTL_S are a
+# threshold and a timeout, and cells cross both in both directions as the LiDAR
+# breathes. Two detours round opposite sides of the same obstacle can differ by
+# a millimetre of cost, and a planner that re-decides from scratch every replan
+# will take the left one, then the right one, then the left one, spending a
+# 375 mm turn each time it changes its mind and making no progress at all.
+#
+# So the committed path is STICKY: it is kept unless it has become unsafe, or
+# unless the new plan is better by a margin big enough to be worth the turns it
+# costs to switch. Expressed as a fraction of the committed path's cost.
+# Default 0.15 means "15 % better or I am not turning round", which at a typical
+# 1000 mm detour is 150 mm -- less than one turn, so a genuinely better route
+# still wins, and noise never does.
+PLAN_HYSTERESIS_FRAC = _cfg_float("FPMS_MISSION_PLAN_HYSTERESIS_FRAC", 0.15,
+                                  0.0, 1.0)
+
+
 class OccupancyGrid:
     """What the LiDAR has seen, in ARENA millimetres, on a fixed square grid.
 
@@ -1643,6 +2031,12 @@ class OccupancyGrid:
     that one for a 360-bin transform would delay an odometry callback or a stop.
     """
 
+    # How many returns the per-cell centroid averages before it stops getting
+    # more stubborn. See `mark`: past this it is a fixed-gain filter, so a
+    # surface that really moved is followed within a few scans instead of being
+    # held at its old place by a hundred stale samples.
+    MEAN_CAP = 16
+
     def __init__(self, cell_mm=None, arena_mm=ARENA_MM, ttl_s=None,
                  min_hits=None, max_range_mm=None):
         self.cell_mm = float(GRID_MM if cell_mm is None else cell_mm)
@@ -1652,7 +2046,20 @@ class OccupancyGrid:
         self.min_hits = int(OCC_MIN_HITS if min_hits is None else min_hits)
         self.max_range_mm = float(OCC_MAX_RANGE_MM if max_range_mm is None
                                   else max_range_mm)
-        self._cells = {}          # (ix, iy) -> [hits, last_seen_monotonic]
+        # (ix, iy) -> [hits, last_seen_monotonic, mean_x_mm, mean_y_mm, n_mean]
+        #
+        # THE LAST THREE ARE THE WHOLE WALL-PAD FIX (see WALL_BAND_MM). A cell
+        # index answers "which 50 mm square", and that used to be all this grid
+        # remembered -- so a wall at x = 1200 came back as x = 1175 and the
+        # planner had to add half a cell of padding to cover the error it had
+        # just introduced. Keeping the running MEAN of the returns folded into
+        # the cell costs two floats and remembers the wall where it is.
+        #
+        # A MEAN, NOT THE LAST POINT: one bad range should move the answer by a
+        # fraction of its error, not by all of it. `n_mean` is capped in `mark`
+        # so a surface that has been stared at for a minute can still follow a
+        # real move rather than being anchored to where it used to be.
+        self._cells = {}
         self._lock = threading.Lock()
         self.scans = 0
         self.last_scan_t = 0.0
@@ -1677,18 +2084,30 @@ class OccupancyGrid:
         if not self.in_grid(c[0], c[1]):
             return None
         now = time.monotonic() if now is None else now
+        x_mm, y_mm = float(x_mm), float(y_mm)
         with self._lock:
             e = self._cells.get(c)
             if e is None or (now - e[1]) > self.ttl_s:
                 # An expired cell is a NEW observation, not a continuation. If
                 # the count carried across the gap, a cell touched once an hour
                 # would eventually cross min_hits and block a route for ever.
-                self._cells[c] = [1, now]
+                # The centroid restarts with it, for the same reason: a mean
+                # that survived the gap would describe a surface nobody has
+                # seen since.
+                self._cells[c] = [1, now, x_mm, y_mm, 1]
             else:
                 # Capped, so a cell stared at for a minute does not need a
                 # minute of absence to fall back under the threshold.
                 e[0] = min(e[0] + 1, self.min_hits + 8)
                 e[1] = now
+                # Running mean, with its own capped count so the centroid stays
+                # able to follow a surface that really moved. Once k is pinned
+                # this is a first-order filter with a fixed gain of 1/k rather
+                # than an average that gets more stubborn for ever.
+                k = min(e[4] + 1, self.MEAN_CAP)
+                e[2] += (x_mm - e[2]) / k
+                e[3] += (y_mm - e[3]) / k
+                e[4] = k
         return c
 
     def integrate(self, ranges_m, pose, range_max_m=6.0, now=None):
@@ -1743,6 +2162,40 @@ class OccupancyGrid:
         return set(c for c, e in items
                    if e[0] >= self.min_hits and (now - e[1]) <= self.ttl_s)
 
+    def points(self, now=None, wall_band_mm=None):
+        """Believed surfaces as MEASURED POINTS, not as cell indices.
+
+        [(x_mm, y_mm, is_wall), ...], one per believed cell, sorted -- sorted
+        because everything downstream of here has to be deterministic and a
+        dict's iteration order is not something to bet a replan on.
+
+        `is_wall` is the asymmetric-padding decision and it is made HERE, once,
+        rather than in the two places that would otherwise each need it: a
+        centroid within `wall_band_mm` of the arena boundary is the arena wall,
+        which `WALL_PAD_MM` already models from a number we know exactly, so
+        re-deriving it from a noisy range would double-count a boundary that was
+        never in doubt. The safety argument for absorbing them -- that the strip
+        involved is narrower than the rover and so was never a route -- is set
+        out in full at WALL_BAND_MM, along with why the band is clamped.
+
+        The point is the CENTROID, so this is also where the old half-cell fudge
+        stops being needed: callers measure a real distance to a real
+        measurement, and pad it by OCC_POINT_PAD_MM for what the sensor is
+        actually worth.
+        """
+        band = WALL_BAND_MM if wall_band_mm is None else float(wall_band_mm)
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            items = list(self._cells.items())
+        out = []
+        for c, e in sorted(items):
+            if e[0] < self.min_hits or (now - e[1]) > self.ttl_s:
+                continue
+            x, y = e[2], e[3]
+            edge = min(x, y, self.arena_mm - x, self.arena_mm - y)
+            out.append((x, y, edge <= band))
+        return out
+
     def forget_stale(self, now=None):
         """Drop expired cells. Housekeeping only: `occupied` already ignores
         them, so this changes no decision, it only bounds the dict."""
@@ -1758,8 +2211,14 @@ class OccupancyGrid:
             total = len(self._cells)
             last = self.last_scan_t
             scans = self.scans
-        return {"cells": len(self.occupied(now=now)), "cells_tracked": total,
+        pts = self.points(now=now)
+        walls = sum(1 for p in pts if p[2])
+        return {"cells": len(pts), "cells_tracked": total,
                 "scans": scans,
+                # ADDITIVE. The split is the single most useful thing to see on
+                # a field: "40 cells" is unreadable, "36 of them are the arena
+                # wall and 4 are actually in the way" is the whole picture.
+                "wall_cells": walls, "obstacle_cells": len(pts) - walls,
                 "age_s": None if not last else round(now - last, 1)}
 
 
@@ -1811,6 +2270,241 @@ def inflate_blocked(occupied, n, cell_mm, radius_mm=None, wall_pad_mm=None,
     for c in free:
         blocked.discard(tuple(c))
     return blocked
+
+
+class CostMap:
+    """The three layers the rover actually cares about, built once per replan.
+
+    This is Nav2's LAYERED COSTMAP idea and nothing else from Nav2: a static
+    layer (the arena boundary, known exactly), an obstacle layer (what the
+    LiDAR believes), and an inflation layer (a soft cost that decays with
+    distance so paths prefer the middle of free space). Borrowing the idea is
+    worth it; borrowing the stack is not, for a 24 x 24 grid on a rover whose
+    only sensor is a 360-bin scan.
+
+    WHAT IS DIFFERENT FROM `inflate_blocked`, AND WHY IT HAD TO BE.
+    `inflate_blocked` answers in CELLS: it grows observed cells by the robot
+    radius and hands back a set. That is fine for a search, and it is still what
+    the search uses -- but it is NOT fine for deciding whether the rover may
+    drive a particular line, because a cell index is a 50 mm square and the
+    rover is at a point. Measured on this arena, the round trip
+    (wall -> cell centre -> inflate by radius + half a cell -> test the path by
+    ITS cell) cost 30 mm of the m2 corridor's 58 mm of real margin and turned a
+    60 mm measurement error into a total refusal. See WALL_BAND_MM.
+
+    So safety here is CONTINUOUS: `clear_mm` measures a real distance from a
+    real point to the nearest thing that is really in the way. The grid survives
+    only as an index for finding candidate points quickly, which is all a grid
+    was ever good for.
+
+    Costs are in MILLIMETRES OF EQUIVALENT DRIVING throughout -- the same unit
+    as `turn_cost_mm` and as the path itself. A search that adds up millimetres,
+    degrees and dimensionless 0-254 costmap units is minimising something no
+    human chose; keeping one unit is the only way the weights stay arguable.
+    """
+
+    def __init__(self, points, n, cell_mm, arena_mm=ARENA_MM, radius_mm=None,
+                 wall_pad_mm=None, point_pad_mm=None, free=(),
+                 absorb_walls=True, decay_mm=None):
+        self.n = int(n)
+        self.cell_mm = float(cell_mm)
+        self.arena_mm = float(arena_mm)
+        self.radius_mm = ROBOT_RADIUS_MM if radius_mm is None else float(radius_mm)
+        self.wall_pad_mm = WALL_PAD_MM if wall_pad_mm is None else float(wall_pad_mm)
+        self.point_pad_mm = (OCC_POINT_PAD_MM if point_pad_mm is None
+                             else float(point_pad_mm))
+        self.decay_mm = (CLEARANCE_DECAY_MM if decay_mm is None
+                         else float(decay_mm))
+        # HOW FAR THE CENTRE MUST STAY FROM A MEASURED SURFACE. Radius because
+        # the rover has width; point pad because a range has error. NOT plus
+        # half a cell -- that term existed to cover the cell-centre
+        # approximation this class does not make.
+        self.reach = self.radius_mm + self.point_pad_mm
+        self.free = set(tuple(c) for c in free)
+
+        # The obstacle layer. Wall returns are dropped into the static layer
+        # instead (WALL_BAND_MM sets out why that is safe), unless the caller
+        # asks otherwise -- `absorb_walls=False` is what the tests use to prove
+        # the old behaviour is still reachable.
+        self.walls_absorbed = 0
+        obs = []
+        for p in points:
+            x, y, is_wall = float(p[0]), float(p[1]), bool(p[2])
+            if is_wall and absorb_walls:
+                self.walls_absorbed += 1
+                continue
+            obs.append((x, y))
+        self.obstacles = obs
+
+        # SPATIAL INDEX, not a second copy of the map. Each cell keeps the
+        # obstacle points that could possibly make a query inside it unsafe, so
+        # `clear_mm` looks at a handful of points instead of all of them. The
+        # stamp radius is `reach` plus one cell diagonal, because a query may sit
+        # anywhere in the cell rather than at its centre -- getting that wrong
+        # would make the index MISS a hazard, which is the one error direction
+        # that is not allowed here.
+        span = int(math.ceil((self.reach + self.cell_mm * DIAG_COST)
+                             / self.cell_mm))
+        self._near = {}
+        for (ox, oy) in obs:
+            cx0, cy0 = int(ox // self.cell_mm), int(oy // self.cell_mm)
+            for dx in range(-span, span + 1):
+                for dy in range(-span, span + 1):
+                    ix, iy = cx0 + dx, cy0 + dy
+                    if 0 <= ix < self.n and 0 <= iy < self.n:
+                        self._near.setdefault((ix, iy), []).append((ox, oy))
+
+        # The cell view, for the search and for `astar_cells`. A cell is blocked
+        # when its CENTRE is unsafe. This is deliberately the coarse test: it is
+        # what the search expands over, and every candidate it produces is then
+        # re-checked continuously by `segment_ok` before it becomes a route.
+        self.blocked = set()
+        for ix in range(self.n):
+            for iy in range(self.n):
+                if (ix, iy) in self.free:
+                    continue
+                c = ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
+                if self.clear_mm(c[0], c[1]) < 0.0:
+                    self.blocked.add((ix, iy))
+        self._dist = self._distance_field()
+        self._prox = dict((c, math.exp(-d / self.decay_mm))
+                          for c, d in self._dist.items())
+
+    # -- the safety question, asked continuously ---------------------------
+    def clear_mm(self, x, y):
+        """Margin in mm at an arena point: >= 0 means the centre may be here.
+
+        Negative is how far INSIDE the forbidden region the point is, which is
+        more useful than a bool when relaxing pads down a ladder.
+        """
+        if (int(x // self.cell_mm), int(y // self.cell_mm)) in self.free:
+            # The cell the rover is standing in is always passable, whatever the
+            # map believes. Same escape hatch, and the same reason, as
+            # `inflate_blocked`'s `free`: a rover that has parked inside the pad
+            # must still be able to plan the route out of it.
+            return float(self.reach)
+        # Static layer: the arena boundary, from a number that is known and not
+        # measured, so no padding for sensor error is owed on it.
+        m = min(x - self.wall_pad_mm, y - self.wall_pad_mm,
+                (self.arena_mm - self.wall_pad_mm) - x,
+                (self.arena_mm - self.wall_pad_mm) - y)
+        # Obstacle layer: the true distance to the nearest believed surface.
+        for (ox, oy) in self._near.get(
+                (int(x // self.cell_mm), int(y // self.cell_mm)), ()):
+            m = min(m, math.hypot(x - ox, y - oy) - self.reach)
+            if m < 0.0:
+                break
+        return m
+
+    def safe(self, x, y):
+        return self.clear_mm(x, y) >= 0.0
+
+    def segment_ok(self, x0, y0, x1, y1, step_mm=None):
+        """Can the rover drive straight from one arena point to another?
+
+        SAMPLED IN CONTINUOUS SPACE at half a cell, which cannot step over an
+        obstacle whose forbidden disc is `reach` (>= 170 mm) across. This is the
+        ONE predicate used for line-of-sight inside Theta*, for the "is the
+        straight line already clear" short-circuit, and for the final check on
+        the route that is published -- so the search, the shortcut and the
+        published plan can never disagree about what "clear" means.
+        """
+        step = float(step_mm) if step_mm else self.cell_mm * 0.5
+        d = math.hypot(x1 - x0, y1 - y0)
+        k = max(1, int(math.ceil(d / step)))
+        for i in range(k + 1):
+            t = float(i) / k
+            if not self.safe(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t):
+                return False
+        return True
+
+    # -- the soft layer ----------------------------------------------------
+    def _distance_field(self):
+        """Per-cell distance to the nearest hazard, by two-pass chamfer.
+
+        APPROXIMATE ON PURPOSE, and cell-resolution on purpose. It feeds only
+        the soft preference for open space, where being 20 mm out changes a
+        tie-break and nothing else; the SAFETY answer never comes from here, it
+        comes from `clear_mm`. Chamfer is used rather than an exact transform
+        because it is O(cells) whatever the influence radius, and the influence
+        radius here (3 * decay, ~750 mm) is most of the arena.
+        """
+        n, cell = self.n, self.cell_mm
+        INF = float(self.arena_mm * 2.0)
+        d = {}
+        for ix in range(n):
+            for iy in range(n):
+                c = ((ix + 0.5) * cell, (iy + 0.5) * cell)
+                m = self.clear_mm(c[0], c[1])
+                d[(ix, iy)] = 0.0 if m <= 0.0 else min(m, INF)
+        fwd = ((-1, 0, cell), (0, -1, cell),
+               (-1, -1, cell * DIAG_COST), (1, -1, cell * DIAG_COST))
+        bwd = ((1, 0, cell), (0, 1, cell),
+               (1, 1, cell * DIAG_COST), (-1, 1, cell * DIAG_COST))
+        for ix in range(n):
+            for iy in range(n):
+                for dx, dy, w in fwd:
+                    o = d.get((ix + dx, iy + dy))
+                    if o is not None and o + w < d[(ix, iy)]:
+                        d[(ix, iy)] = o + w
+        for ix in range(n - 1, -1, -1):
+            for iy in range(n - 1, -1, -1):
+                for dx, dy, w in bwd:
+                    o = d.get((ix + dx, iy + dy))
+                    if o is not None and o + w < d[(ix, iy)]:
+                        d[(ix, iy)] = o + w
+        return d
+
+    def proximity(self, x, y):
+        """How squeezed this point is: 1.0 against a surface, ->0 in the open.
+
+        Nav2's inflation curve, kept dimensionless: exp(-clearance / decay), so
+        it falls by 1/e every CLEARANCE_DECAY_MM. Dimensionless because the
+        weight that turns it into a cost lives in ONE place
+        (CLEARANCE_COST_W), and a curve that carried its own units would let
+        the two drift apart.
+        """
+        # Table lookup, not a call to exp(). The curve depends only on the cell,
+        # and `segment_cost_mm` asks for it once per sample per candidate edge --
+        # tens of thousands of times per search. Computing it once per cell in
+        # `_distance_field` and reading it here is the difference between the
+        # transcendental being free and it being most of the planner.
+        return self._prox.get((int(x // self.cell_mm), int(y // self.cell_mm)),
+                              0.0)
+
+    def segment_cost_mm(self, x0, y0, x1, y1):
+        """Length of a straight run, plus what driving it that close costs.
+
+        cost = d * (1 + w * mean_proximity). Per millimetre travelled, so a long
+        run through open space is not penalised for being long and a long run
+        through a squeeze is penalised in proportion to how much of it is
+        squeezed.
+
+        The proximity term is AVERAGED over the run rather than sampled at one
+        end, because a leg that passes an obstacle half way along is exactly as
+        squeezed as one that starts beside it -- and a planner that only looked
+        at its endpoints would happily thread the gap in the middle for free,
+        which is precisely the behaviour this exists to stop.
+        """
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d <= 0.0 or CLEARANCE_COST_W <= 0.0:
+            return d
+        k = max(1, int(math.ceil(d / self.cell_mm)))
+        acc = 0.0
+        for i in range(k + 1):
+            t = float(i) / k
+            acc += self.proximity(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+        return d * (1.0 + CLEARANCE_COST_W * acc / (k + 1))
+
+    # -- geometry helpers --------------------------------------------------
+    def cell_of(self, x, y):
+        return (int(x // self.cell_mm), int(y // self.cell_mm))
+
+    def centre_of(self, ix, iy):
+        return ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
+
+    def in_grid(self, ix, iy):
+        return 0 <= ix < self.n and 0 <= iy < self.n
 
 
 def astar_cells(blocked, n, start, goal):
@@ -1892,6 +2586,328 @@ def astar_cells(blocked, n, start, goal):
                 hb = h(nb)
                 heapq.heappush(open_heap, (ng + hb, hb, nx, ny))
     return None
+
+
+def path_cost_mm(pts, heading_deg, cmap=None):
+    """WHAT A WHOLE ROUTE COSTS THIS ROVER. One scorer, used everywhere.
+
+    `pts` is [(x, y), ...] starting at the CURRENT POSE and ending at the
+    target. `heading_deg` is the heading the rover is facing right now, which is
+    part of the cost and not a detail: the first turn is as real as any other,
+    and a planner that ignored it would happily propose a route that starts by
+    spinning 170 degrees to save 20 mm.
+
+    Three terms, all in millimetres:
+      * distance,
+      * a turn charged at every vertex INCLUDING the first (`turn_cost_mm`),
+      * the proximity bribe, if a costmap was supplied.
+
+    This is the function the search minimises and the function hysteresis
+    compares two candidate routes with. Deliberately the same one: a planner
+    that searched on one cost and then chose between answers on another would
+    reject its own best path, and the bug would look like flapping.
+    """
+    if not pts:
+        return 0.0
+    total = 0.0
+    hdg = math.radians(float(heading_deg))
+    px, py = pts[0]
+    for (qx, qy) in pts[1:]:
+        d = math.hypot(qx - px, qy - py)
+        if d <= 1e-9:
+            continue
+        b = math.atan2(qy - py, qx - px)
+        total += turn_cost_mm(wrap_pi(b - hdg))
+        total += (cmap.segment_cost_mm(px, py, qx, qy) if cmap is not None
+                  else d)
+        hdg = b
+        px, py = qx, qy
+    return total
+
+
+def theta_star(cmap, start_xy, goal_xy, heading_deg):
+    """ANY-ANGLE search. [(x_mm, y_mm), ...] from start to goal, or None.
+
+    WHY ANY-ANGLE, ON THIS ROVER, IS NOT A LUXURY
+    ---------------------------------------------
+    An 8-connected A* can only ever leave a cell in one of eight directions, so
+    a route that really wants to run at 20 degrees comes back as a staircase of
+    45 degree steps. The old planner then string-pulled that staircase straight
+    again -- which works, but it is repairing damage the search did not have to
+    do, and it can only remove turns the search already committed to, never
+    choose a better angle in the first place. On a chassis where one right-angle
+    turn costs 375 mm of driving (`turn_cost_mm`), that difference is the whole
+    ball game.
+
+    Theta* (Daniel, Nash, Koenig & Felner 2010) is A* with one extra question at
+    every relaxation: can the successor see this node's PARENT directly? If it
+    can, hang it off the parent instead and skip the intermediate vertex
+    entirely. The result is a polyline whose vertices are only where the route
+    genuinely has to bend, at whatever angle it likes.
+
+    WHAT THIS IMPLEMENTATION ADDS TO THE PAPER, and why each one is needed here:
+
+      * TURN COST. The paper minimises length. This minimises `path_cost_mm`,
+        which prices the heading change at each vertex -- so the search prefers
+        a slightly longer route with one bend to a shorter one with three. That
+        is the correct trade for this chassis and it is the opposite of what
+        plain Theta* would choose.
+      * THE START HEADING IS A REAL STATE. `heading_deg` seeds the turn cost, so
+        the route the rover is already pointing at is genuinely cheaper. This is
+        why a clear m2 leg stays turn-free: it is not a special case, it falls
+        out of the cost.
+      * LINE OF SIGHT IS CONTINUOUS, not a Bresenham walk over cells. The paper
+        rasterises because its obstacles are cells; here the obstacles are
+        measured points with a real radius, so `CostMap.segment_ok` samples the
+        actual line the rover would drive. That also disposes of the paper's
+        awkward corner case about whether sight passes between two diagonally
+        touching blocked cells -- there are no blocked cells in the test, only
+        distances, and a gap either admits a 170 mm radius or it does not.
+
+    THE HEURISTIC IS EUCLIDEAN, AND THAT IS NOT A STYLE CHOICE. `astar_cells`
+    above uses OCTILE distance and is right to: octile is the exact cost of an
+    unobstructed 8-connected walk. It is INADMISSIBLE here. Once a path may run
+    at any angle, the true remaining cost is the straight line, and octile
+    OVERESTIMATES it by up to ~8 %, which would let this search settle for a
+    route it has already been told is worse than one it never looked at.
+    Straight-line distance is the tightest admissible heuristic for any-angle
+    search, and every added term (turns, proximity) is non-negative, so it stays
+    a lower bound however the cost model is tuned.
+
+    HONEST ABOUT OPTIMALITY. Basic Theta* is not guaranteed optimal even on
+    length alone (re-parenting to a visible grandparent can miss a better
+    ancestor further back), and the turn term makes the cost history-dependent
+    on top of that, so a closed node is not provably final. Both are accepted:
+    this is a 24 x 24 grid where the answer is re-derived at every leg boundary,
+    and a near-optimal route now beats an optimal one that needed a state space
+    eight times larger to prove it. The heuristic stays ADMISSIBLE regardless --
+    straight-line distance, which turn and proximity costs can only add to --
+    so the search is still directed and still terminates.
+
+    Determinism is inherited unchanged: fixed neighbour order, and a heap key of
+    (f, h, ix, iy) that depends only on WHICH cell, never on when it was pushed.
+    """
+    n, cell = cmap.n, cmap.cell_mm
+    s_cell = cmap.cell_of(*start_xy)
+    g_cell = cmap.cell_of(*goal_xy)
+    if not (cmap.in_grid(*s_cell) and cmap.in_grid(*g_cell)):
+        return None
+    if not cmap.safe(*goal_xy):
+        # A blocked GOAL is answered here rather than by an exhaustive search
+        # that can only fail. "the target is inside an obstacle (or its
+        # inflation)" is a real answer and the caller turns it into the abort it
+        # always had.
+        return None
+    if cmap.segment_ok(start_xy[0], start_xy[1], goal_xy[0], goal_xy[1]):
+        return [tuple(start_xy), tuple(goal_xy)]
+    if s_cell == g_cell:
+        return None
+
+    def pos(c):
+        # The ENDPOINTS ARE THE TRUE POSE AND THE TRUE TARGET, never cell
+        # centres -- the same rule `simplify_cells` states: the grid is a search
+        # space, not a coordinate system. Docking on a cell centre would leave
+        # the rover up to 35 mm from the zone it was asked for, and that error
+        # would read as odometry drift in every log.
+        if c == s_cell:
+            return (float(start_xy[0]), float(start_xy[1]))
+        if c == g_cell:
+            return (float(goal_xy[0]), float(goal_xy[1]))
+        return ((c[0] + 0.5) * cell, (c[1] + 0.5) * cell)
+
+    gx, gy = pos(g_cell)
+
+    def h(c):
+        px, py = pos(c)
+        return math.hypot(gx - px, gy - py)
+
+    # MEMOISED, BECAUSE THE SAME QUESTION IS ASKED THOUSANDS OF TIMES. Both
+    # answers depend only on the PAIR OF CELLS (`pos` is a pure function of the
+    # cell), and Theta* re-asks the same pair every time a node is relaxed from
+    # a different direction. Measured on the m2 detour: 69 ms without this.
+    # Symmetric key, since a line and its reverse are the same line -- which
+    # roughly halves the table and is safe because both predicates sample the
+    # same points either way round.
+    _los, _cost = {}, {}
+
+    def los(a, b):
+        k = (a, b) if a <= b else (b, a)
+        v = _los.get(k)
+        if v is None:
+            ax, ay = pos(a)
+            bx, by = pos(b)
+            v = _los[k] = cmap.segment_ok(ax, ay, bx, by)
+        return v
+
+    def seg_cost(a, b):
+        k = (a, b) if a <= b else (b, a)
+        v = _cost.get(k)
+        if v is None:
+            ax, ay = pos(a)
+            bx, by = pos(b)
+            v = _cost[k] = cmap.segment_cost_mm(ax, ay, bx, by)
+        return v
+
+    parent = {s_cell: None}
+    g = {s_cell: 0.0}
+    # Heading ARRIVING at a node, which is what the turn at that node is
+    # measured against. The start's is the rover's real heading.
+    hdg = {s_cell: math.radians(float(heading_deg))}
+    closed = set()
+    h0 = h(s_cell)
+    heap = [(h0, h0, s_cell[0], s_cell[1])]
+
+    def step_cost(frm, to):
+        """Cost of going frm -> to, including the turn that entry demands."""
+        ax, ay = pos(frm)
+        bx, by = pos(to)
+        d = math.hypot(bx - ax, by - ay)
+        if d <= 1e-9:
+            return 0.0, hdg[frm]
+        b = math.atan2(by - ay, bx - ax)
+        return seg_cost(frm, to) + turn_cost_mm(wrap_pi(b - hdg[frm])), b
+
+    while heap:
+        _f, _h, cx, cy = heapq.heappop(heap)
+        cur = (cx, cy)
+        if cur in closed:
+            continue
+        closed.add(cur)
+        if cur == g_cell:
+            out = []
+            c = cur
+            while c is not None:
+                out.append(pos(c))
+                c = parent[c]
+            out.reverse()
+            return out
+        for dx, dy in NEIGHBOURS:
+            nb = (cx + dx, cy + dy)
+            if not cmap.in_grid(*nb) or nb in closed:
+                continue
+            if nb in cmap.blocked and nb != g_cell:
+                continue
+            # BOTH PATHS ARE COSTED, AND THE CHEAPER WINS. This is the one place
+            # this implementation must NOT follow the published algorithm.
+            #
+            # Basic Theta* takes the parent shortcut (Path 2) unconditionally
+            # whenever line of sight allows it, and it is entitled to: under
+            # uniform cost the triangle inequality guarantees the shortcut is
+            # never longer. THAT GUARANTEE IS GONE HERE. The cost this searches
+            # on is not length -- it is length plus a turn charge plus a
+            # proximity charge -- and a straight shortcut past an obstacle can
+            # genuinely cost more than going via the bend, because it spends the
+            # whole run hugging the thing. Taking Path 2 on sight alone would
+            # let the search cut straight through the inflation gradient it was
+            # given precisely to avoid, which is the documented failure mode of
+            # combining any-angle search with a graded costmap.
+            #
+            # So both are evaluated and the cheaper is kept. Path 2 still wins
+            # almost always, which is what makes this Theta* and not A*.
+            gp = parent.get(cur)
+            cands = []
+            bx, by = pos(nb)
+            if los(cur, nb):
+                # PATH 1 -- the ordinary A* relaxation through this node.
+                c1, b1 = step_cost(cur, nb)
+                cands.append((g[cur] + c1, cur, b1))
+            if gp is not None and los(gp, nb):
+                # PATH 2 -- the Theta* shortcut. If the successor can see this
+                # node's PARENT, the intermediate vertex need not be a bend the
+                # rover makes at all, so charge from the parent and skip it.
+                px, py = pos(gp)
+                if math.hypot(bx - px, by - py) > 1e-9:
+                    b2 = math.atan2(by - py, bx - px)
+                    cands.append((g[gp] + seg_cost(gp, nb)
+                                  + turn_cost_mm(wrap_pi(b2 - hdg[gp])),
+                                  gp, b2))
+            if not cands:
+                continue
+            best = min(cands, key=lambda t: t[0])
+            if best[0] < g.get(nb, float("inf")) - 1e-9:
+                g[nb] = best[0]
+                parent[nb] = best[1]
+                hdg[nb] = best[2]
+                hb = h(nb)
+                heapq.heappush(heap, (best[0] + hb, hb, nb[0], nb[1]))
+    return None
+
+
+def prune_via(route, cmap):
+    """Drop waypoints this chassis cannot actually act on.
+
+    A SEARCH ANSWERS IN GEOMETRY; A ROVER ANSWERS IN MOTIONS IT CAN PERFORM.
+    Every other floor in this file comes from that gap -- MIN_MOVE_MM,
+    MIN_TURN_DEG, MIN_LEG_MM -- and a planner is not exempt from it. Three kinds
+    of vertex are geometrically real and physically fictional:
+
+      * A BEND SMALLER THAN THE SMALLEST TURN THIS CHASSIS CAN MAKE. This is the
+        one that actually bit, and the failure is silent, so it is worth the
+        detail. `plan_route` only emits a correction turn once the bearing error
+        reaches BEARING_TOL_DEG -- and BEARING_TOL_DEG is FLOORED AT
+        MIN_TURN_DEG (9.0 deg here: TURN_RADPS 0.45 for a MIN_PULSE_S of 0.35)
+        precisely because anything smaller cannot be commanded at all. So a
+        waypoint whose bend is under that produces NO TURN, and the rover then
+        drives the following leg along the OLD heading. Measured on the m2
+        detour: an 8.1 deg bend was silently dropped by the follower, the final
+        66 mm hop ran off-axis, and the drawn plan ended 9.4 mm from the zone
+        centre -- an error that looks exactly like odometry drift in the log.
+      * ONE CLOSER TO THE TARGET THAN THE FOLLOWER'S OWN RETIREMENT TOLERANCE
+        (VIA_TOL_MM), which `_drive_to` discards on proximity anyway.
+      * ONE CLOSER TO ITS PREDECESSOR THAN THE SHORTEST MOTION THE FIRMWARE WILL
+        ACT ON (MIN_MOVE_MM), which `split_legs` refuses to emit.
+
+    EVERY REMOVAL IS GUARDED. Dropping a vertex means driving the straight line
+    that replaces it, and that line was never checked by the search -- so it is
+    checked here, with the same `segment_ok` as everything else, and the vertex
+    stays if the shortcut is not clear. Pruning must never be the thing that
+    puts the chassis into an obstacle.
+    """
+    if len(route) <= 2:
+        return list(route)
+    out = [route[0]]
+    for i in range(1, len(route) - 1):
+        p, v, nxt = out[-1], route[i], route[i + 1]
+        bend = abs(math.degrees(wrap_pi(
+            math.atan2(nxt[1] - v[1], nxt[0] - v[0])
+            - math.atan2(v[1] - p[1], v[0] - p[0]))))
+        drop = (bend < BEARING_TOL_DEG
+                or math.hypot(v[0] - route[-1][0],
+                              v[1] - route[-1][1]) <= VIA_TOL_MM
+                or math.hypot(v[0] - p[0], v[1] - p[1]) < MIN_MOVE_MM)
+        if drop and cmap.segment_ok(p[0], p[1], nxt[0], nxt[1]):
+            continue
+        out.append(v)
+    out.append(route[-1])
+    return out
+
+
+def shortcut_points(pts, cmap, heading_deg):
+    """One more greedy pass: drop any vertex the route does not need.
+
+    Basic Theta* only ever compares a node against its immediate parent, so it
+    can leave a bend in that a longer look-back would have removed. This is the
+    same string-pull the grid planner already used, kept for exactly that
+    residue -- and it now has to JUSTIFY each removal against `path_cost_mm`
+    rather than just against length, because on this chassis a shortcut that
+    removes a bend but adds an awkward angle can genuinely be worse.
+    """
+    if len(pts) <= 2:
+        return list(pts)
+    out = [pts[0]]
+    i = 0
+    while i < len(pts) - 1:
+        j = len(pts) - 1
+        while j > i + 1:
+            if cmap.segment_ok(pts[i][0], pts[i][1], pts[j][0], pts[j][1]):
+                cand = out + [pts[j]] + list(pts[j + 1:])
+                if path_cost_mm(cand, heading_deg, cmap) <= \
+                        path_cost_mm(out + list(pts[i + 1:]), heading_deg, cmap) + 1e-6:
+                    break
+            j -= 1
+        out.append(pts[j])
+        i = j
+    return out
 
 
 def segment_is_clear(x0, y0, x1, y1, blocked, cell_mm, n, step_mm=None):
@@ -1976,7 +2992,163 @@ def simplify_cells(cells, cell_mm, start_xy, goal_xy, blocked=None, n=0):
     return pts[1:]
 
 
-def grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=None):
+@dataclass
+class PlanOutcome:
+    """What the planner decided, and enough about HOW to explain it.
+
+    `points` follows the same three-answer contract `grid_detour_points` has
+    always had -- [] clear, [...] detour, None no route -- because every caller
+    of that contract still depends on it and the abort hangs off `None`.
+    Everything else here is explanation, carried out to telemetry rather than
+    only to the log.
+    """
+    points: list = None          # intermediate waypoints; None = no route
+    relax: str = "none"          # which rung of the ladder produced this
+    cost_mm: float = 0.0
+    kept: bool = False           # hysteresis kept the previously committed path
+    searched: bool = False       # a search actually ran (vs a clear straight line)
+    note: str = None
+    obstacles: int = 0
+    walls: int = 0
+
+
+# THE LADDER, top rung first. Each entry is (name, wall pad scale, radius
+# scale). Read the reasoning at PLAN_RELAX: the wall pad is a policy about a
+# boundary that is known and static, so it is relaxed FIRST; the obstacle radius
+# is the rover's actual half-width and is relaxed LAST, LEAST, and never below
+# RELAX_RADIUS_FRAC of itself.
+#
+# THE LADDER CANNOT REACH ZERO. There is no rung that removes padding, because
+# "no route at any margin" and "a route only if the chassis is allowed to
+# collide" are the same answer as far as the rover is concerned, and the honest
+# report is the abort the operator would have got anyway.
+RELAX_LADDER = (("none", 1.0, 1.0),
+                ("wall", 0.5, 1.0),
+                ("wall+radius", 0.5, RELAX_RADIUS_FRAC))
+
+
+def _search(cmap, x_mm, y_mm, heading_deg, tx_mm, ty_mm, planner):
+    """One search on one costmap. [(x, y), ...] including both ends, or None."""
+    if planner == "astar":
+        # The grid search, kept as a first-class option rather than as dead
+        # code. It searches the CELL view of the same costmap, so it inherits
+        # the measured-point inflation and the wall absorption; only the
+        # any-angle part is given up.
+        here = cmap.cell_of(x_mm, y_mm)
+        goal = cmap.cell_of(tx_mm, ty_mm)
+        cells = astar_cells(cmap.blocked - {here, goal}, cmap.n, here, goal)
+        if cells is None:
+            return None
+        pts = [(float(x_mm), float(y_mm))]
+        for c in cells[1:-1]:
+            pts.append(cmap.centre_of(*c))
+        pts.append((float(tx_mm), float(ty_mm)))
+        return pts
+    return theta_star(cmap, (x_mm, y_mm), (tx_mm, ty_mm), heading_deg)
+
+
+def plan_detour(x_mm, y_mm, tx_mm, ty_mm, grid, now=None, heading_deg=None,
+                committed=None, planner=None):
+    """The whole route decision for one leg, with its reasoning. PURE.
+
+    The order of business, and every step is a refusal to do something clever:
+
+      1. NO GRID, OR NOTHING BELIEVED -> the straight line, untouched. This is
+         the short-circuit the m2 regression rests on and it comes first for
+         that reason: on a clean arena this function must be a no-op.
+      2. STRAIGHT LINE STILL CLEAR -> the straight line. Checked against the
+         continuous costmap, so "clear" means the line the rover would really
+         drive, not the cells it would pass through.
+      3. SEARCH, down the relaxation ladder until something is found.
+      4. HYSTERESIS -- keep what we already committed to unless the new answer
+         is properly better.
+
+    A path is only ever returned after `segment_ok` has confirmed every one of
+    its legs on the costmap that produced it. A search that returns a route its
+    own map calls undrivable is a bug, and this is where it would be caught
+    rather than at the wheels.
+    """
+    use = (planner or PLANNER)
+    out = PlanOutcome(points=[])
+    if grid is None or use == "straight":
+        return out
+    pts = grid.points(now=now)
+    if not pts:
+        return out
+    out.walls = sum(1 for p in pts if p[2])
+    out.obstacles = len(pts) - out.walls
+    here = grid.cell_of(x_mm, y_mm)
+    if heading_deg is None:
+        # No heading offered: assume the rover is already pointing at the
+        # target, which makes the first turn free. That is the NEUTRAL
+        # assumption -- it neither invents a turn cost nor hides one -- and it
+        # keeps every existing caller's behaviour when it does not pass a pose.
+        heading_deg = bearing_deg(tx_mm - x_mm, ty_mm - y_mm)
+
+    base = None
+    for (name, wall_s, rad_s) in (RELAX_LADDER if PLAN_RELAX
+                                  else RELAX_LADDER[:1]):
+        cmap = CostMap(pts, grid.n, grid.cell_mm, arena_mm=grid.arena_mm,
+                       radius_mm=ROBOT_RADIUS_MM * rad_s,
+                       wall_pad_mm=WALL_PAD_MM * wall_s, free=(here,))
+        if base is None:
+            base = cmap
+            if cmap.segment_ok(x_mm, y_mm, tx_mm, ty_mm):
+                return out                       # (2) the line is still clear
+        out.searched = True
+        route = _search(cmap, x_mm, y_mm, heading_deg, tx_mm, ty_mm, use)
+        if route is None:
+            continue
+        route = prune_via(shortcut_points(route, cmap, heading_deg), cmap)
+        if not all(cmap.segment_ok(a[0], a[1], b[0], b[1])
+                   for a, b in zip(route, route[1:])):
+            continue                             # a route its own map refuses
+        out.relax = name
+        out.cost_mm = path_cost_mm(route, heading_deg, cmap)
+        out.points = [(round(p[0], 3), round(p[1], 3)) for p in route[1:-1]]
+        if name != "none":
+            out.note = ("no route existed at full margin; this one needed the "
+                        "%s padding relaxed and is drawn on that basis"
+                        % name.replace("+", " and the "))
+        break
+    else:
+        out.points = None                        # every rung failed: no route
+        return out
+
+    # (4) HYSTERESIS. See PLAN_HYSTERESIS_FRAC: the grid flickers, two detours
+    # round opposite sides of one obstacle differ by a millimetre, and a planner
+    # that re-decides from scratch every time spends a 375 mm turn changing its
+    # mind and makes no progress.
+    #
+    # ELIGIBILITY IS THE SAFETY ARGUMENT, not the comparison. The committed path
+    # is only allowed to win if it is STILL DRIVABLE on the map as it is right
+    # now -- re-checked leg by leg against the same `segment_ok` everything else
+    # uses. So the common case at a real obstacle event, where the committed
+    # route now runs through the thing that just stopped the rover, cannot keep
+    # itself alive: it fails the check and the fresh plan wins. What survives is
+    # only the case this exists for, where nothing that matters has changed.
+    #
+    # BOUNDED BY CONSTRUCTION: REPLAN_MAX still counts every replan on the leg,
+    # so even a committed path that keeps being re-kept ends in the same abort
+    # after the same five attempts as before.
+    if committed and out.points is not None:
+        old = [tuple(p) for p in committed]
+        chain = [(x_mm, y_mm)] + old + [(tx_mm, ty_mm)]
+        if all(base.segment_ok(a[0], a[1], b[0], b[1])
+               for a, b in zip(chain, chain[1:])):
+            old_cost = path_cost_mm(chain, heading_deg, base)
+            if old_cost <= out.cost_mm * (1.0 + PLAN_HYSTERESIS_FRAC):
+                out.points = old
+                out.cost_mm = old_cost
+                out.kept = True
+                out.note = ("kept the committed detour: the new route is not "
+                            "%.0f%% better, and switching costs a turn"
+                            % (PLAN_HYSTERESIS_FRAC * 100.0))
+    return out
+
+
+def grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=None,
+                       heading_deg=None, committed=None, planner=None):
     """Intermediate waypoints that get round what the grid has seen.
 
     Three distinct answers, and the caller must treat them differently:
@@ -1989,22 +3161,14 @@ def grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=None):
     THE TARGET IS NOT IN THE LIST. The follower already knows where it is going
     and reaches it with its own adaptive loop; including it would give the
     target two different representations and eventually two different answers.
+
+    Kept as the narrow front door onto `plan_detour` because this contract is
+    what every caller and every test was written against; anything that wants
+    the reasoning as well calls `plan_detour` directly.
     """
-    if grid is None:
-        return []
-    occupied = grid.occupied(now=now)
-    if not occupied:
-        return []
-    here = grid.cell_of(x_mm, y_mm)
-    blocked = inflate_blocked(occupied, grid.n, grid.cell_mm, free=(here,))
-    if segment_is_clear(x_mm, y_mm, tx_mm, ty_mm, blocked, grid.cell_mm, grid.n):
-        return []
-    cells = astar_cells(blocked, grid.n, here, grid.cell_of(tx_mm, ty_mm))
-    if cells is None:
-        return None
-    pts = simplify_cells(cells, grid.cell_mm, (x_mm, y_mm), (tx_mm, ty_mm),
-                         blocked=blocked, n=grid.n)
-    return [p for p in pts[:-1]]
+    return plan_detour(x_mm, y_mm, tx_mm, ty_mm, grid, now=now,
+                       heading_deg=heading_deg, committed=committed,
+                       planner=planner).points
 
 
 def plan_via_route(x_mm, y_mm, heading_deg, via_pts, tx_mm, ty_mm):
@@ -2028,7 +3192,7 @@ def plan_via_route(x_mm, y_mm, heading_deg, via_pts, tx_mm, ty_mm):
 
 
 def plan_grid_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm, grid=None, now=None,
-                    planner=None):
+                    planner=None, committed=None):
     """(segments, note). The straight line when it is clear; A* when it is not.
 
     `note` is None when nothing interesting happened, and a sentence otherwise.
@@ -2043,19 +3207,38 @@ def plan_grid_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm, grid=None, now=None,
     which owned this outcome before any of this existed, owns it still.
     """
     use = (planner or PLANNER)
-    if use != "astar" or grid is None:
+    if use == "straight" or grid is None:
         return plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm), None
-    pts = grid_detour_points(x_mm, y_mm, tx_mm, ty_mm, grid, now=now)
-    if pts is None:
+    r = plan_detour(x_mm, y_mm, tx_mm, ty_mm, grid, now=now,
+                    heading_deg=heading_deg, committed=committed, planner=use)
+    if r.points is None:
         return (plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm),
-                "A* found no clear route to (%.0f, %.0f) around what the LiDAR "
-                "has seen; the straight line is drawn instead and the obstacle "
-                "guard still owns the outcome" % (tx_mm, ty_mm))
-    if not pts:
-        return plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm), None
-    return (plan_via_route(x_mm, y_mm, heading_deg, pts, tx_mm, ty_mm),
-            "A* detour via %d waypoint(s) around %d observed cell(s)"
-            % (len(pts), len(grid.occupied(now=now))))
+                "%s found no clear route to (%.0f, %.0f) around what the LiDAR "
+                "has seen%s; the straight line is drawn instead and the "
+                "obstacle guard still owns the outcome"
+                % (use, tx_mm, ty_mm,
+                   "" if PLAN_RELAX else " (relaxation is switched off)"))
+    if not r.points:
+        # NO WAYPOINTS IS NOT ALWAYS "NOTHING HAPPENED". It normally means the
+        # straight line was clear at full margin, which is the quiet case and
+        # gets no note. But a RELAXED rung can also return a direct route -- the
+        # line the full-margin planner refused, found drivable once a pad was
+        # cut. Drawing that silently would tell the operator the route is
+        # ordinary when it is the one case they most need to be told about.
+        return (plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm),
+                r.note if r.relax != "none" else None)
+    bits = ["%s detour via %d waypoint(s) around %d obstacle cell(s)"
+            % (use, len(r.points), r.obstacles)]
+    if r.walls:
+        # Worth saying out loud: on a walled arena most of what the LiDAR sees
+        # is the arena, and an operator watching "38 cells seen" needs to know
+        # the planner did not treat 34 of them as things to drive round.
+        bits.append("%d further cell(s) were the arena wall and are handled by "
+                    "the wall pad, not routed around" % r.walls)
+    if r.note:
+        bits.append(r.note)
+    return (plan_via_route(x_mm, y_mm, heading_deg, r.points, tx_mm, ty_mm),
+            "; ".join(bits))
 
 
 # ===================================================================== FRAME
@@ -2220,6 +3403,7 @@ ABORT_OBSTACLE = "obstacle inside stop distance"
 ABORT_TIMEOUT = "mission timeout"
 ABORT_SEG_TIMEOUT = "segment timeout"
 ABORT_BURST_CAP = ("burst cap: the wheels ran longer than the segment could possibly need at full duty — the odometry is not to be trusted")
+ABORT_ODOM_FRAME = ("odom frame changed mid-segment: the board switched its orientation between the start of this leg and its measurement, so the distance cannot be projected onto the frame it was referenced to")
 ABORT_STALL = "segment stalled"
 ABORT_WIRE = "another /cmd_vel writer"
 ABORT_SHUTDOWN = "service shutting down"
@@ -2451,6 +3635,12 @@ class MissionNode(Node):
         # docstring section "WHICH YAW IS USED FOR WHAT".
         self.odom_yaw = 0.0
         self.odom_yaw_identity = None  # None until the first message answers it
+        # Bumped whenever the board CHANGES the frame it reports orientation in.
+        # `_displacement` projects onto the board yaw captured at the start of a
+        # segment, so a change part-way through means the measurement and its
+        # reference are in different frames. A segment that spans a bump is
+        # refused rather than believed -- see ABORT_ODOM_FRAME.
+        self.odom_frame_epoch = 0
         self.odom_last = 0.0
         self.odom_source = None       # "/odom" | "/odom_raw"
         self.odom_fused_last = 0.0
@@ -2549,8 +3739,18 @@ class MissionNode(Node):
 
     def _take_odom(self, msg, source):
         try:
-            x = float(msg.pose.pose.position.x)
-            y = float(msg.pose.pose.position.y)
+            # THE ONLY PLACE ODOM_POSE_SIGN IS APPLIED. See its declaration for
+            # what it is and how to check it without driving. Applied here, at
+            # the boundary, so that every consumer downstream — the displacement
+            # projection, the arena fix, the retrace, the telemetry — sees one
+            # consistent frame. Applying it anywhere else would leave two
+            # conventions in the same file, which is how the original mismatch
+            # survived undetected in the first place.
+            # ODOM_SCALE is applied at the same boundary and for the same
+            # reason: one frame convention, established once, before anything
+            # downstream differentiates it. Default 1.0 = no correction.
+            x = float(msg.pose.pose.position.x) * ODOM_POSE_SIGN * ODOM_SCALE
+            y = float(msg.pose.pose.position.y) * ODOM_POSE_SIGN * ODOM_SCALE
             if not (math.isfinite(x) and math.isfinite(y)):
                 return
             q = msg.pose.pose.orientation
@@ -2576,8 +3776,11 @@ class MissionNode(Node):
                     log(f"odom orientation on {source} is {what}")
                 elif self.odom_yaw_identity and not identity:
                     self.odom_yaw_identity = False
+                    self.odom_frame_epoch += 1
                     log(f"odom orientation on {source} started publishing a real "
-                        "yaw; distance projection now uses it")
+                        "yaw; distance projection now uses it. Any segment in "
+                        "flight is now unmeasurable and will abort: it was "
+                        "referenced to the identity frame it started in.")
                 self._odom_times.append(now)
                 prev = self._probe_pose_prev
                 if prev is not None and now - prev[0] > 0.0:
@@ -2672,6 +3875,39 @@ class MissionNode(Node):
 
     def on_lidar(self, payload):
         try:
+            # ---- THE STALE CONTRACT (2026-08-06) -------------------------
+            # fpms-rover-agent now publishes telemetry/lidar on a FIXED CADENCE
+            # whether or not the scanner is returning anything, so that a dead
+            # LiDAR shows up as a declared fault instead of as silence the
+            # dashboard renders as a frozen last frame.
+            #
+            # That guarantee has a sharp edge on this side. `lidar_last` is
+            # what `clearance_mm()` and `lidar_ok()` gate on, and a dead payload
+            # carries ranges of all zeros. Storing it would refresh
+            # `lidar_last`, so the obstacle guard would consider itself SIGHTED,
+            # find no returns anywhere, and conclude the path is clear —
+            # turning "the sensor is broken" into "full speed ahead". That is
+            # strictly worse than the pre-existing fail-open, because the guard
+            # would be confidently wrong rather than merely blind.
+            #
+            # So a stale payload is DROPPED here: `lidar_last` is not touched,
+            # the scan is not stored, and nothing is folded into the occupancy
+            # grid. Within LIDAR_STALE_S the existing guard notices the feed has
+            # aged out and behaves exactly as it always has when the LiDAR is
+            # missing. This ADDS a refusal; it removes no guard.
+            #
+            # `stale` is additive and absent on an un-upgraded agent, so a
+            # missing key is treated as fresh and behaviour is unchanged.
+            if isinstance(payload, dict) and payload.get("stale") is True:
+                now = time.monotonic()
+                if now - getattr(self, "_stale_lidar_logged", 0.0) > 10.0:
+                    self._stale_lidar_logged = now
+                    log(f"lidar payload marked stale "
+                        f"(health={payload.get('health')!r} "
+                        f"age={payload.get('scan_age_s')}s) — dropped, so the "
+                        "obstacle guard ages out rather than reading a dead "
+                        "scan as clear space")
+                return
             # The pose is read BEFORE the scan is stored, so the two describe
             # the same instant as closely as this rover can manage. (self.lock
             # is an RLock, so `pose()` re-entering it below would be legal --
@@ -2755,6 +3991,14 @@ class MissionNode(Node):
     def odom_xy(self):
         with self.lock:
             return self.odom_x, self.odom_y
+
+    def odom_epoch(self):
+        """Which orientation frame the board is currently reporting in.
+
+        Compared across a segment, never read for its value. See ABORT_ODOM_FRAME.
+        """
+        with self.lock:
+            return self.odom_frame_epoch
 
     def board_yaw(self):
         """The BOARD's own yaw, radians. The frame odom_xy lives in — the ONLY
@@ -3280,6 +4524,7 @@ class DeadReckonBackend:
         # is NAV2_BRIEF section 3a's prescription, and what fpms_teleop.py
         # `summarize_leg` and fpms_odom_tf.py `travel_sign()` already do.
         byaw0 = node.board_yaw()
+        epoch0 = node.odom_epoch()          # the frame byaw0 belongs to
         gyaw0 = node.yaw()                  # for heading hold only
         sign = 1.0 if seg.target >= 0 else -1.0
         reverse = sign < 0
@@ -3323,6 +4568,31 @@ class DeadReckonBackend:
                 # was legitimately shorter.
                 if now - t0 >= MIN_PULSE_S and sign * along >= stop_at:
                     break
+                # THE SENSOR-INDEPENDENT CEILING. `cap` has been bound here
+                # since 2026-08-03 and never read, which left ABORT_BURST_CAP
+                # unreachable from the whole file: this is the only caller
+                # `burst_cap_s` returns a number to, and `_turn`, which does
+                # have the check, only ever receives None from it. So the guard
+                # written specifically to "survive the sensors being wrong" was
+                # dead on the day the sensors were wrong.
+                #
+                # It reads NO odometry, which is the entire point: garbage
+                # odometry silently disables every other distance limit. At
+                # FULL_DUTY_MPS a 300 mm leg is capped at 0.74 s; the 2026-08-04
+                # run had only `segment_timeout_s` (derived from CRUISE_MPS, a
+                # setpoint this firmware discards) and ran ~3 s for ~2 m.
+                if cap is not None and now - t0 > cap:
+                    reason = ABORT_BURST_CAP
+                    break
+                # THE FRAME THIS SEGMENT IS BEING MEASURED IN CHANGED. Not a
+                # tolerance and not recoverable: `along` below is projected onto
+                # `byaw0`, captured before the change, so the number would be
+                # measured in one frame and referenced to another. Stop and say
+                # so rather than record a distance nobody can trust -- this is
+                # the "moved 1533.6 mm" report from a rover that went ~2 m.
+                if node.odom_epoch() != epoch0:
+                    reason = ABORT_ODOM_FRAME
+                    break
                 if now - t0 > timeout:
                     reason = ABORT_SEG_TIMEOUT
                     break
@@ -3359,9 +4629,11 @@ class DeadReckonBackend:
         seg.lateral_mm = lateral
         seg.elapsed_s = time.monotonic() - t0
         seg.reason = reason
-        if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL):
+        if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL, ABORT_BURST_CAP,
+                      ABORT_ODOM_FRAME):
             raise MissionAbort(f"{reason} (drive asked {seg.target:+.0f}mm, "
-                               f"measured {seg.measured:+.0f}mm)")
+                               f"measured {seg.measured:+.0f}mm in "
+                               f"{seg.elapsed_s:.2f}s)")
         # LAST: a timeout or a stall is a fault and wins over a detour. The
         # segment is fully measured by now either way.
         if detour_reason:
@@ -4156,6 +5428,31 @@ class MissionRunner:
             "replan_max": REPLAN_MAX,
             "occupancy": (self.node.occ.stats()
                           if getattr(self.node, "occ", None) else None),
+            # ADDITIVE, AND ALL OF IT ADDITIVE. Every key above keeps its
+            # meaning and its shape -- the dashboard already draws `waypoints`,
+            # `segments` and `distance_mm` and must keep working untouched.
+            #
+            # This block is what the planner was CONFIGURED to do, so a route
+            # that looks wrong on the map can be explained without an ssh
+            # session: the cost model that chose it, and the margins it was
+            # allowed to use.
+            "planner_cost": {
+                # What one 90 degree turn is worth in millimetres of driving on
+                # this chassis. The single number that explains why the route
+                # bends where it does -- and why it often does not.
+                "turn_cost_mm_per_90deg": jnum(turn_cost_mm(math.pi / 2.0), 1),
+                "turn_cost_weight": jnum(TURN_COST_WEIGHT, 2),
+                "clearance_weight": jnum(CLEARANCE_COST_W, 2),
+                "clearance_decay_mm": jnum(CLEARANCE_DECAY_MM, 0),
+                "hysteresis_frac": jnum(PLAN_HYSTERESIS_FRAC, 2),
+            },
+            "planner_margins": {
+                "robot_radius_mm": jnum(ROBOT_RADIUS_MM, 0),
+                "wall_pad_mm": jnum(WALL_PAD_MM, 0),
+                "wall_band_mm": jnum(WALL_BAND_MM, 0),
+                "point_pad_mm": jnum(OCC_POINT_PAD_MM, 0),
+                "relax_enabled": bool(PLAN_RELAX),
+            },
         }, qos=1)
 
     def _wire_is_ours(self):
@@ -4481,7 +5778,74 @@ class MissionRunner:
         out = backend.run_segment(seg)
         if out.kind == "drive":
             st.distance_travelled_mm += abs(out.measured)
+        self._publish_residual(out)
         return out
+
+    def _publish_residual(self, seg):
+        """Emit commanded-vs-MEASURED for one segment, the instant it settles.
+
+        This is the single most diagnostic number this rover produces and until
+        now nothing displayed it. Every segment ends with a full stop, a settle
+        and a measurement at rest — that is the whole B8B method — so at this
+        exact point we know both what was asked for and what actually happened,
+        with the chassis stationary and the measurement therefore trustworthy.
+
+        Watching `residual` accumulate live is how an operator distinguishes
+        the three failures that look identical from the arena map:
+
+          * a CONSTANT RATIO between measured and target (every drive short or
+            long by the same factor) is a SCALE error — counts/mm, i.e. set
+            `odom_scale` in the calibration profile. 2.467 is the known
+            74/30 gearbox candidate.
+          * a constant OFFSET on every segment regardless of length is COAST:
+            the rover keeps moving after the burst is cut.
+          * a residual that grows only on TURNS is a heading/gyro problem, and
+            a residual that grows only after a turn is heading leaking into the
+            next drive.
+
+        Published per segment rather than per leg because a leg is several
+        segments and averaging them hides exactly the pattern above.
+        `lateral_mm` is carried too: it is drift ACROSS the leg, which the
+        executor reports and deliberately does not correct.
+        """
+        try:
+            st = self.state
+            target = float(seg.target)
+            measured = float(seg.measured)
+            resid = measured - target
+            unit = "deg" if seg.kind == "turn" else "mm"
+            # Ratio only where it means something. Near zero target it is
+            # numerically meaningless and would swamp the useful cases.
+            ratio = None
+            if abs(target) > (2.0 if seg.kind == "turn" else 20.0):
+                ratio = round(measured / target, 4)
+            self._resid_total = getattr(self, "_resid_total", {})
+            key = seg.kind
+            self._resid_total[key] = self._resid_total.get(key, 0.0) + resid
+            self.bus.publish("telemetry/residual", {
+                "mission": st.name,
+                "leg_i": st.leg_i, "legs_n": st.legs_n, "leg": st.leg_name,
+                "segment_i": st.segment_i, "segments_n": st.segments_n,
+                "kind": seg.kind,
+                "unit": unit,
+                "target": round(target, 2),
+                "measured": round(measured, 2),
+                "residual": round(resid, 2),
+                "ratio": ratio,
+                "cumulative_residual": round(self._resid_total[key], 2),
+                "lateral_mm": round(float(seg.lateral_mm), 2),
+                "elapsed_s": round(float(seg.elapsed_s), 3),
+                "reason": seg.reason,
+                "dock": bool(seg.dock),
+                "retrace": bool(seg.retrace),
+                # So a reader can tell which calibration produced these numbers
+                # without cross-referencing a log.
+                "odom_scale": ODOM_SCALE,
+                "odom_pose_sign": ODOM_POSE_SIGN,
+            }, qos=0)
+        except Exception:
+            # Telemetry must never be able to abort a mission.
+            pass
 
     def detour_armed(self):
         """True while an obstacle should become a reroute rather than an abort.
@@ -4493,7 +5857,7 @@ class MissionRunner:
         """
         return bool(self._detour_armed)
 
-    def _reroute(self, tx, ty, det, replans):
+    def _reroute(self, tx, ty, det, replans, committed=None):
         """A* around what the LiDAR has just seen -- or the abort that was
         always the answer here.
 
@@ -4508,7 +5872,8 @@ class MissionRunner:
             raise MissionAbort(ABORT_LINK)
         why = None
         pts = None
-        if PLANNER != "astar":
+        res = None
+        if PLANNER == "straight":
             why = f"planner is {PLANNER!r}, so no route search was attempted"
         elif grid is None:
             why = "there is no occupancy grid on this node"
@@ -4523,20 +5888,33 @@ class MissionRunner:
                    "around -- the cone guard saw something the grid has not "
                    "confirmed")
         else:
-            pts = grid_detour_points(pose[0], pose[1], tx, ty, grid)
+            # THE HEADING IS PASSED, and it is not decoration: the first turn of
+            # a detour is charged like any other (`turn_cost_mm`), so the route
+            # chosen here is the one that is cheapest FROM WHERE THE ROVER IS
+            # POINTING, not merely the shortest on paper.
+            res = plan_detour(pose[0], pose[1], tx, ty, grid,
+                              heading_deg=pose[2], committed=committed)
+            pts = res.points
             if pts is None:
-                why = ("A* found no clear route to the target around what has "
-                       "been seen")
+                why = (f"{PLANNER} found no clear route to the target around "
+                       "what has been seen, at any padding on the relaxation "
+                       "ladder" if PLAN_RELAX else
+                       f"{PLANNER} found no clear route to the target around "
+                       "what has been seen")
             elif not pts:
-                why = ("A* says the straight line is clear, which contradicts "
-                       "the guard -- driving on would go back into the same "
-                       "obstacle")
+                why = (f"{PLANNER} says the straight line is clear, which "
+                       "contradicts the guard -- driving on would go back into "
+                       "the same obstacle")
         if why:
             raise MissionAbort(f"{det.reason} - no reroute: {why}")
-        log(f"REROUTE {replans}/{REPLAN_MAX}: {det.reason}; A* around "
-            f"{len(grid.occupied())} observed cell(s) via "
+        st = grid.stats()
+        log(f"REROUTE {replans}/{REPLAN_MAX}: {det.reason}; {PLANNER} around "
+            f"{st['obstacle_cells']} obstacle cell(s) "
+            f"({st['wall_cells']} wall) via "
             + " -> ".join(f"({p[0]:.0f},{p[1]:.0f})" for p in pts)
-            + f" -> ({tx:.0f},{ty:.0f})")
+            + f" -> ({tx:.0f},{ty:.0f})"
+            + (f" [relaxed: {res.relax}]" if res.relax != "none" else "")
+            + (" [kept committed]" if res.kept else ""))
         self.bus.publish("events/replan", {
             "leg": self.state.leg_name, "leg_i": self.state.leg_i,
             "replan_i": replans, "replan_max": REPLAN_MAX,
@@ -4546,7 +5924,15 @@ class MissionRunner:
             "target": {"x_mm": jnum(tx, 1), "y_mm": jnum(ty, 1)},
             "waypoints": [{"x_mm": jnum(p[0], 1), "y_mm": jnum(p[1], 1),
                            "kind": "via"} for p in pts],
-            "occupancy": grid.stats(),
+            "occupancy": st,
+            # ADDITIVE. Which planner drew it, what it cost, whether any margin
+            # had to be given up to find it, and whether this is a fresh
+            # decision or the one we were already committed to.
+            "planner": PLANNER,
+            "plan_cost_mm": jnum(res.cost_mm, 1),
+            "relaxed": res.relax,
+            "kept_committed": bool(res.kept),
+            "planner_note": res.note,
         }, qos=1)
         return list(pts)
 
@@ -4662,7 +6048,12 @@ class MissionRunner:
                     if cur.kind == "drive":
                         st.distance_travelled_mm += abs(cur.measured)
                 replans += 1
-                via = self._reroute(tx, ty, det, replans)
+                # The waypoints still pending are what we were COMMITTED to.
+                # Handing them to the planner is what lets it keep them when
+                # nothing that matters has changed, instead of re-deciding which
+                # side of an obstacle to pass on every flicker of the grid and
+                # spending a turn each time (see PLAN_HYSTERESIS_FRAC).
+                via = self._reroute(tx, ty, det, replans, committed=list(via))
             finally:
                 self._detour_armed = False
 
@@ -4880,11 +6271,20 @@ def main():
     signal.signal(signal.SIGINT, _sig)
 
     log(f"planner: {PLANNER} (grid {GRID_MM:.0f}mm, robot radius "
-        f"{ROBOT_RADIUS_MM:.0f}mm, wall pad {WALL_PAD_MM:.0f}mm, occupancy TTL "
-        f"{OCC_TTL_S:.0f}s x{OCC_MIN_HITS} hits, <={REPLAN_MAX} replans/leg). "
+        f"{ROBOT_RADIUS_MM:.0f}mm, wall pad {WALL_PAD_MM:.0f}mm, wall band "
+        f"{WALL_BAND_MM:.0f}mm, point pad {OCC_POINT_PAD_MM:.0f}mm, occupancy "
+        f"TTL {OCC_TTL_S:.0f}s x{OCC_MIN_HITS} hits, <={REPLAN_MAX} "
+        "replans/leg). "
         "A straight line is still planned whenever the straight line is clear; "
-        "A* only runs when the grid says it is not, and an obstacle with no "
-        f"route around it still ends the mission with {ABORT_OBSTACLE!r}.")
+        "the search only runs when the grid says it is not, and an obstacle "
+        f"with no route around it still ends the mission with {ABORT_OBSTACLE!r}.")
+    log(f"planner cost model: one 90deg turn = "
+        f"{turn_cost_mm(math.pi / 2.0):.0f}mm of driving (turn weight "
+        f"{TURN_COST_WEIGHT:g}), clearance weight {CLEARANCE_COST_W:g} decaying "
+        f"over {CLEARANCE_DECAY_MM:.0f}mm, hysteresis "
+        f"{PLAN_HYSTERESIS_FRAC * 100:.0f}%, relaxation ladder "
+        f"{'on' if PLAN_RELAX else 'OFF'}. Turns are priced because on this "
+        "chassis they are the expensive motion, not the distance.")
     log(f"fpms_missions up: thing={THING} backend_default={DEFAULT_BACKEND} "
         f"cruise={CRUISE_MPS:.3f}m/s (wire {to_cmd(CRUISE_MPS):.4f}) "
         f"dock_step={DOCK_STEP_MM:.0f}mm")

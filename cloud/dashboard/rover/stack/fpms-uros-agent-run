@@ -1,0 +1,26 @@
+#!/bin/bash
+# Launch the micro-ROS agent with the ESP32-S3 reset-release holder alongside it.
+#
+# The holder must run *concurrently* with the agent, not before or after it:
+# - before, and its open would be the 0->1 open, so the agent's later open
+#   re-asserts RTS and re-arms the reset;
+# - after (as a one-shot ExecStartPost), and the lines snap back to 0x06 the
+#   instant its fd closes, dropping the board straight back into reset. That was
+#   measured on this rover, and it is why this is a wrapper rather than an
+#   ExecStartPost.
+# The holder polls until the agent owns the fd, then opens a second descriptor,
+# clears RTS/DTR, and holds it for the lifetime of the agent.
+#
+# It lives in the unit's cgroup, so systemd's default KillMode=control-group
+# reaps it with the agent and a restart re-runs the whole sequence.
+set -e
+DEV=/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0
+
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/uros_ws/install/setup.bash
+
+/usr/bin/python3 /usr/local/bin/fpms-uros-release-reset "$DEV" 30 &
+
+# -b 921600 matches the value the board prints from its own flash config at
+# boot ("ros serial baudrate: 921600"). Do not "fix" it.
+exec ros2 run micro_ros_agent micro_ros_agent serial --dev "$DEV" -b 921600

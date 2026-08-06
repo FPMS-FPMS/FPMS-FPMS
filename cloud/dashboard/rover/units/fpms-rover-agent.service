@@ -1,14 +1,40 @@
 [Unit]
-Description=FPMS rover agent (camera + lidar -> dashboard)
-After=network-online.target
-Wants=network-online.target
+Description=FPMS rover agent (camera + LiDAR -> MQTT; the ONLY owner of the scanner tty)
+# ---------------------------------------------------------------------------
+# THIS IS THE LIDAR SOURCE. If it is down, the arena view is blind.
+#
+# It publishes telemetry/lidar on a FIXED CADENCE whether or not the scanner is
+# returning anything, carrying scan_age_s / health / stale / hz / seq. That is
+# what makes a dead scanner visible instead of a frozen last frame. Consumers
+# (fpms_lidar_ros.py, fpms_missions.py) drop payloads marked stale rather than
+# treating an empty scan as clear space — see STACK.md, "the stale contract".
+#
+# NO dependency on micro-ros-agent, deliberately, and this one matters more
+# than most: this process opens a serial port, and the micro-ROS board is on a
+# NEIGHBOURING port whose handshake lines are wired to the ESP32's EN/IO0 pins.
+# The agent resolves the scanner by USB topology path and refuses any device
+# that resolves to the board. Coupling the two units would add nothing and
+# would risk a restart here costing a 90-225s micro-ROS re-link.
+# ---------------------------------------------------------------------------
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
 
 [Service]
-ExecStart=/usr/bin/python3 /usr/local/bin/fpms-rover-agent
-Restart=always
-RestartSec=5
+Type=simple
 User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/fpms/config.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+# video for the camera, dialout for the scanner tty.
 SupplementaryGroups=video dialout
+ExecStart=/usr/bin/python3 /usr/local/bin/fpms-rover-agent
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

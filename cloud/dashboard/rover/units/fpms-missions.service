@@ -9,23 +9,35 @@ Description=FPMS mission executor (MQTT mission -> zone, dock, retrace home)
 # missing link is a cleaner failure than systemd shuffling units around.
 #
 # network-online is the only thing worth waiting for (DDS discovery + broker).
-After=network-online.target
-Wants=network-online.target
+# mosquitto is now an explicit dependency. It was missing from every unit in
+# this stack, and on a cold boot that is a real race: the broker takes a moment
+# to bind :1883, and a client that tried first sat in its own retry loop while
+# the dashboard showed nothing. paho's reconnect covers it eventually, but
+# "eventually" at a competition is a service that looks broken for 30 seconds.
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
 
-# ---- BEFORE ENABLING THIS UNIT ---------------------------------------------
-# 1. fpms_teleop.py must no longer answer `mission`. Delete the "mission" entry
-#    from its TELEOP_ACTIONS map and its _cmd_mission stub, or both processes
-#    answer the same verb and the dashboard shows whichever reply wins the race
-#    — including "no navigation implemented" for a mission that is driving.
-#    rover/test_commands.py has a cross-file check for exactly this.
-# 2. fpms-teleop's idle control tick publishes a ZERO Twist every 0.5s. That is
-#    correct while teleop owns the wire and fatal while this node does:
-#    interleaving 2 Hz zeros into a 20 Hz setpoint is the stall-then-lurch the
-#    firmware's encoder quantisation produces. Suppress that heartbeat while
-#    fpms/<thing>/telemetry/mission is fresh, or stop fpms-teleop for the run.
-#    Until then this node refuses every mission with a nack naming the other
-#    writer, which is the guard doing its job, not a bug.
-# ----------------------------------------------------------------------------
+# ---- THE TWO TELEOP CONFLICTS: BOTH NOW FIXED IN CODE ----------------------
+# This unit used to carry a "do not enable until..." warning about fpms-teleop.
+# Both halves of it have since been fixed in fpms_teleop.py and the warning was
+# stale, so it has been removed rather than left to be re-obeyed by someone who
+# would then needlessly stop teleop before every run:
+#   1. teleop's `_cmd_mission` now returns silently while this node is
+#      publishing telemetry (`if self.bus.mission_active(): return`), so the
+#      two no longer race to answer the same verb.
+#   2. teleop's 2 Hz idle zero-Twist heartbeat is suppressed while a mission is
+#      live, so it can no longer interleave zeros into this node's 20 Hz
+#      setpoint.
+# The app-level interlock remains as the real guard: this node runs a
+# foreign-writer detector on /cmd_vel and NACKs a mission if anything else is
+# writing. Trust that, not the boot order.
+#
+# ORDERED AFTER fpms-cored so the STOP authority is listening before anything
+# that can move exists. Wants=, not Requires=: if cored is down this node must
+# still start, because it has its own stop handling and a rover you cannot
+# drive is not safer than one you can stop.
+After=fpms-cored.service
+Wants=fpms-cored.service
 
 [Service]
 Type=simple
@@ -34,6 +46,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu
 # MANDATORY. The board publishes on domain 20 and nowhere else; on any other
 # domain this node sees no topics, and every mission refuses with "link down".
+EnvironmentFile=-/etc/fpms/config.env
 Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=PYTHONUNBUFFERED=1
