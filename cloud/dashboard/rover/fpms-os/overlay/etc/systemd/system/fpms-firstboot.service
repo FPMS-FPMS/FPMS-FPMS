@@ -1,0 +1,42 @@
+[Unit]
+Description=FPMS-OS first boot provisioning (runs once, then disables itself)
+Documentation=file:/opt/fpms-os/firstboot/README.md
+
+# Everything that CANNOT be baked into a shared image happens here:
+#
+#   - grow the rootfs to fill the card or eMMC
+#   - regenerate SSH host keys (the image ships none, so every flashed board
+#     gets its own; a shared host key across a fleet is a real problem, and it
+#     also makes every laptop's known_hosts conflict)
+#   - read WiFi credentials from the FAT boot partition and provision them
+#   - set the hostname to fpms-pi and fix /etc/hosts so avahi publishes it
+#   - generate the mosquitto password and write it into config.env and the
+#     broker's password file -- NO DEFAULT PASSWORD IS EVER BAKED IN
+#   - verify the USB serial topology and refuse to guess if it is wrong
+#
+# Ordered before everything FPMS, because config.env must exist and hold a real
+# broker password before any service reads it. A missing or placeholder
+# password does not crash anything: every service simply retries forever
+# against a broker that rejects it, and the dashboard is silently empty.
+
+DefaultDependencies=no
+After=systemd-remount-fs.service systemd-udev-settle.service
+Before=network-pre.target mosquitto.service fpms-cored.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=!/var/lib/fpms/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/fpms-firstboot
+
+# Never block the boot on this. A rover that came up with a bad hostname is
+# recoverable over the network; a rover that refused to boot is not.
+TimeoutStartSec=300
+SuccessExitStatus=0 1
+
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target

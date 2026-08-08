@@ -1,0 +1,63 @@
+#!/bin/bash
+# Launch the micro-ROS agent with the ESP32-S3 reset-release holder alongside it.
+#
+# THE HOLDER MUST RUN *CONCURRENTLY* WITH THE AGENT
+# =================================================
+# Not before, and not after. Both were tried on this rover and both fail:
+#
+#   before - ours is then the 0->1 open, and the agent's later open re-applies
+#            the kernel default (TIOCM_DTR|TIOCM_RTS = 0x06) and re-arms the
+#            reset. We cleared it, and the next open broke it again.
+#
+#   after  - as a one-shot ExecStartPost, the lines snap back to 0x06 the
+#            instant its fd closes, dropping the board straight back into
+#            reset. That was measured on this rover, and it is the entire
+#            reason this is a wrapper script rather than a unit with an
+#            ExecStartPost.
+#
+# The holder polls until the agent owns the fd, then opens a SECOND descriptor,
+# drives a real reset edge, and holds the lines clear for the agent's lifetime.
+#
+# It lives in this unit's cgroup, so systemd's default KillMode=control-group
+# reaps it with the agent and a restart re-runs the whole sequence.
+#
+# Without it: RTS drives the ESP32-S3's EN pin, Linux raises RTS on open(), and
+# the agent's own open pins the MCU in reset. Measured at 56 bytes in 15
+# minutes, with the agent apparently running perfectly.
+
+set -e
+
+# shellcheck source=/dev/null
+[ -r /etc/fpms/config.env ] && . /etc/fpms/config.env
+
+# BY-PATH, NEVER by-id, NEVER /dev/ttyUSBn.
+# Both CP2102 adapters report an identical ID_SERIAL of "0001", so by-id can
+# only ever name one of the pair and it is a coin flip which. ttyUSBn is
+# enumeration order. The other adapter (port 1.2) is the LiDAR, and putting
+# micro-ROS traffic into the laser scanner is the failure this guards.
+DEV="${FPMS_DRIVE_PORT:-/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0}"
+
+# ONE place for the baud. This used to be written in two places that disagreed:
+# the unit file's comment insisted 921600 "is correct and must not be fixed",
+# while this wrapper used 230400.
+#
+#   921600  Yahboom FACTORY firmware v2.0.0 -- its flash config prints
+#           "ros serial baudrate: 921600" at boot, so the comment was right
+#           for that firmware. If you roll back to
+#           /home/ubuntu/microROS_Robot_V2.0.0.bin you must put 921600 back.
+#   230400  FPMS firmware v3. MEASURED 2026-08-06: 921600 was unstable on this
+#           board -- the session died within 1-3 minutes, never established on
+#           a cold boot, and degraded further under motor load.
+#
+# A mismatch does not error. The agent runs happily and never establishes a
+# session, which is indistinguishable from a dead board.
+BAUD="${FPMS_UROS_BAUD:-230400}"
+
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/uros_ws/install/setup.bash
+
+echo "fpms-uros-agent-run: dev=$DEV baud=$BAUD"
+
+/usr/bin/python3 /usr/local/bin/fpms-uros-release-reset "$DEV" 30 &
+
+exec ros2 run micro_ros_agent micro_ros_agent serial --dev "$DEV" -b "$BAUD"

@@ -1,0 +1,85 @@
+[Unit]
+Description=FPMS arena anchor - the static map->odom transform
+Documentation=file:/home/ubuntu/nav2/TF_TREE.md
+
+# WHY THIS IS ITS OWN UNIT
+# ========================
+# This transform used to be an ExecStartPre= inside fpms-tf.service, launched
+# with setsid and tracked by a PID file in /run/fpms. STACK.md called that
+# "the least elegant thing here and the least tested", and it had a worse
+# problem than inelegance:
+#
+#   The moment slam_toolbox starts, map->odom has TWO PUBLISHERS.
+#
+# TF_TREE.md is absolute about this: "One publisher per edge, no exceptions."
+# Two publishers on map->odom do not produce an error. They produce a pose that
+# flickers between two self-consistent answers, which is the single hardest
+# class of bug to see on an arena map.
+#
+# Splitting it out lets systemd enforce the exclusion instead of a comment:
+# this unit and the SLAM units declare Conflicts= on each other, so starting
+# one STOPS the other. It is mechanically impossible to have both.
+#
+# WHICH ONE YOU WANT
+# ==================
+#   This unit          dead-reckoning / measured-segment missions. The arena
+#                      frame is anchored to a known start pose and odom drifts
+#                      from there. This is the B8B path that is gate-verified.
+#
+#   slam_toolbox       SLAM. map->odom is computed continuously by the scan
+#                      matcher. Requires a measured LiDAR mount transform,
+#                      which does not exist yet.
+#
+# The image boots with THIS one, because it is the path that has actually
+# driven a mission.
+#
+# THE POSE
+# ========
+# (0.972, 0.228) metres, yaw +pi/2, is the arena start pose: 972 mm, 228 mm,
+# heading 90 degrees. Map metres are arena millimetres over 1000 with the same
+# bottom-left origin, so these are the same numbers the dashboard uses.
+#
+# This is coupled to ~/.fpms_teleop_origin.json, which records "odom was here,
+# the arena was there". If FPMS_MISSION_ODOM_POSE_SIGN is changed, that anchor
+# is reflected through the origin and BOTH conventions produce perfectly
+# plausible numbers. Re-zero with set_coordinate after any sign change.
+
+After=network.target
+Wants=network.target
+
+# Mechanically exclusive with anything else that owns map->odom.
+Conflicts=fpms-slam-mapping.service fpms-slam-localization.service
+
+# Ordered before the barrier the ROS consumers wait on. See
+# fpms-ros-publishers.target for why the consumers are ordered but not coupled.
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=HOME=/home/ubuntu
+
+ExecStartPre=/usr/local/bin/fpms-wait-net
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 run tf2_ros static_transform_publisher \
+  --x ${FPMS_ARENA_ANCHOR_X:-0.972} --y ${FPMS_ARENA_ANCHOR_Y:-0.228} --z 0.0 \
+  --yaw ${FPMS_ARENA_ANCHOR_YAW:-1.5707963} --pitch 0.0 --roll 0.0 \
+  --frame-id map --child-frame-id odom'
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+# Publishers must be up before rosbridge and the console start. See the target.
+WantedBy=fpms-ros-publishers.target

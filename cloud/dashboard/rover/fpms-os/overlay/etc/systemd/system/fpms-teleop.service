@@ -1,0 +1,59 @@
+[Unit]
+Description=FPMS teleop bridge (MQTT -> /cmd_vel)
+Documentation=file:/home/ubuntu/STACK.md
+
+# One of only two units permitted to write /cmd_vel. The other is
+# fpms-missions. Everything else that could is MASKED, not merely disabled --
+# see fpms-ros-tunnel.service and fpms-rtos-follower.service.
+#
+# Two writers on /cmd_vel is not a race the mission executor can win, or even
+# reliably detect in time. The executor does subscribe to its own output to
+# notice a foreign writer and NACK, but that is an app-level guard reacting
+# after the fact; masking removes the class of failure instead of documenting
+# it.
+#
+# The two documented conflicts between this unit and the executor -- teleop
+# answering "mission", and its 2 Hz idle zero-Twist -- are ALREADY FIXED in the
+# code. The warnings that used to sit in fpms-missions.service about them were
+# stale and have been removed.
+#
+# NOTE: this unit was the only ROS unit in the stack with no
+# RMW_IMPLEMENTATION. It inherited the system default, which meant a
+# mismatched RMW between teleop and everything else would have produced a
+# node that runs, discovers nothing, and reports no error. Fixed below.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_teleop.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+# 15s: teleop publishes zero Twists on the way down. Do not shorten this to
+# match the other units -- the extra seconds are the rover coming to a stop.
+TimeoutStopSec=15
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

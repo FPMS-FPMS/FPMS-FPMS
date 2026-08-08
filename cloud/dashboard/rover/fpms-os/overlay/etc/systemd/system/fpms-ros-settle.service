@@ -1,0 +1,66 @@
+[Unit]
+Description=FPMS post-boot DDS settle (FALLBACK - disabled by default in FPMS-OS)
+Documentation=file:/opt/fpms-os/docs/DDS.md
+
+# ###########################################################################
+# # SHIPPED DISABLED. THIS IS A FALLBACK, NOT PART OF THE BOOT PATH.        #
+# ###########################################################################
+#
+# WHAT IT IS FOR
+# ==============
+# It exists because of a real, reproduced cold-boot failure: after a cold boot
+# fpms-lidar-ros is active, logs "scans=2848 dropped=0 rate=9.55 Hz", and
+# `ros2 topic info /scan_lidar` reports "Publisher count: 1" -- and NO
+# subscriber created afterwards ever receives a single LaserScan. Restarting
+# the unit fixes it instantly and reproducibly.
+#
+# The mitigation is crude and effective: wait 75 seconds after boot, then
+# restart the affected publishers so their DDS participants are re-created in
+# the same era as everything else.
+#
+# WHY IT IS DISABLED HERE
+# =======================
+# FPMS-OS addresses the CAUSE instead. That symptom, and the separately
+# documented "rosbridge only delivers topics whose publisher pre-existed it",
+# are the same bug: Fast DDS prefers a shared-memory transport whose segments
+# do not survive across process eras. /etc/fpms/fastdds_udp_only.xml forces
+# UDPv4 and removes it.
+#
+# Running this unit as well would cost about two minutes of boot-to-usable for
+# no benefit, and -- worse -- would mask whether the profile actually worked.
+#
+# WHEN TO ENABLE IT
+# =================
+# If fpms-selftest's cross-era DDS check FAILS on real hardware, the profile
+# did not close the bug on this board. Then:
+#
+#     sudo systemctl enable --now fpms-ros-settle.service
+#
+# and report it, because that means the root cause is something other than SHM
+# and docs/DDS.md is wrong.
+#
+# Note this unit is also why fpms-wait-net exists as a separate mechanism: they
+# guard two different windows. wait-net guards participant creation during the
+# boot carrier flap; this guards participants created correctly and then
+# stranded. Enabling this does not make wait-net redundant.
+
+After=network-online.target fpms-lidar-ros.service fpms-tf.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStartPre=/usr/local/bin/fpms-wait-net
+ExecStartPre=/bin/sleep 75
+ExecStart=/bin/systemctl restart fpms-lidar-ros.service fpms-tf.service
+
+# `systemctl restart` returns 1 if a unit was not running; that is not a
+# failure of this unit's job.
+SuccessExitStatus=0 1
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,63 @@
+[Unit]
+Description=FPMS-OS boot self-test (is this rover actually working?)
+Documentation=file:/opt/fpms-os/selftest/README.md
+
+# Runs once per boot, after the stack has had time to settle, and answers the
+# one question an operator can act on: is this rover actually working?
+#
+# It exists because almost every failure this project has hit LOOKS LIKE
+# SUCCESS from systemd's point of view:
+#
+#   - fpms-lidar-ros active, logging a healthy rate, publisher count 1, and no
+#     subscriber ever receives a scan
+#   - the agent logging "NPU unavailable; streaming without detection" and
+#     carrying on, so the rover streams video and detects nothing
+#   - every service retrying forever against a broker that rejects it, because
+#     config.env was missing and the defaults point somewhere else
+#   - a sudoers rule present but not matching, so the last-resort STOP is a
+#     silent password prompt
+#   - fpms-missions found disabled after a reboot, silently absent
+#
+# In all of those, `systemctl status` is green. The selftest is what makes the
+# difference visible. Its result is published to telemetry/health so it reaches
+# the dashboard, and written to /var/lib/fpms/selftest.json for SSH.
+#
+# IT NEVER MOVES THE ROVER. It does not turn-test for liveness -- that destroys
+# heading -- and it does not open the drive board's tty, because opening that
+# tty resets the ESP32 and costs a 90-225 second re-link.
+#
+# The 90s delay is not arbitrary: the micro-ROS link takes up to 225s to
+# establish from cold, so a check at 30s would report a healthy rover as broken
+# every single boot, and an alarm that cries wolf is worse than no alarm. The
+# report distinguishes "not up yet" from "failed".
+
+After=fpms-ros-publishers.target fpms-rosbridge.service mosquitto.service
+Wants=fpms-ros-publishers.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStartPre=/bin/sleep 90
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec /usr/local/bin/fpms-selftest --boot'
+
+# A FAILED selftest must not mark the unit failed in a way that restart-loops:
+# it is a report, not a service. The exit code is preserved in the journal and
+# in the JSON.
+SuccessExitStatus=0 1 2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

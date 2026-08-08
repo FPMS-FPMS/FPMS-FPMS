@@ -1,0 +1,50 @@
+[Unit]
+Description=FPMS operator console (http :8090) - the UI, served from the rover
+Documentation=file:/home/ubuntu/fpms_console/README.md
+
+# The console is served FROM THE ROVER so the operator needs nothing installed
+# and nothing started on the laptop. Open:
+#
+#     http://fpms-pi.local:8090/
+#
+# ALWAYS TYPE THE NAME, NEVER AN IP. The rover's address has changed more than
+# seven times in this project and every note that wrote one down was wrong the
+# next day. That is what avahi-daemon and the fpms-pi hostname are for, and why
+# fpms-firstboot sets both.
+#
+# Ordered after the publishers for the same reason as rosbridge -- the page
+# talks to rosbridge on :9090, and a topic whose publisher started after
+# rosbridge is silently undeliverable.
+
+After=network-online.target mosquitto.service
+After=fpms-ros-publishers.target fpms-rosbridge.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fpms_console
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+Environment=FPMS_CONSOLE_PORT=8090
+Environment=FPMS_ROSBRIDGE_PORT=9090
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; exec python3 /home/ubuntu/fpms_console/fpms_console.py'
+
+Restart=always
+RestartSec=3
+SyslogIdentifier=fpms-console
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

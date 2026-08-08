@@ -1,0 +1,74 @@
+[Unit]
+Description=FPMS rosbridge websocket (:9090) - the browser's only way into ROS
+Documentation=file:/etc/fpms/rosbridge_params.yaml
+
+# THE PI LISTENS, THE LAPTOP DIALS OUT. Preserve that direction.
+#
+# The operator laptop's Windows Firewall has no inbound rule for 1883 or 9090
+# and there is no admin account to add one. An outbound TCP connection from the
+# browser to the Pi is therefore the ONLY direction that works -- and it is
+# also why the UI itself is served from the Pi, on :8090.
+#
+# THE WHITELIST IS THE SAFETY MECHANISM
+# =====================================
+# /etc/fpms/rosbridge_params.yaml restricts which topics and services are
+# reachable from a browser. The drive topics are ABSENT from it -- not "unused
+# by our UI", absent -- so a stray click, a bug in console.html, or somebody
+# else's tab left open on the same URL cannot turn a wheel through this port.
+# params_glob is empty: no parameter access from a browser at all.
+#
+# It is a params FILE and not a set of -p arguments because a safety whitelist
+# that fails open when you mistype it is not a safety whitelist. If the file is
+# missing, rosbridge starts with NO whitelist. fpms-selftest checks for it.
+#
+# ORDERING: AFTER EVERY PUBLISHER
+# ===============================
+# rosbridge only delivers topics whose publisher already existed when it
+# started. A publisher created afterwards is never discovered, and the client
+# subscription asking for it is accepted and then stays silent forever --
+# connected, subscribed, silent, no error anywhere.
+#
+# Measured: rosbridge started 22:26:33, fpms-odom-tf 22:45:45, and /odom
+# delivered 0 messages while publishing at 6.6 Hz. Reproduced three times.
+#
+# Hence After=fpms-ros-publishers.target rather than After= on each publisher:
+# ordered without being coupled, so a publisher restarting later does not take
+# the operator's whole view of the robot with it. See that target's header.
+#
+# ROS_DOMAIN_ID is set HERE and not in config.env, and EnvironmentFile comes
+# first so config.env cannot override it. The ESP32 publishes on domain 20 and
+# nowhere else; every ad-hoc `ros2 topic list` in this project's history that
+# forgot it saw an EMPTY LIST and concluded the link was dead.
+
+After=network-online.target
+After=fpms-ros-publishers.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# The domain is re-exported inside ExecStart after `bash -lc` sources the login
+# profile, so a stray export in ~/.bashrc cannot win.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; echo "rosbridge starting on ROS_DOMAIN_ID=$ROS_DOMAIN_ID port 9090"; exec ros2 run rosbridge_server rosbridge_websocket --ros-args --params-file /etc/fpms/rosbridge_params.yaml'
+
+Restart=always
+RestartSec=3
+SyslogIdentifier=fpms-rosbridge
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

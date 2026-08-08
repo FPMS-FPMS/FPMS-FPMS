@@ -1,0 +1,47 @@
+[Unit]
+Description=FPMS RTOS follower (MASKED - second /cmd_vel writer)
+Documentation=file:/home/ubuntu/STACK.md
+
+# ###########################################################################
+# # THIS UNIT IS MASKED. IT IS SHIPPED SO THAT IT CAN BE MASKED.            #
+# ###########################################################################
+#
+# Same reasoning as fpms-ros-tunnel.service -- read that header. It can write
+# /cmd_vel, and two writers on /cmd_vel is a class of failure this stack
+# removes rather than documents.
+#
+# Masked rather than deleted so that the mask is a real, checkable state
+# (`systemctl is-enabled` -> masked) rather than an absence that any restore
+# from backup would quietly undo.
+#
+# FPMS_FOLLOW_DRY_RUN=1 is the independent second gate: in dry run the
+# /cmd_vel publisher is never created at all.
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+Environment=FPMS_FOLLOW_DRY_RUN=1
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_rtos_follower.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+[Unit]
+Description=Hold wifi power_save OFF (bcmdhd re-enables it every ~30s)
+Documentation=man:iw(8)
+Documentation=file:/usr/local/sbin/fpms-wifi-ps-hold
+
+# The Broadcom bcmdhd driver silently re-enables WiFi power save every 30-60
+# seconds, with no log line. That stalls packets long enough to miss MQTT's
+# keepalive -- both rover clients use keepalive=30, mosquitto drops a client at
+# 1.5x = 45s -- and the observed disconnect gaps were 47s and 47s.
+#
+# The dashboard showed the rover flapping offline and online on a ~47 second
+# cycle and the LiDAR feed died with it. Nothing in the FPMS stack was at
+# fault.
+#
+# No persistent setting survives this. NetworkManager wifi.powersave=2, an
+# interfaces post-up hook and a udev rule were all tried; the driver overrode
+# all of them. Re-asserting in a loop is the only thing that works.
+#
+# This is a workaround for a driver defect. If a future bcmdhd stops doing it,
+# delete this unit -- but verify with a TEN MINUTE watch first, because the
+# failure window is 30-60s and a 30 second check will tell you it is fixed
+# when it is not.
+
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# No User=: needs CAP_NET_ADMIN for `iw set`.
+
+EnvironmentFile=-/etc/fpms/config.env
+ExecStart=/usr/local/sbin/fpms-wifi-ps-hold
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

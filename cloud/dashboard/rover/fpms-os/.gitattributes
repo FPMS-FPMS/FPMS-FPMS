@@ -1,0 +1,24 @@
+# Everything in FPMS-OS ends up on a Linux rootfs. Force LF regardless of the
+# platform it is authored on.
+#
+# This is not cosmetic. These files are checked out on a Windows workstation,
+# where git's autocrlf would rewrite them to CRLF, and then copied verbatim into
+# the image overlay. A shell script whose shebang line ends "\r" fails at exec
+# with:
+#
+#     /usr/local/bin/fpms-wait-net: /usr/bin/env: bad interpreter:
+#     No such file or directory
+#
+# which is a spectacularly misleading message - /usr/bin/env plainly exists, and
+# the script looks perfect in every editor.
+#
+# fpms-wait-net is an ExecStartPre= with no "-" prefix on fpms-lidar-ros and
+# fpms-tf, so that failure would silently stop the LiDAR and the whole TF tree
+# from ever starting. A systemd unit with a CRLF ExecStart, and an /etc/fpms/
+# config.env whose values all end in an invisible \r, fail in similarly
+# baffling ways.
+*               text eol=lf
+*.png           binary
+*.pgm           binary
+*.img           binary
+*.rknn          binary

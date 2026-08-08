@@ -1,0 +1,92 @@
+[Unit]
+Description=FPMS static TF tree (base_footprint->base_link->laser_frame/imu_frame)
+Documentation=file:/home/ubuntu/nav2/TF_TREE.md
+
+# ###########################################################################
+# # THE LiDAR MOUNT TRANSFORM IS UNMEASURED.                                #
+# #                                                                         #
+# # Until FPMS-OS, this unit launched fpms_tf.launch.py WITH NO ARGUMENTS,  #
+# # so the launch file's own "MEASURE ME" zeros were what got published and #
+# # nothing anywhere said so. Three separate files flagged it and it stayed #
+# # that way.                                                               #
+# #                                                                         #
+# # The offsets are now passed explicitly from /etc/fpms/config.env, so     #
+# # they are settable without editing code -- but THAT DOES NOT MAKE THE    #
+# # DEFAULTS TRUE. They are still zero, and zero is still a guess.          #
+# #                                                                         #
+# # By the launch file's own arithmetic, 1 degree of mount yaw is about     #
+# # 10.5 mm of position error. Both the obstacle cone guard and the         #
+# # occupancy grid inherit that error in the SAME direction, so it does not #
+# # average out over a mission -- it accumulates.                           #
+# #                                                                         #
+# # Only base_footprint->base_link (z=0.035, from the measured 70mm wheel   #
+# # diameter) is real. Everything below base_link is a placeholder.         #
+# #                                                                         #
+# # Set FPMS_TF_OFFSETS_MEASURED=1 only after somebody has put a ruler on   #
+# # the robot. The Nav2 and SLAM units refuse to start until you do.        #
+# ###########################################################################
+#
+# A PREREQUISITE NO TF VALUE CAN FIX: LIDAR_ROTATION_SIGN in fpms_lidar_ros.py
+# is -1 and UNVERIFIED. If the scan comes out mirrored, no value of laser_yaw
+# corrects it -- a mirror is not a rigid transform. Check that first.
+#
+# Correct mount yaw in EXACTLY ONE place. LIDAR_ZERO_OFFSET_DEG in
+# fpms_lidar_ros.py rotates in the same sense as laser_yaw here, and applying
+# a correction in both produces a double correction that looks almost right.
+#
+# NOTE: the static map->odom anchor used to live in this unit as an
+# ExecStartPre with setsid and a PID file. It is now fpms-map-anchor.service,
+# so that it can be made mechanically exclusive with slam_toolbox rather than
+# relying on a comment. See that unit.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# Wait for a STABLE address, not merely for network-online.target. A
+# DomainParticipant created during the boot carrier flap binds an interface set
+# that is invalidated a second later, and the result is a publisher that is
+# discoverable, logs dropped=0, and whose data nobody ever receives. See the
+# script for the measured timeline.
+ExecStartPre=/usr/local/bin/fpms-wait-net
+
+# Offsets in metres and RADIANS. If you measured 12 degrees, the value is
+# 0.2094, not 12.
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/nav2/fpms_tf.launch.py \
+  laser_x:=${FPMS_TF_LASER_X:-0.0} \
+  laser_y:=${FPMS_TF_LASER_Y:-0.0} \
+  laser_z:=${FPMS_TF_LASER_Z:-0.065} \
+  laser_roll:=${FPMS_TF_LASER_ROLL:-0.0} \
+  laser_pitch:=${FPMS_TF_LASER_PITCH:-0.0} \
+  laser_yaw:=${FPMS_TF_LASER_YAW:-0.0} \
+  imu_x:=${FPMS_TF_IMU_X:-0.0} \
+  imu_y:=${FPMS_TF_IMU_Y:-0.0} \
+  imu_z:=${FPMS_TF_IMU_Z:-0.0} \
+  imu_roll:=${FPMS_TF_IMU_ROLL:-0.0} \
+  imu_pitch:=${FPMS_TF_IMU_PITCH:-0.0} \
+  imu_yaw:=${FPMS_TF_IMU_YAW:-0.0} \
+  measured:=${FPMS_TF_OFFSETS_MEASURED:-0}'
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

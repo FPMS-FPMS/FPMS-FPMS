@@ -1,0 +1,70 @@
+[Unit]
+Description=FPMS odometry + TF for Nav2 (/odom_raw + /imu -> /odom, odom->base_footprint)
+Documentation=file:/home/ubuntu/nav2/TF_TREE.md
+
+# TRUST POSE, NEVER TRUST TWIST.
+#
+# /odom_raw reports twist.linear.x with an INVERTED SIGN relative to its own
+# pose.position. Measured directly, wheels off, with nothing else publishing
+# /cmd_vel:
+#
+#   commanded   reported twist   pose displacement   actual
+#     +0.012        -0.842            +1.395         forward
+#     +0.100        -1.225            +3.505         forward
+#     -0.012        +0.574            -1.506         backward
+#      0             0                 0             agree
+#
+# Any guard that compares a commanded sign against reported twist will abort
+# every CORRECT move. That is exactly what killed the first deadband sweep,
+# and it produced a cascade of wrong conclusions -- that the chassis could not
+# creep, that a motor deadband made it stall-then-lurch, and a 290 mm BACKWARD
+# lurch that was in fact a 290 mm FORWARD move -- all since retracted.
+#
+# ODOM_TWIST_SIGN is still -1 in this file and must become +1 with firmware v3.
+# It has NOT been changed, deliberately: changing it, TURN_WIRE_SIGN and
+# CMD_SCALE piecemeal makes the rover drive wrong in a NEW way, and none of
+# them can be measured while the board is on factory firmware.
+#
+# The IMU's orientation is NOT fused -- it publishes an identity quaternion.
+# Heading is integrated from angular_velocity.z. A healthy gyro reads exactly
+# 0.0 while parked because of a +/-0.01 rad/s deadband; that is not a fault
+# and must not be re-diagnosed from a parked reading.
+#
+# This node hard-enforces ROS_DOMAIN_ID: it exits with SystemExit if the
+# environment says anything other than 20. A stale ROS_DOMAIN_ID=0 in a shell
+# profile or /etc/environment therefore kills it outright rather than letting
+# it run silently on the wrong domain.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_odom_tf.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

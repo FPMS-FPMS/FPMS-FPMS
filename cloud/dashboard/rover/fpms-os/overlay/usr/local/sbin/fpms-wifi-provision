@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# fpms-wifi-provision [bootdir] - headless WiFi setup from the boot partition.
+#
+# Called by fpms-firstboot, and re-runnable by hand when the operator changes
+# venue:  sudo fpms-wifi-provision
+#
+# WHY THIS EXISTS
+# ===============
+# The FPMS repository contains NO WiFi credential mechanism at all. No
+# wpa_supplicant.conf, no netplan yaml, no nmcli call, no SSID anywhere. WiFi
+# on the old Pi was configured by hand, out of band, with a monitor and a
+# keyboard - and nothing about it was captured, so reimaging that card would
+# have left a rover that could not join a network and no way to tell it how.
+#
+# That is the single biggest gap for a headless image, and this closes it.
+#
+# THE MODEL
+# =========
+# The operator edits ONE text file on the FAT boot partition from a Windows
+# machine, before the card ever goes in the rover. On first boot we read it,
+# hand it to NetworkManager, and then take the plaintext out of the way.
+#
+# Multiple networks are supported and ORDER MATTERS: the first entry wins ties.
+# Put the Windows Mobile Hotspot first, because that is the 192.168.137.x
+# subnet the mosquitto bridge points at.
+#
+# If nothing known is in range we bring up an access point, so an operator with
+# no monitor and no keyboard can still reach the rover and fix it.
+#
+# NEVER GATES THE STACK. A rover with no WiFi must still boot, still serve the
+# console on :8090 over Ethernet or the fallback AP, and still say so.
+
+set -uo pipefail
+
+BOOTDIR="${1:-/boot/firmware}"
+[ -d "$BOOTDIR" ] || BOOTDIR=/boot
+CONF="$BOOTDIR/fpms-wifi.conf"
+
+AP_SSID="${FPMS_AP_SSID:-FPMS-Rover-Setup}"
+AP_PASS="${FPMS_AP_PASS:-fpmsrover}"
+SCAN_WAIT_S="${FPMS_WIFI_SCAN_WAIT_S:-45}"
+
+log()  { echo "fpms-wifi-provision: $*"; }
+warn() { echo "fpms-wifi-provision: WARNING: $*"; }
+
+command -v nmcli >/dev/null 2>&1 || {
+    warn "nmcli not found. This image expects NetworkManager, which is what"
+    warn "Ubuntu Rockchip 22.04 uses. WiFi not configured."
+    exit 1
+}
+
+# Find the wireless device. /sys/class/net/*/wireless is a more reliable test
+# than assuming wlan0 - a kernel bump or a USB dongle renames it, and a
+# hardcoded name would make this silently no-op.
+WIFI_DEV="$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
+if [ -z "$WIFI_DEV" ]; then
+    for d in /sys/class/net/*; do
+        [ -e "$d/wireless" ] && { WIFI_DEV="$(basename "$d")"; break; }
+    done
+fi
+[ -z "$WIFI_DEV" ] && { warn "no wireless interface present"; exit 1; }
+log "wireless interface: $WIFI_DEV"
+
+nmcli radio wifi on >/dev/null 2>&1 || true
+
+# --- read the operator's file ------------------------------------------------
+# Format, one network per line, priority order:
+#     SSID:PASSWORD
+# Blank lines and # comments ignored. Tolerant of CRLF, because this file is
+# written on Windows and Notepad will absolutely put \r on the end.
+declare -a SSIDS=() PASSES=()
+if [ -r "$CONF" ]; then
+    log "reading $CONF"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue ;; esac
+        ssid="${line%%:*}"
+        pass="${line#*:}"
+        [ "$ssid" = "$line" ] && { warn "skipping malformed line (need SSID:PASSWORD): $line"; continue; }
+        ssid="${ssid%"${ssid##*[![:space:]]}"}"
+        [ -z "$ssid" ] && continue
+        SSIDS+=("$ssid"); PASSES+=("$pass")
+    done < "$CONF"
+    log "found ${#SSIDS[@]} network(s)"
+else
+    log "no $CONF - see README-FPMS.txt on the boot partition"
+fi
+
+# --- register them with NetworkManager --------------------------------------
+# Higher autoconnect-priority wins, so the FIRST line in the file gets the
+# highest number. That is what makes "put the hotspot first" actually mean
+# something.
+prio=$(( ${#SSIDS[@]} + 10 ))
+for i in "${!SSIDS[@]}"; do
+    ssid="${SSIDS[$i]}"; pass="${PASSES[$i]}"
+    name="fpms-$ssid"
+    nmcli connection delete "$name" >/dev/null 2>&1 || true
+    if [ -z "$pass" ]; then
+        nmcli connection add type wifi con-name "$name" ifname "$WIFI_DEV" \
+            ssid "$ssid" >/dev/null 2>&1
+    else
+        nmcli connection add type wifi con-name "$name" ifname "$WIFI_DEV" \
+            ssid "$ssid" \
+            wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" >/dev/null 2>&1
+    fi
+    if [ $? -eq 0 ]; then
+        nmcli connection modify "$name" connection.autoconnect yes \
+            connection.autoconnect-priority "$prio" >/dev/null 2>&1
+        # Power save off at the connection level too. This does NOT replace
+        # fpms-wifi-ps-hold - the bcmdhd driver overrides this setting every
+        # 30-60s, which is the whole reason that daemon exists - but it costs
+        # nothing and covers the window before the daemon starts.
+        nmcli connection modify "$name" 802-11-wireless.powersave 2 >/dev/null 2>&1
+        log "registered '$ssid' (priority $prio)"
+    else
+        warn "could not register '$ssid'"
+    fi
+    prio=$(( prio - 1 ))
+done
+
+# --- take the plaintext out of the way --------------------------------------
+# The credentials now live in NetworkManager's own store. Leaving them in
+# cleartext on a FAT partition that any Windows machine mounts automatically is
+# not something to do by default.
+if [ -r "$CONF" ] && [ "${#SSIDS[@]}" -gt 0 ]; then
+    if mv "$CONF" "$CONF.applied" 2>/dev/null; then
+        chmod 600 "$CONF.applied" 2>/dev/null || true
+        log "moved credentials to $(basename "$CONF").applied"
+        log "(rename it back and re-run this to change networks)"
+    else
+        warn "could not move $CONF - credentials remain in cleartext on the boot partition"
+    fi
+fi
+
+# --- wait, then fall back to an AP ------------------------------------------
+if [ "${#SSIDS[@]}" -gt 0 ]; then
+    log "waiting up to ${SCAN_WAIT_S}s for a known network"
+    deadline=$(( $(date +%s) + SCAN_WAIT_S ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        state="$(nmcli -t -f DEVICE,STATE device 2>/dev/null | awk -F: -v d="$WIFI_DEV" '$1==d{print $2}')"
+        if [ "$state" = "connected" ]; then
+            ssid="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}')"
+            addr="$(ip -4 -o addr show dev "$WIFI_DEV" scope global 2>/dev/null | awk '{print $4}')"
+            log "connected to '${ssid}' as ${addr:-no address yet}"
+            exit 0
+        fi
+        sleep 2
+    done
+    warn "no known network joined within ${SCAN_WAIT_S}s"
+fi
+
+# FALLBACK AP.
+# Without this, a rover with a mistyped SSID is unreachable and needs a monitor
+# and keyboard - which on a competition day is not a thing you have.
+log "starting fallback access point '$AP_SSID'"
+nmcli connection delete fpms-setup-ap >/dev/null 2>&1 || true
+if nmcli connection add type wifi ifname "$WIFI_DEV" con-name fpms-setup-ap \
+        autoconnect no ssid "$AP_SSID" >/dev/null 2>&1 \
+   && nmcli connection modify fpms-setup-ap \
+        802-11-wireless.mode ap 802-11-wireless.band bg \
+        ipv4.method shared \
+        wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$AP_PASS" >/dev/null 2>&1 \
+   && nmcli connection up fpms-setup-ap >/dev/null 2>&1; then
+    log "=========================================================="
+    log " FALLBACK ACCESS POINT IS UP"
+    log "   SSID:     $AP_SSID"
+    log "   password: $AP_PASS"
+    log " Join it, then open  http://fpms-pi.local:8090/"
+    log " or ssh ubuntu@10.42.0.1 and re-run fpms-wifi-provision."
+    log "=========================================================="
+else
+    warn "could not start the fallback AP - the rover may be unreachable"
+    warn "over WiFi. Ethernet still works, and the console is on :8090."
+fi
+
+exit 0

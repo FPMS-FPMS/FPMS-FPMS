@@ -1,0 +1,59 @@
+[Unit]
+Description=FPMS ROS publishers are up (ordering barrier for the consumers)
+Documentation=file:/opt/fpms-os/docs/DDS.md
+
+# WHY THIS TARGET EXISTS
+# ======================
+# rosbridge, foxglove_bridge and fpms_console are CONSUMERS. They have to start
+# after the publishers, and the reason is a measured, three-times-reproduced
+# failure:
+#
+#   "rosbridge only delivers topics whose PUBLISHER already existed when
+#    rosbridge started. A publisher created afterwards is never discovered, and
+#    the client subscription asking for it is accepted and then silent forever."
+#
+#   Evidence: after a reboot, fpms-rosbridge started at 22:26:33 and
+#   fpms-odom-tf at 22:45:45 -- nineteen minutes later. /odom delivered ZERO
+#   messages while publishing healthily at 6.6 Hz. A restart of rosbridge gave
+#   53 messages in 8 seconds.
+#
+#   The symptom is the worst kind: connected, subscribed, silent, no error
+#   anywhere.
+#
+# deploy_stack.sh solves this at deploy time by restarting the four consumers
+# in a block after every publisher. A cold-boot image needs the same guarantee
+# without a human running a script, and that is what this target is.
+#
+# WHY NOT JUST After=fpms-odom-tf.service etc.
+# ============================================
+# Because a hard dependency edge onto a publisher would let a trivial restart
+# of one publisher take the consumers down with it. More importantly, several
+# publishers depend on the micro-ROS serial link, which costs 90-225 SECONDS to
+# re-establish. An edge that transitively reaches micro-ros-agent turns a
+# routine bridge restart into a multi-minute outage of the operator's entire
+# view of the robot. The stack's design rule is that each node detects its own
+# missing input and says so, rather than being ordered behind it.
+#
+# A target is the right shape: publishers declare Before= it, consumers declare
+# After= it. The consumers are ordered without being COUPLED - if a publisher
+# dies later, nothing cascades.
+#
+# NOTE ON THE UNDERLYING BUG
+# ==========================
+# The root cause of the "publisher must pre-exist" symptom is not ordering at
+# all -- it is Fast DDS preferring a shared-memory transport whose segments do
+# not survive across process eras. /etc/fpms/fastdds_udp_only.xml addresses
+# that directly, and if it works this target becomes belt-and-braces rather
+# than load-bearing.
+#
+# It is kept anyway. Ordering consumers after publishers is correct on its own
+# merits, costs nothing, and removing a mitigation for a bug you have not yet
+# confirmed fixed on hardware is exactly how this project has hurt itself
+# before. Re-evaluate once fpms-selftest has reported a clean cross-era DDS
+# check on real hardware for a few boots.
+
+Requires=multi-user.target
+After=multi-user.target
+
+[Install]
+WantedBy=multi-user.target

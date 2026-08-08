@@ -1,0 +1,64 @@
+[Unit]
+Description=FPMS slam_toolbox mapping run (NOT ENABLED - operator-initiated)
+Documentation=file:/home/ubuntu/nav2/TF_TREE.md
+
+# ###########################################################################
+# # INSTALLED, NOT ENABLED. This is an OPERATOR ACTIVITY, not a boot state. #
+# ###########################################################################
+#
+# You start this once, drive the rover slowly around the room, and save a map.
+# It is not something a rover should be doing every time it powers on.
+#
+# IT TAKES OWNERSHIP OF map->odom.
+# ================================
+# slam_toolbox publishes map->odom dynamically from its scan matcher.
+# fpms-map-anchor publishes a static one at the arena start pose. Two
+# publishers on one TF edge do not error -- they produce a pose that flickers
+# between two self-consistent answers, which is the hardest class of bug to see
+# on an arena map.
+#
+# TF_TREE.md: "One publisher per edge, no exceptions."
+#
+# The Conflicts= below makes that mechanical: starting this STOPS the anchor,
+# and starting the anchor stops this. Not a comment, not a checklist item.
+#
+# WHEN YOU ARE DONE
+# =================
+#   ros2 run nav2_map_server map_saver_cli -f ~/slam/maps/fpms_room
+#   sudo systemctl stop fpms-slam-mapping
+#   sudo systemctl start fpms-map-anchor        # back to the dead-reckon path
+#
+# The resulting .posegraph and .data CANNOT be baked into an image -- they
+# describe one physical room. That is why slam/maps/ ships empty.
+#
+# PRECONDITION: a mapping run against an unmeasured LiDAR mount transform
+# produces a map that is wrong by a fixed rotation, and every subsequent
+# localisation inherits it. Measure the mount first.
+
+After=fpms-ros-publishers.target fpms-tf.service fpms-lidar-ros.service
+Conflicts=fpms-map-anchor.service fpms-slam-localization.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStartPre=/bin/bash -c '[ "${FPMS_TF_OFFSETS_MEASURED:-0}" = "1" ] || { echo "REFUSING: the LiDAR mount transform is unmeasured, so any map built now"; echo "will be wrong by a fixed rotation and every later localisation inherits it."; echo "Set FPMS_TF_OFFSETS_MEASURED=1 in /etc/fpms/config.env once measured."; exit 1; }'
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/slam/fpms_slam_mapping.launch.py params_file:=/etc/fpms/slam/mapper_params_mapping.yaml'
+
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+
+# NO [Install] SECTION -- deliberately not enableable by accident.

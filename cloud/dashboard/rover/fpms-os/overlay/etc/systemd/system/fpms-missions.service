@@ -1,0 +1,80 @@
+[Unit]
+Description=FPMS mission executor (plans autonomously, drives measured segments)
+Documentation=file:/home/ubuntu/STACK.md
+
+# The executor plans its own route (Theta*/A* over the live LiDAR occupancy
+# grid, with turn cost, clearance gradient, hysteresis, a fallback ladder and
+# live reroute) and converts it into slow measured segments:
+#
+#     burst -> STOP -> settle -> MEASURE AT REST -> residual -> correct
+#
+# Distance closes on encoders, heading on the gyro. That is the B8B method,
+# gate-verified at m2 = 744.0 mm, and it was deliberately NOT rewritten when
+# the rest of the stack was reorganised -- only fed better constants and made
+# to report its residuals.
+#
+# WAS SILENTLY ABSENT AFTER A REBOOT
+# ==================================
+# This unit was once found DISABLED on the Pi, so the rover came back from a
+# power cycle with no mission executor and nothing said so. Every FPMS-OS unit
+# is enabled at image build time for exactly this reason.
+#
+# ORDERING
+# ========
+# After fpms-cored, with Wants= rather than Requires=. The stop authority must
+# be listening before anything that can move accepts a command -- but if cored
+# fails, this must still start. A rover you cannot drive is not safer than one
+# you can stop.
+#
+# CONFIG LIVES IN THE FILE, NOT THE ENVIRONMENT
+# =============================================
+# fpms_missions.py reads /etc/fpms/config.env directly and does NOT overlay
+# os.environ. An FPMS_MISSION_* value set as a systemd Environment= here would
+# be silently ignored. Mission tuning belongs in config.env. (fpms_cored.py and
+# fpms_charact.py behave the opposite way, which is a genuine trap.)
+#
+# Out-of-range values are clamped and logged to CFG_NOTES at startup rather
+# than being accepted silently, and a calibration profile is adopted only when
+# it carries measured:true AND is inside a sanity range. Read those lines in
+# the journal after any config change -- "ADOPTED" and "REFUSED" are the only
+# evidence that a number you set is a number being used.
+
+After=network-online.target mosquitto.service
+After=fpms-cored.service
+Wants=network-online.target mosquitto.service
+Wants=fpms-cored.service
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_missions.py'
+
+# SIGTERM is the right signal here and not a blunt one: this process installs a
+# handler that aborts the mission and publishes ten zero Twists before exiting.
+# SIGKILL would leave the last non-zero Twist as the most recent thing the
+# drive board heard. fpms-cored's escalation path relies on this behaviour.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=15
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

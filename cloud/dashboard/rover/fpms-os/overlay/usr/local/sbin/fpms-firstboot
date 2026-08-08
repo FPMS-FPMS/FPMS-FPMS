@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# fpms-firstboot - everything that cannot be baked into a shared image.
+#
+# Runs once, from fpms-firstboot.service, before mosquitto and the FPMS stack.
+# Marks itself done in /var/lib/fpms/.firstboot-done. Re-runnable with --force.
+#
+# DESIGN RULE: NEVER BLOCK THE BOOT.
+# Every step here is individually fenced. A rover that came up with a bad
+# hostname is recoverable over the network; a rover that refused to boot
+# because a WiFi file had a typo is a card-reader job. Failures are recorded,
+# reported by fpms-selftest, and do not stop the rest of the sequence.
+
+set -uo pipefail
+
+STATE_DIR=/var/lib/fpms
+DONE_MARK="$STATE_DIR/.firstboot-done"
+REPORT="$STATE_DIR/firstboot.json"
+CONFIG=/etc/fpms/config.env
+BOOTDIR=""
+
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+declare -a PROBLEMS=()
+
+log()  { echo "fpms-firstboot: $*"; }
+warn() { echo "fpms-firstboot: WARNING: $*"; PROBLEMS+=("$*"); }
+
+mkdir -p "$STATE_DIR"
+
+if [ -f "$DONE_MARK" ] && [ "$FORCE" -ne 1 ]; then
+    log "already provisioned (use --force to re-run)"
+    exit 0
+fi
+
+log "=========================================================="
+log " FPMS-OS first boot"
+log "=========================================================="
+
+# --- locate the FAT boot partition ------------------------------------------
+# Ubuntu Rockchip images mount it at /boot/firmware; some at /boot. We want the
+# one an operator can see from Windows, which is the vfat one.
+for cand in /boot/firmware /boot; do
+    if [ -d "$cand" ] && findmnt -no FSTYPE "$cand" 2>/dev/null | grep -qi vfat; then
+        BOOTDIR="$cand"; break
+    fi
+done
+[ -z "$BOOTDIR" ] && { BOOTDIR=/boot; warn "no vfat boot partition found; looking in /boot anyway"; }
+log "boot partition: $BOOTDIR"
+
+# --- 1. grow the rootfs ------------------------------------------------------
+# The image is built small so it compresses and flashes fast. Without this the
+# rover has a few hundred MB free and fills up mid-mission, which on this
+# project has previously looked like "the agent stopped logging".
+grow_rootfs() {
+    local src part disk num
+    src="$(findmnt -no SOURCE / 2>/dev/null)" || return 1
+    [ -z "$src" ] && return 1
+    case "$src" in
+        /dev/mmcblk*p*|/dev/nvme*p*)
+            disk="${src%p*}"; num="${src##*p}" ;;
+        /dev/sd*)
+            disk="$(echo "$src" | sed 's/[0-9]*$//')"; num="$(echo "$src" | grep -o '[0-9]*$')" ;;
+        *) return 1 ;;
+    esac
+    log "growing $src (disk $disk partition $num)"
+    growpart "$disk" "$num" >/dev/null 2>&1 || true   # exits 1 if already grown
+    resize2fs "$src" >/dev/null 2>&1 || return 1
+    return 0
+}
+if grow_rootfs; then
+    log "rootfs: $(df -h / | awk 'NR==2 {print $4" free of "$2}')"
+else
+    warn "could not grow the rootfs automatically - check df -h"
+fi
+
+# --- 2. SSH host keys --------------------------------------------------------
+# The image ships NONE. A shared host key across a fleet is a real problem, and
+# it also makes every laptop's known_hosts conflict between rovers.
+if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+    log "generating SSH host keys"
+    ssh-keygen -A >/dev/null 2>&1 || warn "ssh-keygen -A failed"
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+else
+    log "SSH host keys already present"
+fi
+
+# --- 3. hostname and mDNS ----------------------------------------------------
+# fpms_console.py builds the URL it prints from socket.gethostname() + ".local",
+# and every document in this project says fpms-pi.local. A different hostname
+# silently breaks all of them.
+#
+# The operator can override it with a file on the boot partition, because a
+# two-rover fleet needs two names.
+WANT_HOST=fpms-pi
+[ -r "$BOOTDIR/fpms-hostname" ] && WANT_HOST="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-hostname")"
+[ -z "$WANT_HOST" ] && WANT_HOST=fpms-pi
+
+if [ "$(hostname)" != "$WANT_HOST" ]; then
+    log "setting hostname to $WANT_HOST"
+    hostnamectl set-hostname "$WANT_HOST" 2>/dev/null || echo "$WANT_HOST" > /etc/hostname
+fi
+# avahi publishes the .local name from /etc/hosts on Debian/Ubuntu, so this
+# line is not decoration.
+if ! grep -qE "^127\.0\.1\.1[[:space:]]+$WANT_HOST" /etc/hosts; then
+    sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+    echo "127.0.1.1 $WANT_HOST" >> /etc/hosts
+fi
+systemctl enable --now avahi-daemon >/dev/null 2>&1 \
+    || warn "avahi-daemon did not start - ${WANT_HOST}.local will not resolve"
+
+# --- 4. WiFi -----------------------------------------------------------------
+if [ -x /usr/local/sbin/fpms-wifi-provision ]; then
+    /usr/local/sbin/fpms-wifi-provision "$BOOTDIR" || warn "WiFi provisioning reported a problem"
+else
+    warn "fpms-wifi-provision missing - WiFi not configured"
+fi
+
+# --- 5. the mosquitto password ----------------------------------------------
+# NO DEFAULT PASSWORD IS EVER BAKED INTO THE IMAGE. Every flashed board gets
+# its own, generated here.
+#
+# Why this matters more than it looks: if config.env holds a password the
+# broker does not accept, NOTHING CRASHES. Every service simply retries
+# forever and the dashboard is silently empty, with no fault anywhere.
+provision_broker_password() {
+    local pass user
+    user="$(grep -E '^FPMS_MQTT_USER=' "$CONFIG" 2>/dev/null | cut -d= -f2- | tr -d '"')"
+    [ -z "$user" ] && user=fpms
+
+    # Operator override, if they want the same password as an existing setup.
+    if [ -r "$BOOTDIR/fpms-mqtt-password" ]; then
+        pass="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-mqtt-password")"
+        log "using the broker password supplied on the boot partition"
+    else
+        pass="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 24)"
+        log "generated a new broker password"
+    fi
+    [ -z "$pass" ] && { warn "could not obtain a broker password"; return 1; }
+
+    # config.env - replace the placeholder, or the whole line if re-running.
+    if grep -q '^FPMS_MQTT_PASS=' "$CONFIG" 2>/dev/null; then
+        sed -i "s|^FPMS_MQTT_PASS=.*|FPMS_MQTT_PASS=${pass}|" "$CONFIG"
+    else
+        echo "FPMS_MQTT_PASS=${pass}" >> "$CONFIG"
+    fi
+    chmod 0640 "$CONFIG"; chown root:root "$CONFIG"
+
+    # the broker's own password file
+    touch /etc/mosquitto/fpms.passwd
+    mosquitto_passwd -b /etc/mosquitto/fpms.passwd "$user" "$pass" >/dev/null 2>&1 \
+        || { warn "mosquitto_passwd failed"; return 1; }
+    chmod 0600 /etc/mosquitto/fpms.passwd
+    chown mosquitto:mosquitto /etc/mosquitto/fpms.passwd 2>/dev/null || true
+
+    # the bridge's remote password, in the broker config
+    sed -i "s|^remote_password .*|remote_password ${pass}|" \
+        /etc/mosquitto/conf.d/fpms.conf 2>/dev/null || true
+    chmod 0600 /etc/mosquitto/conf.d/fpms.conf
+
+    # Print it ONCE, to the console, so an operator with a monitor can write it
+    # down, and store it root-only for anyone arriving over SSH later.
+    umask 077
+    printf '%s\n' "$pass" > "$STATE_DIR/broker-password"
+    log "=========================================================="
+    log " MQTT broker credentials for this rover"
+    log "   user:     ${user}"
+    log "   password: ${pass}"
+    log " Enter these on the operator laptop's broker."
+    log " Stored at ${STATE_DIR}/broker-password (root only)."
+    log "=========================================================="
+    return 0
+}
+if grep -q '__FPMS_FIRSTBOOT_WILL_REPLACE_THIS__' "$CONFIG" 2>/dev/null || [ "$FORCE" -eq 1 ]; then
+    provision_broker_password || warn "broker password not provisioned"
+else
+    log "broker password already provisioned"
+fi
+
+# Let the operator point the bridge at a different laptop.
+if [ -r "$BOOTDIR/fpms-broker-host" ]; then
+    host="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-broker-host")"
+    if [ -n "$host" ]; then
+        log "bridging to broker at $host"
+        case "$host" in *:*) ;; *) host="${host}:1883" ;; esac
+        sed -i "s|^address .*|address ${host}|" /etc/mosquitto/conf.d/fpms.conf || true
+    fi
+fi
+
+# --- 6. verify the USB serial topology --------------------------------------
+# This is a CHECK, not a fixup. SPEC/CLAUDE.md are explicit: do not resolve the
+# 1.2/1.3 question by trying both, because the wrong one puts motor command
+# frames into the LiDAR. If the topology is not what we expect, we say so
+# loudly and change nothing.
+verify_topology() {
+    local drive lidar ok=1
+    drive=/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0
+    lidar=/dev/serial/by-path/platform-fc880000.usb-usb-0:1.2:1.0-port0
+
+    if [ -e "$drive" ]; then log "drive board present at USB 1.3"; else
+        warn "NO DEVICE at USB 1.3 (expected the ESP32-S3 drive board)"; ok=0; fi
+    if [ -e "$lidar" ]; then log "LiDAR present at USB 1.2"; else
+        warn "NO DEVICE at USB 1.2 (expected the LiDAR)"; ok=0; fi
+
+    if [ "$ok" -eq 0 ]; then
+        warn "SERIAL TOPOLOGY IS NOT AS EXPECTED - NOT GUESSING."
+        warn "Both CP2102 adapters report ID_SERIAL 0001, so only the USB port"
+        warn "distinguishes them. Binding wrong sends motor frames to the LiDAR."
+        warn "Check with: ls -l /dev/serial/by-path/  and  udevadm info -a -n /dev/ttyUSB0"
+    fi
+    # Note we deliberately do NOT open either device to probe it. Opening the
+    # drive tty raises the handshake lines wired to EN/IO0 and resets the
+    # ESP32, costing a 90-225 second re-link.
+    return 0
+}
+verify_topology
+
+# --- 7. ownership and directories -------------------------------------------
+install -d -o ubuntu -g ubuntu /home/ubuntu/yolo /home/ubuntu/slam/maps
+install -d -o ubuntu -g ubuntu "$STATE_DIR"
+chown -R ubuntu:ubuntu /home/ubuntu 2>/dev/null || true
+
+# --- 8. report ---------------------------------------------------------------
+{
+    printf '{\n'
+    printf '  "hostname": "%s",\n' "$WANT_HOST"
+    printf '  "boot_partition": "%s",\n' "$BOOTDIR"
+    printf '  "problems": ['
+    for i in "${!PROBLEMS[@]}"; do
+        [ "$i" -gt 0 ] && printf ', '
+        printf '"%s"' "$(echo "${PROBLEMS[$i]}" | sed 's/"/\\"/g')"
+    done
+    printf '],\n'
+    printf '  "problem_count": %d\n' "${#PROBLEMS[@]}"
+    printf '}\n'
+} > "$REPORT" 2>/dev/null || true
+
+if [ "${#PROBLEMS[@]}" -eq 0 ]; then
+    log "first boot complete, no problems"
+else
+    log "first boot complete with ${#PROBLEMS[@]} problem(s) - see above and $REPORT"
+fi
+
+touch "$DONE_MARK"
+systemctl disable fpms-firstboot.service >/dev/null 2>&1 || true
+
+log "run 'fpms-selftest' once the stack has settled (about 2 minutes)"
+exit 0

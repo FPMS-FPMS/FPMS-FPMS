@@ -1,0 +1,94 @@
+[Unit]
+Description=micro-ROS Agent (Yahboom MicroROS Board V2.0 / ESP32-S3) on USB port 1.3
+Documentation=https://micro.ros.org
+Documentation=file:/home/ubuntu/STACK.md
+
+# ###########################################################################
+# # UNTOUCHABLE. DO NOT RESTART THIS CASUALLY.                              #
+# #                                                                         #
+# # The board self-reconnects unaided in 90-225 SECONDS after any agent     #
+# # restart. No reset-button press is needed or helpful. If the link looks  #
+# # dead right after a restart, WAIT before touching hardware.              #
+# #                                                                         #
+# # This is also why almost nothing in the FPMS stack declares an ordering  #
+# # edge onto this unit: a dependency here would turn a trivial restart of  #
+# # a bridge into a multi-minute outage of every topic on the robot. Each   #
+# # node detects its own missing input and says so instead.                 #
+# ###########################################################################
+#
+# THE DEVICE
+# ==========
+# /dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0
+#
+# BY-PATH, NEVER by-id, NEVER /dev/ttyUSBn.
+#   - Both onboard CP2102 adapters report an identical ID_SERIAL of "0001", so
+#     udev can only ever create ONE by-id link for the pair. by-id is unusable.
+#   - /dev/ttyUSB1 in particular renumbers across boots.
+#   - The other adapter (port 1.2) is the LiDAR. Getting this wrong sends
+#     micro-ROS traffic into the laser scanner.
+#
+# ORDERING ON THE DEVICE: After=, NOT BindsTo=
+# ============================================
+# This unit previously used BindsTo= on the generated .device unit. CLAUDE.md
+# is explicit: "systemd must use After= + Restart=always on the device unit,
+# not BindsTo=. BindsTo= plus udev churn kills the agent."
+#
+# The failure is that any udev re-trigger -- a rule reload, a ModemManager
+# probe, a USB glitch -- momentarily invalidates the .device unit, and BindsTo=
+# then STOPS this service. With Restart=always and a plain After=, the same
+# event costs at most one restart cycle instead of a dead link.
+#
+# THE BAUD RATE
+# =============
+# Set once, in /etc/fpms/config.env, as FPMS_UROS_BAUD. It used to be written
+# in two places that disagreed: this unit's comment insisted 921600 "is correct
+# and must not be fixed", while the wrapper it actually invoked used 230400.
+#
+#   921600  Yahboom FACTORY firmware v2.0.0. That image prints
+#           "ros serial baudrate: 921600" from its own flash config, so the
+#           comment was right -- for that firmware.
+#   230400  FPMS firmware v3. MEASURED 2026-08-06: 921600 was unstable on this
+#           board. The session died within 1-3 minutes, never established on a
+#           cold boot, and degraded further under motor load.
+#
+# A mismatch does not error. The agent runs happily and never establishes a
+# session, which is indistinguishable from a dead board.
+#
+# ROS_DOMAIN_ID
+# =============
+# 20, and it is not optional. In micro-ROS the CLIENT declares its domain in
+# the CREATE_PARTICIPANT request, so the agent's own domain does not place it.
+# Without this the board publishes perfectly into domain 0, the agent logs a
+# flawless session, and every `ros2 topic list` shows nothing at all.
+
+After=network-online.target
+After=dev-serial-by\x2dpath-platform\x2dfc880000.usb\x2dusb\x2d0:1.3:1.0\x2dport0.device
+Wants=network-online.target
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+SupplementaryGroups=dialout
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+
+# The wrapper starts fpms-uros-release-reset alongside the agent, in this same
+# cgroup. That holder is not optional: RTS drives the ESP32-S3's EN pin and
+# Linux raises it on open(), so without the holder the agent's own open pins
+# the MCU in reset -- measured at 56 bytes in 15 minutes. See the script.
+ExecStart=/usr/local/bin/fpms-uros-agent-run
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

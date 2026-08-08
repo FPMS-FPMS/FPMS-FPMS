@@ -1,0 +1,19 @@
+# FPMS-OS WiFi setup
+#
+# RENAME THIS FILE TO  fpms-wifi.conf  (drop the .example) AND EDIT IT.
+#
+# One network per line:      SSID:PASSWORD
+# Order matters - the first line is tried first.
+# Lines starting with # are ignored. Blank lines are ignored.
+#
+# Put your Windows Mobile Hotspot FIRST. The rover's telemetry link expects the
+# operator laptop to be on 192.168.137.1, which is what that hotspot uses.
+#
+# For an open network with no password, leave the part after the colon empty:
+#     OpenNetwork:
+#
+# Once the rover has read this it renames the file to .applied and locks it,
+# so your password is not left in plain text on a card any computer can mount.
+
+MyMobileHotspot:changeme
+MyHomeWiFi:changeme

@@ -1,0 +1,60 @@
+[Unit]
+Description=FPMS micro-ROS link supervisor (data-liveness watchdog + auto-recovery)
+Documentation=file:/usr/local/bin/fpms-uros-supervisor
+
+# Watches whether the micro-ROS link is carrying DATA, not whether the agent
+# process is alive. Those are different questions and the stack has been fooled
+# by the difference: the agent can log a flawless session while the board sits
+# in reset, or while it publishes into the wrong DDS domain.
+#
+# It also covers the case that has historically needed a human: after any board
+# power cycle, fpms-teleop / fpms-odom-tf / fpms-missions fail to re-match
+# their XRCE subscriptions, because the participant they matched against has
+# been replaced. Restarting those three is the recovery, and this unit does it.
+#
+# STACK.md is blunt that this remains the least-covered failure mode in the
+# stack. Treat a supervisor-initiated recovery as information, not as noise --
+# if it fires often, something upstream is wrong.
+#
+# RUNS AS ROOT, deliberately: it must `systemctl restart` other units. It is
+# the only FPMS unit that does.
+#
+# TIMING IS ON CLOCK_MONOTONIC throughout, because this Pi has no RTC. It boots
+# with a stale clock and NTP steps it by hours a minute later; any wall-clock
+# deadline would fire spuriously at exactly the wrong moment.
+#
+# StartLimitIntervalSec=0 disables systemd's start limiter for this unit. A
+# watchdog that systemd gives up on is worse than no watchdog.
+
+After=network-online.target mosquitto.service micro-ros-agent.service
+After=fpms-teleop.service fpms-odom-tf.service
+Wants=network-online.target mosquitto.service micro-ros-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+
+# This unit reads /etc/fpms/config.env itself, in Python, rather than via
+# systemd. That is deliberate -- it wants the file's values, and it must not
+# inherit an FPMS_UROS_* override from a parent environment. The
+# EnvironmentFile line below is therefore intentionally ABSENT.
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+
+ExecStart=/usr/local/bin/fpms-uros-supervisor
+
+TimeoutStopSec=20
+Restart=always
+# 10s. Longer than the rest of the stack on purpose: a supervisor that restarts
+# faster than the thing it supervises can recover just amplifies the problem.
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

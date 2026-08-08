@@ -1,0 +1,63 @@
+[Unit]
+Description=FPMS LiDAR -> ROS 2 (MQTT telemetry/lidar -> sensor_msgs/LaserScan on /scan_lidar)
+Documentation=file:/home/ubuntu/STACK.md
+
+# /scan_lidar, NOT /scan.
+#
+# The drive board publishes its own /scan and it is DEAD -- every range is
+# exactly 0.0. It is not a usable LiDAR source and never has been. The real
+# scanner is the second CP2102 on USB port 1.2, owned by fpms-rover-agent,
+# which republishes over MQTT; this unit converts that back into a LaserScan.
+#
+# THE STALE CONTRACT -- this is the sharp edge
+# ============================================
+# fpms-rover-agent publishes the LiDAR ON A TIMER, not on data, so that a dead
+# scanner is a declared fault instead of a frozen picture. The consequence is
+# that ARRIVAL NO LONGER IMPLIES FRESHNESS, and a dead payload carries all-zero
+# ranges. Zero converts to inf -- "no return" -- which reads as a completely
+# clear 360 degrees.
+#
+# Left unhandled, the never-stale fix would have turned "the sensor is broken"
+# into "full speed ahead": strictly worse than the old fail-open, because the
+# guard would be CONFIDENTLY wrong.
+#
+# So when stale is true this node does NOT publish a LaserScan at all. Nav2
+# sees the scan STOP, which is a failure mode ROS already handles correctly.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# No "-" prefix: if the network is not stable we would rather this unit wait
+# than create a participant that is discoverable and silent. The script itself
+# exits 0 on timeout so this cannot strand the LiDAR indefinitely.
+ExecStartPre=/usr/local/bin/fpms-wait-net
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_lidar_ros.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

@@ -1,0 +1,83 @@
+[Unit]
+Description=FPMS core - STOP authority, command receipts, stack health
+Documentation=file:/home/ubuntu/STACK.md
+Documentation=file:/opt/fpms-os/docs/ARCHITECTURE.md
+
+# THIS UNIT OWNS THE STOP LATCH.
+#
+# The mechanism is simple and it is the whole point: STOP has its own MQTT
+# client, on its own socket, with its own network thread, subscribed to nothing
+# but stop/estop/auto_off.
+#
+# paho delivers all messages for a client on one thread, in order. Inside
+# fpms_missions.py that same thread also runs on_lidar (a 360-bin occupancy
+# grid integration) and _cmd_mission (which holds a lock across an A* search).
+# Neither is time-bounded, so a stop arriving behind either of them WAITS. Here
+# nothing can ever be in front of a stop, because nothing else is subscribed.
+#
+# The callback does no work at all - no JSON parse before the latch, no lock,
+# no I/O. It sets a threading.Event and appends to a deque. Measured at 3.9us
+# per call over 10,000 calls, and a deliberately malformed payload still
+# latches.
+#
+# ---------------------------------------------------------------------------
+# NOT YET VERIFIED ON HARDWARE
+# ---------------------------------------------------------------------------
+# fpms-cored has never run on the Pi. Its stop path is covered by offline
+# assertions but has never touched a broker, a real telemetry/mission stream,
+# or systemd. Until it has, treat it as ADDITIONAL protection layered over the
+# mission executor's own stop, never as a replacement for it.
+#
+# Two real bugs in the escalation logic were caught by the offline tests before
+# any of it ran: a missing "phase" stringified to "none" and counted as
+# DRIVING (which would have SIGTERMed a healthy executor), and the evidence
+# freshness bound was tied to the escalation delay, making escalation
+# unreachable. Both fixed, both now have tests. That is the level of care this
+# path needs.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+# THE ONE ORDERING EDGE THAT IS A SAFETY PROPERTY.
+#
+# There must be no window at boot where something that can move is accepting
+# commands while the stop authority is not yet listening.
+#
+# Wants=, not Requires=, on the far side: if cored fails, missions must STILL
+# start. A rover you cannot drive is not safer than one you can stop.
+Before=fpms-missions.service fpms-teleop.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# EnvironmentFile FIRST, so config.env cannot override the domain or the RMW.
+# Note that fpms_cored.py additionally overlays os.environ on top of the file
+# in its own load_config(), so these Environment= lines win there too - which
+# is the intended precedence.
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash 2>/dev/null || true; exec python3 /home/ubuntu/fpms_cored.py'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+Restart=always
+# 2 seconds, the shortest in the stack. This is the stop path; every second it
+# is down is a second in which a stop has no owner.
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

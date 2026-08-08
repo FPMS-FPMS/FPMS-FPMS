@@ -1,0 +1,62 @@
+[Unit]
+Description=FPMS rover agent (camera + LiDAR -> MQTT; the ONLY owner of the scanner tty)
+Documentation=file:/home/ubuntu/STACK.md
+
+# THIS UNIT IS THE SOLE OWNER OF THE LiDAR SERIAL PORT.
+#
+# Only one process can hold /dev/serial/by-path/...usb-0:1.2:1.0-port0. If
+# anything else opens it, the agent's frames are corrupted in a way that does
+# not raise -- bytes keep arriving, they are simply not LD frames. That failure
+# ("frame starvation") had to be given its own deadline to detect, because the
+# thread supervisor above it never sees an exception.
+#
+# The agent resolves the scanner BY USB TOPOLOGY and REFUSES any device that
+# resolves to the micro-ROS drive board. That refusal is load-bearing: opening
+# the drive board's tty raises the handshake lines wired to its EN/IO0 pins,
+# resetting the ESP32 out from under micro-ros-agent, costing a 90-225 second
+# re-link and taking the rover's only pose source down with it.
+#
+# NOT A ROS NODE. This is MQTT only, which is why there is no ROS_DOMAIN_ID or
+# RMW_IMPLEMENTATION here. That omission is deliberate, not an oversight.
+#
+# WHY LiDAR AND CAMERA ARE ON SEPARATE MQTT CLIENTS
+# =================================================
+# This is the one place where consolidation was actively wrong. paho serialises
+# all publishes from one client onto one network thread, in order. A 40 kB
+# base64 camera frame queued ahead of a 2.5 kB scan delays that scan by however
+# long the frame takes to drain. Nothing was ever DROPPED -- scans simply
+# arrived LATE, which is the hardest version of this failure to see.
+#
+# Camera frames now drop rather than queue (max_queued=2); QoS-1 fire and fault
+# events go to the unbounded client so they are never discarded.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# video for the camera, dialout for the scanner tty.
+SupplementaryGroups=video dialout
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStart=/usr/bin/python3 /usr/local/bin/fpms-rover-agent
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

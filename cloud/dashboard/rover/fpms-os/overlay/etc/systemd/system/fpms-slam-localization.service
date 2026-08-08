@@ -1,0 +1,50 @@
+[Unit]
+Description=FPMS slam_toolbox localisation against a saved map (NOT ENABLED)
+Documentation=file:/home/ubuntu/nav2/TF_TREE.md
+
+# ###########################################################################
+# # INSTALLED, NOT ENABLED, AND IT CANNOT WORK ON A FRESHLY FLASHED IMAGE.  #
+# ###########################################################################
+#
+# This requires ~/slam/maps/fpms_room.posegraph and .data, which describe ONE
+# PHYSICAL ROOM and therefore cannot be baked into a shared image. The image
+# ships slam/maps/ empty. Run fpms-slam-mapping first, save a map, then start
+# this.
+#
+# Like the mapping unit, it owns map->odom and is mechanically exclusive with
+# fpms-map-anchor. See that unit's header for why two publishers on one TF
+# edge is the hardest bug in this stack to see.
+#
+# The launch file itself refuses to start if the .posegraph and .data are
+# missing, which is the correct behaviour -- a localisation node with no map
+# would otherwise sit publishing an identity transform and looking healthy.
+
+After=fpms-ros-publishers.target fpms-tf.service fpms-lidar-ros.service
+Conflicts=fpms-map-anchor.service fpms-slam-mapping.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStartPre=/bin/bash -c 'test -f /home/ubuntu/slam/maps/fpms_room.posegraph || { echo "REFUSING: no map at ~/slam/maps/fpms_room.posegraph."; echo "A map describes one physical room and cannot ship in an image."; echo "Run: sudo systemctl start fpms-slam-mapping, drive the room, then"; echo "     ros2 run nav2_map_server map_saver_cli -f ~/slam/maps/fpms_room"; exit 1; }'
+ExecStartPre=/bin/bash -c '[ "${FPMS_TF_OFFSETS_MEASURED:-0}" = "1" ] || { echo "REFUSING: LiDAR mount transform unmeasured. See fpms-tf.service."; exit 1; }'
+
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec ros2 launch /home/ubuntu/slam/fpms_slam_localization.launch.py params_file:=/etc/fpms/slam/mapper_params_localization.yaml map_name:=/home/ubuntu/slam/maps/fpms_room'
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+# NO [Install] SECTION -- deliberately not enableable by accident.
