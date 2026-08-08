@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# fpms-doctor <symptom> - guided troubleshooting from this project's history.
+#
+# fpms-selftest tells you WHAT is wrong. This tells you what to do about it,
+# following the decision trees that were actually paid for in lost sessions.
+#
+#   fpms-doctor no-lidar
+#   fpms-doctor wont-move
+#   fpms-doctor empty-dashboard
+#   fpms-doctor stop-not-working
+#   fpms-doctor silent-topic
+#   fpms-doctor wrong-distance
+#   fpms-doctor no-network
+
+set -uo pipefail
+
+CFG=/etc/fpms/config.env
+# shellcheck source=/dev/null
+[ -r "$CFG" ] && . "$CFG"
+THING="${FPMS_THING_NAME:-rover2}"
+
+hdr() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+say() { printf '   %s\n' "$*"; }
+cmd() { printf '\033[1;33m   $ %s\033[0m\n' "$*"; }
+warn(){ printf '\033[1;31m   !! %s\033[0m\n' "$*"; }
+
+usage() {
+    cat <<'EOF'
+fpms-doctor <symptom>
+
+  no-lidar           the scan is missing, frozen, or stale
+  wont-move          commands are accepted but nothing happens
+  empty-dashboard    everything is green and the UI shows nothing
+  stop-not-working   STOP does not stop it
+  silent-topic       a topic exists, has a publisher, delivers nothing
+  wrong-distance     it drives the wrong distance or the wrong way
+  no-network         cannot reach the rover at all
+
+Start with:  fpms-selftest
+EOF
+}
+
+case "${1:-}" in
+
+no-lidar)
+    hdr "1. Is the agent publishing at all?"
+    cmd "mosquitto_sub -h 127.0.0.1 -u '${FPMS_MQTT_USER:-fpms}' -P \"\$(sudo cat /var/lib/fpms/broker-password)\" -t 'fpms/$THING/telemetry/lidar' -C 1 | jq '{health,hz,stale,seq}'"
+    say ""
+    say "The payload publishes ON A TIMER, not on data, so ARRIVAL DOES NOT"
+    say "IMPLY FRESHNESS. That is deliberate: a dead scanner must be a declared"
+    say "fault, not a frozen picture."
+    say ""
+    say "  seq CLIMBING + stale:true  -> THE SCANNER is at fault"
+    say "  seq FROZEN                 -> THE PROCESS is at fault"
+    say ""
+    say "Those need different fixes and were indistinguishable before seq."
+
+    hdr "2. Scanner at fault"
+    say "Something else may have opened the tty. Only one process may hold it."
+    cmd "sudo lsof /dev/serial/by-path/platform-fc880000.usb-usb-0:1.2:1.0-port0"
+    cmd "ls -l /dev/serial/by-path/"
+    warn "Do NOT try the other port to 'see if that is it'. Both CP2102s"
+    warn "report ID_SERIAL 0001, and the other one is the DRIVE BOARD."
+    warn "Opening it resets the ESP32 and costs a 90-225s re-link."
+
+    hdr "3. Process at fault"
+    cmd "sudo systemctl restart fpms-rover-agent"
+    cmd "journalctl -u fpms-rover-agent -b --no-pager | tail -40"
+
+    hdr "4. Arriving on MQTT but not on /scan_lidar"
+    say "Then it is the DDS bug, not the LiDAR. Run: fpms-doctor silent-topic"
+    ;;
+
+silent-topic)
+    hdr "Confirm it"
+    cmd "ros2 topic info /scan_lidar    # will say Publisher count: 1"
+    cmd "ros2 topic hz /scan_lidar      # hangs => confirmed"
+    say ""
+    say "A topic list and 'topic info' PASS either way. Discovery was never"
+    say "the broken part -- that is what made this so hard to see."
+
+    hdr "The cause"
+    say "Fast DDS prefers shared memory for same-host peers, and those segments"
+    say "do not survive across process eras. A publisher from one era and a"
+    say "subscriber from another discover each other and then never exchange a"
+    say "byte. Symptom: connected, subscribed, silent, no error anywhere."
+    say ""
+    say "It was diagnosed twice as two separate bugs -- once as a LiDAR fault,"
+    say "once as 'rosbridge only delivers topics whose publisher pre-existed"
+    say "it' (0 messages from a healthy 6.6 Hz /odom, reproduced 3 times)."
+
+    hdr "Check the fix is actually in the unit's environment"
+    cmd "systemctl show fpms-lidar-ros -p Environment | tr ' ' '\\n' | grep -E 'FASTRTPS|RMW|DOMAIN'"
+    say "Your shell having it set is not enough -- the UNIT must."
+
+    hdr "Fallback"
+    cmd "sudo systemctl enable --now fpms-ros-settle"
+    say "75s sleep then a blind restart of the publishers. Costs ~2 minutes of"
+    say "boot time; it is the mitigation the DDS profile was meant to replace."
+    say ""
+    say "Full write-up: /opt/fpms-os/docs/DDS.md"
+    ;;
+
+wont-move)
+    hdr "In order of likelihood"
+    say "1. NOT ARMED. Missions need an explicit arm and it expires."
+    cmd "mosquitto_sub -h 127.0.0.1 -u '${FPMS_MQTT_USER:-fpms}' -P \"\$(sudo cat /var/lib/fpms/broker-password)\" -t 'fpms/$THING/telemetry/mission' -C 1 | jq .armed"
+    say ""
+    say "2. STOP IS LATCHED."
+    cmd "journalctl -u fpms-cored -b --no-pager | grep -i stop | tail"
+    say ""
+    say "3. THE micro-ROS LINK IS DOWN."
+    cmd "ros2 topic hz /odom_raw"
+    warn "If dead: WAIT. 90-225 seconds, unaided. A restart makes it WORSE."
+    warn "No reset-button press is needed or helpful."
+    say ""
+    say "4. LiDAR STALE and the executor is refusing to move. Correct behaviour."
+    cmd "fpms-doctor no-lidar"
+
+    hdr "If the link is genuinely wedged after ~5 minutes"
+    cmd "sudo systemctl restart micro-ros-agent"
+    say "then, once it is back, the three subscribers must re-match -- their"
+    say "XRCE participant was replaced underneath them:"
+    cmd "sudo systemctl restart fpms-teleop fpms-odom-tf fpms-missions"
+    ;;
+
+empty-dashboard)
+    hdr "Almost always the broker password"
+    say "An auth failure does not crash anything and does not log an error."
+    say "Every service simply retries forever."
+    cmd "grep FPMS_MQTT_PASS $CFG"
+    say "If that is still __FPMS_FIRSTBOOT_WILL_REPLACE_THIS__ then first boot"
+    say "did not complete:"
+    cmd "sudo fpms-firstboot --force"
+
+    hdr "Is the bridge to the laptop up?"
+    cmd "journalctl -u mosquitto -b --no-pager | grep -i bridge | tail"
+    say "A dead bridge and a healthy broker look identical from the rover side."
+    say "They have been confused before."
+
+    hdr "Is the laptop's IP still right?"
+    cmd "grep '^address' /etc/mosquitto/conf.d/fpms.conf"
+    say "Default 192.168.137.1 (Windows Mobile Hotspot). If the laptop's DHCP"
+    say "lease moved, re-provision or set a reservation."
+    ;;
+
+stop-not-working)
+    warn "If the rover is moving RIGHT NOW: cut the battery. Then read this."
+
+    hdr "1. Is cored even running?"
+    cmd "systemctl status fpms-cored"
+    say "It has NEVER been verified on hardware. Treat it as ADDITIONAL"
+    say "protection over the executor's own stop, not a replacement."
+
+    hdr "2. Is the receipt being published?"
+    cmd "mosquitto_sub -h 127.0.0.1 -u '${FPMS_MQTT_USER:-fpms}' -P \"\$(sudo cat /var/lib/fpms/broker-password)\" -t 'fpms/$THING/events/command_receipt' -v"
+    say "Then press STOP. You want state 'honoured'."
+
+    hdr "3. The escalation path"
+    cmd "sudo -n -l | grep fpms-missions"
+    say "sudo matches on LITERAL argv. 'fpms-missions' and"
+    say "'fpms-missions.service' are DIFFERENT RULES, and a mismatch turns the"
+    say "last-resort stop into a silent password prompt nobody answers."
+
+    hdr "4. Is something else writing /cmd_vel?"
+    cmd "systemctl is-enabled fpms-ros-tunnel fpms-rtos-follower   # both: masked"
+    cmd "ros2 topic info /cmd_vel -v | grep -A2 'Publisher count'"
+    warn "'disabled' is NOT 'masked'. disable only drops the WantedBy symlink."
+    ;;
+
+wrong-distance)
+    hdr "FIRST: the sign. Everything else is meaningless if this is wrong."
+    cmd "python3 ~/fpms_charact.py --push-check"
+    say "Push the rover FORWARD along a tape measure. x must INCREASE."
+    say ""
+    say "An inverted sign makes a forward burst measure as reverse travel, the"
+    say "residual correction push the wrong way, and the retrace replay the"
+    say "error again -- with entirely plausible numbers throughout."
+    warn "Changing FPMS_MISSION_ODOM_POSE_SIGN INVALIDATES"
+    warn "~/.fpms_teleop_origin.json. Re-zero with set_coordinate (RESET POSE)."
+
+    hdr "THEN: read telemetry/residual, per SEGMENT not per leg"
+    cmd "mosquitto_sub -h 127.0.0.1 -u '${FPMS_MQTT_USER:-fpms}' -P \"\$(sudo cat /var/lib/fpms/broker-password)\" -t 'fpms/$THING/telemetry/residual' -v"
+    say ""
+    say "  constant RATIO   (short/long by the same factor)  -> odom_scale"
+    say "  constant OFFSET  (same error at any length)       -> coast_mm"
+    say "  grows on TURNS only                               -> gyro_scale"
+    say ""
+    say "Per leg averages hide exactly the pattern you need."
+
+    hdr "Known history"
+    say "COUNTS_PER_REV 3255 was 2.7x too high against a measured ~1120. That"
+    say "ONE constant explains the 2.3m overshoot, the 744mm plan that drove"
+    say "~2m, and the 300mm move that went ~1m. One constant, not three bugs."
+    say ""
+    say "CMD_SCALE 6.1 is a defect artefact, not a calibration -- the loop was"
+    say "saturated. fpms_missions.py contradicts itself about it (line 287"
+    say "says 1.0, line 704 sets 6.1). Re-measure after a v3 flash."
+
+    hdr "And always"
+    warn "Judge motion by the OPERATOR'S EYES, not by odometry. This rover has"
+    warn "reported clean travel while spinning in place."
+    ;;
+
+no-network)
+    hdr "From the laptop"
+    cmd "ping fpms-pi.local"
+    say "mDNS resolution is PER-RESOLVER, not per-machine. It has worked from"
+    say "one language's resolver and failed from another's on the same box at"
+    say "the same time. So 'ping works' does not prove your tool will resolve"
+    say "it, and vice versa. Try the raw IP from your hotspot's client list."
+
+    hdr "On the rover"
+    cmd "nmcli device status"
+    cmd "sudo fpms-wifi-provision"
+    cmd "iw dev \$(iw dev | awk '/Interface/{print \$2;exit}') get power_save"
+    say "power_save must be off. The bcmdhd driver re-enables it every 30-60s,"
+    say "which flapped MQTT on a measured 47s cycle. fpms-wifi-ps-hold holds it."
+
+    hdr "If you cannot reach it at all"
+    say "Join the fallback AP:  FPMS-Rover-Setup / fpmsrover"
+    say "then  ssh ubuntu@10.42.0.1"
+    say "Ethernet always works. The console is on :8090 either way."
+    ;;
+
+*) usage; exit 2 ;;
+esac
+
+printf '\n   More: /opt/fpms-os/docs/  ·  fpms-selftest  ·  RUNBOOK.md\n\n'
