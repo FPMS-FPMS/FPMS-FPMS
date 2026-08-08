@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""fpms-selftest - is this rover actually working?
+
+Usage:
+    fpms-selftest              human-readable report
+    fpms-selftest --json       machine-readable
+    fpms-selftest --quiet      exit code only
+    fpms-selftest --boot       boot mode: also publish to telemetry/health
+
+Exit: 0 all pass, 1 one or more WARN, 2 one or more FAIL.
+
+
+WHY THIS EXISTS
+===============
+Almost every failure this project has hit LOOKS LIKE SUCCESS from systemd's
+point of view. A list of green units has repeatedly meant nothing:
+
+  - fpms-lidar-ros active, logging "scans=2848 dropped=0 rate=9.55 Hz",
+    `ros2 topic info` reporting "Publisher count: 1", and no subscriber ever
+    receiving a single scan.
+  - the agent logging "NPU unavailable; streaming without detection" and
+    carrying on, so the rover streams video and detects nothing.
+  - every service retrying forever against a broker that rejects it, because
+    config.env was absent and the defaults point somewhere else. No error
+    anywhere; the dashboard is simply empty.
+  - fpms-missions found DISABLED after a reboot, silently absent.
+  - a sudoers rule present but not matching, turning the last-resort STOP into
+    a password prompt nobody is there to answer.
+
+Each check below exists because one of those happened.
+
+
+WHAT IT WILL NEVER DO
+=====================
+  - move the rover, in any way
+  - turn-test for liveness (that destroys heading; check pose passively)
+  - open the drive board's tty (that raises the handshake lines wired to
+    EN/IO0 and RESETS the ESP32, costing a 90-225 second re-link)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+
+CONFIG = "/etc/fpms/config.env"
+STATE_DIR = "/var/lib/fpms"
+DDS_PROFILE = "/etc/fpms/fastdds_udp_only.xml"
+PLACEHOLDER = "__FPMS_FIRSTBOOT_WILL_REPLACE_THIS__"
+
+BOOT_UNITS = [
+    "fpms-cored", "fpms-rover-agent", "fpms-lidar-ros", "fpms-tf",
+    "fpms-map-anchor", "fpms-odom-tf", "fpms-teleop", "fpms-missions",
+    "fpms-uros-supervisor", "fpms-wifi-powersave-hold",
+    "micro-ros-agent", "fpms-rosbridge", "fpms-console",
+]
+MUST_BE_MASKED = ["fpms-ros-tunnel", "fpms-rtos-follower"]
+
+results = []
+
+
+def add(name, status, detail, remedy=""):
+    results.append({"check": name, "status": status,
+                    "detail": detail, "remedy": remedy})
+
+
+def sh(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as exc:  # noqa: BLE001
+        return 255, "", str(exc)
+
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------------------------------
+def check_config(cfg):
+    if not os.path.exists(CONFIG):
+        add("config.env exists", FAIL,
+            "%s is missing" % CONFIG,
+            "Every service swallows this and falls back to a broker at "
+            "192.168.137.1 with no credentials, then retries forever. Nothing "
+            "crashes and the dashboard is silently empty. Run: sudo "
+            "fpms-firstboot --force")
+        return
+    add("config.env exists", PASS, CONFIG)
+
+    if cfg.get("FPMS_MQTT_PASS", "") == PLACEHOLDER or not cfg.get("FPMS_MQTT_PASS"):
+        add("broker password provisioned", FAIL,
+            "FPMS_MQTT_PASS is still the image placeholder",
+            "First boot did not complete. Run: sudo fpms-firstboot --force")
+    else:
+        add("broker password provisioned", PASS, "set")
+
+    lidar = cfg.get("FPMS_LIDAR_PORT", "")
+    if lidar.startswith("/dev/ttyUSB"):
+        add("LiDAR bound by topology", FAIL,
+            "FPMS_LIDAR_PORT is %s" % lidar,
+            "ttyUSBn is enumeration order and both CP2102s report ID_SERIAL "
+            "0001. This can silently become the drive board. Use the "
+            "/dev/serial/by-path/... form.")
+    elif "by-path" in lidar:
+        add("LiDAR bound by topology", PASS, lidar)
+    else:
+        add("LiDAR bound by topology", WARN, "unset or unusual: %r" % lidar)
+
+    if cfg.get("FPMS_TF_OFFSETS_MEASURED", "0") != "1":
+        add("LiDAR mount transform", WARN,
+            "unmeasured (FPMS_TF_OFFSETS_MEASURED=0)",
+            "TF is publishing zeros. 1 degree of mount yaw is ~10.5mm of "
+            "position error and both the cone guard and the occupancy grid "
+            "inherit it in the same direction. Nav2 and SLAM refuse to start "
+            "until this is 1. Verify LIDAR_ROTATION_SIGN first - a mirrored "
+            "scan cannot be fixed by any TF value.")
+    else:
+        add("LiDAR mount transform", PASS, "declared measured")
+
+    if cfg.get("FPMS_YOLO_VARIANT", "") not in ("v26", "26", "yolo26"):
+        add("YOLO variant set", WARN,
+            "FPMS_YOLO_VARIANT=%r" % cfg.get("FPMS_YOLO_VARIANT", "<unset>"),
+            "The default 'v8' imports fpms_yolo_npu.py, which exists only on "
+            "the old Pi and is in no repository. Set FPMS_YOLO_VARIANT=v26.")
+    else:
+        add("YOLO variant set", PASS, cfg["FPMS_YOLO_VARIANT"])
+
+
+# --------------------------------------------------------------------------
+# 2. Units
+# --------------------------------------------------------------------------
+def check_units():
+    bad_active, bad_enabled = [], []
+    for unit in BOOT_UNITS:
+        _, active, _ = sh(["systemctl", "is-active", unit + ".service"])
+        _, enabled, _ = sh(["systemctl", "is-enabled", unit + ".service"])
+        if active != "active":
+            bad_active.append("%s=%s" % (unit, active or "unknown"))
+        if enabled not in ("enabled", "enabled-runtime", "static"):
+            bad_enabled.append("%s=%s" % (unit, enabled or "unknown"))
+
+    if bad_active:
+        add("boot units active", FAIL, ", ".join(bad_active),
+            "journalctl -u <unit> -b --no-pager | tail -40")
+    else:
+        add("boot units active", PASS, "%d/%d" % (len(BOOT_UNITS), len(BOOT_UNITS)))
+
+    if bad_enabled:
+        add("boot units enabled", FAIL, ", ".join(bad_enabled),
+            "A unit that is active but not enabled comes back DISABLED after a "
+            "reboot and is then silently absent. fpms-missions has been found "
+            "in exactly that state. Run: sudo systemctl enable <unit>")
+    else:
+        add("boot units enabled", PASS, "all enabled for cold boot")
+
+    not_masked = []
+    for unit in MUST_BE_MASKED:
+        _, state, _ = sh(["systemctl", "is-enabled", unit + ".service"])
+        if state != "masked":
+            not_masked.append("%s=%s" % (unit, state or "unknown"))
+    if not_masked:
+        add("second /cmd_vel writers masked", FAIL, ", ".join(not_masked),
+            "'disabled' is NOT 'masked' - disable only drops the WantedBy "
+            "symlink and anything pulling the unit in by name still starts it. "
+            "Two writers on /cmd_vel is not a race the executor can win. "
+            "Run: sudo systemctl mask %s" % " ".join(
+                u + ".service" for u in MUST_BE_MASKED))
+    else:
+        add("second /cmd_vel writers masked", PASS, "both masked")
+
+
+# --------------------------------------------------------------------------
+# 3. Python imports - the failures that crash-loop a unit at import time
+# --------------------------------------------------------------------------
+def check_python():
+    # paho >= 2.0 first: five files import CallbackAPIVersion unguarded, and
+    # one of them is fpms_cored.py, the STOP authority. Ubuntu 22.04's apt
+    # package is 1.6.1 and does not have it.
+    rc, out, _ = sh([sys.executable, "-c",
+                     "from paho.mqtt.client import CallbackAPIVersion; "
+                     "import paho.mqtt; print(paho.mqtt.__version__)"])
+    if rc == 0:
+        add("paho-mqtt >= 2.0", PASS, out)
+    else:
+        add("paho-mqtt >= 2.0", FAIL,
+            "CallbackAPIVersion is not importable",
+            "apt's python3-paho-mqtt is 1.6.1 and lacks it. Five files import "
+            "it unguarded, including the STOP authority, so the rover has no "
+            "emergency stop and no telemetry. Run: "
+            "sudo pip3 install --break-system-packages 'paho-mqtt>=2.0'")
+
+    rc, out, _ = sh([sys.executable, "-c",
+                     "import numpy; print(numpy.__version__)"])
+    if rc != 0:
+        add("numpy importable", FAIL, "numpy will not import", "check the image build")
+    elif out.startswith("2."):
+        add("numpy is 1.x", FAIL, "numpy %s" % out,
+            "ROS Humble's C extensions are built against the NumPy 1.x ABI. "
+            "2.x breaks tf_transformations with 'np.maximum_sctype was "
+            "removed'. Pin numpy<2.")
+    else:
+        add("numpy is 1.x", PASS, out)
+
+    # A user-local numpy SHADOWS the system one. This exact thing happened on
+    # the old Pi and the failure surfaced far from its cause.
+    shadow = "/home/ubuntu/.local/lib/python3.10/site-packages/numpy"
+    if os.path.exists(shadow):
+        add("no shadowing user-local numpy", FAIL, shadow,
+            "A user-local NumPy overrides the system one for every service. "
+            "Run: sudo -u ubuntu pip3 uninstall -y numpy")
+    else:
+        add("no shadowing user-local numpy", PASS, "none")
+
+    for mod, label, remedy in (
+        ("cv2", "opencv", "apt install python3-opencv (NOT pip opencv-python - "
+                          "it ABI-clashes with ROS cv_bridge)"),
+        ("serial", "pyserial", "pip install pyserial - NOT the PyPI package "
+                               "named 'serial', which is a different library"),
+        ("rclpy", "rclpy", "source /opt/ros/humble/setup.bash"),
+    ):
+        rc, _, err = sh([sys.executable, "-c", "import %s" % mod])
+        if rc == 0:
+            add("%s importable" % label, PASS, "ok")
+        else:
+            add("%s importable" % label, FAIL, err.splitlines()[-1] if err else "import failed", remedy)
+
+    # pyserial vs the impostor: both import as `serial`, only one has Serial.
+    rc, _, _ = sh([sys.executable, "-c",
+                   "import serial; serial.Serial; serial.tools.list_ports"])
+    if rc != 0:
+        add("pyserial is the real one", FAIL,
+            "`serial` imports but is not pyserial",
+            "The PyPI package named 'serial' is a different library and "
+            "silently breaks the agent and the duty driver. "
+            "pip uninstall serial && pip install pyserial")
+    else:
+        add("pyserial is the real one", PASS, "ok")
+
+
+# --------------------------------------------------------------------------
+# 4. DDS - the check that matters most
+# --------------------------------------------------------------------------
+def check_dds(cfg):
+    prof = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", DDS_PROFILE)
+    if not os.path.exists(prof):
+        add("DDS profile present", FAIL, "%s missing" % prof,
+            "Without it Fast DDS prefers shared memory, whose segments do not "
+            "survive across process eras: discovery succeeds and NO DATA "
+            "FLOWS. See /opt/fpms-os/docs/DDS.md")
+    else:
+        try:
+            import xml.etree.ElementTree as ET
+            ET.parse(prof)
+            add("DDS profile present", PASS, prof)
+        except Exception as exc:  # noqa: BLE001
+            add("DDS profile present", FAIL, "%s does not parse: %s" % (prof, exc),
+                "Fast DDS SILENTLY IGNORES a malformed profile and falls back "
+                "to defaults, reintroducing the bug it exists to fix.")
+
+    if os.environ.get("ROS_DOMAIN_ID") not in (None, "", "20"):
+        add("ROS_DOMAIN_ID", FAIL,
+            "ROS_DOMAIN_ID=%s" % os.environ.get("ROS_DOMAIN_ID"),
+            "The ESP32 declares domain 20 in its CREATE_PARTICIPANT and "
+            "publishes nowhere else. On any other domain every topic list is "
+            "empty and looks exactly like dead hardware.")
+    else:
+        add("ROS_DOMAIN_ID", PASS, "20")
+
+    # THE CROSS-ERA CHECK.
+    #
+    # This is the whole point of the DDS section. We are a process that started
+    # long after the publishers, which is precisely the case that fails today
+    # with "connected, subscribed, silent - no error anywhere". A topic list or
+    # `ros2 topic info` passes either way, because discovery was never the
+    # broken part.
+    probe = r'''
+import sys, time
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+
+got = {"n": 0, "topic": None}
+rclpy.init(args=None)
+node = Node("fpms_selftest_probe")
+qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE,
+                 durability=DurabilityPolicy.VOLATILE,
+                 history=HistoryPolicy.KEEP_LAST)
+
+def mk(name):
+    def cb(_msg):
+        got["n"] += 1
+        got["topic"] = got["topic"] or name
+    return cb
+
+node.create_subscription(LaserScan, "/scan_lidar", mk("/scan_lidar"), qos)
+node.create_subscription(Odometry, "/odom_raw", mk("/odom_raw"), qos)
+node.create_subscription(Odometry, "/odom", mk("/odom"), qos)
+
+end = time.time() + 12.0
+while time.time() < end and got["n"] < 1:
+    rclpy.spin_once(node, timeout_sec=0.3)
+node.destroy_node(); rclpy.shutdown()
+print("%d %s" % (got["n"], got["topic"] or "-"))
+'''
+    rc, out, err = sh([sys.executable, "-c", probe], timeout=40)
+    if rc != 0:
+        add("DDS carries data across eras", SKIP,
+            "probe could not run: %s" % (err.splitlines()[-1] if err else rc),
+            "Usually means the ROS environment is not sourced in this shell.")
+        return
+    try:
+        n, topic = out.split()[0], out.split()[1]
+        n = int(n)
+    except (ValueError, IndexError):
+        n, topic = 0, "-"
+    if n > 0:
+        add("DDS carries data across eras", PASS,
+            "%d msg(s) on %s from a freshly started subscriber" % (n, topic))
+    else:
+        add("DDS carries data across eras", FAIL,
+            "no messages on /scan_lidar, /odom_raw or /odom in 12s",
+            "THIS IS THE SILENT ONE. If the publishers are active and the "
+            "topics are discoverable, this is the shared-memory-across-eras "
+            "bug: connected, subscribed, silent, no error anywhere. Confirm "
+            "FASTRTPS_DEFAULT_PROFILES_FILE is set in the UNITS (not just "
+            "your shell), then as a fallback: sudo systemctl enable --now "
+            "fpms-ros-settle. See /opt/fpms-os/docs/DDS.md")
+
+
+# --------------------------------------------------------------------------
+# 5. Serial topology - WITHOUT opening anything
+# --------------------------------------------------------------------------
+def check_serial():
+    drive = "/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0"
+    lidar = "/dev/serial/by-path/platform-fc880000.usb-usb-0:1.2:1.0-port0"
+
+    for path, label in ((drive, "drive board (USB 1.3)"),
+                        (lidar, "LiDAR (USB 1.2)")):
+        if os.path.exists(path):
+            add("%s present" % label, PASS, os.path.realpath(path))
+        else:
+            add("%s present" % label, FAIL, "%s does not exist" % path,
+                "Both CP2102s report ID_SERIAL 0001, so only the USB port "
+                "distinguishes them and binding wrong sends motor frames to "
+                "the LiDAR. Check: ls -l /dev/serial/by-path/ ; do NOT guess.")
+
+    # We deliberately do not open the drive tty. Opening it raises the
+    # handshake lines wired to EN/IO0 and resets the ESP32, costing a 90-225
+    # second re-link. Ownership is read from /proc instead.
+    if os.path.exists(drive):
+        real = os.path.realpath(drive)
+        holders = []
+        for pid in [p for p in os.listdir("/proc") if p.isdigit()]:
+            try:
+                for fd in os.listdir("/proc/%s/fd" % pid):
+                    if os.path.realpath("/proc/%s/fd/%s" % (pid, fd)) == real:
+                        with open("/proc/%s/comm" % pid) as fh:
+                            holders.append(fh.read().strip())
+                        break
+            except OSError:
+                continue
+        if holders:
+            add("drive port ownership", PASS, ", ".join(sorted(set(holders))))
+        else:
+            add("drive port ownership", WARN, "nobody holds it",
+                "micro-ros-agent should. systemctl status micro-ros-agent")
+
+
+# --------------------------------------------------------------------------
+# 6. Broker and LiDAR liveness
+# --------------------------------------------------------------------------
+def check_mqtt(cfg):
+    _, active, _ = sh(["systemctl", "is-active", "mosquitto.service"])
+    if active != "active":
+        add("mosquitto running", FAIL, active or "unknown",
+            "systemctl status mosquitto")
+        return
+    add("mosquitto running", PASS, "active")
+
+    thing = cfg.get("FPMS_THING_NAME", "rover2")
+    user = cfg.get("FPMS_MQTT_USER", "fpms")
+    pw = cfg.get("FPMS_MQTT_PASS", "")
+    topic = "fpms/%s/telemetry/lidar" % thing
+
+    rc, out, _ = sh(["mosquitto_sub", "-h", "127.0.0.1", "-p", "1883",
+                     "-u", user, "-P", pw, "-t", topic, "-C", "1", "-W", "8"],
+                    timeout=15)
+    if rc != 0 or not out:
+        add("LiDAR telemetry arriving", FAIL,
+            "no message on %s within 8s" % topic,
+            "Check fpms-rover-agent, and that the broker password matches. "
+            "An auth failure does NOT crash anything - services retry forever.")
+        return
+
+    try:
+        payload = json.loads(out.splitlines()[-1])
+    except ValueError:
+        add("LiDAR telemetry arriving", WARN, "payload is not JSON")
+        return
+
+    health = payload.get("health", "?")
+    hz = payload.get("hz", 0)
+    stale = payload.get("stale", None)
+    seq = payload.get("seq", None)
+
+    if stale is True:
+        # seq climbing while stale is true means THE SCANNER is the fault;
+        # seq frozen means THE PROCESS is. Those need different fixes and were
+        # previously indistinguishable, which is why seq exists.
+        add("LiDAR healthy", FAIL,
+            "stale=true health=%s hz=%s seq=%s" % (health, hz, seq),
+            "seq advancing => the scanner is at fault (check the tty, the "
+            "baud, and whether something else opened port 1.2). seq frozen "
+            "=> the agent process is at fault. Note the payload publishes on "
+            "a TIMER, so arrival does not imply freshness, and its all-zero "
+            "ranges would read as a completely clear 360 degrees if trusted.")
+    elif health == "ok" and float(hz or 0) > 1.0:
+        add("LiDAR healthy", PASS, "health=ok hz=%.1f seq=%s" % (float(hz), seq))
+    else:
+        add("LiDAR healthy", WARN, "health=%s hz=%s" % (health, hz))
+
+
+# --------------------------------------------------------------------------
+# 7. Safety-critical odds and ends
+# --------------------------------------------------------------------------
+def check_safety():
+    rc, out, _ = sh(["sudo", "-n", "-l"], timeout=8)
+    if rc == 0 and "fpms-missions.service" in out:
+        add("STOP escalation sudoers rule", PASS, "matches")
+    else:
+        add("STOP escalation sudoers rule", FAIL,
+            "sudo -n -l does not show the rule",
+            "sudo matches on LITERAL argv: 'fpms-missions' and "
+            "'fpms-missions.service' are not the same rule. A mismatch turns "
+            "the last-resort stop into a silent password prompt on a moving "
+            "rover. Check /etc/sudoers.d/fpms-cored")
+
+    if not os.path.exists("/etc/fpms/rosbridge_params.yaml"):
+        add("rosbridge whitelist", FAIL, "params file missing",
+            "Without it rosbridge starts with NO topic whitelist, so a browser "
+            "can reach the drive topics. Restore "
+            "/etc/fpms/rosbridge_params.yaml")
+    else:
+        with open("/etc/fpms/rosbridge_params.yaml") as fh:
+            body = fh.read()
+        if "cmd_vel" in body or "cmd_duty" in body:
+            add("rosbridge whitelist", FAIL,
+                "a drive topic appears in the whitelist",
+                "/cmd_vel and /cmd_duty must be ABSENT so a stray click or a "
+                "stale browser tab cannot turn a wheel.")
+        else:
+            add("rosbridge whitelist", PASS, "no drive topics exposed")
+
+
+def check_npu(cfg):
+    # The agent degrades SILENTLY: it logs "NPU unavailable; streaming without
+    # detection" and carries on, so a broken NPU yields a rover that streams
+    # video and detects nothing while systemd reports active.
+    rc, out, _ = sh([sys.executable, "-c",
+                     "from rknnlite.api import RKNNLite; print('ok')"])
+    if rc != 0:
+        add("NPU runtime", FAIL, "rknnlite will not import",
+            "The rover will stream video and detect NOTHING, while systemd "
+            "reports every unit active. Install the aarch64 "
+            "rknn-toolkit-lite2 wheel matched to librknnrt.so.")
+    else:
+        add("NPU runtime", PASS, "rknnlite imports")
+
+    model = os.path.join(cfg.get("FPMS_YOLO_DIR", "/home/ubuntu/yolo"),
+                         "yolo26n-rk3588.rknn")
+    if os.path.exists(model):
+        add("NPU model present", PASS, model)
+    else:
+        add("NPU model present", FAIL, "%s missing" % model,
+            "The model is not in the git repository - it lived only on the old "
+            "Pi. Copy it across before relying on detection.")
+
+    ver = "/sys/kernel/debug/rknpu/version"
+    if os.path.exists(ver):
+        try:
+            with open(ver) as fh:
+                add("NPU driver", PASS, fh.read().strip())
+        except OSError:
+            add("NPU driver", WARN, "present but unreadable (needs root)")
+    else:
+        add("NPU driver", WARN, "%s absent" % ver,
+            "The userspace librknnrt.so must match the kernel rknpu driver. "
+            "Nobody has ever written down which version the old Pi ran.")
+
+
+def check_misc():
+    if time.time() < 1735689600:  # 2025-01-01
+        add("clock sane", FAIL, time.strftime("%Y-%m-%d %H:%M:%S"),
+            "This board has no RTC backup battery and boots to the filesystem "
+            "epoch. Timestamps are unix seconds everywhere and TLS to the "
+            "cloud ingest will not validate. Check systemd-timesyncd.")
+    else:
+        add("clock sane", PASS, time.strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+    st = os.statvfs("/")
+    free_gb = st.f_bavail * st.f_frsize / 1e9
+    if free_gb < 1.0:
+        add("disk space", FAIL, "%.1f GB free" % free_gb, "The rootfs is full.")
+    elif free_gb < 3.0:
+        add("disk space", WARN, "%.1f GB free" % free_gb,
+            "Did the rootfs grow? Run: sudo fpms-firstboot --force")
+    else:
+        add("disk space", PASS, "%.1f GB free" % free_gb)
+
+    cal = "/etc/fpms/calibration.json"
+    if not os.path.exists(cal):
+        add("calibration profile", WARN, "none",
+            "Distance and heading run on unmeasured defaults. This is not a "
+            "fault - a missing profile changes nothing, and a GUESSED one is "
+            "silent and total. Run 'python3 ~/fpms_charact.py --push-check' "
+            "FIRST: it establishes the sign, and everything downstream is "
+            "meaningless if the sign is wrong.")
+    else:
+        try:
+            with open(cal) as fh:
+                prof = json.load(fh)
+            if prof.get("measured") is True:
+                add("calibration profile", PASS,
+                    "measured: " + ", ".join(sorted(
+                        k for k in prof if k != "measured")))
+            else:
+                add("calibration profile", WARN,
+                    "present but measured is not true",
+                    "The executor REFUSES a profile without measured:true and "
+                    "logs it to CFG_NOTES at startup. It is being ignored.")
+        except (OSError, ValueError) as exc:
+            add("calibration profile", WARN, "unreadable: %s" % exc)
+
+
+# --------------------------------------------------------------------------
+def publish_health(cfg, summary):
+    """Best-effort: put the result where the dashboard can see it."""
+    try:
+        topic = "fpms/%s/telemetry/health" % cfg.get("FPMS_THING_NAME", "rover2")
+        sh(["mosquitto_pub", "-h", "127.0.0.1", "-p", "1883",
+            "-u", cfg.get("FPMS_MQTT_USER", "fpms"),
+            "-P", cfg.get("FPMS_MQTT_PASS", ""),
+            "-t", topic, "-q", "1", "-m", json.dumps(summary)], timeout=8)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main():
+    args = set(sys.argv[1:])
+    cfg = load_config()
+
+    check_config(cfg)
+    check_units()
+    check_python()
+    check_dds(cfg)
+    check_serial()
+    check_mqtt(cfg)
+    check_safety()
+    check_npu(cfg)
+    check_misc()
+
+    n_fail = sum(1 for r in results if r["status"] == FAIL)
+    n_warn = sum(1 for r in results if r["status"] == WARN)
+    summary = {
+        "ts": time.time(),
+        "ok": n_fail == 0,
+        "fail": n_fail, "warn": n_warn, "total": len(results),
+        "checks": results,
+    }
+
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "selftest.json"), "w") as fh:
+            json.dump(summary, fh, indent=2)
+    except OSError:
+        pass
+
+    if "--boot" in args:
+        publish_health(cfg, summary)
+
+    if "--json" in args:
+        print(json.dumps(summary, indent=2))
+    elif "--quiet" not in args:
+        print("=" * 72)
+        print(" FPMS-OS self-test    %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        print("=" * 72)
+        for r in results:
+            print("  [%-4s] %-32s %s" % (r["status"], r["check"], r["detail"]))
+            if r["remedy"] and r["status"] in (FAIL, WARN):
+                for i, chunk in enumerate(_wrap(r["remedy"], 62)):
+                    print("         %s%s" % ("-> " if i == 0 else "   ", chunk))
+        print("-" * 72)
+        if n_fail:
+            print("  %d FAILED, %d warnings. This rover is NOT ready." % (n_fail, n_warn))
+        elif n_warn:
+            print("  %d warnings, nothing failed. Read them before a run." % n_warn)
+        else:
+            print("  All checks passed.")
+        print("=" * 72)
+
+    return 2 if n_fail else (1 if n_warn else 0)
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line); line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+if __name__ == "__main__":
+    sys.exit(main())

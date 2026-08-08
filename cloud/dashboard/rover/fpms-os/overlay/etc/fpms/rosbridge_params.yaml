@@ -1,0 +1,75 @@
+# /etc/fpms/rosbridge_params.yaml
+#
+# Loaded by fpms-rosbridge.service as --params-file.
+#
+# THIS FILE IS THE SAFETY MECHANISM. Read the whitelist section before editing.
+
+/**:
+  ros__parameters:
+
+    # 0.0.0.0, not 127.0.0.1. THE PI LISTENS, THE LAPTOP DIALS OUT.
+    #
+    # The operator laptop's Windows Firewall has no inbound rule for 9090 and
+    # there is no admin account to add one. An outbound connection from the
+    # browser to the Pi is the only direction that works, which is also why the
+    # UI itself is served from the Pi on :8090.
+    address: "0.0.0.0"
+    port: 9090
+
+    # 10 MB. A full LaserScan plus the console's periodic bulk subscriptions
+    # exceed the default and the failure mode is a dropped connection with no
+    # useful error in the browser console.
+    max_message_size: 10000000
+
+    unregister_timeout: 10.0
+
+    # PLAN M2 runs an A* search on the rover in response to a service call. On
+    # the protocol thread that would stall every subscription on the socket for
+    # the duration of the search, including the one carrying the LiDAR.
+    call_services_in_new_thread: true
+
+    # ======================================================================
+    # THE WHITELIST. THIS IS THE SAFETY MECHANISM. DO NOT WIDEN IT.
+    # ======================================================================
+    #
+    # /cmd_vel AND /cmd_duty ARE ABSENT BY CONSTRUCTION.
+    #
+    # Not "unused by our UI" -- absent. So that a stray click, a bug in
+    # console.html, or somebody else's browser tab left open on the same URL
+    # cannot turn a wheel through this port. Motion goes through the mission
+    # executor and the teleop bridge over MQTT, where fpms-cored can see it and
+    # the arm/stop logic applies.
+    #
+    # This lives in a params FILE rather than as -p arguments on the command
+    # line for one reason: a safety whitelist that fails open when you mistype
+    # it is not a safety whitelist. A malformed -p silently yields no
+    # restriction at all. If this file is missing, rosbridge starts with NO
+    # whitelist -- fpms-selftest checks for exactly that.
+    #
+    # fnmatch semantics: '*' matches '/' too, so /fpms/* covers /fpms/cmd/stop
+    # and /fpms/mission/x_mm.
+    topics_glob: "[/estop,/fpms/*,/clicked_point,/scan_lidar,/odom_raw,/odom,/imu,/battery,/wheel_ticks,/wheel_duty,/fpms_health,/diagnostics,/rosout]"
+
+    # Only the FPMS service namespace. PLAN/RUN/ARM/RESET POSE/READ ENCODERS.
+    services_glob: "[/fpms/*]"
+
+    # EMPTY. No parameter access from a browser at all. A parameter write can
+    # reconfigure a live node in ways no amount of topic filtering would catch.
+    params_glob: "[]"
+
+    # ======================================================================
+    # A NOTE ON WHAT REACHES THIS PORT AT ALL
+    # ======================================================================
+    #
+    # rosbridge only delivers topics whose PUBLISHER ALREADY EXISTED when
+    # rosbridge started. A publisher created afterwards is never discovered and
+    # the subscription asking for it is accepted and then stays silent forever
+    # -- connected, subscribed, silent, no error anywhere.
+    #
+    # Measured: rosbridge up at 22:26:33, fpms-odom-tf at 22:45:45, /odom
+    # delivering 0 messages while publishing at 6.6 Hz. Reproduced three times.
+    #
+    # Two mechanisms address it: fpms-ros-publishers.target orders this unit
+    # after every publisher, and /etc/fpms/fastdds_udp_only.xml removes the
+    # underlying cause (shared-memory segments that do not survive across
+    # process eras). See /opt/fpms-os/docs/DDS.md.

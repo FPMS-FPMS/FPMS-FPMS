@@ -1,0 +1,100 @@
+// /etc/fpms/calibration.json.example
+//
+// THIS IS AN EXAMPLE. FPMS-OS DELIBERATELY SHIPS NO REAL calibration.json.
+//
+// A missing profile changes nothing -- the executor runs on its documented
+// defaults and logs that it found no profile. A GUESSED profile is silent and
+// total: it changes every distance and every heading the rover computes, and
+// nothing about the resulting behaviour tells you the numbers were invented.
+//
+// The executor adopts a profile only when it carries "measured": true AND each
+// value is inside a sanity range. Adoptions and refusals are logged to
+// CFG_NOTES at startup as "calibration ... ADOPTED" / "... REFUSED". Read those
+// lines -- they are the only evidence that a number you set is a number being
+// used.
+//
+// (JSON has no comments. Strip them, or just use fpms_charact.py, which writes
+// this file for you.)
+//
+// ===========================================================================
+// HOW TO PRODUCE ONE  -  IN THIS ORDER
+// ===========================================================================
+//
+//   1.  python3 ~/fpms_charact.py --push-check
+//
+//       DO THIS FIRST. It establishes the SIGN, and everything downstream is
+//       meaningless if the sign is wrong. Push the rover forward along a tape
+//       measure with the motors off. x must INCREASE.
+//
+//       If it decreases, FPMS_MISSION_ODOM_POSE_SIGN in /etc/fpms/config.env
+//       is wrong. An inverted sign makes a forward burst measure as reverse
+//       travel, the residual correction push the wrong way, and the retrace
+//       replay the error again -- all while producing perfectly plausible
+//       numbers.
+//
+//       CHANGING THE SIGN INVALIDATES ~/.fpms_teleop_origin.json. That file
+//       records "odom was here, the arena was there" under whatever sign was
+//       active; flipping it reflects the anchor through the origin. Re-zero
+//       with set_coordinate afterwards.
+//
+//   2.  python3 ~/fpms_charact.py --spin-check 90     -> gyro_scale
+//   3.  python3 ~/fpms_charact.py --drive             -> coast, min duty, asymmetry
+//   4.  python3 ~/fpms_charact.py --report            -> what is set, and where it came from
+//
+// fpms_charact.py only WATCHES. It publishes nothing to /cmd_vel or /cmd_duty;
+// the operator drives. What it measures is what the ROVER did, not what the
+// operator pressed, so the dashboard's own drive controls work fine for this.
+//
+// ===========================================================================
+
+{
+  // Without this, every value below is IGNORED. It is not a formality -- it is
+  // the flag that distinguishes a measurement from a guess.
+  "measured": true,
+
+  "measured_at": "2026-08-08T00:00:00Z",
+  "measured_by": "operator name, so a suspect profile can be traced",
+  "firmware": "v3",
+
+  // Multiplies pose displacement at exactly one boundary, correcting the whole
+  // chain without a reflash. /odom_raw arrives in metres already integrated on
+  // the board using ITS COUNTS_PER_REV, so a ratio here fixes a wrong constant
+  // over there.
+  //
+  // Sanity range 0.2 .. 5.0. Known candidate: 2.467 = 74/30, from the era when
+  // a 74:1 gearbox was assumed where 30:1 was real.
+  //
+  // HISTORY WORTH KNOWING: COUNTS_PER_REV 3255 was 2.7x too high, and that one
+  // constant explains the 2.3 m overshoot, the 744 mm plan that drove ~2 m, and
+  // the 300 mm move that went ~1 m. One constant, not three bugs.
+  "odom_scale": 1.0,
+
+  // From the raw per-wheel ticks firmware v3 publishes on /wheel_ticks.
+  // MEASURED 2026-08-06 at ~5.5 (hand push forward 5.68, backward 5.47; a
+  // powered run gave 6.56, inflated by tyre slip).
+  //
+  // Caveat recorded at the time: every push was taken on a chassis whose
+  // front-left hub was working loose -- that wheel later came off. The 2.7x
+  // correction is robust. The third digit is not.
+  "counts_per_mm": 5.5,
+
+  // true_deg / integrated_gyro_deg. Heading closes on the gyro, so turn
+  // accuracy rests entirely on this. UNMEASURED -- omit the key rather than
+  // writing 1.0, so a refusal is logged instead of a wrong number adopted.
+  "gyro_scale": 1.0,
+
+  // How far the chassis travels after the burst is cut. A CONSTANT OFFSET in
+  // telemetry/residual regardless of leg length is this; a constant RATIO is
+  // odom_scale; growth only on turns is gyro_scale.
+  "coast_mm": 0.0,
+  "coast_deg": 0.0,
+
+  // Firmware v3 has no dead zone, so this is a real measurable duty floor.
+  // On factory firmware it is meaningless: a 50% dead zone is added to every
+  // velocity command, which is what MIN_PULSE_S=0.35 was standing in for.
+  "min_moving_duty": 0.0,
+
+  // Left/right drive imbalance. The rover has measured ~10% side to side, and
+  // one rear wheel was slipping (950 mm against 740-755 on the others).
+  "lr_asymmetry": 1.0
+}

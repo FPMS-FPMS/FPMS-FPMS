@@ -1,0 +1,76 @@
+# /etc/mosquitto/fpms.acl
+#
+# Topic authorisation, per client id.
+#
+# BEFORE THIS FILE THERE WERE NO ACLs AT ALL. Any authenticated client could
+# publish fpms/<anything>/commands/stop -- or a mission, or a jog -- to any
+# rover on the fleet. The only topic-level safety in the system lived on the
+# rosbridge side, which protects browsers and nothing else.
+#
+# The client ids below are what the services actually construct: each is
+# "<FPMS_THING_NAME>-<role>", e.g. rover2-missions. If you rename the thing,
+# these patterns follow it automatically because %c is the client id and the
+# patterns match on the topic, not the id.
+#
+# ERRING PERMISSIVE WHERE UNCERTAIN. An over-tight ACL here does not produce an
+# error the operator will see -- mosquitto silently drops the publish and the
+# feed just stops, which is the same failure shape this whole project keeps
+# fighting. Where a restriction was not certain, it is commented rather than
+# applied. Tighten only with the topic map in STACK.md section 6 open.
+
+# ---------------------------------------------------------------------------
+# Default for any authenticated user: read telemetry and events, nothing else.
+# ---------------------------------------------------------------------------
+topic read fpms/+/telemetry/#
+topic read fpms/+/events/#
+
+# ---------------------------------------------------------------------------
+# The rover's own services.
+#
+# They publish their telemetry and events, and subscribe to the commands
+# addressed to them. They do NOT need to publish commands -- with one
+# exception, below.
+# ---------------------------------------------------------------------------
+
+pattern write fpms/%u/telemetry/#
+pattern write fpms/%u/events/#
+pattern read  fpms/%u/commands/#
+
+# fpms-cored re-publishes commands/stop at QoS 1 as one of its four
+# independent stop paths -- the case where the executor missed the original
+# because the dashboard published at QoS 0 or lost a reconnect race. So the
+# rover user must be able to WRITE stop, estop and auto_off.
+#
+# This is deliberately narrow: it is the three stop verbs and nothing else.
+# A rover service cannot publish a mission or a jog to itself.
+pattern write fpms/%u/commands/stop
+pattern write fpms/%u/commands/estop
+pattern write fpms/%u/commands/auto_off
+
+# ---------------------------------------------------------------------------
+# The operator laptop (the bridge user).
+#
+# The bridge connects with remote_username from the broker config. It carries
+# commands DOWN to the rover and telemetry UP, so it needs both directions on
+# everything -- there is no useful restriction to make here, because the
+# operator console legitimately issues every command verb.
+#
+# The real control on the operator side is the rosbridge whitelist, which keeps
+# the DRIVE topics off the browser entirely.
+# ---------------------------------------------------------------------------
+user fpms
+topic readwrite fpms/#
+topic read $SYS/broker/#
+
+# ---------------------------------------------------------------------------
+# NOT restricted, and why
+#
+# telemetry/camera carries ~28 KB base64 frames. No size limit is set on this
+# broker (mosquitto's default is unlimited) and none should be set below
+# 262144 -- a limit that is too low does not error, it silently drops the
+# publish and the camera feed simply stops.
+#
+# $SYS is readable by the operator so the bridge state can be inspected. A
+# dead bridge and a healthy broker look identical from the rover side, and
+# they have been confused before.
+# ---------------------------------------------------------------------------
