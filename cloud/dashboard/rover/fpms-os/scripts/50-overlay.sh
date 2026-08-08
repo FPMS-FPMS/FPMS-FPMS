@@ -53,6 +53,15 @@ chmod 0755 /usr/local/bin/* /usr/local/sbin/* 2>/dev/null || true
 chmod 0644 /etc/fpms/fastdds_udp_only.xml
 [ -f /etc/fpms/rosbridge_params.yaml ] && chmod 0644 /etc/fpms/rosbridge_params.yaml
 
+# The model registry. 0644 root:root -- world-readable so the ubuntu-run agent,
+# fpms-npud and fpms-model-verify can all read it, root-only writable so
+# `fpms-model-verify --register` requires sudo. A model registry an unprivileged
+# process could rewrite is not a registry.
+[ -f /etc/fpms/models.json ] && { chmod 0644 /etc/fpms/models.json; chown root:root /etc/fpms/models.json; }
+
+# Written by stage 25, not the overlay, but normalise it here with the rest.
+[ -f /etc/fpms/npu-versions.json ] && chmod 0644 /etc/fpms/npu-versions.json
+
 # udev.
 chmod 0644 /etc/udev/rules.d/99-fpms-*.rules
 chown root:root /etc/udev/rules.d/99-fpms-*.rules

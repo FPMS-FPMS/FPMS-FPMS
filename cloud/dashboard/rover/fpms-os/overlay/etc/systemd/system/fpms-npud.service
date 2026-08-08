@@ -1,0 +1,247 @@
+[Unit]
+Description=FPMS NPU inference daemon (owns the RKNN runtime; serves /run/fpms/npud.sock)
+Documentation=file:/opt/fpms-os/docs/NPU.md
+Documentation=file:/opt/fpms-os/npu/NPU_SPEC.md
+
+# THIS UNIT IS THE SOLE OWNER OF THE RKNN RUNTIME.
+#
+# Nothing else in this image may construct an RKNNLite. One process, one
+# runtime, one worker thread, one queue slot. That is not tidiness - the RKNN
+# context is not documented as thread-safe, and two processes racing for the
+# same NPU cores is a class of failure nobody here can debug on a rover.
+#
+# WHY THIS EXISTS AT ALL
+# ======================
+# Inference used to run INSIDE fpms_rover_agent.py's camera loop, wrapped in
+# ONE try/except that logged
+#
+#     NPU unavailable (...); streaming without detection
+#
+# once and then carried on forever. Two defects came out of that:
+#
+#   1. A slow or wedged NPU call stalled the frame pump - and that same thread
+#      also runs the HSV fire screen, which is the thing this rover is for.
+#   2. The rover streamed video, reported every unit `active`, and detected
+#      NOTHING, with one stale line in a journal as the only evidence.
+#      NPU_SPEC.md calls that "the single worst failure mode in the project,
+#      because it is indistinguishable from success at every level an operator
+#      normally checks."
+#
+# Moving inference into its own process fixes (1) structurally: a camera thread
+# blocked on a socket read with a timeout cannot be blocked by a C call in
+# another process. Publishing telemetry/npu and events/npu_fault fixes (2).
+#
+# NOT A ROS NODE. This is MQTT only - exactly like fpms-rover-agent - which is
+# why there is NO ROS_DOMAIN_ID, NO RMW_IMPLEMENTATION, NO
+# FASTRTPS_DEFAULT_PROFILES_FILE and NO ROS_LOCALHOST_ONLY below. SPEC.md's
+# section 2 block is mandatory for every ROS unit; this is not one. THE
+# OMISSION IS DELIBERATE, NOT AN OVERSIGHT. Do not "fix" it by pasting the
+# block in: a DDS participant this process has no use for is a discovery
+# participant, a multicast socket and a failure mode, for nothing.
+#
+# NO ORDERING EDGE ONTO fpms-rover-agent, ALSO DELIBERATE.
+#   A Before=fpms-rover-agent.service would look reassuring and guarantee
+#   nothing: this is Type=simple, so systemd considers us "started" the instant
+#   execve returns, several seconds before the model has loaded. The agent must
+#   therefore tolerate a missing socket, an ECONNREFUSED and an UNAVAILABLE
+#   reply regardless, so the edge buys no property worth the coupling. This
+#   matches how the rest of the stack is built (SPEC.md section 3): each node
+#   detects its own missing input and says so.
+#
+#   The daemon binds and listens BEFORE it loads the model, precisely so that
+#   the startup window answers "unavailable, still loading" rather than
+#   refusing connections. Degrading is a state we serve, not a state we
+#   disappear into.
+#
+# NEVER RUN ON HARDWARE
+# =====================
+# The Orange Pi 5B has not arrived. Nothing in fpms-npud has executed against a
+# real rknpu driver, a real librknnrt.so or a real .rknn model. Treat every
+# latency threshold and every device/group assumption below as UNCONFIRMED
+# until agent 7's fpms-npu-selftest has run on the board.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# NPU DEVICE ACCESS.
+#
+# MATCHED TO overlay/etc/udev/rules.d/99-fpms-npu.rules (agent 1), which is the
+# authority. If that file changes group, this line changes with it.
+#
+#   /dev/rknpu*                 GROUP="video"  MODE="0660"   <- load-bearing
+#   /dev/dma_heap/system*       GROUP="video"  MODE="0660"   <- load-bearing
+#   /dev/dri/renderD* (rknpu)   GROUP="render" MODE="0666"
+#   /dev/dri/card*    (rknpu)   GROUP="video"  MODE="0660"
+#
+# `video` is the one that matters; `render` is listed because the DRM-render
+# layout is a real possibility on this BSP and 0666 there means membership
+# costs nothing and buys insurance. Agent 1 deliberately chose `video` over a
+# dedicated `npu` group because a group that must be created by one build stage
+# and joined by another is a silent-failure machine: miss either half and udev
+# logs "unknown group" and leaves the node root:root 0600 - byte for byte the
+# situation the rules file exists to fix, with a file present that looks like
+# it fixed it.
+#
+# UNCONFIRMED, because the board has not arrived: WHICH node librknnrt actually
+# opens. Confirm before trusting any of this, with the strace recipe in
+# 99-fpms-npu.rules:
+#
+#     ls -l /dev/rknpu* /dev/dri/ /dev/dma_heap/
+#     id ubuntu | tr ',' '\n' | grep -E 'video|render'
+#
+# An EACCES here does NOT raise - RKNNLite.init_runtime() returns an int - so
+# this getting silently reported by the daemon as fault "runtime_init" is
+# indistinguishable from a version mismatch without the check above.
+SupplementaryGroups=video render
+
+# /run/fpms, created by systemd at start, owned by ubuntu, cleaned at reboot
+# (it is tmpfs). The socket lives at /run/fpms/npud.sock and the daemon chmods
+# it 0660 so only ubuntu can queue work onto the NPU.
+#
+# Preserve=yes because /run/fpms is a SHARED directory name: if any other unit
+# ever declares RuntimeDirectory=fpms, the default (Preserve=no) would have
+# systemd delete the whole directory - and that unit's socket with it - every
+# time fpms-npud restarts. The daemon unlinks its own stale socket at bind
+# time, and refuses to start if something is still listening on it, so nothing
+# is lost by keeping the directory around.
+RuntimeDirectory=fpms
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+# ENVIRONMENT ORDERING - READ THIS BEFORE MOVING A LINE.
+#
+# systemd applies EnvironmentFile= and Environment= IN THE ORDER THEY APPEAR,
+# and a later setting overrides an earlier one. That single rule decides
+# whether tuning the NPU in /etc/fpms/config.env does anything at all.
+#
+# This unit deliberately inverts the ROS units' ordering:
+#
+#   ROS units      Environment= AFTER EnvironmentFile=
+#                  -> the UNIT wins. Correct there: ROS_DOMAIN_ID and
+#                     RMW_IMPLEMENTATION are safety properties and a stale
+#                     value in config.env must not be able to move the rover
+#                     onto a domain where every topic list reads empty.
+#
+#   this unit      EnvironmentFile= AFTER Environment=  (see below)
+#                  -> CONFIG.ENV WINS. Correct here: every FPMS_NPU_* value is
+#                     a tuning knob, and /etc/fpms/config.env is documented as
+#                     the single configuration point for the stack. A knob you
+#                     can set in the documented place that has no effect, and
+#                     reports nothing, is precisely the failure mode this
+#                     project keeps paying for.
+#
+# An earlier revision of this file had EnvironmentFile= first while its comment
+# claimed config.env would win. It would not have: FPMS_NPU_CORE_MASK set by an
+# operator would have been silently overridden by the default below, and
+# fpms-npu-tune's entire output would have been inert. Verify with:
+#
+#     systemctl show fpms-npud -p Environment
+#
+# which reads the resolved environment rather than either file.
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# ---------------------------------------------------------------------------
+# NPU DEFAULTS. Every one of these is a mechanism knob, not a measurement.
+# Agent 4 (fpms-npu-tune) owns the tuning POLICY and writes its answers into
+# /etc/fpms/config.env, which overrides everything below.
+# ---------------------------------------------------------------------------
+
+# 0 | 0_1 | 0_1_2 | auto.
+#
+# init_runtime() with NO core mask uses CORE 0 ONLY, leaving two thirds of a
+# 6 TOPS three-core NPU idle - a recorded defect (NPU_SPEC.md section 0), so
+# the default here is NOT a reproduction of it. Whether 0_1_2 actually beats 0
+# for one 640x640 yolo26n graph is UNMEASURED; if the model was not built for
+# multi-core, init_runtime returns non-zero and the daemon falls back to core 0
+# and PUBLISHES core_mask_fallback:true rather than hiding it.
+Environment=FPMS_NPU_CORE_MASK=0_1_2
+
+# Per-inference budget, milliseconds. UNMEASURED AS A THRESHOLD.
+#
+# The only evidence in this repo is bench_npu.py's ~31 ms inference step, on
+# the OLD Pi, with yolov8n, over a short run. NPU_SPEC.md: "Measure sustained
+# latency, not a first-inference number" - RK3588 throttles hard and silently.
+# 400 ms sits far above any plausible healthy value including a throttled one,
+# so crossing it means something is wrong rather than merely warm. It is a
+# fault threshold, not a performance target. MEASURE ME (agent 7's bench).
+Environment=FPMS_NPU_MAX_LATENCY_MS=400
+
+# The wedge detector. rknn.inference() is a blocking call into librknnrt.so
+# with no cancel API; it CANNOT be interrupted from Python. If a call is still
+# in flight after this long, the daemon publishes npu_fault/"runtime_wedged" at
+# QoS 1 and calls os._exit(3) - because restarting the process is the only
+# cancellation primitive the OS actually offers here, and Restart=always below
+# is what performs the recovery. 10x the budget; UNMEASURED, chosen to be far
+# outside any thermal excursion.
+Environment=FPMS_NPU_HARD_TIMEOUT_MS=4000
+
+# Bounded queue, DROP-OLDEST. Offered load is ~3 inferences/s
+# (FPMS_CAMERA_FPS=6 / FPMS_INFER_EVERY=2), so this queue is empty in a healthy
+# system and anything in it means the NPU is already behind. A detection from
+# four seconds ago is worse than no detection - it points the operator at the
+# wrong part of the frame while still looking like a working detector - so the
+# OLD job is evicted and answered DROPPED, never the new one.
+Environment=FPMS_NPU_QUEUE=1
+Environment=FPMS_NPU_MAX_CLIENTS=8
+
+# Consecutive hard failures before the runtime is torn down and rebuilt in
+# place. The soft recovery; the hard one is the restart above.
+Environment=FPMS_NPU_REINIT_AFTER=3
+Environment=FPMS_NPU_RELOAD_BACKOFF_S=30
+
+Environment=FPMS_NPU_SOCKET=/run/fpms/npud.sock
+
+# Is detection a requirement of this deployment? This does NOT decide whether
+# the daemon exits - it never exits on a missing NPU, because a crash-looping
+# unit publishes nothing and is the same silence this layer exists to remove.
+# It decides whether events/npu_fault carries alert:true (reaches the operator
+# alert path) or alert:false (a bench box knowingly running without detection).
+# On a fire-detection rover, no detector is an alert.
+Environment=FPMS_NPU_REQUIRED=1
+
+# telemetry/npu cadence, and the events/npu_fault cooldown.
+#
+# THE COOLDOWN IS LOAD-BEARING. A past FPMS bug emailed 330 obstacle events and
+# exhausted the Resend daily quota, so a REAL FIRE ALERT COULD NOT SEND
+# (CLAUDE.md "Hard-won constraints"; cloud/HANDOFF.md item 10). npu_fault is
+# published on the rising edge of a NAMED fault and then at most once per
+# FPMS_NPU_FAULT_REPEAT_S while it persists. Continuous state lives on
+# telemetry/npu at QoS 0 instead, where polling costs no quota anywhere.
+# Telemetry describes; events interrupt.
+Environment=FPMS_NPU_TELEMETRY_S=5
+Environment=FPMS_NPU_FAULT_REPEAT_S=300
+
+# LAST, on purpose. See the ordering note above: everything an operator or
+# fpms-npu-tune writes into /etc/fpms/config.env overrides the defaults above,
+# because this line comes after them. Moving it back to the top of the
+# [Service] section silently makes every FPMS_NPU_* knob read-only.
+EnvironmentFile=-/etc/fpms/config.env
+
+ExecStart=/usr/bin/python3 /usr/local/bin/fpms-npud
+
+KillSignal=SIGTERM
+KillMode=mixed
+# The worker thread can be inside an uninterruptible C call at stop time. It is
+# a daemon thread and the process holds no state worth preserving, so SIGKILL
+# after this window is an acceptable outcome, not a bug to work around.
+TimeoutStopSec=10
+
+Restart=always
+# 3s, matching fpms-rover-agent. Not cored's 2s: this is not the stop path.
+# Long enough that a genuine crash-loop is visible in the journal rather than
+# being smeared into a continuous restart, short enough that a wedged-runtime
+# restart costs the detector about one camera frame plus the model load.
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

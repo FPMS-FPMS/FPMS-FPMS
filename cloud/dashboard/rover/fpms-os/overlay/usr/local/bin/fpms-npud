@@ -1,0 +1,1824 @@
+#!/usr/bin/env python3
+"""fpms-npud - the FPMS NPU inference daemon.
+
+Owns the RKNN runtime. Nothing else in this image may construct an RKNNLite.
+
+Usage:
+    fpms-npud              run in the foreground (systemd Type=simple)
+    fpms-npud --help       this text
+
+
+WHY THIS PROCESS EXISTS
+=======================
+Today inference runs INSIDE fpms_rover_agent.py's camera_loop, and the entire
+NPU block - import, load_rknn, init_runtime, labels - is wrapped in ONE
+try/except that logs
+
+    NPU unavailable (...); streaming without detection
+
+exactly once and then carries on forever (fpms_rover_agent.py, the
+`except Exception as e:` at the end of the NPU setup block). Two separate
+defects come out of that shape, and this daemon exists to remove both:
+
+  1. COUPLING. `rknn.inference()` is called on the camera thread, between
+     `cap.read()` and the JPEG encode. That same thread also runs detect_fire()
+     - the flame screen this rover is FOR. A slow or wedged NPU call therefore
+     stalls the frame pump AND the fire detector. bench_npu.py measures the
+     inference step at ~31 ms of a ~? ms frame budget on the old Pi with
+     yolov8n; that is fine right up until the moment it is not, and there is no
+     bound on how long a librknnrt call can take when the driver is unhappy.
+
+  2. SILENCE. One log line, once, at startup, in a journal nobody is reading -
+     and then a rover that streams video, reports every unit `active`, and
+     detects nothing. NPU_SPEC.md calls this "the single worst failure mode in
+     the project, because it is indistinguishable from success at every level an
+     operator normally checks." A daemon whose ONLY job is inference can make
+     that state a first-class, persistent, published fault instead of a
+     scrollback entry.
+
+So: one process, one runtime, one worker thread, a socket, and a health topic
+that never stops telling the truth.
+
+WHAT THIS DAEMON DOES NOT OWN
+  - labelling. The daemon returns boxes/scores/classes, exactly the contract of
+    fpms_yolo26_npu.decode(). COCO_NAMES, custom_labels.json, the wildlife /
+    vegetation / person "kind" mapping and the drawing all stay in the agent.
+    Splitting presentation out of the runtime is the point.
+  - core mask POLICY. Agent 4 (fpms-npu-tune) decides what the mask should be
+    and writes it to FPMS_NPU_CORE_MASK. This file owns the MECHANISM: reading
+    that variable, translating it to an RKNNLite constant, applying it, failing
+    loudly if it cannot, and publishing what is actually in force.
+  - model provenance. Agent 3 (fpms-model-verify, /etc/fpms/models.json) is the
+    authority on which sha256 is the right one. This file reads that registry
+    if it exists and refuses on a CONTRADICTION, but it does not write it.
+  - the selftest. Agent 7 (fpms-npu-selftest) decides pass/fail for an operator.
+
+
+================================================================================
+WIRE FORMAT  -  unix SOCK_STREAM at $FPMS_NPU_SOCKET (default /run/fpms/npud.sock)
+================================================================================
+Length-prefixed, with a magic and a version byte in every frame, in BOTH
+directions. That is deliberate: a client built against protocol 1 talking to a
+daemon speaking protocol 2 must get a NAMED refusal, not a plausible-looking
+garbled parse. This project has been bitten repeatedly by failures that look
+like success; a silently misread box array would be exactly that again.
+
+Header, 12 bytes, network byte order, struct "!4sBBBBI":
+
+    off  size  field
+    ---  ----  --------------------------------------------------------------
+      0     4  magic     b"FNPU"
+      4     1  version   protocol version, currently 1
+      5     1  msgtype   see below
+      6     1  flags     reserved, MUST be 0 (a non-zero value is refused, so
+                         that adding a flag later cannot be silently ignored by
+                         an old daemon)
+      7     1  fmt       payload image format, see below
+      8     4  length    payload byte count, uint32 BE, <= 4 MiB
+
+msgtype - requests have the high bit CLEAR, responses have it SET, so a frame
+read off the wrong end of the socket is immediately recognisable:
+
+    0x01  INFER          client -> daemon, one frame to run
+    0x02  HEALTH         client -> daemon, "what is your state", no image
+    0x81  RESULT         daemon -> client, boxes (JSON)
+    0x82  UNAVAILABLE    daemon -> client, NAMED fault, NEVER any boxes
+    0x83  HEALTH_OK      daemon -> client, health snapshot (JSON)
+    0x84  PROTOCOL_ERROR daemon -> client, then the connection is closed
+    0x85  DROPPED        daemon -> client, this frame was superseded by a newer
+                         one and was never run. NOT a fault - it is backpressure
+                         working as designed. See "QUEUE" below.
+
+fmt:
+
+    0x00  NONE           no image bytes (HEALTH, and every response)
+    0x01  RGB888_640     the image is ALREADY 640x640x3 uint8 RGB, C-contiguous,
+                         HWC, exactly 1 228 800 bytes.
+
+  Only one image format is defined, on purpose. The agent already does
+  `cv2.resize(frame, (640, 640))` + `cvtColor(BGR2RGB)` on its own thread and
+  bench_npu.py measures that preprocess step as a small fraction of the
+  inference step, so moving it across the socket would buy nothing and would
+  put an image-format negotiation - a thing to get wrong - on the hot path.
+  fmt 0x02 is RESERVED for "raw BGR at native size, daemon resizes", if
+  measurement ever justifies it.
+
+INFER payload (fmt 0x01):
+
+    !I    meta_len
+    ...   meta_len bytes of UTF-8 JSON
+    ...   the image bytes (1 228 800 for fmt 0x01)
+
+  meta keys:
+    "h", "w"   REQUIRED. Height/width of the ORIGINAL camera frame, in pixels.
+               The decoder rescales boxes back into this space. Because the
+               agent preprocesses with a plain stretch resize and NOT a
+               letterbox, that rescale is an INDEPENDENT per-axis ratio - see
+               fpms_yolo26_npu.decode(). If the agent's preprocess ever becomes
+               a letterbox, both that decoder AND this contract change.
+    "seq"      optional int, echoed back. Lets a client match replies to frames.
+    "conf"     optional float, per-request confidence threshold override.
+    "iou"      optional float, per-request NMS IoU override.
+
+RESULT payload: UTF-8 JSON
+
+    {"seq": 41, "n": 2,
+     "boxes":  [[x1,y1,x2,y2], ...],   floats, ORIGINAL-frame pixels
+     "scores": [0.71, ...],
+     "classes":[0, 58, ...],           COCO ids
+     "infer_ms": 31.4,                 the rknn.inference() call alone
+     "decode_ms": 3.1,
+     "queue_ms": 0.2,                  time the job waited before running
+     "model_sha256": "...",            so a client can detect a hot model swap
+     "core_mask": "0_1_2"}
+
+UNAVAILABLE payload: UTF-8 JSON
+
+    {"seq": 41, "fault": "model_missing", "detail": "...",
+     "since": 1765200000.0, "required": true}
+
+  There is deliberately no "boxes": [] in an UNAVAILABLE reply. An empty box
+  list means "the NPU ran and saw nothing", which is a completely different
+  statement from "there is no NPU", and a client that cannot tell them apart
+  will draw the wrong conclusion. NPU_SPEC.md design rule 3: never claim a
+  detection you cannot substantiate - and "nothing is there" is a claim.
+
+DROPPED payload: {"seq": 41, "reason": "superseded", "queue_ms": 812.0}
+
+PROTOCOL_ERROR payload: {"error": "...", "daemon_version": 1}
+
+
+CLIENT REFERENCE  (for whoever edits fpms_rover_agent.py - that file is not
+mine to change, so the exact call sequence is written down here instead):
+
+    import json, socket, struct
+    HDR = struct.Struct("!4sBBBBI")
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)                       # NEVER block the camera thread
+    s.connect(os.environ.get("FPMS_NPU_SOCKET", "/run/fpms/npud.sock"))
+
+    img = cv2.cvtColor(cv2.resize(frame, (640, 640)), cv2.COLOR_BGR2RGB)
+    meta = json.dumps({"h": frame.shape[0], "w": frame.shape[1],
+                       "seq": frame_index}).encode()
+    blob = struct.pack("!I", len(meta)) + meta + img.tobytes()
+    s.sendall(HDR.pack(b"FNPU", 1, 0x01, 0, 0x01, len(blob)) + blob)
+
+    magic, ver, mt, flags, fmt, n = HDR.unpack(recv_exact(s, 12))
+    body = json.loads(recv_exact(s, n))
+    if mt == 0x81:   use body["boxes"] / body["scores"] / body["classes"]
+    elif mt == 0x85: KEEP THE PREVIOUS BOXES - the frame was skipped, not blind
+    elif mt == 0x82: PUBLISH "npu": false and body["fault"] - do NOT go quiet
+    else:            protocol/daemon mismatch; treat as 0x82
+
+    Keep the connection open across frames; one connect per frame works but
+    wastes a syscall round trip. On ANY socket error, close, set npu=false, and
+    reconnect lazily on the next inferred frame with a backoff. The agent must
+    never die, block, or fall silent because this daemon is down.
+
+
+================================================================================
+QUEUE  -  bounded, DROP-OLDEST
+================================================================================
+Depth is FPMS_NPU_QUEUE, default 1.
+
+The camera ships at FPMS_CAMERA_FPS=6 with FPMS_INFER_EVERY=2, so the offered
+load is ~3 inferences/second - roughly a 333 ms budget against a ~31 ms
+measured inference. In a healthy system this queue is ALWAYS empty. Anything
+sitting in it means the NPU is already behind, and the only question is what to
+throw away.
+
+DROP-OLDEST, and here is why it is not arguable for this workload:
+
+  - The value of a detection decays with age, fast. This is a moving rover
+    looking for fire. A box drawn where the flame was 4 seconds ago is not
+    "stale but useful", it is WRONG - it points the operator at the wrong part
+    of the frame, and it is wrong in a way that still looks like a working
+    detector.
+  - Every queued frame is strictly less current than the one behind it. There
+    is no information in an old frame that the new frame does not have more of.
+  - Drop-newest would mean that under load the daemon serves an ever-older
+    view while continuously discarding the only frames that matter. That is
+    the failure mode of a video pipeline that "keeps up" on paper and lags in
+    reality, and this project has already been burned by exactly that shape:
+    LiDAR scans were never DROPPED behind camera frames on the shared paho
+    client, they simply arrived LATE - "the hardest version of this failure to
+    see" (fpms-rover-agent.service). Late is worse than absent when the
+    consumer cannot tell the difference.
+
+The evicted job is answered immediately with DROPPED. It is never left to time
+out: a client blocked on a reply that will never come is a stalled camera
+thread, which is the thing this daemon was built to prevent.
+
+Depth 1 rather than 0 (i.e. reject-if-busy) so that a single frame arriving
+during an in-flight inference still gets run rather than discarded - at 3 fps
+that is the common case, not the overload case.
+
+
+================================================================================
+TIMEOUTS  -  what is enforceable, and what is not. Read this before trusting it.
+================================================================================
+FPMS_NPU_MAX_LATENCY_MS is the per-inference budget. There are three layers and
+they enforce genuinely different amounts:
+
+  1. CLIENT DEADLINE - fully enforceable, and it is the one that matters.
+     The connection thread waits on the job's completion Event with a timeout of
+     2x the budget. When it expires the client gets UNAVAILABLE/"timeout" and
+     gets its thread back. THE CAMERA THREAD IS NEVER BLOCKED BY A WEDGED NPU.
+     That property does not depend on being able to cancel anything, only on
+     the inference living in a different process from the camera - which is the
+     entire architectural point of this daemon.
+
+     The deadline is deliberately 2x, not 1x. If the client deadline equalled
+     the worker's budget, every inference that was slow-but-successful would be
+     reported to the client as a timeout while the worker recorded it as a
+     success - two contradictory stories about the same call, and the telemetry
+     would be the one that looked fine.
+
+  2. WORKER BUDGET - detection only, NOT cancellation.
+     `RKNNLite.inference()` is a blocking call into librknnrt.so. It has no
+     cancel, no deadline argument, and no thread-safe abort, and it does not
+     return to the interpreter until the driver returns. THERE IS NO WAY TO
+     INTERRUPT IT FROM PYTHON. A signal will not do it (Python only runs the
+     handler between bytecodes, and we are not executing bytecode), and
+     Thread.join(timeout) leaves the thread running. So the worker can only
+     measure the call AFTER it returns and count it as a fault - which it does:
+     over-budget calls increment consec_slow, publish npu_fault/"inference_slow",
+     and after FPMS_NPU_REINIT_AFTER of them trigger a runtime re-init.
+
+  3. HARD TIMEOUT - a process-level kill, because that is the only cancellation
+     primitive the OS actually gives us here.
+     If a call has been in flight for longer than FPMS_NPU_HARD_TIMEOUT_MS
+     (default 10x the budget) the watchdog declares the runtime wedged,
+     publishes npu_fault/"runtime_wedged" at QoS 1, gives MQTT a moment to
+     flush, and calls os._exit(3). Not sys.exit() - that raises SystemExit in
+     the calling thread and the interpreter would then wait forever to join the
+     stuck worker. Not rknn.release() either: releasing a context whose C call
+     has not returned is undefined and could hang or segfault the same process
+     we are trying to get out of.
+
+     systemd restarts the unit (Restart=always, RestartSec=3), which gives a
+     fresh process, a fresh librknnrt, and a fresh driver context. RECOVERY
+     FROM A WEDGED NPU IS A RESTART. Saying that in a comment is more honest
+     than pretending a threading construct can undo it.
+
+     UNMEASURED: nobody has ever seen an rknpu call wedge on this board,
+     because the board has not arrived. 10x the budget is a bound chosen to be
+     far outside any plausible thermal-throttle excursion, not a measurement.
+     MEASURE ME once sustained load numbers exist (agent 7's bench).
+
+
+================================================================================
+FAULT PUBLISHING  -  edge-triggered, with a cooldown. This is not optional.
+================================================================================
+A past FPMS bug emailed 330 obstacle events and exhausted the Resend daily
+quota, so a REAL FIRE ALERT COULD NOT SEND (CLAUDE.md, "Hard-won constraints";
+cloud/HANDOFF.md item 10). An alert path that fires per-occurrence does not
+merely spam - it destroys the alerting channel for the one event the whole
+product exists to report.
+
+So npu_fault is published on the RISING EDGE of a named fault only, then at
+most once per FPMS_NPU_FAULT_REPEAT_S (default 300) while it persists, and
+npu_recovered once on the falling edge. Changing the fault NAME counts as a new
+edge - a model_missing that becomes a runtime_wedged is different news - but
+the same name repeating does not.
+
+Continuous state lives on telemetry/npu at QoS 0 instead, where a dashboard can
+poll it as often as it likes and it costs no quota anywhere. The rule is:
+telemetry describes, events interrupt.
+
+
+================================================================================
+NEVER RUN ON HARDWARE
+================================================================================
+The Orange Pi 5B has not arrived. NOTHING in this file has executed against a
+real rknpu driver, a real librknnrt.so, or a real .rknn model. Everything below
+that touches RKNNLite is written against Rockchip's documented API and against
+the call sequence in bench_npu.py and fpms_rover_agent.py (load_rknn ->
+init_runtime -> inference -> release), which DID run on the old Pi.
+
+Specifically unconfirmed, with the command that confirms each:
+  - the device node name              ls -l /dev/rknpu* /dev/dri/renderD*
+  - the group that owns it            stat -c '%U %G %a' /dev/rknpu
+  - the driver version string         cat /sys/kernel/debug/rknpu/version
+  - whether debugfs is readable as `ubuntu` at all (it is root-only by default,
+    so the driver version will very likely publish as null - that is expected,
+    not a fault)
+  - whether init_runtime() on this wheel accepts core_mask as a keyword
+  - whether THIS model was built for multi-core and will accept 0_1_2
+  - every latency number quoted anywhere in this file
+"""
+from __future__ import annotations
+
+import collections
+import hashlib
+import json
+import math
+import os
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+
+import numpy as np
+from paho.mqtt.client import Client, CallbackAPIVersion
+
+# ---------------------------------------------------------------- config ---
+#
+# Same loader shape as fpms_rover_agent.py / fpms-selftest, deliberately: this
+# stack has one configuration point and adding a second parsing dialect for it
+# is how the two halves of a setting drift apart.
+#
+# UNLIKE the agent, os.environ wins over the file here. config.env.example
+# documents that the services disagree about this (cored overlays environ on
+# top, the agent reads the file only) - and for THIS daemon the systemd unit is
+# where the NPU defaults live, so the unit's Environment= block must be able to
+# set them. The unit still puts EnvironmentFile= FIRST, so an operator editing
+# config.env can override the unit's defaults, which is the intended precedence.
+
+
+def load_config(path="/etc/fpms/config.env"):
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        # Absent config.env is not fatal here, but it IS the reason every FPMS
+        # service silently retries against the wrong broker forever. Logged in
+        # main() rather than swallowed.
+        pass
+    cfg.update({k: v for k, v in os.environ.items() if k.startswith("FPMS_")})
+    return cfg
+
+
+CFG = load_config()
+
+
+def _s(key, default):
+    return str(CFG.get(key, default)).strip()
+
+
+def _i(key, default):
+    try:
+        return int(float(_s(key, default)))
+    except ValueError:
+        return int(float(default))
+
+
+def _f(key, default):
+    try:
+        return float(_s(key, default))
+    except ValueError:
+        return float(default)
+
+
+THING = _s("FPMS_THING_NAME", "rover2")
+BROKER = _s("FPMS_MQTT_HOST", "127.0.0.1")
+PORT = _i("FPMS_MQTT_PORT", "1883")
+USER = _s("FPMS_MQTT_USER", "")
+PASS = _s("FPMS_MQTT_PASS", "")
+
+SOCKET_PATH = _s("FPMS_NPU_SOCKET", "/run/fpms/npud.sock")
+YOLO_DIR = _s("FPMS_YOLO_DIR", "/home/ubuntu/yolo")
+YOLO_VARIANT = _s("FPMS_YOLO_VARIANT", "v26").lower()
+
+# The core mask. "0" | "0_1" | "0_1_2" | "auto".
+#
+# NPU_SPEC.md: init_runtime() with NO core_mask uses core 0 ONLY, which leaves
+# two thirds of a 6 TOPS 3-core NPU idle - that is the recorded defect this
+# layer exists to close, so the DEFAULT here is 0_1_2 rather than a
+# reproduction of the defect.
+#
+# MEASURE ME: whether 0_1_2 actually beats 0 for ONE 640x640 yolo26n graph is
+# UNMEASURED and is not obvious. Rockchip's multi-core modes trade per-inference
+# latency against aggregate throughput differently depending on how the model
+# was built, and NPU_SPEC.md explicitly flags "single-core per-model with three
+# models in parallel, versus one model across all three" as a real open
+# decision. Agent 4 (fpms-npu-tune) owns resolving it; this daemon only carries
+# out whatever FPMS_NPU_CORE_MASK says and PUBLISHES what is actually in force,
+# so the answer is never inferred from a default nobody checked.
+CORE_MASK_NAME = _s("FPMS_NPU_CORE_MASK", "0_1_2").lower()
+
+# Per-inference budget. UNMEASURED as a THRESHOLD.
+#
+# The only latency evidence in this repo is bench_npu.py's ~31 ms for the
+# inference step, on the OLD Pi, with yolov8n, on a FIRST-inference-style short
+# run. NPU_SPEC.md: "Measure sustained latency, not a first-inference number" -
+# RK3588 throttles hard and silently under sustained load. 400 ms is chosen to
+# sit far above any plausible healthy value INCLUDING a throttled one, so that
+# crossing it means something is genuinely wrong rather than merely warm. It is
+# not a performance target. Agent 7's bench produces the real number.
+MAX_LATENCY_MS = _f("FPMS_NPU_MAX_LATENCY_MS", "400")
+HARD_TIMEOUT_MS = _f("FPMS_NPU_HARD_TIMEOUT_MS", str(MAX_LATENCY_MS * 10))
+
+QUEUE_DEPTH = max(1, _i("FPMS_NPU_QUEUE", "1"))
+MAX_CLIENTS = max(1, _i("FPMS_NPU_MAX_CLIENTS", "8"))
+REINIT_AFTER = max(1, _i("FPMS_NPU_REINIT_AFTER", "3"))
+RELOAD_BACKOFF_S = _f("FPMS_NPU_RELOAD_BACKOFF_S", "30")
+
+TELEMETRY_S = _f("FPMS_NPU_TELEMETRY_S", "5")
+FAULT_REPEAT_S = _f("FPMS_NPU_FAULT_REPEAT_S", "300")
+
+# Is a working NPU a requirement of this deployment, or a nice-to-have?
+#
+# This does NOT decide whether the daemon exits - it never exits on a missing
+# NPU. NPU_SPEC.md requires the opposite: "If the NPU is unavailable the daemon
+# must stay up and keep saying so, so the dashboard shows a persistent fault
+# rather than silence." A crash-looping unit publishes nothing and is exactly
+# the silence we are trying to remove.
+#
+# What it decides is whether npu_fault carries alert:true (operator-visible,
+# reaches the cloud alert path) or alert:false (bench/dev box knowingly running
+# without detection). Default 1: on a fire-detection rover, no detector is an
+# alert.
+REQUIRED = _s("FPMS_NPU_REQUIRED", "1") not in ("0", "false", "no", "")
+
+MODELS_JSON = "/etc/fpms/models.json"            # agent 3 owns this
+NPU_VERSIONS_JSON = "/etc/fpms/npu-versions.json"  # agent 1 owns this
+DRIVER_VERSION_PATH = "/sys/kernel/debug/rknpu/version"
+
+RUNNING = threading.Event()
+RUNNING.set()
+STARTED = time.time()
+
+# ------------------------------------------------------------- protocol ---
+
+MAGIC = b"FNPU"
+PROTO_VERSION = 1
+HEADER = struct.Struct("!4sBBBBI")
+HEADER_LEN = HEADER.size                       # 12
+
+MSG_INFER = 0x01
+MSG_HEALTH = 0x02
+MSG_RESULT = 0x81
+MSG_UNAVAILABLE = 0x82
+MSG_HEALTH_OK = 0x83
+MSG_PROTOCOL_ERROR = 0x84
+MSG_DROPPED = 0x85
+
+FMT_NONE = 0x00
+FMT_RGB888_640 = 0x01
+
+INPUT_SIZE = 640
+IMAGE_BYTES = INPUT_SIZE * INPUT_SIZE * 3      # 1 228 800
+
+# A length-prefixed protocol with no cap is a memory exhaustion primitive for
+# anyone who can open the socket. 4 MiB is ~3.4x the only legal image size, so
+# it accommodates a future fmt without accommodating an attack.
+MAX_PAYLOAD = 4 * 1024 * 1024
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ------------------------------------------------------------- MQTT bus ---
+
+
+class Bus:
+    """Thin MQTT wrapper. Publishing must never raise into the worker."""
+
+    def __init__(self):
+        self.client = Client(client_id=f"{THING}-npud",
+                             callback_api_version=CallbackAPIVersion.VERSION2)
+        if USER:
+            self.client.username_pw_set(USER, PASS or None)
+        self.client.on_connect = self._on_connect
+        # A last will, for the same reason the agent has one: if this process
+        # dies the dashboard must learn it from the broker rather than by
+        # noticing that telemetry stopped. "Telemetry stopped" is precisely the
+        # silence this daemon exists to eliminate, and it must not be the way
+        # its own death is announced.
+        self.client.will_set(
+            f"fpms/{THING}/events/npu_fault",
+            json.dumps({"thing": THING, "component": "npu", "alert": REQUIRED,
+                        "fault": "daemon_offline",
+                        "error": "fpms-npud disconnected without a clean stop; "
+                                 "no inference is being served",
+                        "detection_available": False}),
+            qos=1, retain=False)
+        self.connected = False
+
+    def start(self):
+        # loop_start() gives paho its own network thread. connect_async() means
+        # a broker that is not up yet does not block the socket from listening -
+        # clients still get an honest UNAVAILABLE instead of ECONNREFUSED.
+        try:
+            self.client.connect_async(BROKER, PORT, keepalive=30)
+            self.client.loop_start()
+        except Exception as e:  # noqa: BLE001
+            log(f"MQTT setup failed ({e}); telemetry will retry in the background")
+
+    def _on_connect(self, client, _u, _f, reason_code, _p=None):
+        self.connected = True
+        log(f"MQTT connected to {BROKER}:{PORT} ({reason_code})")
+        self.publish("events/npu_online", {
+            "component": "npu",
+            "socket": SOCKET_PATH,
+            "protocol": PROTO_VERSION,
+            "core_mask_requested": CORE_MASK_NAME,
+            "required": REQUIRED,
+        }, qos=1)
+
+    def publish(self, suffix, payload, qos=0):
+        """Returns True only if the message was actually handed to paho.
+
+        The return value is load-bearing for the fault path: an edge-triggered
+        alert that is "sent" into a disconnected client has consumed its edge
+        and will not be retried for a whole cooldown. See set_fault().
+        """
+        try:
+            payload.setdefault("ts", time.time())
+            payload.setdefault("thing", THING)
+        except Exception:  # noqa: BLE001
+            pass
+        if not self.connected:
+            return False
+        try:
+            self.client.publish(f"fpms/{THING}/{suffix}",
+                                json.dumps(payload), qos=qos)
+            return True
+        except Exception as e:  # noqa: BLE001
+            log(f"publish failed on {suffix}: {e}")
+            return False
+
+
+BUS = Bus()
+
+
+# --------------------------------------------------------------- metrics ---
+
+
+class Metrics:
+    """Latency percentiles, rates and counters. Cheap, lock-guarded."""
+
+    # 256 samples at ~3/s is ~85 s of history: long enough to show a thermal
+    # excursion, short enough that a percentile still describes NOW.
+    WINDOW = 256
+    RATE_WINDOW_S = 30.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.lat = collections.deque(maxlen=self.WINDOW)
+        self.done_at = collections.deque()
+        self.total = 0
+        self.drops = 0
+        self.timeouts = 0
+        self.slow = 0
+        self.errors = 0
+        self.consec_fail = 0
+        self.consec_slow = 0
+        self.reinits = 0
+        self.proto_errors = 0
+
+    def record(self, ms, ok):
+        now = time.monotonic()
+        with self.lock:
+            if ok:
+                self.lat.append(ms)
+                self.total += 1
+                self.done_at.append(now)
+                cutoff = now - self.RATE_WINDOW_S
+                while self.done_at and self.done_at[0] < cutoff:
+                    self.done_at.popleft()
+
+    @staticmethod
+    def _pct(vals, q):
+        """Nearest-rank percentile - an OBSERVED latency, never an interpolated one.
+
+        np.percentile's default linear interpolation would report a value that
+        no inference ever took. For a latency bound that is used to decide
+        whether the NPU is healthy, "the 90th slowest thing that actually
+        happened" is the honest answer; a number between two samples is a
+        number the hardware never produced.
+        """
+        if not vals:
+            return None
+        k = int(math.ceil(q * len(vals))) - 1
+        return round(vals[max(0, min(k, len(vals) - 1))], 2)
+
+    def snapshot(self):
+        with self.lock:
+            vals = sorted(self.lat)
+            now = time.monotonic()
+            cutoff = now - self.RATE_WINDOW_S
+            while self.done_at and self.done_at[0] < cutoff:
+                self.done_at.popleft()
+            n_recent = len(self.done_at)
+            return {
+                "samples": len(vals),
+                "p50_ms": self._pct(vals, 0.50),
+                "p90_ms": self._pct(vals, 0.90),
+                "max_ms": round(vals[-1], 2) if vals else None,
+                "infer_per_s": round(n_recent / self.RATE_WINDOW_S, 2),
+                "total": self.total,
+                "drops": self.drops,
+                "timeouts": self.timeouts,
+                "slow": self.slow,
+                "errors": self.errors,
+                "consecutive_failures": self.consec_fail,
+                "consecutive_slow": self.consec_slow,
+                "reinits": self.reinits,
+                "protocol_errors": self.proto_errors,
+            }
+
+
+METRICS = Metrics()
+
+
+# ----------------------------------------------------------- fault state ---
+#
+# One named fault at a time, edge-triggered. See the FAULT PUBLISHING section
+# in the module docstring for why the cooldown is load-bearing.
+
+FAULT = {"name": "loading", "detail": "runtime not loaded yet",
+         "since": time.time(), "last_sent": 0.0}
+FAULT_LOCK = threading.Lock()
+
+
+def set_fault(name, detail):
+    """Declare a named fault. Publishes only on a rising edge or after cooldown."""
+    now = time.time()
+    with FAULT_LOCK:
+        changed = FAULT["name"] != name
+        if changed:
+            FAULT.update({"name": name, "detail": detail,
+                          "since": now, "last_sent": 0.0})
+        else:
+            FAULT["detail"] = detail
+        due = changed or (now - FAULT["last_sent"] >= FAULT_REPEAT_S)
+        if not due:
+            return
+        payload = {"component": "npu", "alert": REQUIRED, "fault": name,
+                   "error": detail, "since": FAULT["since"],
+                   "detection_available": False,
+                   "required": REQUIRED,
+                   "repeat": not changed}
+    if changed:
+        log(f"FAULT {name}: {detail}")
+
+    # last_sent advances ONLY on a publish that actually left. This daemon
+    # starts alongside mosquitto and its first fault - model_missing,
+    # runtime_import - typically rises seconds before the broker connection
+    # completes. Marking the edge as spent on a publish that went nowhere would
+    # swallow the very first and most important alert for a full
+    # FPMS_NPU_FAULT_REPEAT_S (default five minutes), which is the exact
+    # "silence that looks like health" this file exists to abolish. Retrying
+    # here does not reopen the 330-email hole either: the retry is driven by
+    # the SAME cooldown clock, so an unpublishable fault is attempted at most
+    # once per set_fault() call and the cooldown starts when it lands.
+    if BUS.publish("events/npu_fault", payload, qos=1):
+        with FAULT_LOCK:
+            if FAULT["name"] == name:
+                FAULT["last_sent"] = time.time()
+
+
+def clear_fault():
+    """Falling edge. Published once, never repeated."""
+    with FAULT_LOCK:
+        if FAULT["name"] is None:
+            return
+        was, since = FAULT["name"], FAULT["since"]
+        FAULT.update({"name": None, "detail": "", "since": time.time(),
+                      "last_sent": 0.0})
+    log(f"recovered from fault '{was}'")
+    BUS.publish("events/npu_recovered", {
+        "component": "npu", "alert": False, "cleared": was,
+        "outage_s": round(time.time() - since, 1),
+        "detection_available": True,
+    }, qos=1)
+
+
+def current_fault():
+    with FAULT_LOCK:
+        if FAULT["name"] is None:
+            return None
+        return {"fault": FAULT["name"], "detail": FAULT["detail"],
+                "since": FAULT["since"]}
+
+
+# ---------------------------------------------------------- the runtime ---
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_text(path):
+    """Best effort. debugfs is root-only by default and we run as ubuntu."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def registry_sha(model_path):
+    """Expected sha256 from agent 3's /etc/fpms/models.json, or a reason why not.
+
+    Returns (sha_or_None, note). THREE outcomes, and collapsing them would lose
+    the whole point of the registry:
+
+      a str   - the registry states a hash. A difference is a REFUSAL.
+      None + "declared UNKNOWN"  - the registry has an entry for this file and
+                                   explicitly sets sha256: null. Agent 3's
+                                   _readme is emphatic that this is a declared,
+                                   checkable state and not a shrug: the .rknn
+                                   has never been in git and has never been
+                                   hashed, and a fabricated hash would make
+                                   fpms-model-verify FAIL on the one correct
+                                   file the project owns.
+      None + anything else       - no registry, no entry, or a file we cannot
+                                   parse. Reported as such. A registry we
+                                   cannot read must never silently become a
+                                   registry that agrees with us.
+
+    Only the first outcome can refuse. The other two set sha_state=unverified,
+    which is published in telemetry and is agent 7's business, not a reason to
+    stop serving inference that is probably fine.
+    """
+    if not os.path.exists(MODELS_JSON):
+        return None, "registry absent (agent 3's fpms-model-verify not installed)"
+    try:
+        with open(MODELS_JSON) as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as e:
+        return None, f"registry unreadable: {e}"
+
+    base = os.path.basename(model_path)
+
+    def names_this_file(entry):
+        f = entry.get("file")
+        return isinstance(f, str) and (f == model_path or os.path.basename(f) == base)
+
+    # The documented schema first: {"models": {"<logical>": {"file":..., "sha256":...}}}
+    models = doc.get("models")
+    if isinstance(models, dict):
+        for logical, entry in models.items():
+            if not isinstance(entry, dict) or not names_this_file(entry):
+                continue
+            sha = entry.get("sha256")
+            if isinstance(sha, str) and sha.strip():
+                return sha.strip().lower(), f"registry entry '{logical}'"
+            status = entry.get("sha256_status") or "no sha256_status recorded"
+            return None, (f"registry entry '{logical}' declares sha256 UNKNOWN: "
+                          f"{status}")
+
+    # Fall back to a structural walk, in case the schema moves under us. Better
+    # to find a stated hash in an unexpected place than to miss a contradiction.
+    stack = [doc]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            vals = {v for v in node.values() if isinstance(v, str)}
+            if (base in vals or model_path in vals) \
+                    and isinstance(node.get("sha256"), str) and node["sha256"].strip():
+                return node["sha256"].strip().lower(), "registry (unexpected schema)"
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None, f"registry present but states no sha256 for {base}"
+
+
+class Runtime:
+    """Everything that touches RKNNLite. Single-threaded by construction.
+
+    Only the worker thread ever calls load()/infer()/release(). The watchdog
+    reads `inflight_started` and nothing else. That is not an accident: the
+    RKNN context is not documented as thread-safe, and serialising access
+    through one worker is both the safety property and the reason a bounded
+    queue is meaningful.
+    """
+
+    def __init__(self):
+        self.rknn = None
+        self.decode = None
+        self.model_path = None
+        self.model_sha = None
+        self.model_bytes = 0
+        self.core_mask_name = CORE_MASK_NAME
+        self.core_mask_fallback = False
+        self.sha_state = "unverified"
+        self.sha_note = ""
+        self.loaded = False
+        self.probe_ms = None
+        # Written by the worker immediately before rknn.inference() and cleared
+        # immediately after. A float monotonic timestamp, or 0.0. Read by the
+        # watchdog. Assignment of a float is atomic under the GIL, so no lock is
+        # needed and taking one here would be worse - the watchdog must never be
+        # able to block behind the thread it is watching.
+        self.inflight_started = 0.0
+        self.inflight_seq = 0
+
+    # -- core mask ---------------------------------------------------------
+
+    def resolve_core_mask(self, rknnlite_cls):
+        """Map FPMS_NPU_CORE_MASK onto an RKNNLite constant.
+
+        getattr rather than a direct attribute reference: the aarch64
+        rknn-toolkit-lite2 wheel is version-coupled to librknnrt.so and to the
+        kernel driver (NPU_SPEC.md section 1), and an older wheel may simply not
+        define NPU_CORE_0_1_2. That must be a NAMED refusal, not an
+        AttributeError inside a try/except that logs once and carries on -
+        which is the exact failure shape this daemon replaces.
+        """
+        table = {
+            "0": "NPU_CORE_0",
+            "0_1": "NPU_CORE_0_1",
+            "0_1_2": "NPU_CORE_0_1_2",
+            "auto": "NPU_CORE_AUTO",
+        }
+        attr = table.get(self.core_mask_name)
+        if attr is None:
+            raise ValueError(
+                f"FPMS_NPU_CORE_MASK={self.core_mask_name!r} is not one of "
+                f"{sorted(table)}")
+        val = getattr(rknnlite_cls, attr, None)
+        if val is None:
+            raise ValueError(
+                f"this rknn-toolkit-lite2 wheel has no {attr}; the wheel, "
+                f"librknnrt.so and the kernel rknpu driver must be "
+                f"version-matched (see /etc/fpms/npu-versions.json)")
+        return val
+
+    # -- load --------------------------------------------------------------
+
+    def load(self):
+        """Load model + runtime. Returns True on success, sets a fault on failure."""
+        self.release()
+
+        # 1. The decode module. It lives next to the model in FPMS_YOLO_DIR and
+        #    is imported, not reimplemented: fpms_yolo26_npu.decode() carries
+        #    the stretch-vs-letterbox rescale, the "already sigmoided, do not
+        #    sigmoid again" rule and the per-class NMS offset trick, all of
+        #    which are easy to get subtly and invisibly wrong. Agent 6 owns its
+        #    tests. A second copy would drift.
+        if YOLO_DIR not in sys.path:
+            sys.path.insert(0, YOLO_DIR)
+        try:
+            if YOLO_VARIANT in ("v26", "26", "yolo26"):
+                import fpms_yolo26_npu as ynpu
+            else:
+                # "v8" imports fpms_yolo_npu.py, which exists ONLY on the old Pi
+                # and is in no repository (fpms-selftest flags this). Kept so a
+                # rover that still has that file works, but it is not the
+                # supported path.
+                import fpms_yolo_npu as ynpu       # noqa: F401
+            self.decode = ynpu.decode
+        except Exception as e:  # noqa: BLE001
+            set_fault("decode_import",
+                      f"cannot import the {YOLO_VARIANT} decode module from "
+                      f"{YOLO_DIR}: {e}")
+            return False
+
+        # The module hardcodes an absolute MODEL path; honour FPMS_YOLO_DIR over
+        # it so a relocated install does not load a stale model from elsewhere.
+        model_name = os.path.basename(getattr(ynpu, "MODEL", "yolo26n-rk3588.rknn"))
+        self.model_path = os.path.join(YOLO_DIR, model_name)
+
+        # 2. The model file. NPU_SPEC.md design rule 5: "Do not guess a model.
+        #    If the .rknn is absent or its checksum is unknown, that is a
+        #    declared fault, not a silent fallback." The model is NOT in git -
+        #    it existed only on the old Pi.
+        if not os.path.exists(self.model_path):
+            set_fault("model_missing",
+                      f"{self.model_path} does not exist. The .rknn is not in "
+                      f"the repository - it lived only on the old Pi. Nothing "
+                      f"in git can rebuild it and the converter is x86-only.")
+            return False
+        try:
+            self.model_bytes = os.path.getsize(self.model_path)
+            self.model_sha = sha256_file(self.model_path)
+        except OSError as e:
+            set_fault("model_unreadable", f"{self.model_path}: {e}")
+            return False
+
+        # 3. Cross-check against agent 3's registry. Three distinct outcomes,
+        #    deliberately NOT collapsed into one:
+        #      - contradiction  -> refuse. A wrong-shaped or wrong-version model
+        #                          loads fine and produces garbage boxes, which
+        #                          is worse than no boxes.
+        #      - no registry    -> serve, but publish sha_state=unverified. An
+        #                          absent registry means agent 3's install has
+        #                          not run; it is not evidence about the model.
+        #      - agreement      -> serve, sha_state=verified.
+        expected, note = registry_sha(self.model_path)
+        self.sha_note = note
+        if expected and expected != self.model_sha:
+            self.sha_state = "mismatch"
+            set_fault("model_sha_mismatch",
+                      f"{self.model_path} is sha256 {self.model_sha[:16]}... but "
+                      f"{MODELS_JSON} expects {expected[:16]}.... Refusing to "
+                      f"serve: a wrong model produces boxes that look real.")
+            return False
+        self.sha_state = "verified" if expected else "unverified"
+
+        # 4. The runtime. Imported lazily and guarded: rknn-toolkit-lite2 is an
+        #    aarch64 Rockchip wheel that is NOT on PyPI, so on any dev machine
+        #    this import fails and must fail as a named, published fault rather
+        #    than as an ImportError at module scope that prevents the daemon
+        #    from ever starting and publishing anything.
+        try:
+            from rknnlite.api import RKNNLite
+        except Exception as e:  # noqa: BLE001
+            set_fault("runtime_import",
+                      f"rknnlite will not import ({e}). The rover will stream "
+                      f"video and detect NOTHING. Install the aarch64 "
+                      f"rknn-toolkit-lite2 wheel matched to librknnrt.so and to "
+                      f"the kernel rknpu driver.")
+            return False
+
+        try:
+            mask = self.resolve_core_mask(RKNNLite)
+        except ValueError as e:
+            set_fault("core_mask_unsupported", str(e))
+            return False
+
+        rknn = RKNNLite()
+        try:
+            if rknn.load_rknn(self.model_path) != 0:
+                set_fault("runtime_load",
+                          f"load_rknn returned non-zero for {self.model_path}")
+                return False
+        except Exception as e:  # noqa: BLE001
+            set_fault("runtime_load", f"load_rknn raised for {self.model_path}: {e}")
+            return False
+
+        self.core_mask_fallback = False
+        if not self._init_runtime(rknn, mask, RKNNLite):
+            return False
+
+        self.rknn = rknn
+
+        # 5. The shape probe. Run ONE inference on a zeros frame before any
+        #    client can be served.
+        #
+        #    Why at startup and not on the first real frame: a wrong output
+        #    shape is permanent, and discovering it at 03:00 on the first frame
+        #    that mattered means the rover was reporting healthy until then. A
+        #    zeros image produces no detections, which is irrelevant - we are
+        #    checking the TENSOR, not the content.
+        #
+        #    NOT a latency measurement. NPU_SPEC.md: "Measure sustained latency,
+        #    not a first-inference number." probe_ms is published as a curiosity
+        #    and must not be used as a budget.
+        ok, why = self._probe()
+        if not ok:
+            self.release()
+            set_fault("output_shape", why)
+            return False
+
+        self.loaded = True
+        clear_fault()
+        log(f"NPU ready: {self.model_path} sha256={self.model_sha[:16]}... "
+            f"({self.model_bytes} bytes, {self.sha_state}: {self.sha_note}) "
+            f"core_mask={self.core_mask_name}"
+            f"{' [FELL BACK]' if self.core_mask_fallback else ''} "
+            f"probe={self.probe_ms:.1f} ms")
+        return True
+
+    def _init_runtime(self, rknn, mask, rknnlite_cls):
+        """init_runtime with the requested mask, with two honest fallbacks."""
+        try:
+            rc = rknn.init_runtime(core_mask=mask)
+        except TypeError:
+            # An older rknn-toolkit-lite2 has no core_mask keyword at all. Fall
+            # back to the bare call and SAY SO - because the bare call is the
+            # core-0-only behaviour that this whole layer exists to fix, and it
+            # must not be able to hide behind a successful init.
+            log("init_runtime() on this wheel does not accept core_mask; "
+                "falling back to the default, which is CORE 0 ONLY")
+            self.core_mask_name = "wheel-has-no-core_mask"
+            self.core_mask_fallback = True
+            try:
+                rc = rknn.init_runtime()
+            except Exception as e:  # noqa: BLE001
+                set_fault("runtime_init", f"init_runtime raised: {e}")
+                return False
+        except Exception as e:  # noqa: BLE001
+            set_fault("runtime_init", f"init_runtime raised: {e}")
+            return False
+
+        if rc == 0:
+            return True
+
+        # A multi-core mask can be refused by a model that was not built for
+        # it. Falling back to core 0 keeps detection alive, which is the right
+        # trade - but it is REPORTED in telemetry as core_mask_fallback so the
+        # degraded state is never mistaken for the configured one.
+        single = getattr(rknnlite_cls, "NPU_CORE_0", None)
+        if single is not None and self.core_mask_name not in (
+                "0", "wheel-has-no-core_mask"):
+            log(f"init_runtime(core_mask={self.core_mask_name}) returned {rc}; "
+                f"retrying on core 0 only")
+            try:
+                rc = rknn.init_runtime(core_mask=single)
+            except Exception as e:  # noqa: BLE001
+                set_fault("runtime_init",
+                          f"init_runtime failed on {self.core_mask_name} (rc={rc}) "
+                          f"and raised on the core-0 retry: {e}")
+                return False
+            if rc == 0:
+                self.core_mask_name = "0"
+                self.core_mask_fallback = True
+                log("running on CORE 0 ONLY - two of three NPU cores are idle. "
+                    "This model may not have been built for multi-core; see "
+                    "npu/convert/ (agent 5) and fpms-npu-tune (agent 4).")
+                return True
+
+        set_fault("runtime_init",
+                  f"init_runtime returned {rc}. This is the version-coupling "
+                  f"failure: the kernel rknpu driver, /usr/lib/librknnrt.so and "
+                  f"the rknn-toolkit-lite2 wheel MUST match. Compare "
+                  f"{DRIVER_VERSION_PATH} against {NPU_VERSIONS_JSON}.")
+        return False
+
+    def _probe(self):
+        blank = np.zeros((1, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+        t0 = time.perf_counter()
+        try:
+            self.inflight_started = time.monotonic()
+            outputs = self.rknn.inference(inputs=[blank])
+        except Exception as e:  # noqa: BLE001
+            return False, f"the probe inference raised: {e}"
+        finally:
+            self.inflight_started = 0.0
+        self.probe_ms = (time.perf_counter() - t0) * 1000.0
+
+        ok, why = validate_outputs(outputs)
+        if not ok:
+            return False, why
+        try:
+            self.decode(outputs, INPUT_SIZE, INPUT_SIZE)
+        except Exception as e:  # noqa: BLE001
+            return False, (f"the decoder rejected the probe output: {e}. The "
+                           f"model must be exported with end2end=false - "
+                           f"end2end=true emits [1,300,6] and its top-k op "
+                           f"segfaults on RK3588.")
+        return True, ""
+
+    def release(self):
+        self.loaded = False
+        if self.rknn is not None:
+            try:
+                self.rknn.release()
+            except Exception as e:  # noqa: BLE001
+                log(f"rknn.release() raised (ignored): {e}")
+        self.rknn = None
+
+
+def validate_outputs(outputs):
+    """Refuse anything that is not decodably [1,84,8400].
+
+    NPU_SPEC.md pins the contract: input images [1,3,640,640], output output0
+    [1,84,8400], 8400 = 80*80+40*40+20*20 anchors, 84 = 4 box + 80 class. RKNN
+    is not consistent about whether the batch axis survives or whether the
+    result comes back channel-first or channel-last, so this checks the SET of
+    axes rather than a literal shape - the same reasoning as
+    fpms_yolo26_npu._as_anchor_major(), which is where the decode itself
+    handles the transpose.
+    """
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) != 1:
+            return False, (f"the model returned {len(outputs)} output tensors, "
+                           f"expected exactly 1 (output0). A head split into "
+                           f"separate branch tensors needs a different decoder; "
+                           f"re-export as a single output0.")
+        raw = outputs[0]
+    else:
+        raw = outputs
+    try:
+        a = np.squeeze(np.asarray(raw))
+    except Exception as e:  # noqa: BLE001
+        return False, f"the model output is not array-like: {e}"
+    if a.ndim != 2 or set(a.shape) != {84, 8400}:
+        return False, (f"output shape {np.asarray(raw).shape} is not [1,84,8400] "
+                       f"(squeezed to {a.shape}). Refusing to decode it: a "
+                       f"wrong-shaped tensor decodes into boxes that look real. "
+                       f"Check FPMS_YOLO_VARIANT and the conversion recipe.")
+    return True, ""
+
+
+RT = Runtime()
+
+
+# ------------------------------------------------------------ work queue ---
+
+
+class Job:
+    __slots__ = ("arr", "meta", "seq", "t_submit", "done", "reply")
+
+    def __init__(self, arr, meta):
+        self.arr = arr
+        self.meta = meta
+        self.seq = meta.get("seq")
+        self.t_submit = time.monotonic()
+        self.done = threading.Event()
+        self.reply = None            # (msgtype, payload dict)
+
+    def finish(self, msgtype, payload):
+        # Set the reply BEFORE the event, or a client waking on the event can
+        # read a None reply. Ordering, not locking, is what makes this safe.
+        self.reply = (msgtype, payload)
+        self.done.set()
+
+
+QUEUE = collections.deque()
+QUEUE_CV = threading.Condition()
+
+
+def submit(job):
+    """Enqueue, evicting the OLDEST job if full. See QUEUE in the docstring."""
+    evicted = []
+    with QUEUE_CV:
+        while len(QUEUE) >= QUEUE_DEPTH:
+            evicted.append(QUEUE.popleft())
+        QUEUE.append(job)
+        QUEUE_CV.notify()
+    for old in evicted:
+        # Answer it immediately. An evicted job left to time out would block a
+        # client for the full deadline for no reason, and the client here is a
+        # camera thread.
+        with METRICS.lock:
+            METRICS.drops += 1
+        old.finish(MSG_DROPPED, {
+            "seq": old.seq, "reason": "superseded",
+            "queue_ms": round((time.monotonic() - old.t_submit) * 1000.0, 1),
+            "detail": "a newer frame arrived while this one was still queued; "
+                      "drop-oldest, so the boxes you keep are never stale",
+        })
+
+
+# ------------------------------------------------------------- inference ---
+
+
+def run_job(job):
+    """Run one inference. Worker thread only."""
+    queue_ms = (time.monotonic() - job.t_submit) * 1000.0
+
+    t0 = time.perf_counter()
+    RT.inflight_started = time.monotonic()
+    RT.inflight_seq = job.seq if isinstance(job.seq, int) else 0
+    try:
+        outputs = RT.rknn.inference(inputs=[job.arr])
+    except Exception as e:  # noqa: BLE001
+        with METRICS.lock:
+            METRICS.errors += 1
+            METRICS.consec_fail += 1
+        set_fault("inference_error", f"rknn.inference raised: {e}")
+        job.finish(MSG_UNAVAILABLE, {"seq": job.seq, "fault": "inference_error",
+                                     "detail": str(e), "required": REQUIRED})
+        return
+    finally:
+        RT.inflight_started = 0.0
+    infer_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Shape is re-checked on EVERY inference, not just at load. It costs one
+    # np.squeeze on a shape tuple. A model swapped underneath a running daemon,
+    # or a driver that starts returning short tensors, must not reach the
+    # decoder - and the decoder's own error would arrive as a generic exception
+    # rather than as the named output_shape fault an operator can act on.
+    ok, why = validate_outputs(outputs)
+    if not ok:
+        with METRICS.lock:
+            METRICS.errors += 1
+            METRICS.consec_fail += 1
+        set_fault("output_shape", why)
+        job.finish(MSG_UNAVAILABLE, {"seq": job.seq, "fault": "output_shape",
+                                     "detail": why, "required": REQUIRED})
+        return
+
+    t1 = time.perf_counter()
+    try:
+        kw = {}
+        if isinstance(job.meta.get("conf"), (int, float)):
+            kw["conf_thres"] = float(job.meta["conf"])
+        if isinstance(job.meta.get("iou"), (int, float)):
+            kw["iou_thres"] = float(job.meta["iou"])
+        boxes, scores, classes = RT.decode(outputs, int(job.meta["h"]),
+                                           int(job.meta["w"]), **kw)
+    except Exception as e:  # noqa: BLE001
+        with METRICS.lock:
+            METRICS.errors += 1
+            METRICS.consec_fail += 1
+        set_fault("decode_error", f"decode raised: {e}")
+        job.finish(MSG_UNAVAILABLE, {"seq": job.seq, "fault": "decode_error",
+                                     "detail": str(e), "required": REQUIRED})
+        return
+    decode_ms = (time.perf_counter() - t1) * 1000.0
+
+    METRICS.record(infer_ms, ok=True)
+    with METRICS.lock:
+        METRICS.consec_fail = 0
+        if infer_ms > MAX_LATENCY_MS:
+            METRICS.slow += 1
+            METRICS.consec_slow += 1
+        else:
+            METRICS.consec_slow = 0
+        slow_streak = METRICS.consec_slow
+
+    if infer_ms > MAX_LATENCY_MS:
+        # A single over-budget call is not yet a fault - RK3588 throttles and a
+        # one-off excursion is expected. A STREAK is a fault, because that is
+        # what "the NPU is no longer keeping up" looks like from here.
+        if slow_streak >= REINIT_AFTER:
+            set_fault("inference_slow",
+                      f"{slow_streak} consecutive inferences over "
+                      f"{MAX_LATENCY_MS:.0f} ms (last {infer_ms:.0f} ms). "
+                      f"RK3588 throttles hard and silently under sustained "
+                      f"load; check the thermal policy (agent 4).")
+    elif current_fault() is not None:
+        clear_fault()
+
+    job.finish(MSG_RESULT, {
+        "seq": job.seq,
+        "n": int(len(boxes)),
+        "boxes": [[round(float(v), 1) for v in b] for b in boxes],
+        "scores": [round(float(s), 4) for s in scores],
+        "classes": [int(c) for c in classes],
+        "infer_ms": round(infer_ms, 2),
+        "decode_ms": round(decode_ms, 2),
+        "queue_ms": round(queue_ms, 2),
+        "model_sha256": RT.model_sha,
+        "core_mask": RT.core_mask_name,
+    })
+
+
+def worker_thread():
+    """The ONLY thread that touches RKNNLite."""
+    next_load_attempt = 0.0
+
+    while RUNNING.is_set():
+        if not RT.loaded and time.monotonic() >= next_load_attempt:
+            # Loading happens HERE, not in main(), so the socket is already
+            # listening while the model loads (seconds) and clients get an
+            # honest UNAVAILABLE instead of ECONNREFUSED. Degrading is a state
+            # we serve, not a state we disappear into.
+            if not RT.load():
+                # Keep retrying forever. A missing model may be copied across;
+                # a driver may come back after a udev settle. Retrying costs a
+                # sha256 of a few MB every RELOAD_BACKOFF_S and buys automatic
+                # recovery without an operator noticing the unit needs a kick.
+                next_load_attempt = time.monotonic() + RELOAD_BACKOFF_S
+
+        with QUEUE_CV:
+            while not QUEUE and RUNNING.is_set():
+                QUEUE_CV.wait(0.25)
+            if not RUNNING.is_set():
+                break
+            job = QUEUE.popleft()
+
+        if not RT.loaded:
+            f = current_fault() or {"fault": "unavailable",
+                                    "detail": "runtime not loaded"}
+            job.finish(MSG_UNAVAILABLE, {"seq": job.seq, "required": REQUIRED, **f})
+            continue
+
+        run_job(job)
+
+        with METRICS.lock:
+            need_reinit = METRICS.consec_fail >= REINIT_AFTER \
+                or METRICS.consec_slow >= REINIT_AFTER * 2
+        if need_reinit:
+            # The soft recovery: tear the context down and build a new one, in
+            # this same process. Legitimate for a call that RETURNED badly.
+            # NOT legitimate for a call that never returned - see the watchdog.
+            log("re-initialising the RKNN runtime after repeated failures")
+            with METRICS.lock:
+                METRICS.reinits += 1
+                METRICS.consec_fail = 0
+                METRICS.consec_slow = 0
+            if not RT.load():
+                next_load_attempt = time.monotonic() + RELOAD_BACKOFF_S
+
+    RT.release()
+
+
+# -------------------------------------------------------------- watchdog ---
+
+
+def watchdog_thread():
+    """Hard timeout + telemetry. 250 ms tick.
+
+    Two jobs on one thread on purpose: both are periodic, neither is expensive,
+    and a watchdog that shares a thread with the thing it watches would be
+    useless - it shares with NEITHER the worker nor the connection threads.
+    """
+    hard_s = HARD_TIMEOUT_MS / 1000.0
+    next_telemetry = 0.0
+
+    while RUNNING.is_set():
+        time.sleep(0.25)
+        now = time.monotonic()
+
+        started = RT.inflight_started
+        if started and (now - started) > hard_s:
+            age_ms = (now - started) * 1000.0
+            log(f"WEDGED: rknn.inference() has been in flight for "
+                f"{age_ms:.0f} ms (> {HARD_TIMEOUT_MS:.0f} ms). Exiting so "
+                f"systemd can give us a fresh runtime.")
+            BUS.publish("events/npu_fault", {
+                "component": "npu", "alert": REQUIRED, "fault": "runtime_wedged",
+                "error": f"rknn.inference() did not return within "
+                         f"{HARD_TIMEOUT_MS:.0f} ms (seq {RT.inflight_seq}). "
+                         f"The call is inside librknnrt.so and CANNOT be "
+                         f"cancelled from Python; restarting the process is the "
+                         f"only recovery. systemd will restart this unit.",
+                "detection_available": False, "required": REQUIRED,
+                "inflight_ms": round(age_ms, 1),
+            }, qos=1)
+            # Let paho's network thread drain the QoS-1 publish. 1.5 s is a
+            # guess bounded by TimeoutStopSec=10 in the unit; better to lose
+            # 1.5 s than to lose the one message that explains the restart.
+            time.sleep(1.5)
+            try:
+                BUS.client.loop_stop()
+            except Exception:  # noqa: BLE001
+                pass
+            # os._exit, NOT sys.exit: sys.exit raises SystemExit in THIS thread
+            # and the interpreter would then try to join the worker, which is
+            # stuck in a C call and will never join. os._exit skips all of that
+            # and hands the problem to systemd, which is the only component here
+            # that can actually solve it.
+            os._exit(3)
+
+        if now >= next_telemetry:
+            next_telemetry = now + TELEMETRY_S
+            publish_telemetry()
+
+
+def health_snapshot():
+    m = METRICS.snapshot()
+    f = current_fault()
+    return {
+        "component": "npu",
+        "uptime_s": round(time.time() - STARTED, 1),
+        "socket": SOCKET_PATH,
+        "protocol": PROTO_VERSION,
+
+        # Model
+        "model_loaded": bool(RT.loaded),
+        "model_path": RT.model_path,
+        "model_sha256": RT.model_sha,
+        "model_bytes": RT.model_bytes,
+        "model_sha_state": RT.sha_state,      # verified | unverified | mismatch
+        "model_sha_note": RT.sha_note,
+        "variant": YOLO_VARIANT,
+
+        # Cores. Requested vs in-force, always both, so a fallback is never
+        # mistaken for the configuration.
+        "core_mask_requested": CORE_MASK_NAME,
+        "core_mask": RT.core_mask_name,
+        "core_mask_fallback": RT.core_mask_fallback,
+
+        # Latency. probe_ms is the FIRST-inference number and is published
+        # separately from the percentiles precisely so it is not mistaken for
+        # steady-state performance.
+        "p50_ms": m["p50_ms"], "p90_ms": m["p90_ms"], "max_ms": m["max_ms"],
+        "probe_ms": round(RT.probe_ms, 2) if RT.probe_ms else None,
+        "budget_ms": MAX_LATENCY_MS,
+        "hard_timeout_ms": HARD_TIMEOUT_MS,
+
+        # Rates and counters
+        "infer_per_s": m["infer_per_s"],
+        "latency_samples": m["samples"],
+        "inferences": m["total"],
+        "drops": m["drops"],
+        "timeouts": m["timeouts"],
+        "slow": m["slow"],
+        "errors": m["errors"],
+        "consecutive_failures": m["consecutive_failures"],
+        "consecutive_slow": m["consecutive_slow"],
+        "reinits": m["reinits"],
+        "protocol_errors": m["protocol_errors"],
+        "queue_depth": QUEUE_DEPTH,
+        "queued": len(QUEUE),
+        "clients": CLIENTS["n"],
+
+        # Versions. driver_version is read from debugfs, which is root-only by
+        # default - a null here is expected under User=ubuntu and is NOT
+        # evidence that the driver is missing. NPU_SPEC.md notes that nobody
+        # ever recorded which version the old Pi ran; agent 1 writes the
+        # build-time record that this compares against.
+        "driver_version": read_text(DRIVER_VERSION_PATH),
+        "npu_versions_recorded": os.path.exists(NPU_VERSIONS_JSON),
+
+        # The one field a dashboard should key its "is detection real" light on.
+        "detection_available": bool(RT.loaded) and f is None,
+        "required": REQUIRED,
+        "fault": (f or {}).get("fault"),
+        "fault_detail": (f or {}).get("detail"),
+        "fault_since": (f or {}).get("since"),
+    }
+
+
+def publish_telemetry():
+    # QoS 0, on a timer, unconditionally - INCLUDING while faulted. A dashboard
+    # must be able to distinguish "the NPU is broken" from "fpms-npud is not
+    # running", and it can only do that if the broken case keeps talking.
+    BUS.publish("telemetry/npu", health_snapshot(), qos=0)
+
+
+# ----------------------------------------------------------- the socket ---
+
+CLIENTS = {"n": 0}
+CLIENTS_LOCK = threading.Lock()
+
+
+def recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(min(65536, n - len(buf)))
+        if not chunk:
+            raise ConnectionError("peer closed mid-frame")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_frame(sock, msgtype, payload):
+    body = json.dumps(payload).encode("utf-8")
+    sock.sendall(HEADER.pack(MAGIC, PROTO_VERSION, msgtype, 0, FMT_NONE,
+                             len(body)) + body)
+
+
+def graceful_close(sock):
+    """Half-close, then drain to EOF, so a queued reply is not lost to an RST.
+
+    MEASURED, on the first run of this daemon's protocol tests: closing a
+    socket while unread bytes are still sitting in its receive buffer makes the
+    kernel send RST instead of FIN, and an RST DISCARDS anything already
+    written into the send buffer. The client then sees ConnectionResetError
+    where we had just sent it a perfectly good PROTOCOL_ERROR naming the
+    version mismatch.
+
+    That would defeat the entire point of putting a version byte on the wire -
+    the refusal would arrive as an anonymous reset, indistinguishable from a
+    crashed daemon, and we would be back to guessing. So: shut down the write
+    side (the peer gets our bytes plus EOF), then read whatever is still in
+    flight and throw it away, then close.
+    """
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return
+    try:
+        sock.settimeout(2.0)
+        while sock.recv(65536):
+            pass
+    except OSError:
+        pass
+
+
+def refuse(sock, error, pending=0):
+    """Answer a malformed frame with a NAMED PROTOCOL_ERROR, then close cleanly.
+
+    `pending` is the payload the peer declared but we have not read. Draining
+    it first is what makes the reply survive the close - see graceful_close().
+    A bogus over-cap length is passed as 0, because draining a length we have
+    already decided not to trust would be doing the attacker's allocation for
+    them.
+    """
+    with METRICS.lock:
+        METRICS.proto_errors += 1
+    if 0 < pending <= MAX_PAYLOAD:
+        try:
+            recv_exact(sock, pending)
+        except (OSError, ConnectionError):
+            pass
+    try:
+        send_frame(sock, MSG_PROTOCOL_ERROR,
+                   {"error": error, "daemon_version": PROTO_VERSION})
+    except OSError:
+        pass
+    graceful_close(sock)
+
+
+def client_thread(sock, addr):
+    # A generous but finite socket timeout. Without it a client that connects
+    # and never speaks pins a thread forever, and MAX_CLIENTS then becomes a
+    # denial of service against ourselves rather than a protection.
+    sock.settimeout(30.0)
+
+    # Strictly greater than the worker's budget - see TIMEOUTS in the docstring.
+    deadline_s = (MAX_LATENCY_MS * 2.0) / 1000.0
+
+    try:
+        while RUNNING.is_set():
+            try:
+                head = recv_exact(sock, HEADER_LEN)
+            except (socket.timeout, ConnectionError, OSError):
+                return
+
+            magic, ver, msgtype, flags, fmt, length = HEADER.unpack(head)
+
+            if length > MAX_PAYLOAD:
+                # Checked FIRST and without draining: a bogus length prefix is
+                # the one error where reading what the peer claims to have sent
+                # is itself the attack.
+                refuse(sock, f"payload {length} exceeds the {MAX_PAYLOAD} byte "
+                             f"cap; refused before any allocation")
+                return
+            if magic != MAGIC:
+                refuse(sock, "bad magic; this is not an fpms-npud frame stream",
+                       length)
+                return
+            if ver != PROTO_VERSION:
+                # THE reason there is a version byte. A mismatch is NAMED and
+                # the connection is dropped, rather than a struct that happens
+                # to unpack and a box array that happens to parse.
+                refuse(sock, f"protocol version {ver} != {PROTO_VERSION}; "
+                             f"client and daemon are from different builds",
+                       length)
+                return
+            if flags != 0:
+                refuse(sock, f"flags={flags} is reserved and must be 0; this "
+                             f"daemon does not understand it and will not "
+                             f"silently ignore it", length)
+                return
+
+            payload = recv_exact(sock, length) if length else b""
+
+            if msgtype == MSG_HEALTH:
+                send_frame(sock, MSG_HEALTH_OK, health_snapshot())
+                continue
+
+            if msgtype != MSG_INFER:
+                refuse(sock, f"unknown msgtype 0x{msgtype:02x}")
+                return
+
+            ok, parsed = parse_infer(fmt, payload)
+            if not ok:
+                refuse(sock, parsed)
+                return
+            arr, meta = parsed
+
+            # Answer before queueing when we already know we cannot serve. No
+            # point occupying the single queue slot with a job whose only
+            # possible outcome is a refusal.
+            if not RT.loaded:
+                f = current_fault() or {"fault": "unavailable",
+                                        "detail": "runtime not loaded"}
+                send_frame(sock, MSG_UNAVAILABLE,
+                           {"seq": meta.get("seq"), "required": REQUIRED, **f})
+                continue
+
+            job = Job(arr, meta)
+            submit(job)
+
+            if not job.done.wait(deadline_s):
+                # The enforceable timeout. We give up on the reply; the worker
+                # may still be inside librknnrt and we cannot stop it. What we
+                # CAN guarantee is that the client - a camera thread - gets its
+                # thread back on schedule, every time.
+                with METRICS.lock:
+                    METRICS.timeouts += 1
+                send_frame(sock, MSG_UNAVAILABLE, {
+                    "seq": meta.get("seq"), "fault": "timeout",
+                    "detail": f"no result within {deadline_s * 1000:.0f} ms "
+                              f"(2x the {MAX_LATENCY_MS:.0f} ms budget). The "
+                              f"inference may still be running; it cannot be "
+                              f"cancelled from Python.",
+                    "since": time.time(), "required": REQUIRED})
+                continue
+
+            msgtype_out, body = job.reply
+            send_frame(sock, msgtype_out, body)
+
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except OSError as e:
+        log(f"client {addr or 'unix'} error: {e}")
+    except Exception as e:  # noqa: BLE001
+        log(f"client handler crashed: {e}")
+    finally:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+        with CLIENTS_LOCK:
+            CLIENTS["n"] -= 1
+
+
+def parse_infer(fmt, payload):
+    """(True, (arr, meta)) or (False, "why")."""
+    if fmt != FMT_RGB888_640:
+        return False, (f"fmt 0x{fmt:02x} is not supported; this daemon accepts "
+                       f"only 0x01 RGB888_640 (640x640x3 uint8 RGB, HWC, "
+                       f"C-contiguous)")
+    if len(payload) < 4:
+        return False, "payload too short for the meta length prefix"
+    (meta_len,) = struct.unpack_from("!I", payload, 0)
+    if 4 + meta_len > len(payload):
+        return False, f"meta_len {meta_len} runs past the end of the payload"
+    try:
+        meta = json.loads(payload[4:4 + meta_len].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        return False, f"meta is not UTF-8 JSON: {e}"
+    if not isinstance(meta, dict):
+        return False, "meta must be a JSON object"
+
+    img = payload[4 + meta_len:]
+    if len(img) != IMAGE_BYTES:
+        return False, (f"image is {len(img)} bytes, expected exactly "
+                       f"{IMAGE_BYTES} for 640x640x3 uint8")
+    try:
+        h, w = int(meta["h"]), int(meta["w"])
+    except (KeyError, TypeError, ValueError):
+        return False, ("meta must carry integer \"h\" and \"w\" - the ORIGINAL "
+                       "frame height and width. Boxes are rescaled into that "
+                       "space with an independent per-axis ratio, because the "
+                       "preprocess is a stretch resize and not a letterbox.")
+    if not (0 < h <= 8192 and 0 < w <= 8192):
+        return False, f"implausible original frame size {w}x{h}"
+
+    # .copy() rather than a read-only frombuffer view, on purpose. It costs a
+    # ~1.2 MB memcpy (sub-millisecond, against a ~31 ms inference) and buys a
+    # writable, aligned, C-contiguous buffer that WE own for the whole duration
+    # of a C call we cannot interrupt. The alternative hands librknnrt a view
+    # onto a bytes object whose lifetime is tied to a socket read - which is
+    # fine right up until a refactor makes it not fine, and that failure would
+    # be a segfault, not an exception.
+    arr = np.frombuffer(img, dtype=np.uint8).reshape(
+        1, INPUT_SIZE, INPUT_SIZE, 3).copy()
+    return True, (arr, meta)
+
+
+def bind_socket():
+    path = SOCKET_PATH
+    try:
+        os.makedirs(os.path.dirname(path) or "/", exist_ok=True)
+    except OSError as e:
+        log(f"could not create {os.path.dirname(path)}: {e}")
+
+    # A crash leaves the inode behind and bind() then fails with EADDRINUSE
+    # forever. Unlink first - but ONLY if nothing is listening on it, so a
+    # second copy of the daemon cannot silently steal the socket from the
+    # first and leave two processes fighting over one NPU.
+    if os.path.exists(path):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        live = False
+        try:
+            probe.connect(path)
+            live = True
+        except OSError:
+            # ECONNREFUSED / ENOTSOCK / ENOENT all mean the same thing here:
+            # whatever is at that path, nobody is accepting on it.
+            pass
+        finally:
+            try:
+                probe.close()
+            except OSError:
+                pass
+        if live:
+            raise SystemExit(
+                f"{path} already has a listener - another fpms-npud is "
+                f"running. Refusing to start a second owner of the NPU: two "
+                f"processes racing for the same NPU cores is a failure nobody "
+                f"can debug from a rover.")
+        os.unlink(path)
+        log(f"removed a stale socket at {path}")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    # 0660: owner (ubuntu) and group only. The agent runs as ubuntu:ubuntu, so
+    # this is exactly the access it needs and nothing else on the box gets to
+    # queue work onto the NPU. A world-writable IPC socket on a rover is a
+    # /cmd_vel-shaped mistake in a different costume.
+    os.chmod(path, 0o660)
+    srv.listen(16)
+    srv.settimeout(0.5)          # so the accept loop can observe RUNNING
+    return srv
+
+
+def accept_loop(srv):
+    while RUNNING.is_set():
+        try:
+            conn, addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            if RUNNING.is_set():
+                log("accept failed; the listening socket is gone")
+            return
+
+        with CLIENTS_LOCK:
+            if CLIENTS["n"] >= MAX_CLIENTS:
+                # Refuse politely and name the reason. A silent close here
+                # would look to the agent exactly like a dead daemon.
+                try:
+                    send_frame(conn, MSG_UNAVAILABLE, {
+                        "fault": "too_many_clients",
+                        "detail": f"{CLIENTS['n']} connections already open "
+                                  f"(FPMS_NPU_MAX_CLIENTS={MAX_CLIENTS}); this "
+                                  f"usually means a client is leaking sockets",
+                        "since": time.time(), "required": REQUIRED})
+                except Exception:  # noqa: BLE001
+                    pass
+                # Half-close and drain: the client may already have pushed a
+                # 1.2 MB frame at us, and closing on top of it would replace
+                # this explanation with a bare RST.
+                graceful_close(conn)
+                conn.close()
+                continue
+            CLIENTS["n"] += 1
+
+        threading.Thread(target=client_thread, args=(conn, addr),
+                         daemon=True).start()
+
+
+# -------------------------------------------------------------- lifecycle ---
+
+
+def on_signal(signum, _frame):
+    log(f"signal {signum}; shutting down")
+    RUNNING.clear()
+    with QUEUE_CV:
+        QUEUE_CV.notify_all()
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return 0
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    if not os.path.exists("/etc/fpms/config.env"):
+        # Not fatal, but it is the single most common cause of "every service
+        # is active and the dashboard is empty" in this project: every
+        # load_config() swallows the absence and falls back to a broker nobody
+        # is running. Say it out loud.
+        log("WARNING: /etc/fpms/config.env is absent; running on built-in "
+            "defaults. Broker credentials will almost certainly be wrong and "
+            "nothing will crash to tell you. Run: sudo fpms-firstboot --force")
+
+    log(f"fpms-npud protocol v{PROTO_VERSION} starting: socket={SOCKET_PATH} "
+        f"variant={YOLO_VARIANT} dir={YOLO_DIR} core_mask={CORE_MASK_NAME} "
+        f"budget={MAX_LATENCY_MS:.0f}ms hard={HARD_TIMEOUT_MS:.0f}ms "
+        f"queue={QUEUE_DEPTH} required={REQUIRED}")
+
+    BUS.start()
+
+    try:
+        srv = bind_socket()
+    except SystemExit:
+        raise
+    except OSError as e:
+        # Cannot serve at all. Publish it before dying, so the failure is on a
+        # topic and not only in a journal, then let systemd restart us.
+        set_fault("socket_bind", f"cannot bind {SOCKET_PATH}: {e}")
+        time.sleep(1.0)
+        return 4
+    log(f"listening on {SOCKET_PATH} (mode 0660)")
+
+    threading.Thread(target=worker_thread, name="npu-worker", daemon=True).start()
+    threading.Thread(target=watchdog_thread, name="npu-watchdog", daemon=True).start()
+
+    try:
+        accept_loop(srv)
+    finally:
+        RUNNING.clear()
+        with QUEUE_CV:
+            QUEUE_CV.notify_all()
+        try:
+            srv.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
+        BUS.publish("events/npu_offline", {
+            "component": "npu", "alert": False, "reason": "clean shutdown",
+            "detection_available": False}, qos=1)
+        # Give paho a moment to drain the QoS-1 goodbye, then stop cleanly so
+        # the last will does NOT also fire - a clean stop must not look like a
+        # crash on the dashboard.
+        time.sleep(0.5)
+        try:
+            BUS.client.loop_stop()
+            BUS.client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        # The worker may be inside a C call we cannot interrupt. It is a daemon
+        # thread, so the interpreter will not wait for it; TimeoutStopSec=10 in
+        # the unit is the real bound, and SIGKILL after that is acceptable
+        # because this process holds no state anyone needs preserved.
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

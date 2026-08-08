@@ -1,0 +1,219 @@
+# /etc/udev/rules.d/99-fpms-npu.rules
+#
+# Device access to the RK3588S NPU for the unprivileged `ubuntu` user.
+#
+# THE PROBLEM THIS SOLVES
+# =======================
+# SPEC.md names this file. It was never written. Nothing in the image grants
+# `ubuntu` access to the NPU device node - and EVERY FPMS service runs as
+# `ubuntu`, including fpms-rover-agent and fpms-npud, both of which reach the
+# NPU through /usr/lib/librknnrt.so.
+#
+# An EACCES on the device node is invisible at every level an operator checks:
+#
+#   - RKNNLite.init_runtime() RETURNS an int. It does not raise. bench_npu.py
+#     does `r.load_rknn(y.MODEL); r.init_runtime()` and checks neither return
+#     value, which is exactly how a permission failure becomes a silent one.
+#   - fpms_rover_agent.py wraps the whole NPU block - import, load_rknn,
+#     init_runtime, labels - in ONE try/except that logs
+#         "NPU unavailable (...); streaming without detection"
+#     once, and then carries on forever.
+#
+# So the symptom of "the rules file was never written" is: every unit active,
+# camera streaming, dashboard alive, LiDAR fine, and ZERO detections, for as
+# long as the rover runs. NPU_SPEC.md §0 calls this the single worst failure
+# mode in the project. This file is one of the two things that prevent it (the
+# other is agent 7's selftest, which reports it).
+#
+#
+# WHICH GROUP, AND WHY `video` AND NOT A DEDICATED `npu` GROUP
+# ============================================================
+# Decision: GROUP="video". A dedicated `npu` group was considered and rejected.
+#
+#   1. `video` already exists on Ubuntu 22.04 and the ubuntu-rockchip base
+#      already puts `ubuntu` in it (it is how the camera works today).
+#      VERIFY ON HARDWARE:  id ubuntu | tr ',' '\n' | grep -E 'video|render'
+#   2. 99-fpms-serial.rules already binds the camera with GROUP="video". One
+#      convention for "hardware the rover's one unprivileged user may open" is
+#      easier to audit than two.
+#   3. A dedicated group is a SILENT-FAILURE MACHINE. It needs two things that
+#      live in two different agents' files: the group must be created by a
+#      build stage, and `ubuntu` must be added to it. Miss either half and
+#      udev cannot resolve the name, logs "unknown group" into a journal
+#      nobody reads, and leaves the node root:root 0600 - which is byte for
+#      byte the situation this file exists to fix, with a file present that
+#      looks like it fixed it.
+#   4. Group membership is read at process start. A group created on FIRST
+#      BOOT, after the services are already running, does not reach them until
+#      a restart. `video` is in the passwd database before anything starts.
+#
+# The cost is honest: `video` is broader than the NPU. On a single-purpose
+# rover with one unprivileged user that must already reach the camera, that is
+# an acceptable price for a rule that cannot half-apply.
+#
+#
+# ############################################################################
+# # !! VERIFY ON HARDWARE - THE NODE NAME IS NOT CONFIRMED !!                #
+# #                                                                          #
+# # The board has not arrived. NOTHING below has run on an RK3588S.          #
+# #                                                                          #
+# # Rockchip's BSP rknpu driver exposes the NPU in more than one way          #
+# # depending on kernel config: as a misc character device (/dev/rknpu), or   #
+# # as a DRM device (/dev/dri/card* + /dev/dri/renderD*) when the driver is   #
+# # built with its DRM GEM allocator. Both configurations exist in the wild   #
+# # and this image does not build the kernel, so which one ships is a         #
+# # property of the base image, not of FPMS-OS. The rules below cover both    #
+# # and are written so that the ones that do not match are inert.            #
+# #                                                                          #
+# # Confirm, in this order, on the running board:                             #
+# #                                                                          #
+# #     ls -l /dev/rknpu* /dev/dri/ /dev/dma_heap/ 2>&1                       #
+# #     sudo dmesg | grep -i rknpu                                            #
+# #     udevadm info -a -n /dev/dri/renderD129 | grep -m6 -E 'KERNEL|SUBSYSTEM|DRIVERS'
+# #     udevadm info -a -n /dev/rknpu | grep -m6 -E 'KERNEL|SUBSYSTEM|DRIVERS'
+# #                                                                          #
+# # Then confirm WHICH node librknnrt actually opens - do not infer it:      #
+# #                                                                          #
+# #     sudo apt install -y strace                                            #
+# #     strace -f -e trace=openat python3 -c \                                #
+# #       "from rknnlite.api import RKNNLite; r=RKNNLite(); \                 #
+# #        r.load_rknn('/home/ubuntu/yolo/yolo26n-rk3588.rknn'); \            #
+# #        print('init_runtime ->', r.init_runtime())" 2>&1 | grep -E 'dri|rknpu|dma_heap'
+# #                                                                          #
+# # `init_runtime -> 0` is success. ANY other number is a failure that the    #
+# # agent would have swallowed.                                              #
+# #                                                                          #
+# # After editing this file:  sudo udevadm control --reload                   #
+# #                           sudo udevadm trigger                            #
+# #                                                                          #
+# # fpms-selftest reports a FAIL if `ubuntu` cannot init the runtime, so a    #
+# # wrong guess here cannot pass silently - but it is a five minute job to    #
+# # get right up front.                                                      #
+# ############################################################################
+#
+#
+# NOTE ON SCOPE: the /dev/fpms-npu symlink below is DIAGNOSTIC CONVENIENCE for
+# the selftest and for an operator at a prompt. librknnrt.so opens the real
+# node by its own hardcoded path and never consults a symlink, so renaming or
+# removing the symlink changes nothing about whether inference works. The
+# GROUP=/MODE= are the load-bearing part.
+
+# --- Case A: rknpu as a misc / plain character device -----------------------
+#
+# The classic layout, and the one NPU_SPEC.md's shared contract names
+# (/dev/rknpu). Default for a misc device is root:root 0600, so without this
+# rule `ubuntu` gets EACCES.
+#
+# KERNEL=="rknpu*" rather than =="rknpu" because some BSP revisions register a
+# second node alongside it for the memory allocator. Matching the family costs
+# nothing; a node that does not exist matches nothing.
+#
+# No SUBSYSTEM== filter: whether this lands under `misc` or a bare `rknpu`
+# class differs between BSP revisions, and pinning it to the wrong subsystem
+# is the failure mode where the file exists and does nothing.
+KERNEL=="rknpu*", GROUP="video", MODE="0660", SYMLINK+="fpms-npu"
+
+# --- Case B: rknpu as a DRM RENDER node -------------------------------------
+#
+# When the driver is built with its DRM GEM allocator the NPU appears as a DRM
+# device and userspace uses the RENDER node (renderD*), not the primary node.
+#
+# DRIVERS=="rknpu" is what keeps this off the Mali GPU, which is also a DRM
+# device on this SoC and will also have a renderD* node. Getting that filter
+# wrong would re-permission the GPU instead of the NPU.
+# VERIFY: udevadm info -a -n /dev/dri/renderD129 | grep -m3 DRIVERS
+#
+# MODE="0666" GROUP="render" deliberately RESTATES systemd's own default for
+# renderD* (50-udev-default.rules) instead of tightening it to 0660 video.
+# Two reasons, both about not making things worse:
+#   - 0666 already grants `ubuntu` everything it needs, so tightening buys
+#     nothing on a single-user rover;
+#   - if DRIVERS=="rknpu" turns out to match the GPU on this BSP, a tightened
+#     rule would take Mali away from anything else that wants it, and that
+#     failure would look nothing like an NPU problem.
+# The value of this rule in the DRM case is therefore the SYMLINK and the fact
+# that the file documents the case - not a permission change.
+SUBSYSTEM=="drm", KERNEL=="renderD*", DRIVERS=="rknpu", \
+  GROUP="render", MODE="0666", SYMLINK+="fpms-npu"
+
+# --- Case C: rknpu DRM PRIMARY node -----------------------------------------
+#
+# Belt and braces. librknnrt is expected to use the render node (case B) - the
+# render node exists precisely so unprivileged clients need no DRM auth - but
+# that expectation is UNVERIFIED (see the strace command in the box above). If
+# it turns out to want the primary node, this is the rule that saves the day.
+# root:video 0660 is what a card* node should already be on a seatless
+# headless box; stating it removes the dependency on that being true.
+SUBSYSTEM=="drm", KERNEL=="card*", DRIVERS=="rknpu", \
+  GROUP="video", MODE="0660"
+
+# --- Case D: DMA-BUF heaps ---------------------------------------------------
+#
+# VERIFY ON HARDWARE - include or delete this rule based on the strace above.
+#
+# RKNPU2 2.x runtimes allocate their input/output buffers through DMA-BUF heaps
+# (/dev/dma_heap/system, .../system-uncached) when they are available; the heap
+# nodes default to root:root 0600, so an unprivileged process gets EACCES and
+# the runtime silently falls back to a slower allocator - or fails, depending
+# on version. Neither outcome announces itself.
+#
+# This is the one rule here that genuinely widens attack surface: `video`
+# members can allocate kernel DMA memory. On a rover with one unprivileged
+# user that already owns the camera and the NPU, that is not a meaningful
+# escalation, but if the strace shows librknnrt never touches /dev/dma_heap,
+# DELETE this rule rather than keep it "just in case".
+SUBSYSTEM=="dma_heap", KERNEL=="system*", GROUP="video", MODE="0660"
+
+
+# ############################################################################
+# # DEBUGFS: /sys/kernel/debug/rknpu/ - UDEV CANNOT FIX THIS                 #
+# ############################################################################
+#
+# Three consumers in this layer want to read debugfs as `ubuntu`:
+#
+#     /sys/kernel/debug/rknpu/version   driver version   (selftest, agent 7)
+#     /sys/kernel/debug/rknpu/load      per-core load    (agents 4 and 7)
+#
+# They cannot, and no rule in this file can change that. debugfs entries are
+# not devices, so udev never sees them - and systemd mounts /sys/kernel/debug
+# itself as 0700 root:root, so even a world-readable file underneath is
+# unreachable because `ubuntu` cannot traverse the mount point.
+#
+# The fix belongs to whoever owns the mount and the sudoers rules. In
+# preference order:
+#
+#   1. MOUNT OPTIONS (preferred - narrow, declarative, no per-file chmod).
+#      debugfs honours uid=/gid=/mode=. Mount it 0750 owned by the `video`
+#      group, so members can traverse and nobody else can even list it:
+#          debugfs /sys/kernel/debug debugfs defaults,mode=0750,gid=video 0 0
+#      VERIFY ON HARDWARE:
+#          sudo mount -o remount,mode=0750,gid=video /sys/kernel/debug
+#          sudo -u ubuntu cat /sys/kernel/debug/rknpu/version
+#
+#   2. A NARROW SUDOERS RULE (agent E owns /etc/sudoers.d/). Note the warning
+#      already in 50-overlay.sh: sudo matches the LITERAL argv, so the rule and
+#      the call site must agree exactly or the escalation becomes a silent
+#      password prompt.
+#          ubuntu ALL=(root) NOPASSWD: /bin/cat /sys/kernel/debug/rknpu/version, \
+#                                      /bin/cat /sys/kernel/debug/rknpu/load
+#
+#   3. NO PRIVILEGE AT ALL - and this is the one to reach for first. The
+#      DRIVER version is also reported by the userspace runtime, without
+#      debugfs and without root:
+#          python3 -c "from rknnlite.api import RKNNLite; r=RKNNLite(); \
+#            r.load_rknn('/home/ubuntu/yolo/yolo26n-rk3588.rknn'); \
+#            r.init_runtime(); print(r.get_sdk_version())"
+#      It prints an API line (the librknnrt version) and a DRV line (the
+#      kernel driver version), which is exactly the pair
+#      /etc/fpms/npu-versions.json needs checked.
+#      VERIFY ON HARDWARE: confirm get_sdk_version() reports DRV on this
+#      runtime version - it needs a loaded model and a successful
+#      init_runtime(), so it cannot substitute for debugfs when the NPU is the
+#      thing that is broken. Per-core `load` has no userspace equivalent.
+#
+# REJECTED: doing it from here with RUN+="/bin/chmod ...". It would have to
+# loosen /sys/kernel/debug itself, exposing every other debugfs interface on
+# the box to get at two files; it races the creation of the debugfs entries at
+# module init; and udev RUN+= is the wrong place for filesystem policy. A
+# comment that says "we chose not to" is worth more than a rule that half
+# works.

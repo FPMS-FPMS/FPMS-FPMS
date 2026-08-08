@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""fpms-model-verify - is this .rknn the model we think it is?
+
+Usage:
+    fpms-model-verify                 verify every enabled model in the registry
+    fpms-model-verify yolo26n         verify one model by logical name
+    fpms-model-verify --offline       hash and registry checks only; never opens
+                                      the NPU. Safe anywhere, including x86.
+    fpms-model-verify --json          machine-readable
+    fpms-model-verify --quiet         exit code only
+    fpms-model-verify --list          print the registry and exit
+    fpms-model-verify --register      write the OBSERVED sha256 back into the
+                                      registry (see WHAT --register MEANS below)
+    fpms-model-verify --force         allow --register to overwrite a hash that
+                                      already exists and disagrees; also allows
+                                      the inference probe to run on a model the
+                                      end2end pre-filter flagged. Both are
+                                      deliberate, both are loud.
+
+Exit: 0 everything verified, 1 one or more WARN (present but unproven),
+      2 one or more FAIL.
+
+Registry: /etc/fpms/models.json   (override with FPMS_MODELS_JSON)
+
+
+WHY THIS EXISTS
+===============
+`fpms_rover_agent.py` wraps import, load_rknn, init_runtime and labels in ONE
+try/except, logs
+
+    NPU unavailable (...); streaming without detection
+
+once, and carries on forever. systemd says active. The camera streams. The
+dashboard looks alive. The rover detects nothing.
+
+A wrong MODEL is worse than that, because it does not even produce the log
+line. A .rknn with the wrong output shape loads fine, infers fine, and hands
+the decoder a tensor it will happily reinterpret into boxes. Nothing raises.
+The operator sees rectangles on the video and believes the detector works.
+
+So: nothing on this rover may trust a model it has not checked. This tool is
+the check, and it is deliberately pedantic about the difference between
+
+    "the file is there"          - which proves nothing
+    "the file is the right file" - a hash we have on record
+    "the model is the right shape" - the only claim that means detection works
+
+
+THE CHECK THAT MATTERS MOST IS THE OUTPUT SHAPE
+===============================================
+Expected: output0 [1, 84, 8400].  84 = 4 box + 80 class, 8400 anchors.
+
+The specific catastrophe we are pre-empting is an `end2end=True` export.
+Ultralytics' RKNN documentation reports that it emits [1, 300, 6] and that its
+top-k op SEGFAULTS ON THE NPU. Segfault is not an exception - the agent's
+try/except cannot catch SIGSEGV, so the process just dies and restart-loops.
+
+Catching it by shape, before anything trusts it, is the whole point.
+
+Which leaves a bootstrapping problem: rknn-toolkit-lite2's documented API is
+load_rknn / init_runtime / inference / release / get_sdk_version. THERE IS NO
+SHAPE QUERY. The only way to observe an output shape on the Pi is to run one
+inference - which is the operation that segfaults. Two mitigations:
+
+  1. A cheap, device-free PRE-FILTER: scan the .rknn container bytes for op
+     names that only an end2end graph carries (TopK / NonMaxSuppression). If
+     they appear we refuse to run the probe unless --force.
+     THIS IS A HEURISTIC AND IS UNCONFIRMED ON HARDWARE - see check_end2end().
+  2. The probe runs in a CHILD PROCESS. A SIGSEGV then arrives as
+     returncode -11 instead of killing the verifier, which converts the worst
+     failure mode in the layer into a diagnosable line of output.
+
+
+WHAT --register MEANS
+=====================
+It records the observed sha256 into the registry. That is the act of BLESSING a
+file, so it is fenced:
+
+  - it refuses if the shape checks did not pass, unless the run was --offline;
+  - an --offline registration writes the hash and leaves verified:false with
+    sha256_status RECORDED_UNVERIFIED. We then know WHICH file it is; we still
+    do not know that it works;
+  - a full registration sets verified:true plus who/when/where/how;
+  - it refuses to overwrite a DIFFERENT existing hash without --force. A model
+    silently changing under a registry that auto-updates is a registry that
+    verifies nothing.
+
+The registry keeps its documentation in keys beginning with "_", specifically
+so that a json.load / json.dump round-trip here preserves it. Do not move that
+prose into JSON comments; there are none, and the rewrite would eat it.
+
+
+RUNNING THIS WHILE fpms-npud HOLDS THE NPU
+==========================================
+Unresolved on hardware, so this tool does the honest thing rather than the
+convenient one:
+
+  - It NEVER stops fpms-npud. Taking detection offline to check that detection
+    works is not a trade a verification tool gets to make on a live rover.
+  - It asks for the smallest slice of the device it can: core 0 only, by
+    passing no core_mask (which is core 0 - documented in NPU_SPEC as a BUG for
+    the daemon, but exactly right for a probe, since it leaves cores 1 and 2
+    for the running detector).
+  - Whether the RKNPU driver admits a second context at all is MEASURE ME. If
+    init_runtime() fails while fpms-npud is active, we do not guess which
+    caused it: we report SKIP, name the daemon as the likely holder, and print
+    the exact command to re-run cleanly. A SKIP is not a pass and does not
+    exit 0.
+
+Confirm the contention behaviour on hardware with:
+    systemctl is-active fpms-npud && fpms-model-verify yolo26n
+    sudo systemctl stop fpms-npud && fpms-model-verify yolo26n; \
+        sudo systemctl start fpms-npud
+
+
+WHAT IT WILL NEVER DO
+=====================
+  - move the rover, or touch any drive or LiDAR tty
+  - stop, restart or reconfigure fpms-npud
+  - invent a hash, a version, or a shape to fill a blank
+  - write anything to the registry without --register
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+
+REGISTRY = os.environ.get("FPMS_MODELS_JSON", "/etc/fpms/models.json")
+CONFIG = "/etc/fpms/config.env"
+NPUD_UNIT = "fpms-npud.service"
+NPUD_SOCKET = os.environ.get("FPMS_NPU_SOCKET", "/run/fpms/npud.sock")
+
+# Read once per run, not per call: the probe child pays the RKNN init cost and
+# there is no reason to pay it twice.
+PROBE_TIMEOUT_S = 90
+
+results = []
+
+
+def add(model, name, status, detail, remedy=""):
+    results.append({"model": model, "check": name, "status": status,
+                    "detail": detail, "remedy": remedy})
+
+
+def sh(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as exc:  # noqa: BLE001
+        return 255, "", str(exc)
+
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+def load_registry():
+    with open(REGISTRY) as fh:
+        return json.load(fh)
+
+
+def resolve_path(entry, reg, cfg):
+    """Absolute path of the model file, or None if the registry declares none.
+
+    A relative "file" resolves against FPMS_YOLO_DIR if set, else the
+    registry's defaults.model_dir. An absolute one wins outright - the model
+    path is hardcoded in fpms_yolo26_npu.MODEL too, and a registry that
+    silently relocated it would describe a different file than the agent loads.
+    """
+    path = entry.get("file")
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    base = cfg.get("FPMS_YOLO_DIR") or \
+        reg.get("defaults", {}).get("model_dir", "/home/ubuntu/yolo")
+    return os.path.join(base, path)
+
+
+def sha256_of(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 1. The file, and whether it is the file we have on record
+# ---------------------------------------------------------------------------
+def check_file(mname, entry, path):
+    """Returns (observed_sha256 or None, ok_to_probe)."""
+    if path is None:
+        add(mname, "model file declared", FAIL,
+            entry.get("file_status", "registry has no \"file\" for this model"),
+            "The registry cannot point at a file it does not know the name of. "
+            "This is a declared unknown, not a bug to paper over - see the "
+            "entry's file_status.")
+        return None, False
+
+    if not os.path.exists(path):
+        add(mname, "model file present", FAIL, "%s missing" % path,
+            "THE MODEL IS NOT IN GIT. It exists only on the old Pi. Nothing in "
+            "this repository can rebuild it from prose, and a rover without it "
+            "streams video and detects nothing while every unit reports "
+            "active. See /opt/fpms-os/npu/models/README.md - copy it off that "
+            "SD card, or rebuild from ONNX via npu/convert/.")
+        return None, False
+
+    size = os.path.getsize(path)
+    add(mname, "model file present", PASS, "%s (%d bytes)" % (path, size))
+
+    observed = sha256_of(path)
+    recorded = entry.get("sha256")
+    exp_size = entry.get("size_bytes")
+
+    if recorded is not None and not isinstance(recorded, str):
+        # A non-string hash is a hand-edit accident. Treat it as a fault, never
+        # as "no hash" -- degrading a corrupt entry into the unverified path
+        # would turn a FAIL into a WARN, which is the wrong direction.
+        add(mname, "sha256 on record", FAIL,
+            "registry sha256 is %r, not a hex string" % (recorded,),
+            "Fix the entry in %s. Observed hash: %s" % (REGISTRY, observed))
+        return observed, False
+
+    if recorded is None:
+        add(mname, "sha256 on record", WARN,
+            "registry has no hash; observed %s" % observed,
+            "UNVERIFIED, not blessed. We can tell you which file this is, not "
+            "that it is the right one - nobody ever hashed the original. If "
+            "this rover's model is known good, record it: "
+            "fpms-model-verify %s --register" % mname)
+    elif recorded.lower() == observed.lower():
+        add(mname, "sha256 matches registry", PASS, observed)
+        if exp_size is not None and exp_size != size:
+            # A matching hash with a mismatched size means the registry's own
+            # fields disagree, which means somebody edited one by hand.
+            add(mname, "registry self-consistent", WARN,
+                "sha256 matches but size_bytes says %s, file is %d"
+                % (exp_size, size),
+                "Fix size_bytes in %s - a registry that contradicts itself "
+                "gets ignored." % REGISTRY)
+    else:
+        add(mname, "sha256 matches registry", FAIL,
+            "registry %s != file %s" % (recorded, observed),
+            "THIS IS NOT THE MODEL THE REGISTRY DESCRIBES. Either the file was "
+            "replaced (by a reconversion, a partial scp, or a corrupt card) or "
+            "the registry entry is stale. Do not proceed on the assumption "
+            "that the shapes below still apply. If the new file is the "
+            "intended one, re-register deliberately: "
+            "fpms-model-verify %s --register --force" % mname)
+        return observed, False
+
+    return observed, True
+
+
+# ---------------------------------------------------------------------------
+# 2. The end2end pre-filter - device-free, and the reason we dare probe at all
+# ---------------------------------------------------------------------------
+def check_end2end_prefilter(mname, path):
+    """Look for op names that only an end2end export carries.
+
+    An `end2end=True` export emits [1,300,6] and its top-k op SEGFAULTS ON THE
+    NPU. We would like to know that before we ask the NPU to run it.
+
+    The .rknn container embeds op and tensor name strings, so `strings` on a
+    known-good yolo26n file shows Conv/Softmax/Concat and NOT TopK. That makes
+    a byte scan a cheap advisory - it needs no device, no runtime, and no
+    version match, so it works on an x86 workstation before the card is ever
+    flashed.
+
+    MEASURE ME. This has NOT been confirmed against a real end2end .rknn -
+    the board has not arrived and we have no bad export to test against.
+    Confirm it the day you have both, with:
+
+        strings model.rknn | grep -Ei 'topk|nonmaxsuppression'
+
+    Because it is unconfirmed it may only WARN, never FAIL: a false positive
+    that blocked the one good model the project owns would be worse than the
+    thing it guards against. What it DOES do is withhold the inference probe
+    unless --force, so a suspected end2end model is not handed to the NPU by
+    accident.
+
+    Returns True if a marker was found.
+    """
+    markers = (b"TopK", b"NonMaxSuppression", b"topk")
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError as exc:
+        add(mname, "end2end pre-filter", SKIP, "cannot read %s: %s" % (path, exc))
+        return False
+
+    hits = sorted({m.decode() for m in markers if m in blob})
+    if hits:
+        add(mname, "end2end pre-filter", WARN,
+            "container contains %s" % ", ".join(hits),
+            "This is the signature of an end2end=True export, whose top-k op "
+            "SEGFAULTS ON THE NPU and emits [1,300,6] instead of [1,84,8400]. "
+            "The inference probe is being WITHHELD. This scan is a heuristic "
+            "and has never been checked against a real bad export, so it is "
+            "not proof - but re-export with end2end=false before you run this "
+            "on a rover. Override with --force if you have reason to believe "
+            "the match is coincidental.")
+        return True
+
+    add(mname, "end2end pre-filter", PASS,
+        "no TopK/NonMaxSuppression strings in the container")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 3. The probe. Runs in a CHILD so a SIGSEGV is a return code, not a crash.
+# ---------------------------------------------------------------------------
+#
+# stdout is NOT clean: librknnrt prints its own banners there. So the child
+# emits exactly one sentinel-prefixed JSON line and the parent scans for that
+# prefix. Stage markers go to stderr, flushed, so that if the child dies mid-op
+# we can still say WHICH op killed it.
+#
+# The child deliberately does NOT import fpms_yolo26_npu. Using the decoder to
+# validate the decoder's own input is circular: _as_anchor_major() is written
+# to tolerate several layouts, which is exactly the tolerance we are trying to
+# see past here.
+PROBE = r'''
+import json, sys
+import numpy as np
+
+def stage(s):
+    sys.stderr.write("STAGE:%s\n" % s); sys.stderr.flush()
+
+path = sys.argv[1]
+core_attr = sys.argv[2]          # "" means: call init_runtime() with no mask
+do_infer = sys.argv[3] == "1"
+
+out = {"ok": False, "stage": "import"}
+stage("import")
+from rknnlite.api import RKNNLite
+
+rk = RKNNLite()
+try:
+    try:
+        out["sdk"] = str(rk.get_sdk_version())
+    except Exception as exc:
+        out["sdk"] = None
+        out["sdk_error"] = str(exc)
+
+    stage("load_rknn")
+    out["stage"] = "load_rknn"
+    rc = rk.load_rknn(path)
+    out["load_rc"] = rc
+    if rc != 0:
+        raise SystemExit(0)
+
+    stage("init_runtime")
+    out["stage"] = "init_runtime"
+    if core_attr:
+        mask = getattr(RKNNLite, core_attr, None)
+        if mask is None:
+            out["core_mask_error"] = "RKNNLite has no attribute %s" % core_attr
+            rc = rk.init_runtime()
+            out["core_mask_used"] = "default (core 0)"
+        else:
+            rc = rk.init_runtime(core_mask=mask)
+            out["core_mask_used"] = core_attr
+    else:
+        # No mask == core 0 only. For the DAEMON that is a bug (two thirds of
+        # the NPU idle); for a probe it is correct - it leaves cores 1 and 2
+        # to whatever is actually detecting.
+        rc = rk.init_runtime()
+        out["core_mask_used"] = "default (core 0)"
+    out["init_rc"] = rc
+    if rc != 0:
+        raise SystemExit(0)
+
+    if not do_infer:
+        out["ok"] = True
+        out["stage"] = "init_runtime"
+        raise SystemExit(0)
+
+    # Synthetic input in EXACTLY the form the agent feeds: NHWC uint8 RGB,
+    # [1,640,640,3], from cv2.resize + BGR2RGB + expand_dims. The graph is
+    # NCHW; the runtime does the transpose. Probing with NCHW float would test
+    # a path the rover never takes.
+    #
+    # Mid-grey rather than zeros: an all-zero frame is a degenerate input on a
+    # quantised graph and can produce all-zero outputs that hide a real
+    # scaling fault.
+    stage("inference")
+    out["stage"] = "inference"
+    img = np.full((1, 640, 640, 3), 114, dtype=np.uint8)
+    outputs = rk.inference(inputs=[img])
+
+    stage("analyse")
+    out["stage"] = "analyse"
+    shapes, stats = [], []
+    for o in outputs:
+        a = np.asarray(o)
+        shapes.append(list(a.shape))
+        finite = bool(np.all(np.isfinite(a)))
+        s = {"dtype": str(a.dtype), "finite": finite,
+             "min": float(np.nanmin(a)) if a.size else None,
+             "max": float(np.nanmax(a)) if a.size else None}
+
+        # Split box from class channels independently of the decoder, and
+        # WITHOUT hardcoding 84 -- the registry is allowed to describe a model
+        # with a different class count, and a probe that only understood COCO
+        # would silently report "could not split" for it. The channel axis is
+        # the short one: 84 against 8400, and any plausible variant keeps that
+        # ratio by orders of magnitude.
+        sq = np.squeeze(a)
+        if sq.ndim == 2:
+            am = sq if sq.shape[1] < sq.shape[0] else sq.T   # -> (anchors, ch)
+            s["channels"] = int(am.shape[1])
+            box, cls = am[:, :4], am[:, 4:]
+            s["box_min"], s["box_max"] = float(box.min()), float(box.max())
+            s["cls_min"], s["cls_max"] = float(cls.min()), float(cls.max())
+            s["cls_mean"] = float(cls.mean())
+            s["anchors"] = int(am.shape[0])
+        stats.append(s)
+
+    out["shapes"] = shapes
+    out["stats"] = stats
+    out["ok"] = True
+finally:
+    try:
+        rk.release()
+    except Exception:
+        pass
+    sys.stdout.write("FPMS_PROBE_JSON " + json.dumps(out) + "\n")
+    sys.stdout.flush()
+'''
+
+
+def npud_holds_device():
+    """Best-effort: is the inference daemon likely holding the NPU?
+
+    Used only to EXPLAIN a failure, never to cause one, and never to justify
+    stopping it. Two independent signals because either can be true alone on a
+    half-configured box.
+    """
+    _, active, _ = sh(["systemctl", "is-active", NPUD_UNIT])
+    sock = os.path.exists(NPUD_SOCKET)
+    return active == "active" or sock, active, sock
+
+
+def run_probe(path, core_attr, do_infer):
+    """Returns (parsed_json_or_None, returncode, last_stage, stderr_tail)."""
+    try:
+        p = subprocess.run(
+            [sys.executable, "-c", PROBE, path, core_attr, "1" if do_infer else "0"],
+            capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
+        rc, out, err = p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return None, "timeout", "unknown", ""
+    except Exception as exc:  # noqa: BLE001
+        return None, 255, "spawn", str(exc)
+
+    stages = [ln[6:] for ln in err.splitlines() if ln.startswith("STAGE:")]
+    last = stages[-1] if stages else "start"
+    data = None
+    for ln in out.splitlines():
+        if ln.startswith("FPMS_PROBE_JSON "):
+            try:
+                data = json.loads(ln[len("FPMS_PROBE_JSON "):])
+            except ValueError:
+                data = None
+    tail = "\n".join(l for l in err.splitlines()
+                     if not l.startswith("STAGE:"))[-400:]
+    return data, rc, last, tail
+
+
+def check_runtime_and_shape(mname, entry, path, args, suspect_end2end):
+    """The load / init_runtime / output-shape checks. Returns True if the
+    model's shape was OBSERVED and is correct."""
+    if args.offline:
+        add(mname, "NPU shape verified", SKIP, "--offline: device not touched",
+            "A hash proves WHICH file this is. It does not prove the model "
+            "produces [1,84,8400]. Re-run on the rover without --offline "
+            "before trusting a detection.")
+        return False
+
+    do_infer = not suspect_end2end or args.force
+    core_attr = os.environ.get("FPMS_NPU_VERIFY_CORE", "")
+
+    data, rc, stage, tail = run_probe(path, core_attr, do_infer)
+
+    # --- the failure this whole tool is built around -----------------------
+    if rc == "timeout":
+        add(mname, "NPU probe completes", FAIL,
+            "probe did not return within %ds (last stage: %s)"
+            % (PROBE_TIMEOUT_S, stage),
+            "A wedged NPU call. It was killed in a child process so it could "
+            "not stall this tool - but the same call inside fpms-npud would "
+            "stall detection with no error anywhere. Check dmesg for rknpu "
+            "timeouts and the NPU load at /sys/kernel/debug/rknpu/load.")
+        return False
+
+    # POSIX: a child killed by a signal gives -signum. 139/134 are the shell's
+    # 128+signum form, kept in case this is ever invoked through one.
+    if (isinstance(rc, int) and rc < 0) or rc in (139, 134):
+        signame = {-11: "SIGSEGV", 139: "SIGSEGV", -6: "SIGABRT",
+                   134: "SIGABRT"}.get(rc, "signal %s" % rc)
+        add(mname, "NPU probe completes", FAIL,
+            "child died with %s during %s" % (signame, stage),
+            "THIS IS THE end2end=True SIGNATURE. Ultralytics report that an "
+            "end2end export's top-k op segfaults on the RK3588 NPU. It is "
+            "caught here as a return code only because the probe runs in a "
+            "child - inside fpms-npud or the agent this kills the process, "
+            "and no try/except can catch it, so systemd restart-loops "
+            "forever. Re-export with end2end=false: see npu/convert/. "
+            "%s" % tail)
+        return False
+
+    if data is None:
+        add(mname, "NPU probe completes", FAIL,
+            "probe returned no result (rc=%s, last stage: %s)" % (rc, stage),
+            "Usually rknnlite failing to import: the aarch64 "
+            "rknn-toolkit-lite2 wheel is not on PyPI and must match "
+            "librknnrt.so and the kernel rknpu driver. %s" % tail)
+        return False
+
+    if data.get("sdk"):
+        add(mname, "runtime version", PASS, data["sdk"].replace("\n", " "))
+
+    # --- load / init -------------------------------------------------------
+    if data.get("load_rc") not in (0, None) or "load_rc" not in data:
+        add(mname, "load_rknn", FAIL,
+            "load_rknn returned %s" % data.get("load_rc", "<never reached>"),
+            "The container did not parse. A truncated scp is the usual cause - "
+            "compare sizes with the source, then re-copy.")
+        return False
+    add(mname, "load_rknn", PASS, "returned 0")
+
+    if data.get("init_rc") != 0:
+        held, active, sock = npud_holds_device()
+        if held:
+            add(mname, "init_runtime", SKIP,
+                "init_runtime returned %s while %s is %s (socket %s)"
+                % (data.get("init_rc"), NPUD_UNIT, active,
+                   "present" if sock else "absent"),
+                "The daemon is the likely holder of the device. Whether the "
+                "RKNPU driver admits a second context at all is UNMEASURED, "
+                "so this is not reported as a fault. This tool will NOT stop "
+                "the daemon for you - that would take detection offline to "
+                "prove detection works. Either ask the daemon to verify over "
+                "%s, or during a maintenance window: sudo systemctl stop "
+                "fpms-npud && fpms-model-verify %s && sudo systemctl start "
+                "fpms-npud" % (NPUD_SOCKET, mname))
+        else:
+            add(mname, "init_runtime", FAIL,
+                "init_runtime returned %s and nothing else holds the device"
+                % data.get("init_rc"),
+                "This is the version-coupling failure, and it is the one the "
+                "agent swallows. The kernel rknpu driver, /usr/lib/librknnrt.so "
+                "and the rknn-toolkit-lite2 wheel must all match. Compare "
+                "/sys/kernel/debug/rknpu/version against "
+                "/etc/fpms/npu-versions.json.")
+        return False
+    add(mname, "init_runtime", PASS,
+        "returned 0 (core mask: %s)" % data.get("core_mask_used", "?"))
+
+    if not do_infer:
+        add(mname, "output shape [1,84,8400]", SKIP,
+            "inference withheld by the end2end pre-filter",
+            "Re-run with --force once you are satisfied the marker match was "
+            "coincidental. Until then the shape is UNKNOWN, which is not the "
+            "same as wrong - and not the same as right.")
+        return False
+
+    # --- THE CHECK ---------------------------------------------------------
+    return check_shape_and_range(mname, entry, data)
+
+
+def check_shape_and_range(mname, entry, data):
+    want = entry.get("output", {}).get("shape") or [1, 84, 8400]
+    want_set = {d for d in want if d != 1}
+    shapes = data.get("shapes") or []
+
+    if len(shapes) != 1:
+        add(mname, "output count", FAIL,
+            "model returned %d output tensors, expected 1" % len(shapes),
+            "This decoder handles a single fused output0. A head exported as "
+            "separate branch tensors needs a different decode path entirely - "
+            "re-export as one output0. Shapes seen: %s" % shapes)
+        return False
+
+    got = shapes[0]
+    got_set = {d for d in got if d != 1}
+
+    if got_set == want_set:
+        layout = "x".join(str(d) for d in got)
+        if got != want:
+            # Not a fault: RKNN is genuinely inconsistent about channel order
+            # and the batch axis, and _as_anchor_major() locates the 84 axis
+            # rather than trusting one layout. Record which one we saw.
+            add(mname, "output shape [1,84,8400]", PASS,
+                "%s - a permutation of the expected %s; the decoder locates "
+                "the 84 axis so this is fine" % (layout, want))
+        else:
+            add(mname, "output shape [1,84,8400]", PASS, layout)
+    elif got_set == {300, 6}:
+        add(mname, "output shape [1,84,8400]", FAIL,
+            "got %s - THIS IS AN end2end=True EXPORT" % got,
+            "REFUSED. [1,300,6] is the end2end head: already-NMS'd detections, "
+            "and a top-k op that segfaults on the NPU. It is incompatible with "
+            "fpms_yolo26_npu.decode in every respect - a decoder fed this "
+            "would read detection rows as anchors and emit nonsense boxes. "
+            "Re-export with end2end=false. See npu/convert/.")
+        return False
+    else:
+        add(mname, "output shape [1,84,8400]", FAIL,
+            "got %s, expected %s" % (got, want),
+            "A WRONG-SHAPED MODEL DOES NOT ERROR - it produces garbage boxes "
+            "that look like detections. Do not run detection on this file. "
+            "Check num_classes (84 = 4 + 80; a custom class count changes this "
+            "axis) and the input size (8400 anchors is 640x640 only - a 416 "
+            "or 1280 export gives a different anchor count).")
+        return False
+
+    # --- range sanity ------------------------------------------------------
+    st = (data.get("stats") or [{}])[0]
+
+    if st.get("finite") is False:
+        add(mname, "outputs finite", FAIL,
+            "output contains NaN or Inf (min=%s max=%s)"
+            % (st.get("min"), st.get("max")),
+            "Non-finite outputs from a constant input mean the graph or the "
+            "quantisation is broken. Every score comparison downstream then "
+            "silently returns False and the rover detects nothing.")
+        return False
+    add(mname, "outputs finite", PASS,
+        "min=%.4g max=%.4g" % (st.get("min", 0.0), st.get("max", 0.0)))
+
+    cmin, cmax = st.get("cls_min"), st.get("cls_max")
+    if cmin is None:
+        add(mname, "class channels in [0,1]", SKIP, "could not split channels")
+    elif cmax > 1.001 or cmin < -0.001:
+        add(mname, "class channels in [0,1]", FAIL,
+            "class channels span [%.4g, %.4g]" % (cmin, cmax),
+            "Channels 4..83 are ALREADY SIGMOIDED in this graph, so they must "
+            "be probabilities. Values outside [0,1] mean they are raw logits - "
+            "the export dropped the Sigmoid, and CONF_THRES=0.35 would then "
+            "match almost every anchor. Do not fix this by sigmoiding in the "
+            "decoder without re-reading the graph: two sigmoids is the other "
+            "failure below.")
+        return False
+    elif cmin >= 0.5:
+        add(mname, "class channels in [0,1]", FAIL,
+            "every class score is >= 0.5 (min %.4g, mean %.4g)"
+            % (cmin, st.get("cls_mean", float("nan"))),
+            "That is the signature of a DOUBLE SIGMOID: sigmoid(x) >= 0.5 for "
+            "all x >= 0, so a graph that sigmoids an already-sigmoided tensor "
+            "compresses everything into [0.5, 0.73]. With CONF_THRES=0.35 the "
+            "rover would report a detection on every one of 8400 anchors. Do "
+            "not add a sigmoid anywhere in this path.")
+        return False
+    else:
+        add(mname, "class channels in [0,1]", PASS,
+            "[%.4g, %.4g], mean %.4g on a constant frame"
+            % (cmin, cmax, st.get("cls_mean", float("nan"))))
+
+    bmin, bmax = st.get("box_min"), st.get("box_max")
+    if bmax is None:
+        add(mname, "box channels in pixel units", SKIP, "could not split channels")
+    elif bmax <= 1.001:
+        add(mname, "box channels in pixel units", FAIL,
+            "box channels span [%.4g, %.4g] - normalised, not pixels"
+            % (bmin, bmax),
+            "Channels 0..3 must arrive as xywh CENTRE form ALREADY multiplied "
+            "by the per-anchor stride ([8]*6400 + [16]*1600 + [32]*400), i.e. "
+            "in 640x640 input-pixel units, because the DFL reconstruction is "
+            "folded into the graph. Values under 1.0 mean it is not folded, "
+            "and every box would decode to a sub-pixel dot at the origin.")
+        return False
+    elif bmax > 4000:
+        add(mname, "box channels in pixel units", WARN,
+            "box channels reach %.4g, well outside a 640px input" % bmax,
+            "Not necessarily wrong on a synthetic constant frame, where the "
+            "head is extrapolating from nothing. Re-check against a real "
+            "image before dismissing it.")
+    else:
+        add(mname, "box channels in pixel units", PASS,
+            "[%.4g, %.4g] on a 640px input" % (bmin, bmax))
+
+    # The anchor count comes from the REGISTRY, not from a literal 8400. The
+    # shape check above already compares against the registry, so hardcoding
+    # the count here would make this tool reject a legitimately-declared
+    # non-COCO or non-640 model that it had just passed two lines earlier.
+    #
+    # For the shipped entry it resolves to 8400 = 80*80 + 40*40 + 20*20, i.e.
+    # 640x640 with strides 8/16/32.
+    want_anchors = max(want_set) if want_set else None
+    anchors = st.get("anchors")
+    if anchors is not None and want_anchors and anchors != want_anchors:
+        add(mname, "anchor count", FAIL,
+            "%d anchors, registry expects %d" % (anchors, want_anchors),
+            "A different anchor count means a different input size, and the "
+            "agent's cv2.resize(frame,(640,640)) is then feeding the wrong "
+            "shape. 8400 is 640x640 with strides 8/16/32.")
+        return False
+    if anchors is not None:
+        add(mname, "anchor count", PASS, "%d" % anchors)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 4. Registration - the act of blessing a file
+# ---------------------------------------------------------------------------
+def register(reg, mname, observed, path, shape_verified, args):
+    entry = reg["models"][mname]
+    existing = entry.get("sha256")
+
+    if existing and existing.lower() != observed.lower() and not args.force:
+        add(mname, "--register", FAIL,
+            "refusing to overwrite a different recorded hash",
+            "The registry says %s, the file is %s. A registry that quietly "
+            "adopts whatever it finds verifies nothing. If the new file is "
+            "genuinely the one you want, say so: --register --force"
+            % (existing, observed))
+        return False
+
+    if not shape_verified and not args.offline:
+        add(mname, "--register", FAIL,
+            "refusing to register a model whose shape checks did not pass",
+            "Registering a hash is how a model becomes trusted. Blessing a "
+            "model that failed its shape check is precisely the failure this "
+            "tool exists to prevent. Fix the model, or record the hash "
+            "without blessing it: fpms-model-verify %s --offline --register"
+            % mname)
+        return False
+
+    entry["sha256"] = observed
+    entry["size_bytes"] = os.path.getsize(path)
+    entry.pop("size_bytes_status", None)
+
+    who = os.environ.get("SUDO_USER") or os.environ.get("USER") or "unknown"
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    where = socket.gethostname()
+
+    if shape_verified:
+        entry["sha256_status"] = "recorded from the file on %s" % where
+        entry["verified"] = True
+        entry["verified_at"] = when
+        entry["verified_on"] = where
+        entry["verified_by"] = who
+        entry["verified_how"] = ("fpms-model-verify: sha256 recorded, "
+                                 "load_rknn and init_runtime returned 0, "
+                                 "output shape OBSERVED as [1,84,8400]")
+        note = "verified:true"
+    else:
+        # --offline. We now know WHICH file this is. We still do not know that
+        # it works, and saying otherwise would make the flag meaningless.
+        entry["sha256_status"] = (
+            "RECORDED_UNVERIFIED - hash taken on %s by %s with --offline. "
+            "Identifies the file; proves nothing about its shape or that it "
+            "loads. Re-run on RK3588S hardware without --offline." % (where, who))
+        entry["verified"] = False
+        entry["verified_at"] = None
+        entry["verified_on"] = where
+        entry["verified_by"] = who
+        entry["verified_how"] = "sha256 only (--offline); NPU never opened"
+        note = "verified stays false (--offline)"
+
+    tmp = REGISTRY + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(reg, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, REGISTRY)   # atomic: a half-written registry is worse
+    except OSError as exc:          # than an out-of-date one
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        add(mname, "--register", FAIL, "cannot write %s: %s" % (REGISTRY, exc),
+            "Needs root. Re-run with sudo.")
+        return False
+
+    add(mname, "--register", PASS,
+        "%s recorded in %s (%s)" % (observed[:16] + "...", REGISTRY, note))
+    return True
+
+
+# ---------------------------------------------------------------------------
+def check_registry_consistency(mname, entry):
+    """Does the entry contradict itself? Needs no file and no device.
+
+    Worth its own check because the shape check trusts output.shape from the
+    registry. If num_classes and output.shape disagree, the tool would happily
+    "verify" a model against a channel count nobody meant, and the recorded
+    verified:true would be evidence for the wrong thing.
+    """
+    shape = (entry.get("output") or {}).get("shape")
+    ncls = entry.get("num_classes")
+    if not shape or ncls is None:
+        return
+    dims = {d for d in shape if d != 1}
+    if (ncls + 4) not in dims:
+        add(mname, "registry self-consistent", FAIL,
+            "num_classes=%d implies %d channels, output.shape is %s"
+            % (ncls, ncls + 4, shape),
+            "4 box + num_classes must be one of the output dimensions. Fix "
+            "the entry in %s before trusting any result below it." % REGISTRY)
+
+
+def verify_model(mname, entry, reg, cfg, args):
+    check_registry_consistency(mname, entry)
+    path = resolve_path(entry, reg, cfg)
+    observed, ok = check_file(mname, entry, path)
+
+    shape_verified = False
+    if ok:
+        suspect = False
+        if not args.offline:
+            suspect = check_end2end_prefilter(mname, path)
+        shape_verified = check_runtime_and_shape(mname, entry, path, args, suspect)
+
+    if entry.get("verified") is True and not shape_verified and not args.offline:
+        # The registry claims this was proven once. It is not being proven now.
+        add(mname, "registry claim holds", FAIL,
+            "registry says verified:true but this run could not confirm it",
+            "A stale verified:true is worse than no flag at all - everything "
+            "downstream reads it as permission. Either fix the model or clear "
+            "the flag by hand in %s." % REGISTRY)
+
+    if args.register and observed and path:
+        register(reg, mname, observed, path, shape_verified, args)
+    elif args.register and not observed:
+        add(mname, "--register", FAIL, "nothing to register - no readable file",
+            "You cannot hash a file that is not there.")
+
+
+def print_report():
+    print("=" * 74)
+    print(" FPMS-OS model verify    %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print(" registry: %s" % REGISTRY)
+    print("=" * 74)
+    last = None
+    for r in results:
+        if r["model"] != last:
+            print("\n  %s" % r["model"])
+            last = r["model"]
+        print("    [%-4s] %-30s %s" % (r["status"], r["check"], r["detail"]))
+        if r["remedy"] and r["status"] in (FAIL, WARN, SKIP):
+            for i, chunk in enumerate(_wrap(r["remedy"], 58)):
+                print("           %s%s" % ("-> " if i == 0 else "   ", chunk))
+    print("-" * 74)
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
+    ap.add_argument("models", nargs="*", help="logical names; default: all enabled")
+    ap.add_argument("--offline", action="store_true",
+                    help="hash and registry checks only; never opens the NPU")
+    ap.add_argument("--register", action="store_true",
+                    help="write the observed sha256 back into the registry")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite a disagreeing hash; probe a flagged model")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--list", action="store_true", help="print the registry and exit")
+    args = ap.parse_args()
+
+    cfg = load_config()
+
+    try:
+        reg = load_registry()
+    except OSError as exc:
+        print("FATAL: cannot read %s: %s" % (REGISTRY, exc), file=sys.stderr)
+        print("Without a registry nothing knows what a model on this rover is "
+              "supposed to be, and every .rknn is trusted by default. Restore "
+              "it from the image overlay.", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print("FATAL: %s does not parse: %s" % (REGISTRY, exc), file=sys.stderr)
+        print("A malformed registry must never be treated as an empty one - "
+              "that would silently disable every check in this tool.",
+              file=sys.stderr)
+        return 2
+
+    models = reg.get("models", {})
+
+    if args.list:
+        for name, e in models.items():
+            print("%-12s %-6s %s" % (
+                name,
+                "on" if e.get("enabled") else "off",
+                e.get("file") or "<no file: %s>" % e.get("file_status", "unknown")))
+            print("%-12s %-6s sha256=%s verified=%s" % (
+                "", "", e.get("sha256") or "UNKNOWN", e.get("verified")))
+        return 0
+
+    if args.models:
+        # Naming a model explicitly verifies it even if enabled:false - that is
+        # how you inspect the entry you are not currently running.
+        wanted = []
+        for name in args.models:
+            if name not in models:
+                print("no such model in %s: %s (have: %s)"
+                      % (REGISTRY, name, ", ".join(models)), file=sys.stderr)
+                return 2
+            wanted.append(name)
+    else:
+        wanted = [n for n, e in models.items() if e.get("enabled")]
+        if not wanted:
+            print("FATAL: no enabled models in %s" % REGISTRY, file=sys.stderr)
+            print("An empty registry is not a passing registry - this rover "
+                  "would load whatever it found with nothing to check it "
+                  "against.", file=sys.stderr)
+            return 2
+
+    for name in wanted:
+        verify_model(name, models[name], reg, cfg, args)
+
+    n_fail = sum(1 for r in results if r["status"] == FAIL)
+    n_warn = sum(1 for r in results if r["status"] in (WARN, SKIP))
+
+    summary = {
+        "ts": time.time(),
+        "registry": REGISTRY,
+        "models": wanted,
+        "ok": n_fail == 0 and n_warn == 0,
+        "fail": n_fail, "warn": n_warn, "total": len(results),
+        "checks": results,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    elif not args.quiet:
+        print_report()
+        if n_fail:
+            print("  %d FAILED, %d unproven. DO NOT TRUST DETECTION FROM THIS "
+                  "MODEL." % (n_fail, n_warn))
+        elif n_warn:
+            print("  %d checks unproven, nothing failed. This model is "
+                  "IDENTIFIED but not VERIFIED." % n_warn)
+        else:
+            print("  Verified. Shape observed, not assumed.")
+        print("=" * 74)
+
+    # WARN and SKIP both exit 1 on purpose. "We could not check" must never be
+    # the same exit code as "we checked and it was fine", or every CI job and
+    # every boot script quietly accepts an unverified model.
+    return 2 if n_fail else (1 if n_warn else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

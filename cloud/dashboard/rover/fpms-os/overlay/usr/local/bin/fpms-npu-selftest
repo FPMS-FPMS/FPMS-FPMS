@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""fpms-npu-selftest - is the NPU actually detecting anything?
+
+Usage:
+    fpms-npu-selftest              human-readable report
+    fpms-npu-selftest --json       machine-readable
+    fpms-npu-selftest --quiet      exit code only
+    fpms-npu-selftest --boot       boot mode: publish telemetry/npu, and
+                                   events/npu_fault on a fault EDGE
+
+Exit: 0 all pass, 1 one or more WARN, 2 one or more FAIL.
+      Same contract as fpms-selftest, deliberately - one system, two depths.
+
+
+WHY THIS EXISTS
+===============
+fpms_rover_agent.py wraps the ENTIRE NPU block - import, load_rknn,
+init_runtime, labels - in ONE try/except that logs
+
+    NPU unavailable (...); streaming without detection
+
+exactly once, and then runs blind forever. Every systemd unit reports
+active. The camera works. Frames arrive on telemetry/camera. The dashboard
+looks alive. Nothing is detected.
+
+That is the single worst failure mode in this project, because it is
+INDISTINGUISHABLE FROM SUCCESS at every level an operator normally checks.
+"Did it boot" will not catch it. "Is the unit active" will not catch it.
+"Is the video up" will not catch it - the video is the thing that is up.
+
+This tool exists to make it loud. It performs a REAL INFERENCE and inspects
+the numbers that come back. Everything else here is a way of naming which
+part of the chain broke when that inference does not happen.
+
+
+HOW THIS RELATES TO fpms-selftest
+=================================
+fpms-selftest already carries three shallow NPU checks:
+
+    NPU runtime        does `from rknnlite.api import RKNNLite` work
+    NPU model present  does the .rknn file exist on disk
+    NPU driver         can we read /sys/kernel/debug/rknpu/version
+
+Those are presence checks. Every one of them can PASS on a rover that
+detects nothing: the import succeeds and init_runtime() fails on a version
+mismatch; the file exists and is the wrong model; the driver node reads and
+the ubuntu user cannot open the device.
+
+This is the deep version. It is a strict superset - it opens the device as
+`ubuntu`, cross-checks the three-way version chain, verifies the model by
+sha256 against the registry, runs an inference, and looks at the values in
+the tensor that comes back.
+
+INTENDED CONVERGENCE: fpms-selftest's check_npu() should eventually become a
+delegation -- run `fpms-npu-selftest --quiet` and fold the exit code into one
+result line with "run fpms-npu-selftest" as the remedy -- so there is one
+implementation of NPU truth, not two that can drift. Until agents 1-4 have
+landed and this has been run on real silicon, the shallow checks stay where
+they are: a fast boot path that needs no model load must keep working even
+if this tool is absent.
+
+
+WHAT IT WILL NEVER DO
+=====================
+  - move the rover, in any way. It touches no drive topic, opens no drive
+    tty, and publishes nothing to /cmd_vel or /cmd_duty. Its entire write
+    surface is /var/lib/fpms/npu-selftest.json and two MQTT topics.
+  - open the drive board's tty (that resets the ESP32: 90-225 s re-link)
+  - stop, restart, or reconfigure fpms-npud. It reports contention; it does
+    not resolve it. Anything that would change system state is printed as a
+    command for a human to run.
+
+
+HONESTY
+=======
+NONE OF THIS HAS RUN ON AN RK3588S. The board has not arrived. Everything
+below is written against Rockchip's documented interfaces and the one
+measurement this project actually owns (~20 ms per inference on the old Pi,
+from the baseline in profile_steps.py). Anything unconfirmed is marked
+MEASURE ME and carries the exact command that confirms it. Where a value
+could not be established, this file refuses rather than inventing one.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+
+CONFIG = "/etc/fpms/config.env"
+STATE_DIR = "/var/lib/fpms"
+STATE_FILE = "/var/lib/fpms/npu-selftest.json"
+VERSIONS_JSON = "/etc/fpms/npu-versions.json"   # agent 1, stage 25
+MODELS_JSON = "/etc/fpms/models.json"           # agent 3
+UDEV_RULE = "/etc/udev/rules.d/99-fpms-npu.rules"  # agent 1
+LIBRKNNRT = "/usr/lib/librknnrt.so"
+DRV_VERSION = "/sys/kernel/debug/rknpu/version"
+DRV_LOAD = "/sys/kernel/debug/rknpu/load"
+NPU_USER = "ubuntu"
+
+# MEASURE ME: /dev/rknpu is what NPU_SPEC.md names, and it is what the
+# Rockchip BSP driver registers as a misc device on the boards we can find
+# documentation for. It has NOT been confirmed on this board. Some BSP builds
+# expose the NPU only through the DRM render node instead. Confirm with:
+#     ls -l /dev/rknpu* /dev/dri/renderD* ; cat /proc/misc | grep -i rknpu
+# and if it differs, fix this list - do not paper over it in the udev rule.
+DEVICE_CANDIDATES = ["/dev/rknpu", "/dev/rknpu0"]
+
+# The rover's real duty cycle, from config.env. 6 fps camera / infer every
+# 2nd frame = 3 inferences per second = a 333 ms period. The default budget
+# below is deliberately far tighter than that period and far looser than the
+# ~20 ms the old Pi actually achieved, so it fires on a real regression and
+# not on jitter. Sustained behaviour is the bench's job, not this tool's.
+DEFAULT_MAX_LATENCY_MS = 120.0
+
+EXPECTED_SHAPE = [1, 84, 8400]
+PROBE_ITERS = 12          # plus one discarded warm-up
+PROBE_TIMEOUT_S = 180     # a cold model load on a busy board is not fast
+
+results = []
+
+
+def add(name, status, detail, remedy=""):
+    results.append({"check": name, "status": status,
+                    "detail": detail, "remedy": remedy})
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def sh(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # Strip ANSI: a child Python colourises tracebacks, and those escapes
+        # end up inside a JSON payload and inside a journal line where they
+        # are noise at best and unreadable at 2am at worst.
+        return (p.returncode, ANSI.sub("", p.stdout).strip(),
+                ANSI.sub("", p.stderr).strip())
+    except Exception as exc:  # noqa: BLE001
+        return 255, "", str(exc)
+
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    # An explicit environment beats the file, because that is the precedence
+    # systemd gives it and we must test what the agent will actually see.
+    for k in ("FPMS_YOLO_DIR", "FPMS_NPU_CORE_MASK", "FPMS_NPU_REQUIRED",
+              "FPMS_NPU_MAX_LATENCY_MS", "FPMS_THING_NAME", "FPMS_MQTT_USER",
+              "FPMS_MQTT_PASS", "FPMS_CAMERA_FPS", "FPMS_INFER_EVERY"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+def as_user(argv):
+    """Run argv as `ubuntu` when we are root, unchanged otherwise.
+
+    This is not cosmetic. The gap this tool exists to close is that the NPU
+    device is root-openable and ubuntu-unopenable, which every root-run check
+    in the project would have passed. If we are root we MUST drop, or we
+    verify nothing about the user that actually runs the agent.
+    """
+    if os.geteuid() != 0:
+        return argv, False
+    if os.path.exists("/sbin/runuser") or os.path.exists("/usr/sbin/runuser"):
+        return ["runuser", "-u", NPU_USER, "--"] + argv, True
+    return ["sudo", "-n", "-u", NPU_USER] + argv, True
+
+
+def read_text(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip(), None
+    except OSError as exc:
+        return None, exc
+
+
+def parse_versionish(text):
+    """Pull the first x.y.z (or x.y) out of a vendor version string.
+
+    The driver prints things like 'RKNPU driver: v0.9.8'; librknnrt prints
+    'librknnrt version: 1.6.0 (9a7b5d24c@2023-12-13T17:31:11)'. We compare on
+    the numeric part only - the build hash differs between two runtimes that
+    are perfectly compatible, and a string compare would cry wolf forever.
+    """
+    if not text:
+        return None
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
+    return m.group(1) if m else None
+
+
+def librknnrt_version():
+    """Best-effort version of the userspace runtime, without loading it.
+
+    `strings` is not guaranteed present on a minimal image, so we scan the
+    .so ourselves for the vendor's own banner. If this returns None the
+    authoritative answer still arrives via RKNNLite.get_sdk_version() in the
+    inference probe, which is why this failing is not fatal.
+    """
+    try:
+        with open(LIBRKNNRT, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    m = re.search(rb"librknnrt version:\s*([0-9][0-9A-Za-z_.\-]*)", blob)
+    if m:
+        return m.group(1).decode("ascii", "replace")
+    m = re.search(rb"rknnrt version:\s*([0-9][0-9A-Za-z_.\-]*)", blob)
+    return m.group(1).decode("ascii", "replace") if m else None
+
+
+def sha256_file(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def read_core_load():
+    """Per-core utilisation from debugfs, or None if we cannot read it.
+
+    Vendor format is a single line like:
+        NPU load:  Core0: 12%, Core1:  0%, Core2:  0%,
+    MEASURE ME: confirm on hardware with `sudo cat /sys/kernel/debug/rknpu/load`
+    while an inference is running. Older BSPs print only one aggregate number,
+    in which case this returns {0: n} and the per-core verdict downgrades to a
+    WARN rather than claiming a two-core stall it cannot see.
+    """
+    text, _ = read_text(DRV_LOAD)
+    if text is None:
+        return None
+    found = re.findall(r"Core(\d+)\s*:\s*(\d+)\s*%", text)
+    if found:
+        return {int(c): int(v) for c, v in found}
+    m = re.search(r"(\d+)\s*%", text)
+    return {0: int(m.group(1))} if m else None
+
+
+# --------------------------------------------------------------------------
+# Core mask vocabulary
+#
+# NPU_SPEC.md is explicit: init_runtime() with NO core_mask uses CORE 0 ONLY.
+# Two thirds of a 6 TOPS NPU sits idle and absolutely nothing else in the
+# system would ever tell you - the rover still detects, just at a third of
+# the silicon it paid for. That is why an unset mask is a FAIL here and not
+# a WARN: silence is never success.
+# --------------------------------------------------------------------------
+MASK_NAMES = {
+    "0": "NPU_CORE_0", "core0": "NPU_CORE_0", "npu_core_0": "NPU_CORE_0",
+    "1": "NPU_CORE_0",                       # bitmask 0b001
+    "0_1": "NPU_CORE_0_1", "npu_core_0_1": "NPU_CORE_0_1",
+    "3": "NPU_CORE_0_1",                     # bitmask 0b011
+    "0_1_2": "NPU_CORE_0_1_2", "npu_core_0_1_2": "NPU_CORE_0_1_2",
+    "7": "NPU_CORE_0_1_2",                   # bitmask 0b111
+    "auto": "NPU_CORE_AUTO", "npu_core_auto": "NPU_CORE_AUTO",
+}
+
+
+def normalise_mask(raw):
+    if raw is None or str(raw).strip() == "":
+        return None
+    return MASK_NAMES.get(str(raw).strip().lower())
+
+
+# --------------------------------------------------------------------------
+# The inference probe
+#
+# Runs OUT OF PROCESS, as `ubuntu`, on purpose:
+#   - a version mismatch inside librknnrt can abort() or segfault, and a
+#     health check that dies with the thing it is checking reports nothing;
+#   - NPU_SPEC records that an end2end=True export's top-k op SEGFAULTS on
+#     this NPU, so a wrong model is a live crash risk, not a wrong number;
+#   - running as ubuntu is the only way to test the permission that matters.
+#
+# Communication is one marker line on stdout, because the RKNN runtime prints
+# a wall of 'I RKNN: ...' banners that would swallow anything less distinctive.
+# bench_npu.py's driver grep-filtered exactly that noise; this carries the
+# lesson forward instead of re-learning it.
+# --------------------------------------------------------------------------
+MARKER = "__FPMS_NPU_JSON__"
+
+PROBE = r'''
+import json, sys, time
+out = {"ok": False, "stage": "import", "err": None}
+MARKER = "__FPMS_NPU_JSON__"
+
+def emit():
+    sys.stdout.write("\n" + MARKER + " " + json.dumps(out) + "\n")
+    sys.stdout.flush()
+
+try:
+    import numpy as np
+    from rknnlite.api import RKNNLite
+
+    model, mask_name, iters = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    out["numpy"] = np.__version__
+
+    r = RKNNLite()
+    out["stage"] = "load_rknn"
+    if r.load_rknn(model) != 0:
+        raise RuntimeError("load_rknn() returned non-zero")
+
+    out["stage"] = "init_runtime"
+    mask = getattr(RKNNLite, mask_name, None) if mask_name != "-" else None
+    out["mask_requested"] = mask_name
+    out["mask_resolved"] = mask
+    if mask is None:
+        rc = r.init_runtime()
+    else:
+        rc = r.init_runtime(core_mask=mask)
+    if rc != 0:
+        raise RuntimeError("init_runtime() returned %r" % rc)
+
+    # The version chain, straight from the runtime. This is the ONLY source
+    # an unprivileged user has for the driver version, because debugfs is
+    # root-only - which is exactly the situation the agent runs in.
+    out["stage"] = "sdk_version"
+    try:
+        out["sdk_version"] = str(r.get_sdk_version())
+    except Exception as exc:
+        out["sdk_version"] = None
+        out["sdk_version_err"] = repr(exc)
+
+    # Synthetic input, NHWC uint8, seeded so two runs are comparable. Content
+    # is irrelevant: we are testing the plumbing, the shape and the numeric
+    # range, NOT detection accuracy. Decode correctness is agent 6's tests.
+    out["stage"] = "inference"
+    rng = np.random.default_rng(20260808)
+    img = rng.integers(0, 255, (1, 640, 640, 3), dtype=np.uint8)
+
+    lat = []
+    for i in range(iters + 1):
+        t0 = time.perf_counter()
+        res = r.inference(inputs=[img])
+        dt = (time.perf_counter() - t0) * 1000.0
+        if i:                      # discard the warm-up; it is never typical
+            lat.append(dt)
+        else:
+            out["warmup_ms"] = dt
+
+    a = np.asarray(res[0])
+    out["n_outputs"] = len(res)
+    out["shape"] = list(a.shape)
+    out["dtype"] = str(a.dtype)
+    out["latency_ms"] = lat
+
+    fa = a.astype("float64")
+    out["finite"] = bool(np.isfinite(fa).all())
+    out["all_zero"] = bool(not np.any(fa))
+    out["min"] = float(np.nanmin(fa))
+    out["max"] = float(np.nanmax(fa))
+    # [1,84,8400]: rows 0-3 are box geometry (DFL already folded in), rows
+    # 4-83 are the 80 COCO class scores. NPU_SPEC: classes are ALREADY
+    # SIGMOIDED in this graph - so they must lie in [0,1], and anything
+    # outside it means we are looking at raw logits, i.e. the wrong export.
+    if fa.ndim == 3 and fa.shape[1] >= 5:
+        cls = fa[:, 4:, :]
+        box = fa[:, :4, :]
+        out["cls_min"] = float(np.nanmin(cls))
+        out["cls_max"] = float(np.nanmax(cls))
+        out["box_min"] = float(np.nanmin(box))
+        out["box_max"] = float(np.nanmax(box))
+    out["ok"] = True
+    out["stage"] = "done"
+    try:
+        r.release()
+    except Exception:
+        pass
+except Exception as exc:
+    out["err"] = "%s: %s" % (type(exc).__name__, exc)
+emit()
+'''
+
+
+def run_probe(model_path, mask_name):
+    """Run the probe, sampling per-core load in parallel while it works.
+
+    Sampling from HERE (which may be root) is the trick that lets us answer
+    "is core 0 the only one doing anything" even though the probe itself runs
+    as ubuntu and cannot read debugfs. We take the maximum seen per core: a
+    core that never rises above 0% across the whole run did no work.
+    """
+    argv, dropped = as_user([sys.executable, "-c", PROBE, model_path,
+                             mask_name or "-", str(PROBE_ITERS)])
+    info = {"ran_as_ubuntu": dropped, "load_peak": None, "load_samples": 0}
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except Exception as exc:  # noqa: BLE001
+        info["spawn_error"] = str(exc)
+        return info
+
+    peak, samples, deadline = {}, 0, time.time() + PROBE_TIMEOUT_S
+    while proc.poll() is None and time.time() < deadline:
+        load = read_core_load()
+        if load:
+            samples += 1
+            for core, val in load.items():
+                peak[core] = max(peak.get(core, 0), val)
+        time.sleep(0.02)
+
+    if proc.poll() is None:
+        proc.kill()
+        info["timeout"] = True
+    out, err = proc.communicate()
+    info["load_peak"] = peak or None
+    info["load_samples"] = samples
+    info["stderr_tail"] = (err or "").strip().splitlines()[-3:]
+    for line in (out or "").splitlines():
+        if line.startswith(MARKER):
+            try:
+                info["probe"] = json.loads(line[len(MARKER):].strip())
+            except ValueError:
+                info["probe"] = None
+            break
+    return info
+
+
+# --------------------------------------------------------------------------
+# 1. The device node, and whether `ubuntu` can actually open it
+# --------------------------------------------------------------------------
+def check_device():
+    found = [p for p in DEVICE_CANDIDATES if os.path.exists(p)]
+    if not found:
+        add("NPU device node", FAIL,
+            "none of %s exist" % ", ".join(DEVICE_CANDIDATES),
+            "No device means no inference and the agent will log 'NPU "
+            "unavailable' once and stream blind forever. Confirm the real "
+            "node name on this board - it may not be /dev/rknpu: "
+            "ls -l /dev/rknpu* /dev/dri/renderD* ; grep -i rknpu /proc/misc ; "
+            "dmesg | grep -i rknpu. If the node is genuinely absent the "
+            "kernel is not the Rockchip BSP one - there is no mainline rknpu "
+            "driver and no amount of userspace will fix that.")
+        return None
+
+    dev = found[0]
+    try:
+        st = os.stat(dev)
+        mode = oct(st.st_mode & 0o777)
+        detail = "%s mode %s uid %d gid %d" % (dev, mode, st.st_uid, st.st_gid)
+    except OSError as exc:
+        add("NPU device node", FAIL, "%s: %s" % (dev, exc),
+            "The node exists but cannot be stat'ed. Check the mount and the "
+            "device permissions.")
+        return dev
+
+    # Presence is not access. Ask the kernel, as ubuntu, rather than doing
+    # permission arithmetic - mode bits miss ACLs and supplementary groups,
+    # and this is precisely the check that must not be approximately right.
+    argv, _ = as_user([sys.executable, "-c",
+                       "import os,sys; fd=os.open(sys.argv[1], os.O_RDWR); "
+                       "os.close(fd); print('open-ok')", dev])
+    rc, out, err = sh(argv, timeout=15)
+    if rc == 0 and "open-ok" in out:
+        add("NPU device openable by %s" % NPU_USER, PASS, detail)
+    else:
+        add("NPU device openable by %s" % NPU_USER, FAIL,
+            "%s -- %s" % (detail, (err.splitlines()[-1] if err else "rc=%d" % rc)),
+            "THIS IS THE PERMISSIONS GAP. 99-fpms-npu.rules was named in "
+            "SPEC.md and never written, so nothing grants the unprivileged "
+            "ubuntu user access to the NPU. Root can open it, every root-run "
+            "check passes, and the agent - which runs as ubuntu - cannot. "
+            "Install the rule and reload: sudo udevadm control --reload && "
+            "sudo udevadm trigger. Interim, without a reboot: sudo chgrp "
+            "video %s && sudo chmod g+rw %s" % (dev, dev))
+
+    if os.path.exists(UDEV_RULE):
+        add("NPU udev rule installed", PASS, UDEV_RULE)
+    else:
+        add("NPU udev rule installed", WARN, "%s missing" % UDEV_RULE,
+            "Access may currently work by accident (a default group, or a "
+            "manual chmod) and will not survive a reboot or a re-enumeration. "
+            "The rule is agent 1's; without it this is luck, not "
+            "configuration.")
+    return dev
+
+
+# --------------------------------------------------------------------------
+# 2. Runtime import and construction
+# --------------------------------------------------------------------------
+def check_runtime_import():
+    argv, _ = as_user([sys.executable, "-c",
+                       "from rknnlite.api import RKNNLite; "
+                       "r = RKNNLite(); print('constructed')"])
+    rc, out, err = sh(argv, timeout=60)
+    if rc == 0 and "constructed" in out:
+        add("rknnlite imports and constructs", PASS, "RKNNLite() ok")
+        return True
+    add("rknnlite imports and constructs", FAIL,
+        err.splitlines()[-1] if err else "rc=%d" % rc,
+        "The rover will stream video and detect NOTHING while systemd "
+        "reports every unit active. The wheel is aarch64-only, Rockchip's, "
+        "and NOT on PyPI - `pip install rknn-toolkit-lite2` cannot fix this. "
+        "It must be the wheel matched to /usr/lib/librknnrt.so. Note this "
+        "ran as %s: an import that works for root and not for ubuntu is a "
+        "PYTHONPATH or a --user install problem, not a missing wheel."
+        % NPU_USER)
+    return False
+
+
+# --------------------------------------------------------------------------
+# 3. The three-way version chain
+#
+# kernel rknpu driver <-> librknnrt.so <-> rknn-toolkit-lite2 wheel.
+# A mismatch anywhere fails at init_runtime(), and the agent SWALLOWS that.
+# This whole check exists because nobody ever wrote down which versions the
+# old Pi ran, so a working rover and a broken one could not be compared.
+# --------------------------------------------------------------------------
+def check_versions(probe_info):
+    expected, exc = None, None
+    if os.path.exists(VERSIONS_JSON):
+        try:
+            with open(VERSIONS_JSON) as fh:
+                expected = json.load(fh)
+        except (OSError, ValueError) as e:
+            exc = e
+    if expected is None:
+        add("NPU version record", FAIL,
+            "%s %s" % (VERSIONS_JSON, "unreadable: %s" % exc if exc else "absent"),
+            "Without a build record there is no way to tell a version "
+            "mismatch from a hardware fault - which is exactly the hole the "
+            "old Pi left. Stage 25 (25-npu-runtime.sh) writes this at build "
+            "time; if it is missing, the image was built without pinning the "
+            "runtime and the driver together.")
+    else:
+        add("NPU version record", PASS,
+            ", ".join("%s=%s" % (k, v) for k, v in sorted(expected.items())
+                      if isinstance(v, (str, int, float)))[:120] or "present")
+
+    probe = probe_info.get("probe") or {}
+    sdk = probe.get("sdk_version") or ""
+
+    # Driver. debugfs is root-only by default, so "cannot read as this user"
+    # is a DIFFERENT statement from "absent" and must not be reported as a
+    # fault - the agent runs as ubuntu and never reads it either.
+    drv_text, drv_err = read_text(DRV_VERSION)
+    drv_src = DRV_VERSION
+    if drv_text is None and sdk:
+        m = re.search(r"driver version[:\s]*([0-9][0-9A-Za-z.\-]*)", sdk, re.I)
+        if m:
+            drv_text, drv_src = m.group(1), "RKNNLite.get_sdk_version()"
+
+    if drv_text is None:
+        if os.path.exists(DRV_VERSION):
+            add("NPU driver version readable", SKIP,
+                "%s present but unreadable as this user (%s)"
+                % (DRV_VERSION, getattr(drv_err, "strerror", drv_err)),
+                "Not a fault: debugfs is root-only by default. Read it with "
+                "sudo cat %s, or rely on the runtime's own report - "
+                "RKNNLite.get_sdk_version() names the driver version and is "
+                "readable by ubuntu." % DRV_VERSION)
+        else:
+            add("NPU driver version readable", FAIL,
+                "%s absent and the runtime did not report a driver version"
+                % DRV_VERSION,
+                "debugfs may simply not be mounted (sudo mount -t debugfs "
+                "none /sys/kernel/debug) - check that FIRST. If it is mounted "
+                "and /sys/kernel/debug/rknpu does not exist, the rknpu driver "
+                "is not loaded and this is not the Rockchip BSP kernel.")
+    else:
+        add("NPU driver version readable", PASS,
+            "%s (via %s)" % (drv_text, drv_src))
+
+    rt_text = librknnrt_version()
+    if rt_text is None and sdk:
+        m = re.search(r"(?:rknnrt|rknn_api) version[:\s]*([0-9][0-9A-Za-z.\-]*)",
+                      sdk, re.I)
+        rt_text = m.group(1) if m else None
+    if not os.path.exists(LIBRKNNRT):
+        add("librknnrt.so present", FAIL, "%s missing" % LIBRKNNRT,
+            "The wheel is a thin binding; the actual runtime is this .so. "
+            "Without it every init_runtime() fails and the agent swallows it. "
+            "Reinstall via scripts/25-npu-runtime.sh.")
+    else:
+        add("librknnrt.so present", PASS,
+            "%s (%s)" % (LIBRKNNRT, rt_text or "version string not found"))
+
+    # Wheel version. Two sources because rknn-toolkit-lite2 has changed where
+    # it puts this between releases; neither is guaranteed. MEASURE ME.
+    argv, _ = as_user([sys.executable, "-c",
+                       "import json;\n"
+                       "v=None\n"
+                       "try:\n"
+                       "    import importlib.metadata as m\n"
+                       "    v=m.version('rknn-toolkit-lite2')\n"
+                       "except Exception:\n"
+                       "    pass\n"
+                       "if not v:\n"
+                       "    try:\n"
+                       "        import rknnlite; v=getattr(rknnlite,'__version__',None)\n"
+                       "    except Exception:\n"
+                       "        pass\n"
+                       "print(json.dumps(v))"])
+    rc, out, _ = sh(argv, timeout=45)
+    whl = None
+    if rc == 0:
+        try:
+            whl = json.loads(out.splitlines()[-1])
+        except (ValueError, IndexError):
+            whl = None
+
+    got = {"driver": parse_versionish(drv_text),
+           "runtime": parse_versionish(rt_text),
+           "wheel": parse_versionish(whl)}
+    want = {}
+    if isinstance(expected, dict):
+        for key, aliases in (("driver", ("driver", "rknpu_driver", "kernel")),
+                             ("runtime", ("runtime", "librknnrt", "rknnrt")),
+                             ("wheel", ("wheel", "toolkit_lite2",
+                                        "rknn_toolkit_lite2"))):
+            for a in aliases:
+                if a in expected:
+                    want[key] = parse_versionish(str(expected[a]))
+                    break
+
+    unknown = [k for k, v in got.items() if v is None]
+    mismatched = [
+        "%s: found %s, recorded %s" % (k, got[k], want[k])
+        for k in ("driver", "runtime", "wheel")
+        if got.get(k) and want.get(k) and got[k] != want[k]
+    ]
+    shown = ", ".join("%s=%s" % (k, got[k] or "?") for k in
+                      ("driver", "runtime", "wheel"))
+
+    if mismatched:
+        add("version chain agrees", FAIL, "; ".join(mismatched),
+            "A mismatch in this chain fails at init_runtime() with a message "
+            "fpms_rover_agent.py CATCHES AND DISCARDS - the rover streams and "
+            "detects nothing. The three must move together: reflash the "
+            "kernel, replace /usr/lib/librknnrt.so, and reinstall the wheel "
+            "from the SAME Rockchip release. Do not upgrade one to 'fix' "
+            "another.")
+    elif unknown and not want:
+        add("version chain agrees", SKIP,
+            "%s (nothing recorded to compare against)" % shown,
+            "Cannot verify agreement without %s. This is the exact state the "
+            "old Pi was in: it worked, and nobody could say with what."
+            % VERSIONS_JSON)
+    elif unknown:
+        add("version chain agrees", WARN,
+            "%s - could not read: %s" % (shown, ", ".join(unknown)),
+            "A version that cannot be read cannot be matched. Run this as "
+            "root to reach debugfs, and confirm the runtime with: strings %s "
+            "| grep -i 'librknnrt version'" % LIBRKNNRT)
+    else:
+        add("version chain agrees", PASS, shown)
+
+
+# --------------------------------------------------------------------------
+# 4. The model, by checksum and not by name
+# --------------------------------------------------------------------------
+def find_registry_entry(reg, path):
+    """Locate this model in agent 3's registry without assuming its schema.
+
+    We accept a list of records, a dict keyed by name, or a nested mix, and
+    match on basename or full path. Being liberal here is deliberate: this
+    check must not turn into a false FAIL because a sibling agent chose a
+    different key name.
+    """
+    base = os.path.basename(path)
+    stack, seen = [reg], 0
+    while stack and seen < 500:
+        node = stack.pop()
+        seen += 1
+        if isinstance(node, dict):
+            sha = node.get("sha256") or node.get("sha256sum") or node.get("sha")
+            cand = [str(node.get(k)) for k in ("path", "file", "filename",
+                                               "name") if node.get(k)]
+            if sha and any(os.path.basename(c) == base or c == path
+                           for c in cand):
+                return {"sha256": str(sha).lower().strip(), "entry": node}
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
+def check_model(cfg):
+    yolo_dir = cfg.get("FPMS_YOLO_DIR", "/home/ubuntu/yolo")
+    path = os.path.join(yolo_dir, "yolo26n-rk3588.rknn")
+    if not os.path.exists(path):
+        add("NPU model present", FAIL, "%s missing" % path,
+            "The .rknn is NOT in the git repository - it exists only on the "
+            "old Pi, and if that card dies nothing in git can rebuild it. "
+            "Copy it across before relying on detection, and register its "
+            "sha256 in %s. Do not substitute another .rknn to 'see if it "
+            "works': a wrong-shaped model loads happily and emits garbage "
+            "boxes." % MODELS_JSON)
+        return None
+    size_mb = os.path.getsize(path) / 1e6
+    add("NPU model present", PASS, "%s (%.1f MB)" % (path, size_mb))
+
+    if not os.path.exists(MODELS_JSON):
+        add("model checksum verified", FAIL, "%s absent" % MODELS_JSON,
+            "Without the registry a corrupted or swapped model is "
+            "undetectable, and a wrong model does not error - it detects "
+            "wrongly, which is worse. The registry is agent 3's; verify by "
+            "hand meanwhile: sha256sum %s" % path)
+        return path
+    try:
+        with open(MODELS_JSON) as fh:
+            reg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        add("model checksum verified", FAIL,
+            "%s does not parse: %s" % (MODELS_JSON, exc),
+            "An unparseable registry verifies nothing and is silently "
+            "skipped by anything less strict than this. Fix the JSON.")
+        return path
+
+    rec = find_registry_entry(reg, path)
+    if rec is None:
+        add("model checksum verified", WARN,
+            "no entry for %s in %s" % (os.path.basename(path), MODELS_JSON),
+            "An unregistered model is an unknown model. Add it with its "
+            "sha256, its input/output shapes, and the export flags - "
+            "especially end2end=false, because end2end=true emits [1,300,6] "
+            "whose top-k op SEGFAULTS on this NPU.")
+        return path
+
+    try:
+        actual = sha256_file(path)
+    except OSError as exc:
+        add("model checksum verified", FAIL, "cannot read %s: %s" % (path, exc))
+        return path
+    if actual == rec["sha256"]:
+        add("model checksum verified", PASS, "sha256 %s..." % actual[:16])
+    else:
+        add("model checksum verified", FAIL,
+            "sha256 %s... but registry says %s..."
+            % (actual[:16], rec["sha256"][:16]),
+            "This is NOT the model this image was built and validated "
+            "against. It will still load, still init, and still emit boxes - "
+            "they will simply be wrong, and nothing downstream can tell. "
+            "Restore the registered model or, if this one is genuinely "
+            "newer, update %s deliberately." % MODELS_JSON)
+    return path
+
+
+# --------------------------------------------------------------------------
+# 5+6. A real inference, its latency, and the numbers that come back
+#
+# This is the check the whole tool is built around. Everything above names a
+# cause; this one names the symptom the operator actually cares about.
+# --------------------------------------------------------------------------
+def check_inference(cfg, probe_info, model_path):
+    if probe_info.get("not_attempted"):
+        add("NPU inference completes", SKIP,
+            "not attempted: %s" % probe_info["not_attempted"],
+            "Fix the check named above first. Nothing below the runtime and "
+            "the model can be tested, and reporting this as a FAIL would "
+            "point the operator at the wrong line at 2am.")
+        return
+    if "probe" not in probe_info or probe_info.get("probe") is None:
+        tail = "; ".join(probe_info.get("stderr_tail") or []) or "no output"
+        if probe_info.get("timeout"):
+            add("NPU inference completes", FAIL,
+                "probe did not finish within %ds" % PROBE_TIMEOUT_S,
+                "A wedged inference is worse than a failed one: NPU_SPEC "
+                "requires inference off the camera thread precisely so a hang "
+                "cannot stall the frame pump and the LiDAR path. Check "
+                "dmesg for rknpu resets, and whether fpms-npud is already "
+                "hammering the device.")
+        else:
+            add("NPU inference completes", FAIL,
+                "probe produced no result: %s" % tail[:160],
+                "The probe runs out-of-process because a version mismatch in "
+                "librknnrt can abort() outright. No marker line usually means "
+                "it died hard - run it by hand as ubuntu and read the "
+                "traceback: sudo -u ubuntu python3 -c 'from rknnlite.api "
+                "import RKNNLite; RKNNLite()'")
+        return
+
+    p = probe_info["probe"]
+    if not p.get("ok"):
+        stage = p.get("stage", "?")
+        remedy = {
+            "import": "rknnlite will not import for %s. See the runtime "
+                      "check above." % NPU_USER,
+            "load_rknn": "The .rknn will not load. Either the file is "
+                         "truncated/corrupt (check sha256 above) or it was "
+                         "exported for a different target than rk3588.",
+            "init_runtime": "THIS IS THE ONE THE AGENT SWALLOWS. "
+                            "init_runtime() failing is almost always the "
+                            "three-way version mismatch (driver vs "
+                            "librknnrt.so vs wheel) or the device permission "
+                            "gap. Both are checked above - read those lines "
+                            "first, they name the actual cause.",
+            "inference": "Load and init succeeded and the inference itself "
+                         "failed. Check dmesg for rknpu faults and confirm "
+                         "the model's input is [1,3,640,640] with an "
+                         "end2end=false export.",
+        }.get(stage, "Run the probe by hand and read the traceback.")
+        add("NPU inference completes", FAIL,
+            "failed at %s: %s" % (stage, p.get("err") or "unknown"), remedy)
+        return
+
+    lat = sorted(p.get("latency_ms") or [])
+    if not lat:
+        add("NPU inference completes", FAIL, "no latency samples returned", "")
+        return
+    med = lat[len(lat) // 2]
+    worst = lat[-1]
+    try:
+        budget = float(cfg.get("FPMS_NPU_MAX_LATENCY_MS",
+                               DEFAULT_MAX_LATENCY_MS))
+    except ValueError:
+        budget = DEFAULT_MAX_LATENCY_MS
+
+    detail = ("%d inferences, median %.1f ms, max %.1f ms (warm-up %.1f ms "
+              "discarded), budget %.0f ms"
+              % (len(lat), med, worst, p.get("warmup_ms", 0.0), budget))
+    if med <= budget:
+        add("NPU inference completes", PASS, detail)
+    else:
+        add("NPU inference completes", FAIL, detail,
+            "Detection is running but too slowly to keep up. The rover needs "
+            "~3 inferences/second (FPMS_CAMERA_FPS=6 / FPMS_INFER_EVERY=2), a "
+            "333 ms period, and the old Pi did this in about 20 ms - so a "
+            "median past %.0f ms means something is wrong, not merely tight. "
+            "Likely: core 0 only (see below), thermal throttling, or "
+            "contention with fpms-npud. Run npu/bench/fpms_npu_bench.py to "
+            "tell those apart - a single number cannot." % budget)
+
+    # Shape. A wrong shape here is the difference between detection and
+    # confident nonsense, and NOTHING downstream would notice.
+    shape = p.get("shape")
+    if shape == EXPECTED_SHAPE:
+        add("output shape as contracted", PASS,
+            "%s %s" % (shape, p.get("dtype", "")))
+    elif shape == [1, 300, 6]:
+        add("output shape as contracted", FAIL,
+            "%s - this is an end2end=True export" % shape,
+            "MANDATORY: end2end=false. The end2end=True graph carries a top-k "
+            "op that SEGFAULTS on this NPU, and its [1,300,6] output is not "
+            "what the decoder parses. Re-export with end2end=false - see "
+            "npu/convert/.")
+    else:
+        add("output shape as contracted", FAIL,
+            "%s, expected %s" % (shape, EXPECTED_SHAPE),
+            "The decoder will read this as boxes anyway and emit garbage "
+            "with plausible-looking confidences. Refuse it. Confirm the "
+            "export: input images [1,3,640,640], output output0 [1,84,8400], "
+            "end2end=false.")
+
+    # Value sanity. Classes in THIS graph are already sigmoided - NPU_SPEC is
+    # explicit - so anything outside [0,1] means we are staring at raw logits
+    # from a different export, and every confidence downstream is a lie.
+    if not p.get("finite", True):
+        add("output values plausible", FAIL,
+            "output contains NaN or Inf (min %.4g max %.4g)"
+            % (p.get("min", float("nan")), p.get("max", float("nan"))),
+            "A non-finite tensor means a broken quantisation or a runtime "
+            "fault. The decoder's threshold comparisons silently drop NaNs, "
+            "so this presents as 'no detections', not as an error.")
+    elif p.get("all_zero"):
+        add("output values plausible", FAIL, "every output element is zero",
+            "An all-zero tensor is what a runtime that did not actually run "
+            "returns. It decodes to zero detections - i.e. it looks exactly "
+            "like a quiet scene. Check dmesg for rknpu faults and re-run.")
+    elif "cls_min" in p:
+        cmin, cmax = p["cls_min"], p["cls_max"]
+        if -0.001 <= cmin and cmax <= 1.001:
+            add("output values plausible", PASS,
+                "classes in [%.3f, %.3f], boxes in [%.1f, %.1f]"
+                % (cmin, cmax, p.get("box_min", 0), p.get("box_max", 0)))
+        else:
+            add("output values plausible", FAIL,
+                "class scores in [%.3f, %.3f], expected [0,1]" % (cmin, cmax),
+                "Classes in this graph are ALREADY SIGMOIDED. Values outside "
+                "[0,1] mean raw logits, i.e. a different export than the one "
+                "this stack decodes - and a decoder that sigmoids again would "
+                "squash every score toward 0.5 and detect nothing. Do not "
+                "'fix' this in the decoder; re-export the model.")
+    else:
+        add("output values plausible", SKIP,
+            "shape %s has no class band to inspect" % shape)
+
+
+# --------------------------------------------------------------------------
+# 7. The core mask - the silent two-thirds
+# --------------------------------------------------------------------------
+def check_core_mask(cfg, probe_info):
+    raw = cfg.get("FPMS_NPU_CORE_MASK")
+    name = normalise_mask(raw)
+
+    if raw is None or str(raw).strip() == "":
+        add("NPU core mask", FAIL, "FPMS_NPU_CORE_MASK is unset",
+            "Unset means init_runtime() is called with no core_mask, which "
+            "uses CORE 0 ONLY - two thirds of a 6 TOPS NPU idle. Nothing else "
+            "in this system would ever tell you: detection still works, at a "
+            "third of the silicon. Set FPMS_NPU_CORE_MASK=0_1_2 (or whatever "
+            "npu/bench/fpms_npu_bench.py measures as best) and restart "
+            "fpms-npud.")
+    elif name is None:
+        add("NPU core mask", FAIL, "FPMS_NPU_CORE_MASK=%r is not a mask" % raw,
+            "Unrecognised values fall through to the default, which is core 0 "
+            "only. Use one of: 0, 0_1, 0_1_2, auto.")
+    elif name == "NPU_CORE_0":
+        add("NPU core mask", FAIL, "core 0 only (FPMS_NPU_CORE_MASK=%s)" % raw,
+            "Two thirds of the NPU is idle and every symptom of it is "
+            "invisible - the rover detects, just slower, and no log line "
+            "mentions it. Set FPMS_NPU_CORE_MASK=0_1_2 unless the bench says "
+            "otherwise, and re-run npu/bench/fpms_npu_bench.py to confirm the "
+            "gain on this board rather than assuming it.")
+    elif name == "NPU_CORE_AUTO":
+        add("NPU core mask", WARN, "NPU_CORE_AUTO",
+            "AUTO picks ONE idle core per context - it is a scheduling "
+            "policy, not three-core inference. It is the right answer only if "
+            "you are running three models in parallel, one per core. For a "
+            "single YOLO graph, measure 0_1_2 against it before shipping "
+            "AUTO: npu/bench/fpms_npu_bench.py")
+    else:
+        add("NPU core mask", PASS, "%s (FPMS_NPU_CORE_MASK=%s)" % (name, raw))
+
+    # Empirical confirmation. Configuration is an intention; debugfs is what
+    # happened. These disagree exactly when it matters most.
+    peak = probe_info.get("load_peak")
+    if not peak:
+        add("cores actually used", SKIP,
+            "%s not readable (%d samples)"
+            % (DRV_LOAD, probe_info.get("load_samples", 0)),
+            "debugfs is root-only; run this as root to sample it. Meanwhile: "
+            "sudo cat %s while an inference runs." % DRV_LOAD)
+        return
+    used = sorted(c for c, v in peak.items() if v > 0)
+    summary = ", ".join("Core%d peak %d%%" % (c, peak[c])
+                        for c in sorted(peak))
+    if not used:
+        add("cores actually used", WARN,
+            "no core rose above 0%% during the probe (%s)" % summary,
+            "Either the sampling missed a very short burst - a 20 ms "
+            "inference against a 20 ms poll is a coin flip - or nothing ran "
+            "on the NPU at all. Cross-check against 'NPU inference completes' "
+            "above: if that passed, this is a sampling artefact.")
+    elif len(peak) > 1 and used == [0] and name in ("NPU_CORE_0_1",
+                                                    "NPU_CORE_0_1_2"):
+        add("cores actually used", FAIL,
+            "mask says %s but only Core0 did any work (%s)" % (name, summary),
+            "The configured mask is not the mask in force. Something is "
+            "calling init_runtime() without it - the agent's own NPU block "
+            "does exactly that today. Check that fpms-npud reads "
+            "FPMS_NPU_CORE_MASK and that its unit carries the "
+            "EnvironmentFile.")
+    else:
+        add("cores actually used", PASS, summary)
+
+
+# --------------------------------------------------------------------------
+# 8. The daemon, and whether its telemetry is FRESH
+#
+# Freshness, not arrival. The LiDAR taught this project that lesson at some
+# cost: telemetry/lidar publishes on a TIMER, so a message arriving proves
+# the publisher is alive and says nothing about the sensor behind it.
+# --------------------------------------------------------------------------
+def check_daemon(cfg):
+    _, active, _ = sh(["systemctl", "is-active", "fpms-npud.service"])
+    _, enabled, _ = sh(["systemctl", "is-enabled", "fpms-npud.service"])
+    if active != "active":
+        add("fpms-npud running", FAIL, active or "unknown",
+            "With the daemon down, inference happens inside the camera loop "
+            "again (or not at all) and a wedged NPU call stalls the frame "
+            "pump that also feeds the fire detector. "
+            "journalctl -u fpms-npud -b --no-pager | tail -40")
+        return
+    if enabled not in ("enabled", "enabled-runtime", "static"):
+        add("fpms-npud running", WARN, "active but %s" % (enabled or "unknown"),
+            "Active-but-disabled comes back DISABLED after a reboot and is "
+            "then silently absent - fpms-missions was once found in exactly "
+            "that state. Run: sudo systemctl enable fpms-npud")
+    else:
+        add("fpms-npud running", PASS, "active, %s" % enabled)
+
+    thing = cfg.get("FPMS_THING_NAME", "rover2")
+    topic = "fpms/%s/telemetry/npu" % thing
+    rc, out, _ = sh(["mosquitto_sub", "-h", "127.0.0.1", "-p", "1883",
+                     "-u", cfg.get("FPMS_MQTT_USER", "fpms"),
+                     "-P", cfg.get("FPMS_MQTT_PASS", ""),
+                     "-t", topic, "-C", "3", "-W", "10"], timeout=20)
+    if rc != 0 or not out:
+        add("telemetry/npu fresh", FAIL,
+            "nothing on %s within 10s" % topic,
+            "The daemon is active and saying nothing, which is the shape of "
+            "every silent failure in this project. Check the broker password "
+            "(an auth failure crashes nothing - services retry forever) and "
+            "journalctl -u fpms-npud.")
+        return
+
+    payload = None
+    for line in reversed(out.splitlines()):
+        try:
+            cand = json.loads(line)
+        except ValueError:
+            continue
+        # Skip our own publications, or --boot would validate itself.
+        if isinstance(cand, dict) and cand.get("source") == "fpms-npu-selftest":
+            continue
+        payload = cand
+        break
+    if payload is None:
+        add("telemetry/npu fresh", WARN,
+            "only this tool's own payloads seen on %s" % topic,
+            "fpms-npu-selftest publishes here too, and tags itself "
+            "source=fpms-npu-selftest so it cannot be mistaken for the "
+            "daemon. The daemon itself has published nothing.")
+        return
+
+    ts = payload.get("ts")
+    age = (time.time() - float(ts)) if isinstance(ts, (int, float)) else None
+    infers = payload.get("inferences", payload.get("count"))
+    if age is None:
+        add("telemetry/npu fresh", WARN, "payload carries no usable ts",
+            "Arrival is not freshness. Without a timestamp a frozen daemon "
+            "and a healthy one are indistinguishable - the same trap "
+            "telemetry/lidar's seq field exists to close.")
+    elif age > 30:
+        add("telemetry/npu fresh", FAIL, "last payload is %.0f s old" % age,
+            "Stale telemetry from an ACTIVE unit means the daemon's loop is "
+            "wedged, not dead - systemd will never restart it. Restart it and "
+            "read the journal for what it was doing: sudo systemctl restart "
+            "fpms-npud")
+    else:
+        extra = "" if infers is None else ", %s inferences" % infers
+        add("telemetry/npu fresh", PASS, "%.1f s old%s" % (age, extra))
+
+    # The headline number, from the daemon's own point of view.
+    det = payload.get("detecting")
+    if det is False:
+        add("daemon reports detecting", FAIL,
+            "fpms-npud says detecting=false",
+            "THE ROVER IS STREAMING VIDEO AND DETECTING NOTHING. Everything "
+            "above names why. Start at the first FAIL in this report.")
+    elif det is True:
+        add("daemon reports detecting", PASS, "detecting=true")
+
+
+# --------------------------------------------------------------------------
+# 9. Thermal headroom and throttling
+# --------------------------------------------------------------------------
+def zones():
+    out = []
+    for zpath in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        ztype, _ = read_text(os.path.join(zpath, "type"))
+        temp, _ = read_text(os.path.join(zpath, "temp"))
+        if ztype is None or temp is None:
+            continue
+        try:
+            c = int(temp) / 1000.0
+        except ValueError:
+            continue
+        trips = []
+        for tp in sorted(glob.glob(os.path.join(zpath, "trip_point_*_temp"))):
+            tt, _ = read_text(tp)
+            ty, _ = read_text(tp.replace("_temp", "_type"))
+            try:
+                trips.append((ty or "?", int(tt) / 1000.0))
+            except (ValueError, TypeError):
+                continue
+        out.append({"path": zpath, "type": ztype, "c": c, "trips": trips})
+    return out
+
+
+def check_thermal():
+    zs = zones()
+    if not zs:
+        add("NPU thermal headroom", SKIP, "no thermal zones readable",
+            "Confirm on hardware: grep . /sys/class/thermal/thermal_zone*/type")
+        check_throttle()
+        return
+
+    # Prefer an npu-named zone; RK3588's vendor DT declares soc/gpu/npu zones,
+    # but MEASURE ME - the exact set is board- and BSP-dependent.
+    z = next((x for x in zs if "npu" in x["type"].lower()), None)
+    if z is None:
+        z = next((x for x in zs if "soc" in x["type"].lower()), zs[0])
+        note = " (no npu zone; using %s)" % z["type"]
+    else:
+        note = ""
+
+    passive = [t for ty, t in z["trips"] if "passive" in ty.lower()]
+    critical = [t for ty, t in z["trips"] if "crit" in ty.lower()]
+    limit = min(passive) if passive else None
+    detail = "%s %.1f C%s" % (z["type"], z["c"], note)
+    if limit is not None:
+        detail += ", %.1f C to the passive trip at %.0f C" % (limit - z["c"],
+                                                              limit)
+    elif critical:
+        detail += ", critical trip %.0f C" % min(critical)
+
+    if limit is None:
+        add("NPU thermal headroom", WARN, detail + " (no passive trip found)",
+            "Without a trip point we cannot say how close to throttling this "
+            "is. Read the zone's trip points: grep . %s/trip_point_*_temp"
+            % z["path"])
+    elif z["c"] >= limit:
+        add("NPU thermal headroom", FAIL, detail,
+            "At or past the passive trip: the SoC is shedding frequency right "
+            "now and every latency number in this report is a throttled one. "
+            "RK3588 throttles HARD and silently under sustained load. Check "
+            "airflow and the heatsink before tuning anything in software.")
+    elif limit - z["c"] < 10:
+        add("NPU thermal headroom", WARN, detail,
+            "Under 10 C of headroom at IDLE-ish load. A sustained run will "
+            "cross the trip - that is precisely what "
+            "npu/bench/fpms_npu_bench.py measures. Do not accept a "
+            "first-inference latency as representative.")
+    else:
+        add("NPU thermal headroom", PASS, detail)
+
+    check_throttle()
+
+
+def check_throttle():
+    # Throttling is visible as a LOWERED CEILING, not as a low current
+    # frequency: an idle NPU sits at its minimum OPP quite legitimately.
+    # devfreq_cooling lowers max_freq, so compare the ceiling to the OPP table.
+    for dev in glob.glob("/sys/class/devfreq/*npu*"):
+        cur, _ = read_text(os.path.join(dev, "cur_freq"))
+        mx, _ = read_text(os.path.join(dev, "max_freq"))
+        avail, _ = read_text(os.path.join(dev, "available_frequencies"))
+        if not (mx and avail):
+            continue
+        try:
+            top = max(int(x) for x in avail.split())
+            ceiling = int(mx)
+        except ValueError:
+            continue
+        d = "cur %s MHz, ceiling %d/%d MHz" % (
+            (int(cur) // 1000000 if cur and cur.isdigit() else "?"),
+            ceiling // 1000000, top // 1000000)
+        if ceiling < top:
+            add("NPU not throttled", FAIL, d,
+                "The devfreq ceiling has been pulled BELOW the OPP table's "
+                "top - that is thermal throttling in progress, and it is "
+                "invisible to every other check. Latency measured now is not "
+                "the latency you get cold. Improve cooling; do not compensate "
+                "by raising FPMS_NPU_MAX_LATENCY_MS.")
+        else:
+            add("NPU not throttled", PASS, d)
+        return
+    add("NPU not throttled", SKIP, "no NPU devfreq node found",
+        "MEASURE ME: confirm the node name on hardware - "
+        "ls /sys/class/devfreq/ (expected something like fdab0000.npu).")
+
+
+# --------------------------------------------------------------------------
+def publish(cfg, summary, faulted_edge):
+    """Best-effort. A health check that can be blocked by a broker is not one."""
+    thing = cfg.get("FPMS_THING_NAME", "rover2")
+    user = cfg.get("FPMS_MQTT_USER", "fpms")
+    pw = cfg.get("FPMS_MQTT_PASS", "")
+    try:
+        sh(["mosquitto_pub", "-h", "127.0.0.1", "-p", "1883",
+            "-u", user, "-P", pw,
+            "-t", "fpms/%s/telemetry/npu" % thing, "-q", "1",
+            "-m", json.dumps(summary)], timeout=8)
+        # Edge-triggered, QoS 1, per NPU_SPEC. Edge and not level because a
+        # fault republished every 90 seconds becomes wallpaper, and wallpaper
+        # is how "streaming without detection" survived this long.
+        if faulted_edge:
+            event = {
+                "ts": summary["ts"], "source": "fpms-npu-selftest",
+                "fault": True, "fail": summary["fail"],
+                "first_failure": next(
+                    (r["check"] for r in summary["checks"]
+                     if r["status"] == FAIL), None),
+                "detail": next((r["detail"] for r in summary["checks"]
+                                if r["status"] == FAIL), None),
+            }
+            sh(["mosquitto_pub", "-h", "127.0.0.1", "-p", "1883",
+                "-u", user, "-P", pw,
+                "-t", "fpms/%s/events/npu_fault" % thing, "-q", "1",
+                "-m", json.dumps(event)], timeout=8)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def previous_ok():
+    try:
+        with open(STATE_FILE) as fh:
+            return bool(json.load(fh).get("ok"))
+    except (OSError, ValueError):
+        return None
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+def main():
+    args = set(sys.argv[1:])
+    cfg = load_config()
+    was_ok = previous_ok()
+
+    check_device()
+    have_runtime = check_runtime_import()
+    model_path = check_model(cfg)
+
+    # One probe, consumed by three checks. Loading a 640x640 model twice to
+    # answer two questions would double the only expensive thing this tool
+    # does, and would contend twice with the daemon for the device.
+    mask_name = normalise_mask(cfg.get("FPMS_NPU_CORE_MASK"))
+    if have_runtime and model_path:
+        probe_info = run_probe(model_path, mask_name)
+    else:
+        probe_info = {"not_attempted": ("rknnlite does not import"
+                                        if not have_runtime
+                                        else "no model on disk")}
+
+    check_versions(probe_info)
+    check_inference(cfg, probe_info, model_path)
+    check_core_mask(cfg, probe_info)
+    check_daemon(cfg)
+    check_thermal()
+
+    n_fail = sum(1 for r in results if r["status"] == FAIL)
+    n_warn = sum(1 for r in results if r["status"] == WARN)
+    n_skip = sum(1 for r in results if r["status"] == SKIP)
+
+    probe = probe_info.get("probe") or {}
+    lat = sorted(probe.get("latency_ms") or [])
+    summary = {
+        "ts": time.time(),
+        "source": "fpms-npu-selftest",
+        "ok": n_fail == 0,
+        "fail": n_fail, "warn": n_warn, "skip": n_skip,
+        "total": len(results),
+        # The headline. Anything consuming this topic should be able to alarm
+        # on one boolean without parsing the check list.
+        "detecting": bool(probe.get("ok")),
+        "shape": probe.get("shape"),
+        "latency_ms_median": (lat[len(lat) // 2] if lat else None),
+        "latency_ms_max": (lat[-1] if lat else None),
+        "core_mask": cfg.get("FPMS_NPU_CORE_MASK") or None,
+        "core_load_peak": probe_info.get("load_peak"),
+        "sdk_version": probe.get("sdk_version"),
+        "checks": results,
+    }
+
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_FILE, "w") as fh:
+            json.dump(summary, fh, indent=2)
+    except OSError:
+        pass
+
+    if "--boot" in args:
+        publish(cfg, summary, faulted_edge=(n_fail > 0 and was_ok is not False))
+
+    if "--json" in args:
+        print(json.dumps(summary, indent=2))
+    elif "--quiet" not in args:
+        print("=" * 72)
+        print(" FPMS-OS NPU self-test    %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S"))
+        print("=" * 72)
+        for r in results:
+            print("  [%-4s] %-32s %s" % (r["status"], r["check"], r["detail"]))
+            if r["remedy"] and r["status"] in (FAIL, WARN, SKIP):
+                for i, chunk in enumerate(_wrap(r["remedy"], 62)):
+                    print("         %s%s" % ("-> " if i == 0 else "   ", chunk))
+        print("-" * 72)
+        if probe.get("ok"):
+            print("  A real inference ran and returned %s." % (probe.get("shape"),))
+        else:
+            print("  NO INFERENCE RAN. If the agent is up, this rover is "
+                  "streaming")
+            print("  video and detecting NOTHING - and every unit will still "
+                  "read active.")
+        if n_fail:
+            print("  %d FAILED, %d warnings. Detection is NOT trustworthy."
+                  % (n_fail, n_warn))
+        elif n_warn:
+            print("  %d warnings, nothing failed. Read them before a run."
+                  % n_warn)
+        else:
+            print("  All checks passed.")
+        print("=" * 72)
+
+    return 2 if n_fail else (1 if n_warn else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

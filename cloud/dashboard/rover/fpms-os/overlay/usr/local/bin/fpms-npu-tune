@@ -1,0 +1,1386 @@
+#!/usr/bin/env python3
+"""fpms-npu-tune - NPU core policy and thermal reality, reported not assumed.
+
+Usage:
+    fpms-npu-tune                       human-readable report (CHANGES NOTHING)
+    fpms-npu-tune --json                machine-readable, same data
+    fpms-npu-tune --watch               monitor loop; logs ONLY on state change
+    fpms-npu-tune --verify              print the exact commands that confirm
+                                        every path this tool guesses at
+    fpms-npu-tune --print-env           the config.env line this policy implies
+
+    fpms-npu-tune --apply --core-mask   resolve the mask, write /run/fpms/npu.env
+    fpms-npu-tune --apply --governor performance    pin NPU DVFS (costs power)
+    fpms-npu-tune --apply --restore-governor        undo the above
+
+Exit: 0 ok, 1 something is degraded or unknown, 2 a fault worth acting on.
+Never nonzero in --watch: it is a monitor, not a gate.
+
+
+WHY THIS EXISTS
+===============
+Two separate defects, both silent, both costing detection.
+
+1. TWO THIRDS OF THE NPU IS IDLE.
+   The RK3588S has three NPU cores, 6 TOPS total. `init_runtime()` called with
+   no `core_mask` runs on ONE core. Nothing in the FPMS codebase has ever set a
+   mask, so every inference this rover has ever run used a third of the
+   hardware -- and nothing anywhere said so.
+
+   Worse, the obvious-looking fix is wrong. `RKNN_NPU_CORE_AUTO` reads like
+   "use everything"; in Rockchip's C API it means "automatically pick an IDLE
+   core" -- singular. For a single-model workload that is still one core.
+   Setting FPMS_NPU_CORE_MASK=auto believing it means "all" leaves you exactly
+   where you started, with a config line that looks like the question was
+   settled. This tool refuses to let that read as success.
+   VERIFY ON HARDWARE:
+     python3 -c "from rknnlite.api import RKNNLite as R; print(R.NPU_CORE_AUTO, R.NPU_CORE_0, R.NPU_CORE_0_1_2)"
+
+   And the value is a NAME, not a number. fpms-npud (agent 2) accepts exactly
+   "0" | "0_1" | "0_1_2" | "auto" and refuses everything else, so
+   FPMS_NPU_CORE_MASK=7 -- the natural spelling if you are thinking in bit
+   masks, which is how the kernel and this tool think -- stops the daemon from
+   starting. This tool speaks the daemon's vocabulary and flags any setting
+   that would be refused, before the daemon has to.
+
+2. RK3588 THROTTLES HARD AND SILENTLY.
+   A first-inference benchmark number is meaningless on this SoC. Frequency
+   drops, latency doubles, nothing logs. `bench_npu.py` measures 30 frames
+   from cold and reports a per-frame breakdown that is true for exactly those
+   30 frames. This tool exists so the thermal state behind any such number is
+   visible at the time it was taken.
+
+
+THE CORE-MASK DECISION, AND WHY IT GOES THE WAY IT DOES
+=======================================================
+There is a real trade-off and it is NOT "more cores is faster":
+
+  - Mask per model, one core each (0x1 / 0x2 / 0x4): three models run
+    genuinely concurrently. This is a THROUGHPUT win. It requires >=2
+    inference requests in flight to win anything at all.
+  - One model across all three (0x7): the graph is split across cores, which
+    lowers SINGLE-INFERENCE LATENCY. Speedup is sublinear -- weights are
+    duplicated per core and all three cores share one DDR bus -- and for a
+    small model the split overhead can exceed the gain.
+
+FPMS runs ONE model. `FPMS_CAMERA_FPS=6` with `FPMS_INFER_EVERY=2` is roughly
+3 inferences per second: a 333 ms budget per inference, arriving one at a
+time. There is no concurrency for throughput mode to exploit. Cores 1 and 2
+would sit idle in mask-per-model, which is the defect we started with.
+
+So the only lever this workload can pull is latency, and latency here is not
+vanity: it is the AGE of a detection. At the shipped cruise speed of 0.18 m/s
+the rover travels 18 mm per 100 ms of inference latency before a fire box has
+a position attached to it. Lower latency also buys headroom against
+FPMS_NPU_MAX_LATENCY_MS as the SoC heats up and clocks down -- which is the
+window in which this rover stops detecting without announcing it.
+
+=> POLICY: with FPMS_NPU_CORE_MASK unset, this resolves to ALL THREE CORES --
+   token `0_1_2` -- for the shipped one-model workload. That is also
+   fpms-npud's own built-in default, so the two agree by construction; this
+   tool's job is to say WHY, and to catch a config.env override that would
+   quietly undo it.
+
+   MEASURE ME, and this is a real gate, not a formality: yolo26n is a nano
+   model. If agent 7's bench shows 0_1_2 latency is WORSE than 0 -- entirely
+   possible when per-core split overhead dominates a small graph -- then set
+   FPMS_NPU_CORE_MASK=0 explicitly in config.env and record the two measured
+   numbers next to it. The policy is "spread one model for latency"; 0_1_2 is
+   the value that policy currently implies, not an article of faith.
+     bench:  /opt/fpms-os/npu/bench/fpms_npu_bench.py   (agent 7)
+
+   The power argument does NOT overturn this. Three cores for a third of the
+   time is roughly the same energy as one core for the whole time; what costs
+   battery is sustained 100% duty, and at 3 inferences/second the NPU is idle
+   the large majority of every second. Compare that with the governor decision
+   below, where the power cost IS the deciding factor.
+
+
+THE GOVERNOR DECISION GOES THE OTHER WAY
+========================================
+This tool can pin a `performance` DVFS governor. It does not do so by default
+and the unit does not do so at boot, deliberately.
+
+A performance pin holds the NPU at maximum frequency CONTINUOUSLY, including
+the ~90% of every second this workload leaves it idle. What it buys is the
+DVFS ramp on the leading edge of an inference -- microseconds to a few
+milliseconds -- on a 333 ms budget. What it costs is standing power and heat
+on a battery that warns at 11.1 V and cuts at 10.8 V, on a SoC that responds
+to heat by throttling, which is the thing the pin was supposed to prevent.
+
+Burning battery for inference the mission does not need is a real cost, and a
+tool that silently reconfigures the SoC on every boot is not what this project
+wants. So: report by default, `--apply` to change, /run (tmpfs) to remember
+the old value, and a reboot puts it back on its own.
+
+Pin it for a bench run. Do not pin it for a mission unless a measurement says
+the ramp is a material part of the latency budget.
+
+
+EVERY PATH BELOW IS UNVERIFIED
+==============================
+The board has not arrived. Thermal zone indices, the rknpu debugfs layout and
+the devfreq node name all vary by BSP kernel version and none of them have
+been seen on this hardware. Nothing here is hardcoded: every node is
+discovered at runtime, every absence degrades to "unknown" rather than to a
+plausible number, and `fpms-npu-tune --verify` prints the exact command that
+confirms each one. When you have the board, run it and paste the output into
+npu/README.md.
+"""
+
+import json
+import os
+import re
+import signal
+import sys
+import time
+
+TOOL = "fpms-npu-tune"
+VERSION = "1"
+
+CONFIG = "/etc/fpms/config.env"
+RUN_DIR = "/run/fpms"
+REPORT_JSON = "/run/fpms/npu-tune.json"       # agent 7's selftest may read this
+MASK_ENV = "/run/fpms/npu.env"                # FPMS_NPU_CORE_MASK=<n>, tmpfs
+RESTORE_JSON = "/run/fpms/npu-tune-restore.json"
+
+THERMAL_ROOT = "/sys/class/thermal"
+DEVFREQ_ROOT = "/sys/class/devfreq"
+RKNPU_DEBUG = "/sys/kernel/debug/rknpu"
+COMPATIBLE = "/proc/device-tree/compatible"
+
+# THE VOCABULARY THE DAEMON ACTUALLY ACCEPTS.
+#
+# This is not our choice to make. fpms-npud (agent 2) owns the mechanism, and
+# its resolve_core_mask() takes NAMED TOKENS, not bit masks:
+#
+#     table = {"0": NPU_CORE_0, "0_1": NPU_CORE_0_1,
+#              "0_1_2": NPU_CORE_0_1_2, "auto": NPU_CORE_AUTO}
+#
+# and anything else is a named refusal that stops the daemon. So
+# FPMS_NPU_CORE_MASK=7 -- the obvious spelling if you are thinking in bit
+# masks, which is how the kernel and this tool think -- is REFUSED. Policy
+# speaks the mechanism's language, not the other way round.
+#
+# VERIFIED by reading overlay/usr/local/bin/fpms-npud on 2026-08-08. Re-check
+# if that file changes:  grep -A8 'table = {' /usr/local/bin/fpms-npud
+#
+# Note "0" here means NPU_CORE_0 (core 0 only), NOT the integer 0. The integer
+# 0 is NPU_CORE_AUTO, which this table spells "auto". They are different
+# things and the collision is exactly why nothing below is a bare number.
+NPUD_TOKENS = {
+    "0":     (1, "core 0 only"),
+    "0_1":   (3, "cores 0+1"),
+    "0_1_2": (7, "cores 0+1+2 (all three)"),
+    # RKNN's own AUTO. In Rockchip's C API RKNN_NPU_CORE_AUTO means
+    # "automatically pick an IDLE core" -- singular. Which core is chosen is a
+    # runtime decision, so there is no fixed bit mask to report.
+    # VERIFY ON HARDWARE:
+    #   python3 -c "from rknnlite.api import RKNNLite as R; print(R.NPU_CORE_AUTO)"
+    "auto":  (None, "RKNN NPU_CORE_AUTO - ONE idle core, chosen at runtime"),
+}
+
+# Turning the policy's answer back into the daemon's language. Only these three
+# masks are expressible; the daemon has no token for "core 2 only".
+TOKEN_FOR_MASK = {1: "0", 3: "0_1", 7: "0_1_2"}
+
+# Spellings an operator might plausibly reach for. fpms-npud accepts NONE of
+# them. They are mapped here only so the report can say what was probably
+# meant before it says the daemon will refuse to start.
+ALIASES = {
+    "1": 1, "0x1": 1, "core0": 1,
+    "3": 3, "0x3": 3, "core0_1": 3,
+    "7": 7, "0x7": 7, "core0_1_2": 7, "all": 7,
+}
+
+# Fallbacks used ONLY when the kernel exposes no trip points to discover.
+# Marked because they are inferred from RK3588 datasheet-class numbers, not
+# measured on this board.
+FALLBACK_WARN_C = 80.0        # VERIFY ON HARDWARE
+FALLBACK_CRIT_C = 95.0        # VERIFY ON HARDWARE
+
+OK, DEGRADED, FAULT = "ok", "degraded", "fault"
+
+_HAVE_ALARM = hasattr(signal, "SIGALRM")
+
+
+def log(msg):
+    """One line, prefixed, flushed. journald gets these verbatim."""
+    sys.stdout.write("%s: %s\n" % (TOOL, msg))
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Bounded sysfs I/O
+#
+# A sysfs or debugfs read hits driver code. A wedged rknpu driver can make one
+# block, and this process runs forever and may be ordered before the inference
+# daemon -- so an unbounded read here is a boot hazard. Every read is fenced
+# with SIGALRM.
+#
+# Honest limit: SIGALRM cannot interrupt a task in uninterruptible sleep. If
+# the driver hangs in D state no userspace timeout saves us, which is exactly
+# why the unit sits on nothing's critical path and why the one place systemd
+# orders anything after us carries a bounded TimeoutStartSec.
+# ---------------------------------------------------------------------------
+class _ReadTimeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _ReadTimeout()
+
+
+def read_text(path, timeout=1.0, limit=65536):
+    """Return the file's contents stripped, or None. Never raises, never hangs
+    on an interruptible read."""
+    prev = None
+    try:
+        if _HAVE_ALARM:
+            prev = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 - absence and timeout are both just "no data"
+        return None
+    finally:
+        if _HAVE_ALARM and prev is not None:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, prev)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def read_int(path, timeout=1.0):
+    txt = read_text(path, timeout)
+    if txt is None:
+        return None
+    m = re.search(r"-?\d+", txt)
+    return int(m.group(0)) if m else None
+
+
+def write_text(path, value, timeout=2.0):
+    """Returns (ok, error-string). The only function in this file that writes
+    to the kernel, and it is only ever reached under --apply."""
+    prev = None
+    try:
+        if _HAVE_ALARM:
+            prev = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+        with open(path, "w") as fh:
+            fh.write(value)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    finally:
+        if _HAVE_ALARM and prev is not None:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, prev)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def listdir(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def load_config():
+    """Same shallow parse fpms-selftest uses. config.env is owned elsewhere;
+    this tool reads it and never writes it."""
+    cfg = {}
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    # A value already in our environment (unit Environment=, or the operator's
+    # shell) beats the file, because that is what the daemon would actually see.
+    for k in ("FPMS_NPU_CORE_MASK", "FPMS_NPU_MAX_LATENCY_MS",
+              "FPMS_NPU_TUNE_INTERVAL_S", "FPMS_NPU_TUNE_GOVERNOR",
+              "FPMS_NPU_TUNE_HEARTBEAT_S"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Discovery: thermal
+# ---------------------------------------------------------------------------
+def scale_temp(raw):
+    """Thermal zones report millidegrees C on every kernel we know of, but the
+    unit is not guaranteed by the sysfs ABI and some vendor drivers report
+    whole degrees. Scale by magnitude rather than by assumption; 1000 'degrees'
+    is not a temperature this SoC survives.
+    VERIFY ON HARDWARE:  cat /sys/class/thermal/thermal_zone0/temp"""
+    if raw is None:
+        return None
+    return raw / 1000.0 if abs(raw) >= 1000 else float(raw)
+
+
+def discover_thermal_zones():
+    """Enumerate every thermal zone with its type, temperature and trip points.
+
+    Zone INDICES ARE NOT STABLE and must never be hardcoded: RK3588 BSP kernels
+    have shipped soc-thermal at zone0 in one release and gpu-thermal at zone0
+    in another. Match on the `type` string, which is at least descriptive.
+    VERIFY ON HARDWARE:  cat /sys/class/thermal/thermal_zone*/type"""
+    zones = []
+    for name in listdir(THERMAL_ROOT):
+        if not name.startswith("thermal_zone"):
+            continue
+        base = os.path.join(THERMAL_ROOT, name)
+        ztype = read_text(os.path.join(base, "type"))
+        temp = scale_temp(read_int(os.path.join(base, "temp")))
+        if ztype is None and temp is None:
+            continue
+        trips = []
+        for f in listdir(base):
+            m = re.match(r"trip_point_(\d+)_temp$", f)
+            if not m:
+                continue
+            t = scale_temp(read_int(os.path.join(base, f)))
+            ttype = read_text(os.path.join(base, "trip_point_%s_type" % m.group(1)))
+            if t is not None:
+                trips.append({"index": int(m.group(1)), "temp_c": round(t, 1),
+                              "type": ttype})
+        trips.sort(key=lambda t: t["temp_c"])
+        zones.append({
+            "node": name,
+            "type": ztype,
+            "temp_c": None if temp is None else round(temp, 1),
+            "trips": trips,
+        })
+    return zones
+
+
+def pick_zone(zones, *needles):
+    """First zone whose type contains any of the needles. Returns None rather
+    than a substitute -- reporting the GPU's temperature as the NPU's would be
+    a fabricated measurement, and this project has been hurt by those."""
+    for needle in needles:
+        for z in zones:
+            if z["type"] and needle in z["type"].lower():
+                return z
+    return None
+
+
+def discover_cooling_devices():
+    """Cooling devices are the only NON-INFERRED evidence of throttling: a
+    cur_state above 0 means the thermal governor is actively holding something
+    down. A frequency below max proves nothing on its own -- an idle devfreq
+    governor also clocks down, and confusing the two is how 'it throttles'
+    becomes an unfalsifiable claim.
+    VERIFY ON HARDWARE:  grep . /sys/class/thermal/cooling_device*/type"""
+    devs = []
+    for name in listdir(THERMAL_ROOT):
+        if not name.startswith("cooling_device"):
+            continue
+        base = os.path.join(THERMAL_ROOT, name)
+        devs.append({
+            "node": name,
+            "type": read_text(os.path.join(base, "type")),
+            "cur_state": read_int(os.path.join(base, "cur_state")),
+            "max_state": read_int(os.path.join(base, "max_state")),
+        })
+    return devs
+
+
+# ---------------------------------------------------------------------------
+# Discovery: DVFS
+# ---------------------------------------------------------------------------
+def discover_npu_devfreq():
+    """Find the NPU's devfreq node.
+
+    The directory is named after the device tree node -- on RK3588 BSP kernels
+    that has been seen as `fdab0000.npu`, but the address is SoC- and
+    DTS-dependent and RK3588S is not required to match RK3588. Match on 'npu'
+    appearing in the node name or in the resolved device path instead.
+    VERIFY ON HARDWARE:  ls -l /sys/class/devfreq/"""
+    for name in listdir(DEVFREQ_ROOT):
+        base = os.path.join(DEVFREQ_ROOT, name)
+        real = ""
+        try:
+            real = os.path.realpath(base)
+        except OSError:
+            pass
+        if "npu" not in name.lower() and "npu" not in real.lower():
+            continue
+
+        def hz(f):
+            return read_int(os.path.join(base, f))
+
+        avail = read_text(os.path.join(base, "available_frequencies")) or ""
+        govs = read_text(os.path.join(base, "available_governors")) or ""
+        return {
+            "node": name,
+            "path": base,
+            "cur_hz": hz("cur_freq"),
+            "min_hz": hz("min_freq"),
+            "max_hz": hz("max_freq"),
+            "governor": read_text(os.path.join(base, "governor")),
+            "available_governors": govs.split(),
+            # The DVFS operating points, lowest first. These are the OPPs the
+            # governor may choose between; an empty list means the kernel is
+            # not exposing them, NOT that the NPU has one frequency.
+            "opps_hz": sorted(int(x) for x in avail.split() if x.isdigit()),
+        }
+    return None
+
+
+def discover_rknpu_debug():
+    """/sys/kernel/debug/rknpu/{version,load,freq,...}
+
+    debugfs is root-only and may not be mounted at all. The layout is driver-
+    version specific: `load` has shipped both as a single percentage and as a
+    per-core list, and `freq`/`volt`/`power` exist on some driver versions and
+    not others. Read what is there, claim nothing about what is not.
+    VERIFY ON HARDWARE:
+      sudo ls /sys/kernel/debug/rknpu/
+      sudo cat /sys/kernel/debug/rknpu/version
+      sudo cat /sys/kernel/debug/rknpu/load"""
+    info = {
+        "path": RKNPU_DEBUG,
+        "present": os.path.isdir(RKNPU_DEBUG),
+        "readable": None,
+        "version": None,
+        "load_raw": None,
+        "freq_raw": None,
+        "files": [],
+    }
+    if not info["present"]:
+        info["readable"] = False
+        # Distinguish "no debugfs" from "no rknpu". They need different fixes:
+        # one is a mount, the other is a missing/failed driver.
+        info["debugfs_mounted"] = os.path.isdir("/sys/kernel/debug")
+        return info
+    info["debugfs_mounted"] = True
+    info["files"] = listdir(RKNPU_DEBUG)
+    info["version"] = read_text(os.path.join(RKNPU_DEBUG, "version"))
+    info["load_raw"] = read_text(os.path.join(RKNPU_DEBUG, "load"))
+    info["freq_raw"] = read_text(os.path.join(RKNPU_DEBUG, "freq"))
+    info["readable"] = any(v is not None for v in
+                           (info["version"], info["load_raw"], info["freq_raw"]))
+    return info
+
+
+def parse_load(raw):
+    """Per-core utilisation out of `/sys/kernel/debug/rknpu/load`.
+
+    Two formats have shipped and this tool must not care which it meets:
+      'NPU load:  Core0:  0%, Core1:  0%, Core2:  0%,'   (RK3588 multi-core)
+      'NPU load:  12%'                                    (single-core drivers)
+    Returns (per_core_list_or_None, overall_or_None).
+    VERIFY ON HARDWARE:  sudo cat /sys/kernel/debug/rknpu/load"""
+    if not raw:
+        return None, None
+    cores = re.findall(r"Core\s*(\d+)\s*:\s*(\d+)\s*%", raw, re.IGNORECASE)
+    if cores:
+        out = [None] * (max(int(i) for i, _ in cores) + 1)
+        for idx, pct in cores:
+            out[int(idx)] = int(pct)
+        known = [c for c in out if c is not None]
+        return out, (max(known) if known else None)
+    single = re.search(r"(\d+)\s*%", raw)
+    if single:
+        return None, int(single.group(1))
+    return None, None
+
+
+def detect_core_count(rknpu, devfreq):
+    """How many NPU cores does this SoC actually have?
+
+    Preference order is deliberate: an observed per-core load list is
+    EVIDENCE; the SoC compatible string is an INFERENCE. Returns
+    (count_or_None, how_we_know)."""
+    per_core, _ = parse_load(rknpu.get("load_raw"))
+    if per_core:
+        return len(per_core), "observed in %s/load" % RKNPU_DEBUG
+
+    compat = read_text(COMPATIBLE) or ""
+    compat = compat.replace("\x00", " ").lower()
+    if "rk3588" in compat:
+        # RK3588 and RK3588S both carry the same 3-core 6 TOPS NPU. Inferred
+        # from the part, not seen on this board.
+        # VERIFY ON HARDWARE:  tr '\\0' '\\n' < /proc/device-tree/compatible
+        return 3, "inferred from SoC compatible %r (VERIFY ON HARDWARE)" % compat.strip()
+
+    if devfreq:
+        return None, "devfreq node %s present but core count not exposed" % devfreq["node"]
+    return None, "no evidence available"
+
+
+# ---------------------------------------------------------------------------
+# Policy: the core mask
+# ---------------------------------------------------------------------------
+def resolve_core_mask(cfg, core_count, core_count_how):
+    """Decide what FPMS_NPU_CORE_MASK should be, in the daemon's vocabulary.
+
+    See the module docstring for the reasoning. In one line: FPMS runs one
+    model at ~3 inferences/second, so there is no concurrency for per-core
+    throughput mode to exploit, and the only lever is single-inference latency
+    -> spread the one model across every core the SoC has.
+
+    Returns both the token fpms-npud accepts and the bit mask it implies. The
+    token is what gets written anywhere; the mask exists so this tool can ask
+    whether the SoC actually has the cores being named."""
+    raw_in = cfg.get("FPMS_NPU_CORE_MASK")
+    raw = (raw_in or "").strip().lower()
+    out = {
+        "configured": raw_in if raw_in is not None else "(unset)",
+        "token": None,          # what fpms-npud will be given
+        "resolved": None,       # the bit mask it implies, or None for auto
+        "resolved_hex": None,
+        "label": None,
+        "policy": "latency (one model, ~3 inferences/s, no concurrency to win)",
+        "source": None,
+        # Each warning carries its own severity. A mask that names a core the
+        # SoC does not have is a FAULT (init_runtime() fails and the agent
+        # swallows it); a mask that merely wastes cores is DEGRADED.
+        "warnings": [],
+        "measured": False,   # nothing here has run on an RK3588S. MEASURE ME.
+    }
+
+    def warn(sev, text):
+        out["warnings"].append({"severity": sev, "text": text})
+
+    if raw == "":
+        # NOTHING CONFIGURED -> the policy decides. This is the only branch
+        # where this tool chooses; every other branch reports someone else's
+        # choice back to them.
+        if core_count is None:
+            # Refuse to guess wide. A token naming a core the SoC does not
+            # have makes init_runtime() fail, and fpms_rover_agent.py swallows
+            # that and streams video with no detection -- the worst failure
+            # mode in the project. Core 0 only is never worse than the
+            # behaviour we are replacing.
+            out["token"], out["resolved"] = "0", 1
+            out["source"] = "policy FALLBACK: core count unknown (%s)" % core_count_how
+            warn(DEGRADED,
+                 "Could not establish how many NPU cores this SoC has, so the "
+                 "policy fell back to core 0 only -- one third of the NPU. "
+                 "This is not a failure of the NPU, it is a failure to READ "
+                 "it: debugfs is root-only and may not be mounted. Run "
+                 "`sudo fpms-npu-tune` and `sudo cat /sys/kernel/debug/rknpu/load`.")
+        else:
+            mask = (1 << core_count) - 1
+            token = TOKEN_FOR_MASK.get(mask)
+            if token is None:
+                # More cores than fpms-npud has a token for. Name the most
+                # cores it CAN express rather than inventing a spelling it
+                # will refuse.
+                token, mask = "0_1_2", 7
+                warn(DEGRADED,
+                     "This SoC reports %d NPU cores, but fpms-npud's "
+                     "vocabulary only reaches 0_1_2 (three). Using 0_1_2; "
+                     "cores beyond the third are unused." % core_count)
+            out["token"], out["resolved"] = token, mask
+            out["source"] = ("policy: FPMS_NPU_CORE_MASK unset -> all %d cores "
+                             "(%s)" % (core_count, core_count_how))
+    elif raw in NPUD_TOKENS:
+        out["resolved"], out["label"] = NPUD_TOKENS[raw]
+        out["token"] = raw
+        out["source"] = "explicit FPMS_NPU_CORE_MASK=%s" % raw
+    elif raw in ALIASES:
+        # Reports what they meant, then says the daemon will not accept it.
+        mask = ALIASES[raw]
+        out["resolved"] = mask
+        out["token"] = TOKEN_FOR_MASK.get(mask)
+        out["source"] = "FPMS_NPU_CORE_MASK=%s (spelling fpms-npud REFUSES)" % raw
+        warn(FAULT,
+             "FPMS_NPU_CORE_MASK=%r is a bit-mask spelling. fpms-npud takes "
+             "NAMED TOKENS and refuses anything else, so the daemon will not "
+             "start with this set. It looks like you meant %s -- write "
+             "FPMS_NPU_CORE_MASK=%s instead."
+             % (raw, TOKEN_FOR_MASK.get(mask, "?"), TOKEN_FOR_MASK.get(mask, "0_1_2")))
+    else:
+        out["source"] = "unparseable FPMS_NPU_CORE_MASK=%r" % raw
+        warn(FAULT,
+             "FPMS_NPU_CORE_MASK=%r is not one of fpms-npud's tokens, so the "
+             "daemon refuses it and does not start -- the rover streams video "
+             "and detects nothing. Accepted: 0 | 0_1 | 0_1_2 | auto. Leave it "
+             "unset to let this tool's policy choose." % raw)
+
+    mask = out["resolved"]
+    out["resolved_hex"] = None if mask is None else "0x%x" % mask
+    if out["label"] is None:
+        out["label"] = ("unknown" if mask is None
+                        else dict((v[0], v[1]) for v in NPUD_TOKENS.values()
+                                  if v[0] is not None).get(mask, "mask 0x%x" % mask))
+
+    # The trap. In fpms-npud's vocabulary the dangerous value is "auto", NOT
+    # "0" -- "0" there means NPU_CORE_0, one named core, which at least says
+    # what it does. "auto" is RKNN's NPU_CORE_AUTO: one IDLE core, singular,
+    # while reading like "let the system use everything".
+    if raw == "auto":
+        warn(FAULT,
+             "FPMS_NPU_CORE_MASK=auto is RKNN's NPU_CORE_AUTO, which selects "
+             "ONE IDLE CORE -- it does not mean 'all cores'. With a single "
+             "model this leaves two thirds of a 6 TOPS NPU idle while the "
+             "config line reads as though the question had been settled. Use "
+             "0_1_2, or leave it unset and let this tool's policy resolve it.")
+    elif mask is not None and core_count and mask >= (1 << core_count):
+        warn(FAULT,
+             "%s names a core this SoC does not have (%d cores detected). "
+             "init_runtime() will FAIL, and fpms_rover_agent.py swallows that "
+             "failure and streams video with no detection."
+             % (out["token"] or "this mask", core_count))
+    elif mask is not None and core_count and bin(mask).count("1") == 1 and core_count > 1:
+        warn(DEGRADED,
+             "Token %s uses a single core of %d. That is the right choice ONLY "
+             "if a measurement showed multi-core latency was worse for this "
+             "model -- record the two numbers next to the setting if so."
+             % (out["token"], core_count))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Snapshot
+# ---------------------------------------------------------------------------
+def snapshot(cfg):
+    zones = discover_thermal_zones()
+    cooling = discover_cooling_devices()
+    devfreq = discover_npu_devfreq()
+    rknpu = discover_rknpu_debug()
+    core_count, how = detect_core_count(rknpu, devfreq)
+    mask = resolve_core_mask(cfg, core_count, how)
+    per_core, overall = parse_load(rknpu.get("load_raw"))
+
+    npu_zone = pick_zone(zones, "npu")
+    soc_zone = pick_zone(zones, "soc", "cpu", "center", "package")
+    temps = [z["temp_c"] for z in zones if z["temp_c"] is not None]
+    hottest = max(temps) if temps else None
+    hottest_zone = None
+    if hottest is not None:
+        for z in zones:
+            if z["temp_c"] == hottest:
+                hottest_zone = z["type"] or z["node"]
+                break
+
+    # Thresholds come from the kernel's own trip points where they exist.
+    # Discovering them beats hardcoding: the BSP knows this SoC's limits and
+    # this file does not.
+    warn_c, crit_c, thresh_src = FALLBACK_WARN_C, FALLBACK_CRIT_C, "fallback (VERIFY ON HARDWARE)"
+    ref = npu_zone or soc_zone
+    if ref and ref["trips"]:
+        passive = [t["temp_c"] for t in ref["trips"]
+                   if (t["type"] or "").lower() in ("passive", "hot", "active")]
+        critical = [t["temp_c"] for t in ref["trips"]
+                    if (t["type"] or "").lower() == "critical"]
+        if passive:
+            warn_c = min(passive)
+        if critical:
+            crit_c = min(critical)
+        thresh_src = "trip points on %s" % (ref["type"] or ref["node"])
+
+    # Throttling: only assert it on cooling-device evidence. Otherwise null.
+    active_cool = [d for d in cooling
+                   if d["cur_state"] not in (None, 0) and (d["max_state"] or 0) > 0]
+    if cooling:
+        throttling = bool(active_cool)
+    else:
+        throttling = None
+
+    freq_pct = None
+    if devfreq and devfreq["cur_hz"] and devfreq["max_hz"]:
+        freq_pct = round(100.0 * devfreq["cur_hz"] / devfreq["max_hz"], 1)
+
+    snap = {
+        "tool": TOOL,
+        "version": VERSION,
+        "ts": time.time(),
+        "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+        "root": os.geteuid() == 0 if hasattr(os, "geteuid") else None,
+        "core_mask": mask,
+        "cores": {"count": core_count, "how": how},
+        "driver_version": rknpu.get("version"),
+        "load": {
+            "path": os.path.join(RKNPU_DEBUG, "load"),
+            "per_core_pct": per_core,
+            "overall_pct": overall,
+            "raw": rknpu.get("load_raw"),
+        },
+        "thermal": {
+            "zones": zones,
+            "cooling_devices": cooling,
+            "npu_c": npu_zone["temp_c"] if npu_zone else None,
+            "npu_zone": (npu_zone or {}).get("type"),
+            "soc_c": soc_zone["temp_c"] if soc_zone else None,
+            "soc_zone": (soc_zone or {}).get("type"),
+            "hottest_c": hottest,
+            "hottest_zone": hottest_zone,
+            "warn_c": warn_c,
+            "crit_c": crit_c,
+            "thresholds_from": thresh_src,
+            "throttling": throttling,
+            "active_cooling": [d["type"] for d in active_cool],
+        },
+        "dvfs": devfreq or {"node": None, "path": None},
+        "dvfs_pct_of_max": freq_pct,
+        "debugfs": {k: rknpu[k] for k in ("present", "readable", "files",
+                                          "debugfs_mounted") if k in rknpu},
+        "max_latency_ms": cfg.get("FPMS_NPU_MAX_LATENCY_MS"),
+        "issues": [],
+        "status": OK,
+    }
+    grade(snap)
+    return snap
+
+
+def grade(snap):
+    """Turn the snapshot into named issues. Absence of a reading is DEGRADED,
+    never OK: 'I could not measure it' and 'it is fine' are different answers
+    and this project has repeatedly been burned by treating them as the same."""
+    issues = snap["issues"]
+
+    def add(sev, name, detail, remedy=""):
+        issues.append({"severity": sev, "issue": name,
+                       "detail": detail, "remedy": remedy})
+
+    for w in snap["core_mask"]["warnings"]:
+        add(w["severity"], "core mask", w["text"],
+            "Set FPMS_NPU_CORE_MASK in /etc/fpms/config.env, then restart "
+            "fpms-npud. `fpms-npu-tune --print-env` prints the line.")
+
+    if not snap["debugfs"].get("present"):
+        if snap["debugfs"].get("debugfs_mounted") is False:
+            add(DEGRADED, "debugfs not mounted",
+                "/sys/kernel/debug is not mounted, so per-core NPU load and "
+                "the driver version cannot be read at all.",
+                "sudo mount -t debugfs none /sys/kernel/debug")
+        else:
+            add(FAULT, "rknpu driver absent",
+                "%s does not exist. debugfs is mounted, so this is the rknpu "
+                "kernel driver missing or failed to probe -- not a mount "
+                "problem. There is no mainline rknpu driver; this must be the "
+                "Rockchip BSP kernel." % RKNPU_DEBUG,
+                "uname -a; dmesg | grep -i rknpu")
+    elif snap["debugfs"].get("readable") is False:
+        add(DEGRADED, "debugfs unreadable",
+            "%s exists but nothing in it could be read. debugfs is root-only."
+            % RKNPU_DEBUG,
+            "Re-run as root: sudo fpms-npu-tune")
+
+    if snap["driver_version"] is None and snap["debugfs"].get("readable"):
+        add(DEGRADED, "driver version unknown",
+            "%s/version did not read. The runtime, the wheel and the driver "
+            "must be version-matched; a mismatch fails at init_runtime() with "
+            "a message the agent swallows." % RKNPU_DEBUG,
+            "sudo cat /sys/kernel/debug/rknpu/version; "
+            "cat /etc/fpms/npu-versions.json")
+
+    if not snap["thermal"]["zones"]:
+        add(DEGRADED, "no thermal zones",
+            "%s exposed no zones. RK3588 throttles hard and silently; with no "
+            "zones there is no way to know whether a latency number was taken "
+            "hot or cold." % THERMAL_ROOT,
+            "cat /sys/class/thermal/thermal_zone*/type")
+    else:
+        hot = snap["thermal"]["hottest_c"]
+        if hot is not None:
+            if hot >= snap["thermal"]["crit_c"]:
+                add(FAULT, "SoC at critical temperature",
+                    "%s is %.1f C, at or past the critical trip %.1f C (%s)."
+                    % (snap["thermal"]["hottest_zone"], hot,
+                       snap["thermal"]["crit_c"], snap["thermal"]["thresholds_from"]),
+                    "Stop the mission and let it cool. Inference latency is "
+                    "already unrepresentative at this temperature.")
+            elif hot >= snap["thermal"]["warn_c"]:
+                add(DEGRADED, "SoC hot",
+                    "%s is %.1f C, past the passive trip %.1f C (%s). Any "
+                    "latency measured now is a throttled number."
+                    % (snap["thermal"]["hottest_zone"], hot,
+                       snap["thermal"]["warn_c"], snap["thermal"]["thresholds_from"]),
+                    "Expect the governor to clock down. Re-bench cold before "
+                    "concluding anything about the model.")
+        if snap["thermal"]["npu_c"] is None:
+            add(DEGRADED, "no NPU thermal zone",
+                "No thermal zone's type contains 'npu'. Reporting another "
+                "zone's temperature as the NPU's would be a fabricated "
+                "measurement, so NPU temperature is reported as unknown.",
+                "cat /sys/class/thermal/thermal_zone*/type   # find the real name")
+
+    if snap["thermal"]["throttling"] is True:
+        add(DEGRADED, "actively throttling",
+            "Cooling devices engaged: %s. Frequency is being held down by the "
+            "thermal governor RIGHT NOW."
+            % ", ".join(snap["thermal"]["active_cooling"] or ["(unnamed)"]),
+            "Any inference latency measured in this state is a throttled "
+            "number, not the model's latency.")
+
+    if snap["dvfs"].get("node") is None:
+        add(DEGRADED, "no NPU devfreq node",
+            "No devfreq node matched 'npu' under %s, so NPU frequency, the "
+            "available operating points and the governor are all unknown. The "
+            "node name is DTS-dependent and was never confirmed on this board."
+            % DEVFREQ_ROOT,
+            "ls -l /sys/class/devfreq/")
+    else:
+        if not snap["dvfs"].get("opps_hz"):
+            add(DEGRADED, "no DVFS operating points exposed",
+                "%s/available_frequencies is empty or absent. This does NOT "
+                "mean the NPU has one frequency -- it means the kernel is not "
+                "telling us." % snap["dvfs"]["path"],
+                "cat %s/available_frequencies" % snap["dvfs"]["path"])
+
+    # Worst severity wins. No issues at all is the only way to reach "ok" --
+    # "I could not measure it" is DEGRADED, never OK.
+    if any(i["severity"] == FAULT for i in issues):
+        snap["status"] = FAULT
+    elif issues:
+        snap["status"] = DEGRADED
+    else:
+        snap["status"] = OK
+
+
+# ---------------------------------------------------------------------------
+# Human report
+# ---------------------------------------------------------------------------
+def mhz(hz):
+    return "?" if not hz else "%d MHz" % round(hz / 1e6)
+
+
+def print_report(snap):
+    t = snap["thermal"]
+    d = snap["dvfs"]
+    m = snap["core_mask"]
+
+    print("")
+    print("  %s  %s   status: %s" % (TOOL, snap["ts_iso"], snap["status"].upper()))
+    if snap.get("root") is False:
+        print("  (not root: debugfs is root-only, so per-core load and the "
+              "driver version will read as unknown)")
+    print("")
+
+    print("  CORES")
+    print("    detected        %s   (%s)"
+          % (snap["cores"]["count"] if snap["cores"]["count"] else "unknown",
+             snap["cores"]["how"]))
+    print("    configured      FPMS_NPU_CORE_MASK=%s" % m["configured"])
+    print("    resolves to     %s   (%s%s)"
+          % (m["token"] or "REFUSED", m["label"],
+             "" if not m["resolved_hex"] else ", mask %s" % m["resolved_hex"]))
+    print("    policy          %s" % m["policy"])
+    print("    measured?       NO - nothing here has run on an RK3588S. MEASURE ME.")
+    if snap["load"]["per_core_pct"]:
+        print("    load            %s"
+              % "  ".join("core%d %s%%" % (i, "?" if v is None else v)
+                          for i, v in enumerate(snap["load"]["per_core_pct"])))
+    elif snap["load"]["overall_pct"] is not None:
+        print("    load            %d%% (driver reports no per-core breakdown)"
+              % snap["load"]["overall_pct"])
+    else:
+        print("    load            unknown (%s unreadable)" % snap["load"]["path"])
+    print("    driver          %s" % (snap["driver_version"] or "unknown"))
+    print("")
+
+    print("  THERMAL     thresholds from: %s" % t["thresholds_from"])
+    if not t["zones"]:
+        print("    (no thermal zones found under %s)" % THERMAL_ROOT)
+    for z in t["zones"]:
+        flag = ""
+        if z["temp_c"] is not None and z["temp_c"] >= t["crit_c"]:
+            flag = "  <== CRITICAL"
+        elif z["temp_c"] is not None and z["temp_c"] >= t["warn_c"]:
+            flag = "  <== hot"
+        print("    %-14s %-18s %s%s"
+              % (z["node"], z["type"] or "?",
+                 "?" if z["temp_c"] is None else "%.1f C" % z["temp_c"], flag))
+    print("    npu             %s" % ("unknown - no zone type contains 'npu'"
+                                      if t["npu_c"] is None else "%.1f C (%s)"
+                                      % (t["npu_c"], t["npu_zone"])))
+    print("    throttling      %s" % {True: "YES - " + ", ".join(t["active_cooling"] or ["?"]),
+                                      False: "no (no cooling device engaged)",
+                                      None: "unknown (no cooling devices exposed)"}[t["throttling"]])
+    print("")
+
+    print("  DVFS")
+    if not d.get("node"):
+        print("    (no devfreq node matched 'npu' under %s)" % DEVFREQ_ROOT)
+    else:
+        print("    node            %s" % d["node"])
+        print("    frequency       %s  (min %s, max %s%s)"
+              % (mhz(d["cur_hz"]), mhz(d["min_hz"]), mhz(d["max_hz"]),
+                 "" if snap["dvfs_pct_of_max"] is None
+                 else ", now %.0f%% of max" % snap["dvfs_pct_of_max"]))
+        print("    governor        %s   available: %s"
+              % (d["governor"] or "?", " ".join(d["available_governors"]) or "?"))
+        print("    operating pts   %s"
+              % (", ".join(mhz(f) for f in d["opps_hz"]) if d["opps_hz"]
+                 else "not exposed by the kernel"))
+    print("")
+
+    if snap["issues"]:
+        print("  ISSUES")
+        for i in snap["issues"]:
+            print("    [%s] %s" % (i["severity"].upper(), i["issue"]))
+            print("           %s" % i["detail"])
+            if i["remedy"]:
+                print("           -> %s" % i["remedy"])
+        print("")
+    else:
+        print("  ISSUES  none\n")
+
+    print("  This tool changed nothing. `--apply` is required for that, and")
+    print("  `fpms-npu-tune --verify` prints the commands that confirm every")
+    print("  path above on real hardware.")
+    print("")
+
+
+# ---------------------------------------------------------------------------
+# --verify: hand the operator the commands, do not make them trust this file
+# ---------------------------------------------------------------------------
+VERIFY_TEXT = """
+Every path this tool reads was inferred from RK3588 BSP documentation and NOT
+seen on this board. Run these on the Pi and paste the output into
+/opt/fpms-os/npu/README.md so the next person does not have to guess.
+
+  1. Thermal zone names and indices (indices are NOT stable across kernels)
+       cat /sys/class/thermal/thermal_zone*/type
+       paste -d' ' <(cat /sys/class/thermal/thermal_zone*/type) \\
+                   <(cat /sys/class/thermal/thermal_zone*/temp)
+     Expect a zone whose type mentions npu. If there is none, NPU temperature
+     is genuinely unavailable -- do not substitute the GPU or SoC zone.
+
+  2. Trip points, which is where this tool gets its warn/critical thresholds
+       grep . /sys/class/thermal/thermal_zone*/trip_point_*_temp
+       grep . /sys/class/thermal/thermal_zone*/trip_point_*_type
+
+  3. Cooling devices -- the only non-inferred evidence of throttling
+       grep . /sys/class/thermal/cooling_device*/type
+       grep . /sys/class/thermal/cooling_device*/cur_state
+
+  4. The NPU devfreq node. The directory name is DTS-dependent.
+       ls -l /sys/class/devfreq/
+       cat /sys/class/devfreq/*npu*/cur_freq
+       cat /sys/class/devfreq/*npu*/available_frequencies
+       cat /sys/class/devfreq/*npu*/available_governors
+       cat /sys/class/devfreq/*npu*/governor
+       cat /sys/class/devfreq/*npu*/trans_stat        # time spent per OPP
+
+  5. rknpu debugfs. Root only, and the layout is driver-version specific.
+       sudo ls  /sys/kernel/debug/rknpu/
+       sudo cat /sys/kernel/debug/rknpu/version
+       sudo cat /sys/kernel/debug/rknpu/load
+       sudo cat /sys/kernel/debug/rknpu/freq      # may not exist
+     If /sys/kernel/debug/rknpu is missing, first check debugfs is mounted:
+       mount | grep debugfs
+     and only then conclude the driver is absent:
+       dmesg | grep -i rknpu
+
+  6. The core count and the mask constants, from the runtime itself
+       tr '\\0' '\\n' < /proc/device-tree/compatible
+       python3 -c "from rknnlite.api import RKNNLite as R; \\
+                   print({k: getattr(R, k) for k in dir(R) if k.startswith('NPU_CORE')})"
+     Confirm NPU_CORE_AUTO == 0 and NPU_CORE_0_1_2 == 7, and confirm that AUTO
+     selects ONE idle core rather than all three -- that distinction is the
+     reason FPMS_NPU_CORE_MASK=auto is a trap.
+
+  7. That the value this tool resolves actually reaches the daemon
+       systemctl cat  fpms-npud | grep EnvironmentFile
+       systemctl show fpms-npud -p Environment
+     The second command is the one that settles it. SPEC.md section 2 and
+     fpms-npud.service's own header make OPPOSITE claims about whether a value
+     in config.env overrides a later Environment= line; both cannot be right,
+     and reading either file again will not tell you which. Measure it.
+
+  8. The measurement that decides the mask policy (agent 7's bench)
+       sudo FPMS_NPU_CORE_MASK=0     /opt/fpms-os/npu/bench/fpms_npu_bench.py
+       sudo FPMS_NPU_CORE_MASK=0_1_2 /opt/fpms-os/npu/bench/fpms_npu_bench.py
+     Tokens, not numbers: fpms-npud refuses a bit mask. Compare SUSTAINED
+     latency percentiles, not the first inference. Run each long enough to
+     reach thermal steady state and record the temperature alongside -- with
+     `fpms-npu-tune --json` captured at the same moment -- or the numbers mean
+     nothing.
+"""
+
+
+# ---------------------------------------------------------------------------
+# --apply
+# ---------------------------------------------------------------------------
+def ensure_run_dir():
+    try:
+        os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+        return True
+    except OSError as exc:
+        log("cannot create %s: %s" % (RUN_DIR, exc))
+        return False
+
+
+def apply_core_mask(snap):
+    """Write the resolved mask where the inference daemon can pick it up.
+
+    This does NOT reconfigure the SoC -- a core mask is an argument to
+    init_runtime() inside the daemon's own process, so no external tool can
+    change it for a process that is already running. All this does is turn the
+    policy's `auto` into a concrete number that a static config file cannot
+    express, and put it in tmpfs where a reboot re-derives it.
+
+    CROSS-AGENT CONTRACT -- AS CHECKED ON 2026-08-08, THIS FILE IS INERT.
+    fpms-npud.service carries `EnvironmentFile=-/etc/fpms/config.env` and an
+    `Environment=FPMS_NPU_CORE_MASK=0_1_2` default. It does NOT read
+    /run/fpms/npu.env. For the runtime resolution to reach the daemon, someone
+    who owns that unit must add
+
+        EnvironmentFile=-/run/fpms/npu.env
+
+    to it. Until then the authoritative setting is the explicit value in
+    /etc/fpms/config.env, which `--print-env` prints ready to paste -- and the
+    daemon's built-in default is 0_1_2, which already agrees with this policy,
+    so the shipped behaviour is correct even with this file ignored. Re-check
+    rather than trusting this comment:
+        systemctl cat fpms-npud | grep EnvironmentFile
+
+    And note an unresolved contradiction while you are there: SPEC.md section 2
+    says EnvironmentFile= placed first means config.env CANNOT override the
+    Environment= lines, while fpms-npud.service's own comment says the same
+    ordering means config.env DOES win. Both cannot be true. Settle it by
+    measurement, not by reading either file:
+        systemctl show fpms-npud -p Environment
+    """
+    m = snap["core_mask"]
+    if m["token"] is None:
+        # Writing a value the daemon refuses would turn a config typo into a
+        # daemon that will not start, with this tool's name on it.
+        log("refusing to write a core mask: %s" % m["source"])
+        for w in m["warnings"]:
+            log("%s: %s" % (w["severity"].upper(), w["text"]))
+        return 2
+    if not ensure_run_dir():
+        return 2
+    body = (
+        "# Written by %s at %s. tmpfs: re-derived every boot, never persisted.\n"
+        "# Policy: one model at ~3 inferences/s has no concurrency for per-core\n"
+        "# throughput mode, so spread it for latency. Resolved from: %s\n"
+        "# Token vocabulary is fpms-npud's: 0 | 0_1 | 0_1_2 | auto. NOT a\n"
+        "# bit mask -- the daemon refuses numbers.\n"
+        "FPMS_NPU_CORE_MASK=%s\n"
+        % (TOOL, snap["ts_iso"], m["source"], m["token"])
+    )
+    try:
+        tmp = MASK_ENV + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, MASK_ENV)          # atomic: npud never reads a half file
+        os.chmod(MASK_ENV, 0o644)
+    except OSError as exc:
+        log("FAILED to write %s: %s" % (MASK_ENV, exc))
+        return 2
+
+    log("core mask %s (%s) -> %s  [%s]"
+        % (m["token"], m["label"], MASK_ENV, m["source"]))
+    for w in m["warnings"]:
+        log("%s: %s" % (w["severity"].upper(), w["text"]))
+    return 0
+
+
+POWER_WARNING = """
+  POWER AND HEAT COST -- read before you leave this pinned
+  -------------------------------------------------------
+  A performance governor holds the NPU at maximum frequency CONTINUOUSLY,
+  including the ~90% of every second that a 3-inference/second workload leaves
+  it idle. What it buys is the DVFS ramp at the leading edge of an inference:
+  microseconds to a few milliseconds, against a 333 ms budget.
+
+  What it costs is standing power, on a battery whose pack thresholds are
+  documented as 11.1 V warn and 10.8 V cut, and heat on a SoC that answers
+  heat by throttling -- which is the thing the pin was meant to prevent.
+
+  Pin it for a bench run. Do not leave it pinned for a mission unless a
+  measurement says the ramp is a material part of the latency budget.
+
+  This pin lives in tmpfs state and is NOT persisted: a reboot puts the
+  governor back on its own. `fpms-npu-tune --apply --restore-governor` undoes
+  it now.
+"""
+
+
+def apply_governor(snap, want):
+    d = snap["dvfs"]
+    if not d.get("node"):
+        log("cannot set governor: no NPU devfreq node found under %s. "
+            "Confirm with: ls -l /sys/class/devfreq/" % DEVFREQ_ROOT)
+        return 2
+
+    avail = d.get("available_governors") or []
+    if avail and want not in avail:
+        # Refuse rather than write a value the kernel will reject. A failed
+        # write here is silent from the operator's side.
+        log("refusing: governor %r is not in this kernel's list (%s)"
+            % (want, " ".join(avail)))
+        return 2
+
+    current = d.get("governor")
+    if current == want:
+        log("governor already %s on %s - nothing to do" % (want, d["node"]))
+        return 0
+
+    if want == "performance":
+        sys.stdout.write(POWER_WARNING)
+        sys.stdout.flush()
+
+    if ensure_run_dir() and current:
+        # Record what it was, so --restore-governor is not a guess. tmpfs, so
+        # the record dies with the pin it describes.
+        try:
+            with open(RESTORE_JSON, "w") as fh:
+                json.dump({"node": d["node"], "path": d["path"],
+                           "governor": current, "ts": snap["ts_iso"]}, fh, indent=2)
+        except OSError as exc:
+            log("WARNING: could not record the previous governor (%s). "
+                "--restore-governor will not know what to put back; a reboot "
+                "still will." % exc)
+
+    ok, err = write_text(os.path.join(d["path"], "governor"), want)
+    if not ok:
+        log("FAILED to set governor to %s on %s: %s (root required)"
+            % (want, d["node"], err))
+        return 2
+    now = read_text(os.path.join(d["path"], "governor"))
+    log("governor %s -> %s on %s (readback: %s)"
+        % (current or "?", want, d["node"], now or "?"))
+    if now != want:
+        log("WARNING: readback does not match. The kernel accepted the write "
+            "and did something else -- treat the governor as UNKNOWN.")
+        return 1
+    return 0
+
+
+def restore_governor(snap):
+    rec = None
+    try:
+        with open(RESTORE_JSON) as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    if not rec:
+        log("nothing to restore: no %s. Either the governor was never changed "
+            "by this tool, or the machine has rebooted since -- a reboot "
+            "already restored it." % RESTORE_JSON)
+        return 0
+    ok, err = write_text(os.path.join(rec["path"], "governor"), rec["governor"])
+    if not ok:
+        log("FAILED to restore governor %s on %s: %s"
+            % (rec["governor"], rec["node"], err))
+        return 2
+    log("governor restored to %s on %s" % (rec["governor"], rec["node"]))
+    try:
+        os.unlink(RESTORE_JSON)
+    except OSError:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --watch: the unit's normal mode
+# ---------------------------------------------------------------------------
+def temp_bucket(c, warn_c, crit_c):
+    """Coarse, hysteresis-free-by-construction temperature state.
+
+    The 5 C bucket is what stops this from logging every cycle forever: a SoC
+    idling near a bucket edge would otherwise flap a line into the journal
+    every few seconds, and this process runs for the whole life of the mission.
+    Named bands are separated out because crossing a trip is worth a line even
+    if the bucket did not change."""
+    if c is None:
+        return "unknown"
+    if c >= crit_c:
+        return "CRITICAL"
+    if c >= warn_c:
+        return "hot"
+    return "%d-%dC" % (int(c // 5) * 5, int(c // 5) * 5 + 5)
+
+
+def state_signature(snap):
+    """The tuple whose change is worth a journal line. Deliberately excludes
+    raw temperature and raw frequency -- both move constantly and neither
+    changing by a degree is an event."""
+    t = snap["thermal"]
+    d = snap["dvfs"]
+    load = snap["load"]["per_core_pct"]
+    return (
+        snap["status"],
+        snap["cores"]["count"],
+        snap["core_mask"]["token"],
+        d.get("governor"),
+        temp_bucket(t["hottest_c"], t["warn_c"], t["crit_c"]),
+        t["throttling"],
+        # "is anything on the NPU at all" -- not the value, just the fact.
+        None if load is None else tuple(v is not None and v > 0 for v in load),
+        bool(snap["debugfs"].get("readable")),
+    )
+
+
+def summary_line(snap):
+    t = snap["thermal"]
+    d = snap["dvfs"]
+    load = snap["load"]["per_core_pct"]
+    if load:
+        loads = "load[" + "/".join("?" if v is None else str(v) for v in load) + "]%"
+    elif snap["load"]["overall_pct"] is not None:
+        loads = "load %d%%" % snap["load"]["overall_pct"]
+    else:
+        loads = "load unknown"
+    return ("status=%s mask=%s(%s) cores=%s %s temp=%s gov=%s freq=%s throttle=%s"
+            % (snap["status"],
+               snap["core_mask"]["token"] or "REFUSED", snap["core_mask"]["label"],
+               snap["cores"]["count"] or "?",
+               loads,
+               "?" if t["hottest_c"] is None
+               else "%.1fC(%s)" % (t["hottest_c"], t["hottest_zone"]),
+               d.get("governor") or "?",
+               mhz(d.get("cur_hz")),
+               {True: "YES", False: "no", None: "?"}[t["throttling"]]))
+
+
+def publish(snap):
+    """Write the JSON where agent 7's selftest can read it. tmpfs, atomic.
+    A stale file is worse than no file, so `ts` is in the payload and the
+    consumer is expected to check it."""
+    if not ensure_run_dir():
+        return
+    try:
+        tmp = REPORT_JSON + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(snap, fh, indent=2, default=str)
+        os.replace(tmp, REPORT_JSON)
+        os.chmod(REPORT_JSON, 0o644)
+    except OSError:
+        # Publishing is best-effort. A monitor that dies because it could not
+        # write a report file is worse than one that keeps watching.
+        pass
+
+
+def watch(cfg):
+    try:
+        interval = max(2, int(float(cfg.get("FPMS_NPU_TUNE_INTERVAL_S", 10))))
+    except ValueError:
+        interval = 10
+    try:
+        heartbeat = int(float(cfg.get("FPMS_NPU_TUNE_HEARTBEAT_S", 0)))
+    except ValueError:
+        heartbeat = 0
+
+    log("watching (interval %ds, heartbeat %s) - report only, changes nothing"
+        % (interval, "off" if heartbeat <= 0 else "%ds" % heartbeat))
+
+    last_sig = None
+    last_beat = 0.0
+    while True:
+        try:
+            snap = snapshot(cfg)
+            publish(snap)
+            sig = state_signature(snap)
+            now = time.time()
+            if sig != last_sig:
+                log(summary_line(snap))
+                # Only the issues that are new information; the summary line
+                # already carries the state.
+                for i in snap["issues"]:
+                    if i["severity"] == FAULT:
+                        log("  FAULT: %s - %s" % (i["issue"], i["detail"]))
+                last_sig = sig
+                last_beat = now
+            elif heartbeat > 0 and (now - last_beat) >= heartbeat:
+                log("(heartbeat) " + summary_line(snap))
+                last_beat = now
+        except Exception as exc:  # noqa: BLE001
+            # A monitor must never be the thing that fails. Log once per
+            # distinct message and keep going.
+            msg = "monitor iteration failed: %r" % (exc,)
+            if msg != last_sig:
+                log(msg)
+                last_sig = msg
+        time.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+def usage():
+    print(__doc__.split("WHY THIS EXISTS")[0].strip())
+
+
+def main(argv):
+    args = argv[1:]
+
+    if "-h" in args or "--help" in args:
+        usage()
+        return 0
+    if "--verify" in args:
+        print(VERIFY_TEXT)
+        return 0
+
+    cfg = load_config()
+
+    if "--watch" in args:
+        watch(cfg)          # never returns
+        return 0
+
+    snap = snapshot(cfg)
+
+    if "--print-env" in args:
+        m = snap["core_mask"]
+        print("# Add to /etc/fpms/config.env (owned by the hardware agent -")
+        print("# ask before editing it) and restart fpms-npud. Rationale:")
+        print("# one model at ~3 inferences/s has no concurrency for per-core")
+        print("# throughput mode, so spread the model for latency instead.")
+        print("# Resolved from: %s" % m["source"])
+        if m["token"] is None:
+            print("# NO VALUE TO PRINT - the configured mask is one fpms-npud")
+            print("# refuses. Accepted tokens: 0 | 0_1 | 0_1_2 | auto.")
+            return 2
+        # The token, never the bit mask: fpms-npud takes names and refuses
+        # numbers, so `FPMS_NPU_CORE_MASK=7` would stop the daemon starting.
+        print("FPMS_NPU_CORE_MASK=%s   # %s" % (m["token"], m["label"]))
+        return 0
+
+    if "--apply" in args:
+        rc = 0
+        did = False
+        if "--core-mask" in args:
+            rc = max(rc, apply_core_mask(snap))
+            did = True
+        if "--restore-governor" in args:
+            rc = max(rc, restore_governor(snap))
+            did = True
+        if "--governor" in args:
+            i = args.index("--governor")
+            if i + 1 >= len(args):
+                log("--governor needs a value, e.g. --governor performance")
+                return 2
+            rc = max(rc, apply_governor(snap, args[i + 1]))
+            did = True
+        if not did:
+            log("--apply on its own changes nothing. Add --core-mask, "
+                "--governor <name>, or --restore-governor.")
+            return 2
+        return rc
+
+    # Report is the default, and reports write nothing.
+    if "--json" in args:
+        print(json.dumps(snap, indent=2, default=str))
+    else:
+        print_report(snap)
+
+    return {OK: 0, DEGRADED: 1, FAULT: 2}[snap["status"]]
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as exc:  # noqa: BLE001
+        # Last line of defence. This binary can be on the boot path; it must
+        # never take a traceback to systemd and it must never restart-loop on
+        # a parsing bug against a sysfs layout nobody has seen yet.
+        log("unhandled error (this tool changed nothing): %r" % (exc,))
+        sys.exit(2)

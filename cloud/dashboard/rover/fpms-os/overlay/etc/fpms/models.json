@@ -1,0 +1,248 @@
+{
+  "_file": "/etc/fpms/models.json",
+
+  "_readme": [
+    "THE MODEL REGISTRY. Read by fpms-model-verify, and by anything that wants",
+    "to know what a .rknn on this rover is supposed to be BEFORE it trusts the",
+    "numbers coming out of it.",
+    "",
+    "JSON has no comments, so the prose lives in _readme and in the per-model",
+    "\"notes\" arrays. Keys beginning with an underscore are documentation and are",
+    "ignored by every consumer.",
+    "",
+    "WHY A SHA256 IS null HERE AND NOT A PLAUSIBLE-LOOKING STRING",
+    "-----------------------------------------------------------",
+    "yolo26n-rk3588.rknn IS NOT IN THE GIT REPOSITORY. It exists on exactly one",
+    "SD card, in one Pi, and has never been hashed by anybody. We therefore do",
+    "not have its sha256, and a fabricated one is strictly worse than none: a",
+    "wrong hash makes fpms-model-verify FAIL on the one genuinely correct file",
+    "the project owns, and the obvious way an operator 'fixes' that is to stop",
+    "checking hashes at all.",
+    "",
+    "So the missing value is VISIBLY missing. sha256 is null, sha256_status says",
+    "why, and verified is false. Same precedent as calibration.json: a missing",
+    "profile changes nothing, a guessed one is silent and total.",
+    "",
+    "null is not a shrug. It is a declared, checkable state - fpms-model-verify",
+    "reports UNVERIFIED for it, exits non-zero, and prints the observed hash so a",
+    "human can put it here with `fpms-model-verify --register` on the day the",
+    "file is first seen on hardware.",
+    "",
+    "WHAT IS ACTUALLY VERIFIED IN THIS FILE",
+    "--------------------------------------",
+    "Shapes, names, class count and the end2end=false requirement were read off",
+    "the source ONNX and are recorded in fpms_yolo26_npu.py's header, which was",
+    "written from an op histogram of that graph. Those are evidence.",
+    "The hash, the converter version and the runtime this was built against are",
+    "UNKNOWN, and are marked UNKNOWN rather than filled in."
+  ],
+
+  "schema_version": 1,
+  "generated_at": "2026-08-08",
+  "generated_by": "FPMS-OS npu layer, hand-written. No tool produced this file.",
+
+  "defaults": {
+    "model_dir": "/home/ubuntu/yolo",
+    "_model_dir_note": [
+      "Overridden by FPMS_YOLO_DIR in /etc/fpms/config.env. A relative \"file\"",
+      "below is resolved against the effective model_dir; an absolute one is",
+      "used as-is."
+    ]
+  },
+
+  "models": {
+
+    "yolo26n": {
+      "logical_name": "yolo26n",
+      "description": "YOLO26-nano, COCO-80, converted for RK3588 NPU. The detector the rover actually runs.",
+      "selected_by": "FPMS_YOLO_VARIANT=v26 in /etc/fpms/config.env",
+      "enabled": true,
+
+      "file": "/home/ubuntu/yolo/yolo26n-rk3588.rknn",
+      "_file_note": [
+        "Hardcoded as MODEL in fpms_yolo26_npu.py. If you move the model you must",
+        "change both, or the decode module and this registry will describe",
+        "different files and nothing will say so."
+      ],
+
+      "sha256": null,
+      "sha256_status": "UNKNOWN - the file has never been in git and has never been hashed. Not fabricated. See _readme.",
+      "size_bytes": null,
+      "size_bytes_status": "UNKNOWN - same reason.",
+
+      "verified": false,
+      "verified_at": null,
+      "verified_on": null,
+      "verified_by": null,
+      "verified_how": null,
+      "_verified_note": [
+        "verified:true means: a named human ran fpms-model-verify on real RK3588S",
+        "hardware, the sha256 below matched the file on disk, the model loaded",
+        "under RKNNLite, init_runtime() returned 0, and the OBSERVED output shape",
+        "was [1,84,8400]. Nothing less sets this flag. In particular a hash",
+        "recorded with --register while the NPU was unavailable leaves this false",
+        "and sets sha256_status to RECORDED_UNVERIFIED - we know WHICH file it is,",
+        "we still do not know that it works."
+      ],
+
+      "input": {
+        "name": "images",
+        "shape": [1, 3, 640, 640],
+        "layout": "NCHW",
+        "evidence": "read off models/yolo26n.onnx; recorded in fpms_yolo26_npu.py header",
+        "_feed_note": [
+          "The GRAPH is NCHW, but the agent hands rknn.inference() an NHWC uint8",
+          "array: cv2.resize(frame,(640,640)) -> cvtColor BGR2RGB ->",
+          "np.expand_dims(img,0), i.e. [1,640,640,3] uint8 RGB. The RKNN runtime",
+          "does the transpose. fpms-model-verify feeds the same NHWC uint8 form",
+          "on purpose - a probe that fed NCHW float would be testing a path the",
+          "rover never takes.",
+          "",
+          "Preprocessing is a STRETCH resize, not a letterbox, so box rescaling is",
+          "an independent per-axis ratio with no padding term. If preprocessing",
+          "ever becomes a letterbox, fpms_yolo26_npu.decode needs padding",
+          "compensation added and this note is the warning that it does."
+        ]
+      },
+
+      "output": {
+        "name": "output0",
+        "shape": [1, 84, 8400],
+        "_shape_note": [
+          "84 = 4 box + 80 class. 8400 = 80*80 + 40*40 + 20*20 anchors.",
+          "THIS IS THE CHECK THAT MATTERS MOST. A wrong-shaped model does not",
+          "raise; it produces garbage boxes that look exactly like detections.",
+          "",
+          "RKNN is not consistent about whether it returns [1,84,8400] or a",
+          "channel-last [1,8400,84], and may drop the batch axis - fpms_yolo26_npu",
+          "._as_anchor_major() locates the 84 axis rather than trusting one",
+          "layout. fpms-model-verify accepts any permutation whose non-unit axes",
+          "are {84, 8400} and records which one it actually saw."
+        ],
+        "channels": {
+          "box": [0, 4],
+          "box_form": "xywh CENTRE, already multiplied by the per-anchor stride constant, i.e. in 640x640 input-pixel units",
+          "class": [4, 84],
+          "class_form": "ALREADY SIGMOIDED - these are probabilities in [0,1]. DO NOT SIGMOID AGAIN."
+        },
+        "postprocess_on_cpu": [
+          "confidence threshold, then a light per-class NMS, in fpms_yolo26_npu.decode.",
+          "'NMS-free' describes how YOLO26 was TRAINED. With end2end=false the",
+          "exported head still emits all 8400 anchors and the CPU still thresholds."
+        ]
+      },
+
+      "num_classes": 80,
+      "class_set": "COCO-80",
+
+      "labels": {
+        "file": null,
+        "status": "NO LABEL FILE EXISTS ON THIS ROVER.",
+        "_note": [
+          "The 80 COCO names are a COCO_NAMES list compiled into",
+          "fpms_rover_agent.py. There is no labels.txt, no coco.names, and nothing",
+          "in the image writes one. Naming a file here that does not exist would",
+          "be the same fabrication as inventing a hash.",
+          "",
+          "There IS an optional operator override: ${FPMS_YOLO_DIR}/custom_labels.json,",
+          "a {\"<class_id>\": \"display name\"} map the agent loads inside a bare",
+          "try/except - a malformed or absent file is silently ignored and the",
+          "COCO names are used. It renames what is drawn; it does NOT change what",
+          "the model detects, and it is not a source of truth for class ids.",
+          "",
+          "FIRE IS NOT A COCO CLASS. Fire detection in this rover is a colour",
+          "heuristic in the agent, not a model output. Do not read a fire alert as",
+          "evidence that the NPU is working."
+        ],
+        "override_file": "/home/ubuntu/yolo/custom_labels.json",
+        "override_required": false
+      },
+
+      "provenance": {
+        "source_onnx": "models/yolo26n.onnx",
+        "source_onnx_sha256": null,
+        "source_onnx_status": "NOT IN THIS REPOSITORY EITHER. The path is the one cited in fpms_yolo26_npu.py's header as 'the source the .rknn was converted from'. Whether that file still exists anywhere is UNKNOWN.",
+        "upstream_weights": "UNKNOWN - which yolo26n.pt, from which release, was never written down",
+
+        "end2end": false,
+        "_end2end_note": [
+          "MANDATORY, and the single most dangerous knob in the conversion.",
+          "Ultralytics' own RKNN documentation reports that end2end=True emits",
+          "[1,300,6] and that its top-k op SEGFAULTS ON THE NPU.",
+          "",
+          "A segfault on load is a spectacularly bad failure mode: the agent wraps",
+          "the whole NPU block in one try/except, but a SIGSEGV is not an",
+          "exception - the process dies, systemd restarts it, and it dies again.",
+          "Catching this by SHAPE, before anything runs it, is the entire point of",
+          "fpms-model-verify."
+        ],
+
+        "converter": "rknn-toolkit2 (x86_64 only; the Pi can run models, never build them)",
+        "converter_version": null,
+        "converter_version_status": "UNKNOWN. Nobody recorded which rknn-toolkit2 built this file. This is the same gap as the runtime/driver versions - there was no build record, so a working rover and a broken one could not be compared.",
+        "target_platform": "rk3588",
+        "quantization": null,
+        "quantization_status": "UNKNOWN - whether this was built with do_quantization=True and, if so, against which calibration images, was not recorded.",
+
+        "conversion_env_pins": {
+          "onnx": "1.14.1",
+          "_onnx_why": "rknn-toolkit2 calls onnx.mapping, which was removed in onnx 1.16",
+          "numpy": "<2",
+          "_numpy_why": "rknn-toolkit2 and rknn-toolkit-lite2 are built against the NumPy 1.x C API"
+        },
+
+        "runtime_built_against": {
+          "librknnrt_so": null,
+          "rknpu_driver": null,
+          "rknn_toolkit_lite2": null,
+          "status": "ALL UNKNOWN. Driver, runtime and wheel must version-match or init_runtime() fails - and the agent swallows that failure. /etc/fpms/npu-versions.json records what THIS image ships; nothing records what the model was built against.",
+          "confirm_with": "cat /sys/kernel/debug/rknpu/version   (driver, on hardware)"
+        },
+
+        "rebuild_from_source": "npu/convert/convert_yolo26.sh"
+      },
+
+      "notes": [
+        "IF THIS FILE IS LOST, IT CANNOT BE RECONSTRUCTED FROM PROSE.",
+        "See npu/models/README.md - it explains where the only copy lives and how",
+        "to get it off that card before the card dies."
+      ]
+    },
+
+    "yolov8n": {
+      "logical_name": "yolov8n",
+      "description": "The previous detector. Listed so that selecting it is a declared, checkable state rather than a silent one.",
+      "selected_by": "FPMS_YOLO_VARIANT=v8 - which is ALSO the code default in fpms_rover_agent.py, so this entry is what you get by forgetting to set the variable",
+      "enabled": false,
+
+      "file": null,
+      "file_status": "UNKNOWN FILENAME. The v8 path imports fpms_yolo_npu.py from ${FPMS_YOLO_DIR} and reads its MODEL constant. That module is ALSO absent from the repository, so even the model's filename is unrecoverable from git. Not guessed here.",
+
+      "sha256": null,
+      "sha256_status": "UNKNOWN - there is no file to hash and no name to look for.",
+      "verified": false,
+
+      "input": {"name": null, "shape": null, "status": "UNKNOWN - would come from fpms_yolo_npu.py, which is missing"},
+      "output": {"name": null, "shape": null, "status": "UNKNOWN - the v8 head differs from v26's; do not assume [1,84,8400]"},
+      "num_classes": 80,
+      "class_set": "COCO-80",
+      "labels": {"file": null, "status": "see yolo26n"},
+
+      "provenance": {
+        "status": "UNKNOWN in every field."
+      },
+
+      "notes": [
+        "config.env sets FPMS_YOLO_VARIANT=v26 EXPLICITLY for this reason. Left at",
+        "the code default the agent imports a module that does not exist, catches",
+        "the ImportError, logs 'NPU unavailable; streaming without detection', and",
+        "runs blind forever while systemd reports it active.",
+        "",
+        "enabled:false means fpms-model-verify skips this entry unless you name it",
+        "on the command line. It does not mean the entry is harmless - it means",
+        "there is nothing here to verify, which is exactly the state that must not",
+        "be mistaken for a pass."
+      ]
+    }
+  }
+}

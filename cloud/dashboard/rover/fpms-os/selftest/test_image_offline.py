@@ -160,11 +160,25 @@ def test_ros_units_have_dds_profile():
 
 
 def test_env_file_before_environment():
-    """EnvironmentFile= must precede Environment= so config.env cannot win.
+    """Ordering decides who wins, and the correct answer differs by unit type.
 
-    Otherwise a stale ROS_DOMAIN_ID in config.env silently overrides the unit
-    and every topic list comes back empty, which looks exactly like dead
-    hardware.
+    systemd applies EnvironmentFile= and Environment= in the order they appear,
+    later overriding earlier. So:
+
+      ROS units   Environment= must come AFTER EnvironmentFile=, so the UNIT
+                  wins. ROS_DOMAIN_ID and RMW_IMPLEMENTATION are safety
+                  properties -- a stale value in config.env must not be able to
+                  put the rover on a domain where every topic list reads empty,
+                  which is indistinguishable from dead hardware.
+
+      non-ROS     EnvironmentFile= may come last, so CONFIG.ENV wins. Every
+                  FPMS_NPU_* value is a tuning knob, and config.env is
+                  documented as the single configuration point. A knob set in
+                  the documented place that silently has no effect is its own
+                  failure mode -- fpms-npud shipped that way for one revision.
+
+    What is never acceptable is a unit whose comment claims one and whose
+    directive order does the other, so this also checks the two agree.
     """
     for u in units():
         body = unit_directives(u)
@@ -173,12 +187,30 @@ def test_env_file_before_environment():
         lines = body.splitlines()
         first_file = next(i for i, l in enumerate(lines)
                           if l.strip().startswith("EnvironmentFile="))
-        first_env = next(i for i, l in enumerate(lines)
-                         if l.strip().startswith("Environment="))
-        if first_file > first_env:
+        last_env = max(i for i, l in enumerate(lines)
+                       if l.strip().startswith("Environment="))
+        is_ros = "ROS_DOMAIN_ID" in body
+
+        if is_ros and first_file > last_env:
             fail("env_order",
-                 "%s: Environment= appears before EnvironmentFile=, so "
-                 "config.env can override the domain and the RMW" % u)
+                 "%s is a ROS unit but EnvironmentFile= comes after the last "
+                 "Environment=, so config.env can override ROS_DOMAIN_ID and "
+                 "RMW_IMPLEMENTATION. A stale domain there reads as dead "
+                 "hardware." % u)
+
+        # For a non-ROS unit either order is defensible, but the file must not
+        # claim the opposite of what it does. Look for the claim in the prose.
+        if not is_ros:
+            raw = unit_text(u).lower()
+            claims_cfg_wins = ("config.env wins" in raw
+                               or "config.env does win" in raw
+                               or "config.env overrides" in raw)
+            cfg_actually_wins = first_file > last_env
+            if claims_cfg_wins and not cfg_actually_wins:
+                fail("env_order",
+                     "%s says config.env wins, but EnvironmentFile= comes "
+                     "before the Environment= defaults, so the UNIT wins and "
+                     "every knob set in config.env is silently ignored." % u)
 
 
 def test_dds_profile():

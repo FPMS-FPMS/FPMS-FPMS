@@ -1,0 +1,161 @@
+[Unit]
+Description=NPU core policy and thermal reality (report-only monitor)
+Documentation=file:/usr/local/bin/fpms-npu-tune
+Documentation=file:/opt/fpms-os/npu/NPU_SPEC.md
+
+# WHAT THIS UNIT DOES, AND THE ONE THING IT CHANGES
+# -------------------------------------------------
+# It runs `fpms-npu-tune --watch`: a monitor that reads thermal zones, NPU
+# frequency and DVFS operating points, the governor, and per-core utilisation
+# from /sys/kernel/debug/rknpu/load, publishes a JSON snapshot to
+# /run/fpms/npu-tune.json for the selftest, and logs to the journal ONLY when
+# the state changes.
+#
+# The state-change rule is not a nicety. This process lives for the whole
+# mission; a line per poll would be tens of thousands of lines an hour and
+# would bury the one transition that matters. Temperature is bucketed and the
+# thresholds come from the kernel's own trip points, so an idling SoC near a
+# bucket edge does not flap the journal. Same discipline as
+# fpms-wifi-ps-hold.
+#
+# The ONLY thing this unit changes is the resolved core mask, written to
+# /run/fpms/npu.env by the ExecStartPre below. That is tmpfs and it does not
+# touch the SoC: a core mask is an argument to init_runtime() inside the
+# inference daemon's own process, so nothing outside that process can set it.
+# All the unit does is turn the policy's `auto` into the concrete number a
+# static config file cannot express.
+#
+# It does NOT pin a DVFS governor. That is deliberate and it is a battery
+# decision: a performance pin holds the NPU at maximum frequency continuously,
+# including the ~90% of every second a 3-inference/second workload leaves it
+# idle, on a pack that warns at 11.1 V and cuts at 10.8 V. What it buys is the
+# DVFS ramp on a 333 ms budget. An operator can pin it for a bench run with
+#   sudo fpms-npu-tune --apply --governor performance
+#   sudo fpms-npu-tune --apply --restore-governor
+# and a reboot undoes it either way, because the record lives in tmpfs.
+#
+#
+# WHY IT EXISTS
+# -------------
+# Two silent defects, both costing detection.
+#
+# The RK3588S NPU has three cores. init_runtime() with no core_mask uses ONE,
+# and nothing in the FPMS codebase has ever set a mask -- so every inference
+# this rover has run used a third of the hardware, and nothing said so. The
+# obvious-looking fix is also wrong: FPMS_NPU_CORE_MASK=auto is RKNN's
+# NPU_CORE_AUTO, which picks one IDLE core, not all three. And the value is a
+# NAME, not a number -- fpms-npud accepts 0 | 0_1 | 0_1_2 | auto and refuses a
+# bit mask like 7, which would stop the daemon starting. This unit's
+# ExecStartPre resolves the policy into that vocabulary, and the monitor
+# reports a FAULT if the effective value is either trap.
+#
+# And RK3588 throttles hard and silently under sustained load. A
+# first-inference benchmark number is meaningless on this SoC; bench_npu.py
+# measures 30 frames from cold. The monitor makes the thermal state behind any
+# such number visible at the time it was taken.
+#
+#
+# IT CANNOT HANG OR CRASH THE BOOT
+# ---------------------------------
+# Every sysfs and debugfs read in the tool is fenced with SIGALRM, every
+# failure degrades to "unknown" rather than to a plausible number, and the
+# monitor loop swallows its own exceptions. The one ordering edge below is
+# bounded by TimeoutStartSec, and the ExecStartPre carries a "-" so its
+# failure is ignored.
+#
+# Note the honest limit: SIGALRM cannot interrupt a read stuck in
+# uninterruptible sleep. If the rknpu driver wedges in D state, no userspace
+# timeout helps -- which is why nothing critical is ordered after this unit
+# and why TimeoutStartSec is short.
+#
+# There is deliberately NO ConditionPathExists=/sys/kernel/debug/rknpu. The
+# absence of that path is the single most important thing this tool can
+# report; a condition would turn it into a unit that quietly does not run,
+# which is the exact failure mode the NPU layer exists to abolish.
+
+After=local-fs.target
+# Ordered before the inference daemon so the resolved mask exists before npud
+# reads its environment. This is ordering only -- no Requires=, no Wants=. If
+# this unit is absent, masked or broken, npud still starts; it just falls back
+# to whatever FPMS_NPU_CORE_MASK says in /etc/fpms/config.env.
+Before=fpms-npud.service
+
+[Service]
+Type=simple
+# No User=: /sys/kernel/debug is root-only, so per-core NPU load and the
+# driver version are unreadable as any other user. Running unprivileged would
+# make this report "unknown" for the two fields it exists to surface.
+
+EnvironmentFile=-/etc/fpms/config.env
+
+# DELIBERATELY NO RuntimeDirectory=fpms.
+#
+# It would be the tidy way to get /run/fpms created, but systemd REMOVES a
+# RuntimeDirectory when its unit stops unless RuntimeDirectoryPreserve= is
+# set -- and this unit has Restart=always, so every restart would delete
+# /run/fpms and take fpms-npud's socket (/run/fpms/npud.sock) with it. A
+# monitor that kills the inference daemon by restarting is not a monitor. The
+# tool creates the directory itself with makedirs(exist_ok=True) and never
+# removes it.
+
+# The only change this unit makes. tmpfs, atomic, re-derived every boot.
+#
+# CROSS-AGENT CONTRACT -- AS CHECKED ON 2026-08-08 THIS FILE IS INERT, and
+# saying so is the point. fpms-npud.service reads
+# EnvironmentFile=-/etc/fpms/config.env and sets its own
+# Environment=FPMS_NPU_CORE_MASK=0_1_2 default. It does NOT read
+# /run/fpms/npu.env. For the runtime resolution to reach the daemon, whoever
+# owns that unit must add
+#     EnvironmentFile=-/run/fpms/npu.env
+# to it. Check, do not assume:
+#     systemctl cat fpms-npud | grep EnvironmentFile
+#
+# Nothing is broken in the meantime: the daemon's built-in default is 0_1_2,
+# which is exactly what this policy resolves to on a three-core SoC. The
+# monitor's job is then to VERIFY that, and to shout if a config.env override
+# quietly replaced it with `auto` (one idle core) or with a bit mask the
+# daemon refuses.
+#
+# While you are in there, one more thing needs settling by measurement rather
+# than by reading: SPEC.md section 2 says an EnvironmentFile= placed first
+# means config.env CANNOT override the later Environment= lines, and
+# fpms-npud.service's own header says the same ordering means config.env DOES
+# win. Both cannot be true, and it decides whether NPU tuning in config.env
+# has any effect at all.
+#     systemctl show fpms-npud -p Environment
+ExecStartPre=-/usr/local/bin/fpms-npu-tune --apply --core-mask
+
+ExecStart=/usr/local/bin/fpms-npu-tune --watch
+
+# Bounds the ordering edge above. If the ExecStartPre ever wedges on a driver
+# read, npud waits at most this long and then starts anyway.
+TimeoutStartSec=20
+TimeoutStopSec=10
+
+Restart=always
+RestartSec=10
+
+# A monitor must never compete with the thing it is monitoring.
+Nice=10
+
+# Report-only, enforced by the kernel rather than by good intentions:
+# ProtectKernelTunables makes /sys read-only for this process, so the monitor
+# is structurally incapable of changing the governor or any other SoC setting
+# even if a future edit to the script tried to. Reads, including debugfs, are
+# unaffected. /run stays writable for the JSON snapshot and the mask env file.
+#
+# If per-core load and the driver version report as "unknown" on real
+# hardware, test whether the sandbox is the cause before blaming the driver:
+#   sudo systemd-run --pty --uid=0 /usr/local/bin/fpms-npu-tune
+# and compare against `systemctl status fpms-npu-tune`.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ReadWritePaths=/run
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

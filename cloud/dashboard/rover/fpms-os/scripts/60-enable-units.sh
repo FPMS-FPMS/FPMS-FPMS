@@ -23,6 +23,13 @@ BOOT_UNITS=(
     fpms-uros-supervisor.service
     fpms-wifi-powersave-hold.service
     micro-ros-agent.service
+    # The NPU layer. fpms-npud owns the RKNN runtime so that a slow or wedged
+    # inference cannot stall the camera pump that also feeds the fire detector.
+    # fpms-npu-tune runs in REPORT mode -- it changes nothing unless an operator
+    # passes --apply -- and exists so thermal throttling is visible rather than
+    # silently eating the latency budget.
+    fpms-npud.service
+    fpms-npu-tune.service
     fpms-ros-publishers.target
     fpms-rosbridge.service
     fpms-console.service

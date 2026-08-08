@@ -93,9 +93,16 @@ cat <<'EOF'
      NOT IN THE REPOSITORY, AND THEREFORE NOT IN THIS IMAGE:
 
        ~/yolo/yolo26n-rk3588.rknn   the detection model
-       ~/yolo/fpms_yolo_npu.py      the v8 decode path
        ~/fpms_console/              the operator console web UI
        ~/nav2/arena_zones.json      arena zone definitions
+
+     (fpms_yolo_npu.py, the v8 decode path, IS in the repo at
+      rover/rescued/fpms_yolo_npu.py -- but it targets yolov8n.rknn,
+      not yolo26, so it does not rescue the v26 path. The MODEL is
+      still the thing that exists nowhere but the old Pi, and unlike
+      a script it cannot be reconstructed from prose. See
+      npu/models/README.md for the rescue procedure, and
+      npu/convert/ for rebuilding one from ONNX.)
 
      These live only on the old Pi. Copy them across before relying on
      detection or the console:
