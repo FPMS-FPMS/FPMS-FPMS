@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# fpms-wait-net - wait for a STABLE network carrier before a DDS node starts.
+#
+# WHY THIS EXISTS
+# ---------------
+# This is an ExecStartPre= on fpms-lidar-ros, fpms-tf and fpms-ros-settle, and
+# it is declared WITHOUT a leading "-", which means a non-zero exit stops the
+# unit from starting at all. That is deliberate for the failure it guards, and
+# it is also why this script must never exit non-zero for a reason as ordinary
+# as "the WiFi is slow". Read the exit policy at the bottom before changing it.
+#
+# The failure, measured on the Pi on 2026-08-06 from `journalctl -b`:
+#
+#     16:07:12  carrier gained   (wlan0)
+#     16:07:12  carrier lost     (wlan0)
+#     16:07:13  carrier gained   (wlan0)
+#     16:07:14  network-online.target reached
+#
+# network-online.target is satisfied by the FIRST address that appears. A DDS
+# DomainParticipant created inside that flap binds the interface set that
+# existed at that instant, and that set is then invalidated a second later.
+# What you observe afterwards is the worst shape of failure this project has:
+#
+#     - the node is active and stays active
+#     - it logs "scans=2848 dropped=0 rate=9.55 Hz"
+#     - `ros2 topic info /scan_lidar` reports "Publisher count: 1"
+#     - and NO subscriber created afterwards ever receives a single message
+#
+# Nothing errors. Nothing retries. It is simply silent forever. Restarting the
+# unit fixes it instantly and reproducibly, which is what fpms-ros-settle.service
+# was built to do on a 75 second timer.
+#
+# So: waiting for network-online.target is not enough. We wait for an address
+# that has HELD for a few consecutive seconds.
+#
+# RELATIONSHIP TO THE DDS PROFILE
+# -------------------------------
+# FPMS-OS also forces Fast DDS onto UDPv4 via /etc/fpms/fastdds_udp_only.xml,
+# which addresses a second, independent cause of the same symptom (shared-memory
+# segments not surviving across process eras). These two fixes are additive, not
+# alternatives. Keep both until hardware has confirmed which one was load
+# bearing - removing a mitigation for a bug you have not confirmed fixed is how
+# this project has hurt itself before.
+#
+# TUNING
+# ------
+# All three knobs are read from /etc/fpms/config.env so they can be changed
+# without touching a unit file:
+#
+#     FPMS_WAITNET_STABLE_S   seconds an address must hold   (default 3)
+#     FPMS_WAITNET_TIMEOUT_S  total seconds before giving up (default 45)
+#     FPMS_WAITNET_IFACE      interface to watch, or "any"   (default any)
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+[ -r /etc/fpms/config.env ] && . /etc/fpms/config.env
+
+STABLE_S="${FPMS_WAITNET_STABLE_S:-3}"
+TIMEOUT_S="${FPMS_WAITNET_TIMEOUT_S:-45}"
+IFACE="${FPMS_WAITNET_IFACE:-any}"
+
+log() { echo "fpms-wait-net: $*"; }
+
+# Return 0 if we currently hold a routable address.
+#
+# We deliberately ignore loopback and link-local (169.254.0.0/16, fe80::/10).
+# Link-local is what you get DURING the flap, so treating it as "up" would
+# defeat the entire point of this script.
+have_address() {
+    if [ "$IFACE" = "any" ]; then
+        ip -4 -o addr show scope global 2>/dev/null | grep -qv ' lo ' && return 0
+        ip -6 -o addr show scope global 2>/dev/null | grep -qv ' lo ' && return 0
+        return 1
+    fi
+    ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -q . && return 0
+    ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
+# A fingerprint of the current address set. If this CHANGES during the stability
+# window, the window restarts - that is the whole mechanism. An address that
+# appears, vanishes and reappears has not been stable, even though a naive
+# "do we have an address" poll would have said yes at both ends.
+address_fingerprint() {
+    ip -o addr show scope global 2>/dev/null \
+        | awk '{print $2, $4}' | grep -v '^lo ' | sort | tr '\n' ','
+}
+
+deadline=$(( $(date +%s) + TIMEOUT_S ))
+held_since=0
+last_fp=""
+
+while :; do
+    now=$(date +%s)
+
+    if have_address; then
+        fp="$(address_fingerprint)"
+        if [ "$fp" != "$last_fp" ]; then
+            # The address set changed. This is the flap. Restart the clock and
+            # say so - a line here is the evidence that the guard did its job.
+            [ -n "$last_fp" ] && log "address set changed, restarting stability window"
+            last_fp="$fp"
+            held_since=$now
+        elif [ $(( now - held_since )) -ge "$STABLE_S" ]; then
+            log "network stable for ${STABLE_S}s: ${fp%,}"
+            exit 0
+        fi
+    else
+        # No routable address at all. Any partial window is void.
+        if [ -n "$last_fp" ]; then
+            log "lost all global addresses, restarting stability window"
+            last_fp=""
+        fi
+        held_since=0
+    fi
+
+    if [ "$now" -ge "$deadline" ]; then
+        # EXIT POLICY - read this before "fixing" it.
+        #
+        # We exit 0. Not because the network is fine, but because the
+        # alternative is worse: this script gates fpms-lidar-ros and fpms-tf,
+        # and a non-zero exit here means the rover boots with NO /scan_lidar
+        # and NO TF tree whatsoever. A rover on a bad network that still
+        # publishes its scan and still answers a STOP is strictly better than
+        # a rover that silently declined to start its sensors.
+        #
+        # The warning is loud, it lands in the journal, and fpms-selftest
+        # reports it. Silence is never success - but neither is refusing to
+        # boot. See SPEC.md section 8 rule 1.
+        log "WARNING: no stable address after ${TIMEOUT_S}s - starting anyway."
+        log "WARNING: DDS participants created now may bind an interface set"
+        log "WARNING: that is later invalidated. If topics are discoverable but"
+        log "WARNING: carry no data, restart this unit. See docs/DDS.md."
+        exit 0
+    fi
+
+    sleep 1
+done

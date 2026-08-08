@@ -1,0 +1,43 @@
+# /etc/sudoers.d/fpms-cored   (mode 0440, root:root)
+#
+# fpms-cored runs as the unprivileged user `ubuntu` and owns the STOP latch.
+# Three of its four stop paths are pure messaging. The fourth - escalation - is
+# the only destructive action anywhere in the FPMS stack, and it exists to cover
+# the one case the other three cannot: the mission executor still running its
+# loop under a moving rover while having missed or ignored the stop.
+#
+# Escalation is SIGTERM, not SIGKILL, and that matters: fpms-missions installs a
+# handler that aborts the mission and publishes ten zero Twists before exiting,
+# and Restart=always brings it straight back. SIGKILL would leave the last
+# non-zero Twist as the most recent thing the drive board heard.
+#
+# It is fenced hard - it fires only if telemetry/mission still reports a driving
+# phase 3s after the stop, only on evidence no older than 2.5s, once per stop,
+# logged loudly, and disableable with FPMS_CORE_STOP_ESCALATE=0.
+#
+# ############################################################################
+# # THE ARGV MUST MATCH BYTE FOR BYTE.                                       #
+# #                                                                          #
+# # sudo matches on the literal argument vector. "fpms-missions" and          #
+# # "fpms-missions.service" are NOT the same rule. A mismatch does not error  #
+# # in any visible way - it turns the last-resort stop into a silent password #
+# # prompt that nobody is there to answer, on a rover that is still moving.   #
+# #                                                                          #
+# # The line below matches fpms_cored.py's invocation exactly:                #
+# #                                                                          #
+# #   cmd = ["sudo", "-n", "/bin/systemctl", "kill", "-s", "SIGTERM",         #
+# #          "fpms-missions.service"]                                         #
+# #                                                                          #
+# # If you change one, change the other in the same commit.                   #
+# ############################################################################
+#
+# Exactly one command. No wildcards, no shell, no NOPASSWD:ALL. `ubuntu` also
+# has general passwordless sudo on this image because the deploy tooling
+# requires it - this narrow rule is still worth having, because it is the one
+# grant that must survive any future tightening of that.
+#
+# fpms-selftest verifies this rule resolves with `sudo -n -l`, because a
+# sudoers file that is present but not matching is indistinguishable from a
+# working one until the moment it matters.
+
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl kill -s SIGTERM fpms-missions.service

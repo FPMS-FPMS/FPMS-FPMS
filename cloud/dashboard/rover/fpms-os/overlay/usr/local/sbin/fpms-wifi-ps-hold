@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# fpms-wifi-ps-hold - hold WiFi power save OFF, forever.
+#
+# WHY THIS EXISTS
+# ---------------
+# The Broadcom bcmdhd driver on the Orange Pi 5B silently re-enables WiFi power
+# save every 30-60 seconds. It does not log it. `iw dev wlan0 set power_save
+# off` appears to work, and then quietly stops being true.
+#
+# The consequence was measured and is specific. Power save stalls packets long
+# enough to miss MQTT's keepalive: both rover clients use keepalive=30, and
+# mosquitto drops a client at 1.5x keepalive = 45s. The observed disconnect
+# gaps were 47s and 47s - near exact. The dashboard showed the rover flapping
+# offline and online on a ~47 second cycle, and the LiDAR feed died with it.
+#
+# There is no persistent setting that survives this. NetworkManager's
+# wifi.powersave=2, /etc/network/interfaces post-up hooks and a udev rule were
+# all tried on the old Pi; the driver overrode all of them. The only thing that
+# works is to keep asserting it, which is what this script does.
+#
+# This is a workaround for a driver defect, not a design choice. If a future
+# bcmdhd stops doing this, delete the unit - but verify with a 10 minute
+# `watch -n1 iw dev wlan0 get power_save` first, because the failure window is
+# 30-60s and a 30 second check will tell you it is fixed when it is not.
+#
+# NOTES
+# -----
+# - Runs as root (the unit sets no User=), because `iw set` needs CAP_NET_ADMIN.
+# - Interface is discovered, not hardcoded. The old Pi was wlan0, but a USB
+#   dongle or a kernel bump can rename it, and a hardcoded name would make this
+#   silently no-op - which is the same as not running at all.
+# - Logs ONLY on state change. This loops every few seconds forever; logging
+#   each iteration would fill the journal and bury the events that matter.
+
+set -uo pipefail
+
+# shellcheck source=/dev/null
+[ -r /etc/fpms/config.env ] && . /etc/fpms/config.env
+
+INTERVAL_S="${FPMS_WIFI_PS_INTERVAL_S:-3}"
+
+log() { echo "fpms-wifi-ps-hold: $*"; }
+
+# Find the first wireless interface. /sys/class/net/<if>/wireless exists only
+# for 802.11 devices, which is a more reliable test than matching on a name.
+find_wifi_iface() {
+    local d
+    for d in /sys/class/net/*; do
+        [ -e "$d/wireless" ] && { basename "$d"; return 0; }
+    done
+    # Fall back to iw's own view, in case a driver does not populate sysfs.
+    iw dev 2>/dev/null | awk '/^\tInterface/ {print $2; exit}'
+}
+
+power_save_state() {
+    # Prints "on", "off", or "" if the interface has gone away.
+    iw dev "$1" get power_save 2>/dev/null | awk '/Power save/ {print $NF}'
+}
+
+iface=""
+last_reported=""      # last state we logged, so we only log transitions
+asserts=0             # how many times we have had to turn it back off
+
+log "starting (interval ${INTERVAL_S}s)"
+
+while :; do
+    # Re-discover if we have no interface, or the one we had disappeared.
+    # A USB WiFi dongle being re-enumerated, or the driver reloading, both
+    # look like this and both used to leave the old script asserting into a
+    # device that no longer existed.
+    if [ -z "$iface" ] || [ ! -e "/sys/class/net/$iface" ]; then
+        new_iface="$(find_wifi_iface || true)"
+        if [ -z "$new_iface" ]; then
+            if [ "$last_reported" != "absent" ]; then
+                log "no wireless interface present - waiting"
+                last_reported="absent"
+            fi
+            sleep "$INTERVAL_S"
+            continue
+        fi
+        iface="$new_iface"
+        last_reported=""
+        log "watching $iface"
+    fi
+
+    state="$(power_save_state "$iface")"
+
+    case "$state" in
+        off)
+            if [ "$last_reported" != "off" ]; then
+                log "$iface power_save is off (asserted ${asserts} times so far)"
+                last_reported="off"
+            fi
+            ;;
+        on)
+            # This is the driver having re-enabled it behind our back. It is
+            # the entire reason this process exists, so it is worth a line -
+            # the count over time tells you whether the defect is still live.
+            asserts=$((asserts + 1))
+            log "$iface power_save came back ON - re-asserting off (#${asserts})"
+            iw dev "$iface" set power_save off 2>/dev/null \
+                || log "WARNING: 'iw dev $iface set power_save off' failed"
+            last_reported="on"
+            ;;
+        "")
+            # Interface vanished between the existence check and the query.
+            if [ "$last_reported" != "gone" ]; then
+                log "$iface stopped responding - will re-discover"
+                last_reported="gone"
+            fi
+            iface=""
+            ;;
+    esac
+
+    sleep "$INTERVAL_S"
+done

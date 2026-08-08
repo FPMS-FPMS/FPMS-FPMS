@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""fpms-uros-release-reset - keep the ESP32-S3 out of reset while the agent runs.
+
+Usage:  fpms-uros-release-reset <device> <wait_seconds>
+
+Invoked from /usr/local/bin/fpms-uros-agent-run as:
+
+    /usr/bin/python3 /usr/local/bin/fpms-uros-release-reset "$DEV" 30 &
+
+backgrounded, in the same cgroup as the agent, so systemd's default
+KillMode=control-group reaps it when the unit stops.
+
+
+WHY THIS EXISTS
+===============
+
+On the Yahboom MicroROS Board V2.0, the CP2102's handshake lines are wired to
+the ESP32-S3's reset and boot-select pins in the usual auto-programming circuit:
+
+    RTS -> EN   (reset, active low)
+    DTR -> IO0  (boot select; low at reset = download mode)
+
+Linux raises BOTH lines by default on open(). The tty layer restores modem
+control bits to 0x06 (TIOCM_DTR | TIOCM_RTS) whenever a descriptor is opened,
+and drops back to that state the instant the last descriptor closes.
+
+That default holds EN low. The board sits in hardware reset for as long as the
+micro-ROS agent has the port open - which is to say, forever.
+
+The measurement that identified this: with micro-ros-agent apparently running
+healthily, the link carried 56 bytes in 15 minutes. Not a slow link, not a baud
+mismatch - a CPU that had never left reset.
+
+THE PART THAT IS EASY TO GET WRONG
+----------------------------------
+Simply clearing RTS is not enough, and this cost real time to work out.
+
+The ESP32-S3 begins executing on the EN RISING EDGE. If the board has been
+sitting with EN held low and we merely release the line, EN goes high - but if
+the chip was already latched in reset from a previous era there is no clean
+edge for it to act on, and it can stay parked. A level is not a reset.
+
+So we drive a deliberate edge: hold IO0 in the app-mode state, pull EN low,
+hold it long enough to be unambiguous, then release. That produces a real
+rising edge and the application firmware starts.
+
+WHY IT MUST RUN CONCURRENTLY WITH THE AGENT
+-------------------------------------------
+Both alternatives were tried on this rover and both fail:
+
+  * Running BEFORE the agent: ours is then the 0->1 open. When the agent opens
+    the port afterwards, the kernel re-applies 0x06 and re-arms the reset. We
+    fixed it and the next open broke it again.
+
+  * Running AFTER as a one-shot ExecStartPost: the lines snap back to 0x06 the
+    instant our fd closes, dropping the board straight back into reset. This
+    was measured on this rover, and it is the reason fpms-uros-agent-run is a
+    wrapper script rather than a unit with an ExecStartPost.
+
+The only thing that works is to hold a SECOND descriptor open alongside the
+agent's, for as long as the agent lives. Modem control bits are a property of
+the tty, not of a descriptor, so our cleared state persists while any fd holds
+it - and ours does.
+
+We therefore wait for the agent to take the port first, then open alongside it.
+
+
+POLARITY - THE ONE THING TO CHECK ON NEW HARDWARE
+=================================================
+pyserial's `rts`/`dtr` attributes are ASSERTION flags, not pin levels. Asserting
+RTS pulls the corresponding line to its active level, which on this
+auto-reset circuit pulls EN LOW. So:
+
+    ser.rts = True   ->  EN low   ->  chip held in reset
+    ser.rts = False  ->  EN high  ->  chip runs
+    ser.dtr = True   ->  IO0 low  ->  DOWNLOAD mode  (we never want this)
+    ser.dtr = False  ->  IO0 high ->  APP mode       (what we want)
+
+Getting DTR backwards does not fail loudly - it drops the board into the serial
+bootloader, where it answers nothing and looks exactly like a dead board. If a
+future board revision inverts either line, flip the two constants below and
+nothing else.
+"""
+
+import os
+import sys
+import time
+
+try:
+    import serial  # pyserial
+except ImportError:
+    sys.stderr.write(
+        "fpms-uros-release-reset: pyserial is not installed. The ESP32-S3 will "
+        "stay in reset and the micro-ROS link will carry no data.\n"
+    )
+    sys.exit(1)
+
+
+# --- polarity constants: see the POLARITY note above -------------------------
+EN_ASSERT_HOLDS_RESET = True   # ser.rts = this value  -> chip held in reset
+IO0_ASSERT_IS_DOWNLOAD = True  # ser.dtr = this value  -> download mode
+
+RESET_HOLD_S = 0.150   # how long EN stays low. 150ms is comfortably longer than
+                       # the chip needs and is what the working sequence used.
+POST_RESET_SETTLE_S = 0.050
+
+POLL_INTERVAL_S = 0.25
+
+
+def log(msg):
+    print("fpms-uros-release-reset: %s" % msg, flush=True)
+
+
+def port_holders(dev):
+    """PIDs holding `dev` open, by walking /proc/*/fd.
+
+    Returns None (not []) if /proc cannot be read - "cannot tell" and "nobody
+    has it" are different answers and the caller must not confuse them.
+    """
+    try:
+        real = os.path.realpath(dev)
+    except OSError:
+        return None
+
+    holders = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+
+    me = str(os.getpid())
+    for pid in pids:
+        if pid == me:
+            continue
+        fddir = "/proc/%s/fd" % pid
+        try:
+            for fd in os.listdir(fddir):
+                try:
+                    if os.path.realpath(os.path.join(fddir, fd)) == real:
+                        holders.append(int(pid))
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            # Process exited, or not ours to read. Neither is an error here.
+            continue
+    return holders
+
+
+def wait_for_agent(dev, timeout_s):
+    """Block until some other process holds `dev`, or the timeout expires.
+
+    Returns True if the agent took the port. On timeout we return False and
+    proceed anyway: a board released from reset with no agent attached is
+    harmless and self-correcting, whereas refusing to act guarantees a dead
+    link. See the exit policy at the end of main().
+    """
+    deadline = time.monotonic() + timeout_s
+    warned = False
+    while time.monotonic() < deadline:
+        holders = port_holders(dev)
+        if holders:
+            log("agent holds %s (pid %s)" % (dev, ",".join(map(str, holders))))
+            return True
+        if holders is None and not warned:
+            log("WARNING: cannot read /proc to see who holds the port")
+            warned = True
+        time.sleep(POLL_INTERVAL_S)
+    return False
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("usage: fpms-uros-release-reset <device> [wait_seconds]\n")
+        return 2
+
+    dev = sys.argv[1]
+    wait_s = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
+
+    if not os.path.exists(dev):
+        # Do not treat this as fatal to the unit. The device unit ordering and
+        # udev settle can race us on a cold boot; the agent itself will fail
+        # loudly and systemd will restart the whole wrapper.
+        log("WARNING: %s does not exist yet - nothing to release" % dev)
+        return 0
+
+    if not wait_for_agent(dev, wait_s):
+        log("WARNING: no other process took %s within %.0fs - "
+            "releasing reset anyway" % (dev, wait_s))
+
+    # Open a SECOND descriptor alongside the agent's. Do not touch baud rate,
+    # framing or flow control here: the agent owns the line discipline and this
+    # process is only interested in the two modem control lines.
+    try:
+        ser = serial.Serial()
+        ser.port = dev
+        # exclusive=False is essential. The agent already has it; asking for
+        # exclusive access would fail and leave the board in reset.
+        ser.exclusive = False
+        ser.open()
+    except Exception as exc:  # noqa: BLE001 - any failure here is reportable
+        log("ERROR: could not open %s alongside the agent: %s" % (dev, exc))
+        log("ERROR: the ESP32-S3 will remain in reset and the link will be dead")
+        return 1
+
+    try:
+        # 1. Put IO0 in app mode BEFORE the reset edge. The boot mode is latched
+        #    at the rising edge of EN, so this has to be settled first or the
+        #    chip comes up in the serial bootloader and answers nothing.
+        ser.dtr = not IO0_ASSERT_IS_DOWNLOAD
+
+        # 2. Drive EN low, hold, release. This is the deliberate edge - see the
+        #    "a level is not a reset" note in the module docstring.
+        ser.rts = EN_ASSERT_HOLDS_RESET
+        time.sleep(RESET_HOLD_S)
+        ser.rts = not EN_ASSERT_HOLDS_RESET
+        time.sleep(POST_RESET_SETTLE_S)
+
+        log("released reset on %s (EN edge driven, IO0 in app mode)" % dev)
+        log("holding lines clear for the lifetime of the agent")
+
+        # 3. Hold. The modem control bits stay as we left them for as long as
+        #    any descriptor is open, and ours is. We are in the agent's cgroup,
+        #    so systemd reaps us when the unit stops and the next start re-runs
+        #    the whole sequence.
+        #
+        #    We re-assert periodically rather than sleeping forever: if anything
+        #    else opens the tty (ModemManager, a stray `screen`, an operator
+        #    running fpms_duty_driver by hand) the kernel re-applies 0x06 on
+        #    that open and the board goes back into reset. Re-asserting costs
+        #    nothing and closes that hole. udev rules mark both CP2102s
+        #    ID_MM_DEVICE_IGNORE so ModemManager should never be the culprit,
+        #    but "should never" is not a mechanism.
+        while True:
+            time.sleep(2.0)
+            if ser.rts != (not EN_ASSERT_HOLDS_RESET):
+                log("EN was re-asserted by another open - clearing again")
+                ser.rts = not EN_ASSERT_HOLDS_RESET
+            if ser.dtr != (not IO0_ASSERT_IS_DOWNLOAD):
+                ser.dtr = not IO0_ASSERT_IS_DOWNLOAD
+
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        log("ERROR: lost hold on %s: %s" % (dev, exc))
+        return 1
+    finally:
+        # Deliberately NOT closing cleanly in the happy path - see above, the
+        # lines snap back to 0x06 on last close. If we are exiting, the agent
+        # is going down too and the next start re-runs the sequence.
+        try:
+            ser.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

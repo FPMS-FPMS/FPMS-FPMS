@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  /etc/fpms/fastdds_udp_only.xml - force Fast DDS onto UDPv4 only.
+
+  This is the highest-value file in FPMS-OS. Read docs/DDS.md before changing it.
+
+  THE BUG
+  =======
+  Fast DDS enables a shared-memory transport by default and prefers it for
+  same-host communication. On this hardware, SHM segments do not reliably
+  survive across what amount to separate "process eras" - a publisher started
+  in one era and a subscriber started in another complete DISCOVERY correctly
+  and then never exchange a single byte.
+
+  The repository documents this twice, in two different subsystems, without
+  ever naming the cause:
+
+    units/fpms-ros-settle.service
+      "the node is active, it logs `scans=2848 dropped=0 rate=9.55 Hz`, and
+       `ros2 topic info /scan_lidar` reports 'Publisher count: 1'. And yet NO
+       subscriber created afterwards ever receives a single LaserScan...
+       Restarting the unit fixes it instantly and reproducibly."
+
+    ROS_PORT.md  (root cause section, reproduced three times)
+      "rosbridge only delivers topics whose PUBLISHER already existed when
+       rosbridge started. A publisher created afterwards is never discovered,
+       and the client subscription asking for it is accepted and then silent
+       forever... connected, subscribed, silent - no error anywhere."
+
+      Evidence: after a reboot, fpms-rosbridge started at 22:26:33 and
+      fpms-odom-tf at 22:45:45 - nineteen minutes later - and /odom delivered
+      0 messages while publishing healthily at 6.6 Hz. A restart gave 53
+      messages in 8 seconds.
+
+  Those are the same bug. "The publisher must pre-exist the subscriber" is a
+  description of the symptom, not a cause. The cause is the transport.
+
+  WHAT THE MITIGATIONS COST TODAY
+  ===============================
+    - fpms-ros-settle.service sleeps 75 seconds after boot and then blindly
+      restarts fpms-lidar-ros and fpms-tf. That is ~2 minutes of boot-to-usable
+      spent on this.
+    - deploy_stack.sh must restart the four ROS consumers in a block AFTER
+      every publisher, and documents why at length.
+    - fpms-uros-supervisor incidentally re-creates participants and papers over
+      it further.
+
+  None of those are fixes. This file is.
+
+  HOW TO VERIFY IT WORKED
+  =======================
+  The check must exercise the case that fails today: a subscriber created LONG
+  after the publisher. A topic list or `ros2 topic info` will pass either way -
+  discovery was never the broken part.
+
+      # leave the stack running for a few minutes, then, in a fresh shell:
+      export ROS_DOMAIN_ID=20
+      export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      export FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+      ros2 topic hz /scan_lidar        # must report a rate, not hang
+
+  `fpms-selftest` performs exactly this check on every boot.
+
+  A NOTE ON ROS_LOCALHOST_ONLY
+  ============================
+  Every FPMS unit also sets ROS_LOCALHOST_ONLY=1. That is complementary, not
+  redundant: localhost-only restricts which interfaces DDS uses, but it does
+  NOT disable the shared-memory transport. You need both. Localhost-only is
+  safe here because every ROS node runs on the Pi - the operator laptop reaches
+  the rover over the Foxglove/rosbridge websockets and MQTT, and neither of
+  those uses DDS.
+
+  IF THIS FILE IS MALFORMED IT IS SILENTLY IGNORED
+  ================================================
+  Fast DDS does not fail loudly on a profile it cannot parse - it logs at a
+  level nobody reads and falls back to defaults, which reintroduces exactly the
+  bug this file exists to remove. scripts/40-ros-layer.sh therefore parses this
+  file at build time and FAILS THE BUILD if it does not, and fpms-selftest
+  re-checks it at boot.
+
+  SCHEMA
+  ======
+  This is the Fast DDS profile schema as shipped with ROS 2 Humble
+  (Fast DDS 2.6.x). Two things commonly get this wrong:
+    - the namespace must be the fastRTPS_Profiles one below, not the newer
+      eProsima "fastdds" namespace used by 2.10+;
+    - <useBuiltinTransports>false</useBuiltinTransports> is what actually
+      removes SHM. Listing a UDPv4 transport in <userTransports> alone is not
+      enough - the builtin set, which includes SHM, is still added alongside it
+      and Fast DDS will still prefer SHM for same-host peers.
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>fpms_udpv4</transport_id>
+        <type>UDPv4</type>
+
+        <!-- Large enough for a full LaserScan and the camera-adjacent traffic
+             without fragmenting on the loopback path. 64 KiB is the practical
+             UDP datagram ceiling; the socket buffers are sized to match so a
+             burst of scans during a costmap rebuild is not dropped at the
+             kernel. -->
+        <maxMessageSize>65500</maxMessageSize>
+        <sendBufferSize>1048576</sendBufferSize>
+        <receiveBufferSize>4194304</receiveBufferSize>
+      </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="fpms_udp_only_participant" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>fpms_udpv4</transport_id>
+        </userTransports>
+
+        <!-- THE LOAD-BEARING LINE. Without this, the builtin transports
+             (which include shared memory) are added in addition to ours and
+             SHM is still preferred for same-host communication - meaning the
+             bug is entirely unfixed while the profile looks correct. -->
+        <useBuiltinTransports>false</useBuiltinTransports>
+
+        <builtin>
+          <!-- Everything on this robot is on this robot. Keeping discovery
+               traffic off the WiFi also removes a second, independent source
+               of flakiness: the link has been measured at ~108 ms RTT on the
+               operator hotspot where 2-5 ms is expected, and swings between
+               -47 and -78 dBm. Below about -70 dBm the LiDAR telemetry stops.
+               DDS discovery does not belong on that link. -->
+          <metatrafficUnicastLocatorList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+              </udpv4>
+            </locator>
+          </metatrafficUnicastLocatorList>
+
+          <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+              </udpv4>
+            </locator>
+          </initialPeersList>
+
+          <!-- Announce often enough that a node starting late is found
+               quickly. The default 3s lease means a consumer restarted after
+               a publisher can wait noticeably long before traffic flows, and
+               "wait and see" is precisely the diagnostic state this project
+               keeps getting stuck in. -->
+          <discovery_config>
+            <leaseDuration>
+              <sec>10</sec>
+            </leaseDuration>
+            <leaseAnnouncement>
+              <sec>3</sec>
+            </leaseAnnouncement>
+          </discovery_config>
+        </builtin>
+      </rtps>
+    </participant>
+
+  </profiles>
+</dds>
