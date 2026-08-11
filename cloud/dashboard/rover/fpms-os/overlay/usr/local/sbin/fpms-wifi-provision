@@ -52,7 +52,11 @@ command -v nmcli >/dev/null 2>&1 || {
 # Find the wireless device. /sys/class/net/*/wireless is a more reliable test
 # than assuming wlan0 - a kernel bump or a USB dongle renames it, and a
 # hardcoded name would make this silently no-op.
-WIFI_DEV="$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
+# Capture then filter: awk's `exit` SIGPIPEs nmcli and pipefail turns that
+# into 141 in a plain assignment, so the rover would decide it has no wireless
+# interface on a machine that plainly does.
+_NMDEV="$(nmcli -t -f DEVICE,TYPE device 2>/dev/null || true)"
+WIFI_DEV="$(awk -F: '$2=="wifi"{print $1; exit}' <<<"$_NMDEV" || true)"
 if [ -z "$WIFI_DEV" ]; then
     for d in /sys/class/net/*; do
         [ -e "$d/wireless" ] && { WIFI_DEV="$(basename "$d")"; break; }
@@ -141,7 +145,8 @@ if [ "${#SSIDS[@]}" -gt 0 ]; then
     while [ "$(date +%s)" -lt "$deadline" ]; do
         state="$(nmcli -t -f DEVICE,STATE device 2>/dev/null | awk -F: -v d="$WIFI_DEV" '$1==d{print $2}')"
         if [ "$state" = "connected" ]; then
-            ssid="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null | awk -F: '$1=="yes"{print $2; exit}')"
+            _nmw="$(nmcli -t -f ACTIVE,SSID device wifi 2>/dev/null || true)"
+            ssid="$(awk -F: '$1=="yes"{print $2; exit}' <<<"$_nmw" || true)"
             addr="$(ip -4 -o addr show dev "$WIFI_DEV" scope global 2>/dev/null | awk '{print $4}')"
             log "connected to '${ssid}' as ${addr:-no address yet}"
             exit 0

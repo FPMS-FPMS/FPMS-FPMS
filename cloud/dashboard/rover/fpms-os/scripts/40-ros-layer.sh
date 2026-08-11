@@ -306,7 +306,11 @@ BT_PATCHED=0
 bt_locate() {  # bt_locate <filename> -> path on stdout, non-zero if not found
     local name="$1" hit
     if [ -f "$BT_DIR/$name" ]; then echo "$BT_DIR/$name"; return 0; fi
-    hit="$(find /opt/ros/humble/share -maxdepth 3 -name "$name" -type f 2>/dev/null | head -1)"
+    # `find | head -1` makes find die of SIGPIPE; pipefail then puts 141 in
+    # this plain assignment and set -e kills the stage. Capture, then slice.
+    _hits="$(find /opt/ros/humble/share -maxdepth 3 -name "$name" -type f 2>/dev/null || true)"
+    hit="${_hits%%$'
+'*}"
     [ -n "$hit" ] || return 1
     echo "$hit"
 }

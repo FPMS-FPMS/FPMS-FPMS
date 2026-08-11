@@ -90,8 +90,12 @@ chmod 0644 "$KEYRING"
 # fail here - it fails as an unsigned-repository error from apt-get update -
 # so the point of this block is only to make that error explainable.
 KEY_INFO="$(gpg --show-keys --with-colons "$KEYRING" 2>/dev/null || true)"
-KEY_EXP="$(printf '%s\n' "$KEY_INFO" | awk -F: '$1=="pub" {print $7; exit}')"
-KEY_FPR="$(printf '%s\n' "$KEY_INFO" | awk -F: '$1=="fpr" {print $10; exit}')"
+# Herestrings, not pipelines. awk's `exit` would SIGPIPE a live producer and
+# pipefail would put 141 into these plain assignments. A herestring is
+# already-complete data, so there is nothing left running to signal.
+# See apt_group() for the variant of this that actually killed a build.
+KEY_EXP="$(awk -F: '$1=="pub" {print $7; exit}' <<<"$KEY_INFO" || true)"
+KEY_FPR="$(awk -F: '$1=="fpr" {print $10; exit}' <<<"$KEY_INFO" || true)"
 say "ROS key ${KEY_FPR:-<unreadable>}"
 if [ -n "${KEY_EXP:-}" ] && [ "$KEY_EXP" -lt "$(date +%s)" ] 2>/dev/null; then
     echo "WARNING: the ROS signing key expired on $(date -d "@$KEY_EXP" 2>/dev/null || echo "$KEY_EXP")." >&2
@@ -138,7 +142,7 @@ case "$ROS_POLICY" in
   Before believing it, run this INSIDE the image and read the real answer:
       apt-cache policy ros-humble-ros-base" ;;
 esac
-say "ros-humble-ros-base: $(printf '%s\n' "$ROS_POLICY" | awk '/Candidate:/{print $2; exit}')"
+say "ros-humble-ros-base: $(awk '/Candidate:/{print $2; exit}' <<<"$ROS_POLICY" || true)"
 
 disk
 
@@ -152,12 +156,31 @@ disk
 # packages.ros.org/ros2/ubuntu/dists/jammy/main/binary-arm64 on 2026-08-10.
 apt_group() {
     local label="$1"; shift
-    local p cand missing=""
+    local p pol missing=""
     for p in "$@"; do
-        cand="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
-        if [ -z "$cand" ] || [ "$cand" = "(none)" ]; then
-            missing="$missing $p"
-        fi
+        # NO PIPELINE. This line killed a build, silently.
+        #
+        # It used to be:
+        #     cand="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/{print $2; exit}')"
+        #
+        # awk's `exit` closes the pipe while apt-cache is still writing, so
+        # apt-cache dies of SIGPIPE (141). Under `set -o pipefail` the command
+        # substitution carries 141, and a PLAIN assignment adopts that status,
+        # so `set -e` killed the whole function on the FIRST package -- before
+        # apt ran, with no output at all. The stage reported
+        # "FAILED after 0 min" and the log ended mid-sentence.
+        #
+        # (`local cand="$(...)"` would have masked it, because `local` supplies
+        # its own exit status. That difference is the entire bug, and it is why
+        # the declaration above no longer initialises anything.)
+        #
+        # Matching on the captured text needs no subprocess and cannot race.
+        pol="$(apt-cache policy "$p" 2>/dev/null || true)"
+        case "$pol" in
+            *"Candidate: (none)"*|"") missing="$missing $p" ;;
+            *"Candidate: "*)          : ;;
+            *)                        missing="$missing $p" ;;
+        esac
     done
     if [ -n "$missing" ]; then
         echo "FATAL: apt group '$label' names packages that do not exist for" >&2

@@ -139,8 +139,8 @@ fi
 # broker does not accept, NOTHING CRASHES. Every service simply retries
 # forever and the dashboard is silently empty, with no fault anywhere.
 provision_broker_password() {
-    local pass user
-    user="$(grep -E '^FPMS_MQTT_USER=' "$CONFIG" 2>/dev/null | cut -d= -f2- | tr -d '"')"
+    local pass user _raw
+    user="$(grep -E '^FPMS_MQTT_USER=' "$CONFIG" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
     [ -z "$user" ] && user=fpms
 
     # Operator override, if they want the same password as an existing setup.
@@ -148,7 +148,13 @@ provision_broker_password() {
         pass="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-mqtt-password")"
         log "using the broker password supplied on the boot partition"
     else
-        pass="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 24)"
+        # The trailing `head -c 24` closes the pipe while tr is still
+        # writing, so tr dies of SIGPIPE; with pipefail this plain assignment
+        # adopts 141 and password generation fails on a rover that then
+        # retries against a broker forever with nothing in the log.
+        _raw="$(head -c 48 /dev/urandom | base64 || true)"
+        _raw="${_raw//[^A-Za-z0-9]/}"
+        pass="${_raw:0:24}"
         log "generated a new broker password"
     fi
     [ -z "$pass" ] && { warn "could not obtain a broker password"; return 1; }
