@@ -1,0 +1,51 @@
+# The rover tree ends up on a Linux rootfs. Force LF in the working tree.
+#
+# WHY THIS FILE EXISTS
+# ====================
+# fpms-os/.gitattributes has carried this rule for a while, but it only governs
+# fpms-os/. The rover source -- the .py files, stack/, nav2/, slam/ -- sits two
+# levels ABOVE it and was covered by nothing, so on a Windows checkout with
+# core.autocrlf=true every one of those files lands CRLF. Measured: all 38
+# payload files.
+#
+# `git ls-files --eol` showed `i/lf w/crlf attr/` -- the committed content was
+# always fine, so this is not a repository corruption. It is a working-tree
+# problem, and the working tree is exactly what the image build reads.
+#
+# WHAT IT COSTS WHEN IT IS WRONG
+# ==============================
+#   stack/fpms-uros-supervisor gets a shebang ending "\r", and
+#   fpms-uros-supervisor.service ExecStart=s that path directly, so exec fails:
+#
+#       /usr/local/bin/fpms-uros-supervisor: /usr/bin/env: bad interpreter:
+#       No such file or directory
+#
+#   which is spectacularly misleading -- /usr/bin/env plainly exists and the
+#   file looks perfect in every editor. That unit supervises the micro-ROS
+#   drive link, so the symptom is a rover that cannot move.
+#
+#   nav2/arena_map.yaml stays CRLF, so the image build's comparison against a
+#   freshly generated (LF) map can never match on a text diff -- which failed
+#   the build for a completely spurious reason.
+#
+#   Every ~/*.py is installed 0755 with a \r shebang: fine under the units
+#   (which run `python3 file.py`) and broken the moment anyone runs ./file.py.
+#
+# The image build normalises the payload defensively at stage 30, but that
+# repairs a copy. This repairs the source, which is where it should be fixed.
+#
+# NOTE: applying this renormalises the working tree on the next checkout. The
+# committed bytes do not change -- they were already LF.
+*               text eol=lf
+
+# Binary payloads that must never be touched.
+*.png           binary
+*.jpg           binary
+*.pgm           binary
+*.rknn          binary
+*.onnx          binary
+*.pt            binary
+*.bin           binary
+*.img           binary
+*.tar.gz        binary
+*.posegraph     binary

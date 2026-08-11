@@ -140,8 +140,11 @@ shipped for months.
   `LIDAR_ROTATION_SIGN`, and the calibration profile. The image ships them
   unmeasured and *says so*, and the units that would act on them refuse to
   start. It does not guess.
-- **The base image SHA256 is unset.** `build.sh` refuses to build until
-  somebody checks it against the upstream release. That is intentional.
+- **The base image is pinned and verified** — `ubuntu-22.04-preinstalled-server-arm64-orangepi-5b.img.xz`
+  at `v2.4.0`, sha256 checked against upstream's own published sidecar.
+  The gate that requires this caught a real bug: the URL previously named
+  `ubuntu-22.04.4-…`, a point release upstream does not publish, and it 404'd.
+  Pinned URLs rot; that is why the gate exists.
 - **`docs/FAILURE_MODES.md`** lists what is fixed and what is not. Read it
   before a competition.
 

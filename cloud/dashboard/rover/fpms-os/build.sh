@@ -618,6 +618,13 @@ Run a full build first, or pass --fresh to build one from the base image."
     fi
 
     log "resuming against the existing image ($(du -m "$OUT" | cut -f1) MB)"
+
+    # prepare_image() creates these; the resume path skips it, so mount_image
+    # would fail with "mount point does not exist" on any resume that starts in
+    # a clean checkout -- or, as here, after the working directory was moved.
+    # Cheap, idempotent, and it makes resume standalone.
+    mkdir -p "$WORK" "$MNT"
+
     release_stale
     attach_loop
     mount_image
