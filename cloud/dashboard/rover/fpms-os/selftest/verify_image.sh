@@ -200,6 +200,36 @@ PAYLOAD_EXE=(
     fpms-wifi-provision
 )
 
+# The LiDAR mount calibration tool. Two files that are useless apart: the
+# library is pure functions with no ROS and no I/O, and the node is the thing
+# that subscribes to /scan_lidar and /imu. Both ship in the overlay and are
+# placed by stage 50's wholesale copy of overlay/usr/local/**, so neither
+# appears in PAYLOAD_EXE - that list is stage 30's, and stage 30 only VERIFIES
+# these.
+#
+# They are checked at all because the mount transform has never been measured:
+# every base_link -> laser_frame offset in fpms_tf.launch.py is a MEASURE ME
+# placeholder, and fpms-nav2 and both SLAM units refuse to start until
+# FPMS_TF_OFFSETS_MEASURED=1. This tool is the only thing in the image that can
+# produce those numbers, so an image that shipped without it is an image that
+# can never navigate - and nothing else in this file would notice.
+CALIB_BIN=fpms-calibrate-lidar
+CALIB_LIB=usr/local/lib/fpms/fpms_scanmatch.py
+
+# Named one at a time. A rename inside the library is silent: the module still
+# imports and the tool dies on an AttributeError with the operator's hands on
+# the rover.
+CALIB_FUNCS=(
+    scan_to_xy
+    wrap_pi
+    estimate_rotation
+    estimate_translation
+    mirror_verdict
+    yaw_from_straight_push
+    lever_arm_from_rotation
+    plane_level_diagnostic
+)
+
 # Named by fpms-nav2.service, fpms-slam-localization.service and
 # fpms-slam-mapping.service by absolute path, and hard-asserted by stage 40.
 ETC_FPMS_CONFIGS=(
@@ -1631,6 +1661,234 @@ the fuller record; check its status field."
 }
 
 # --------------------------------------------------------------------------
+# 11. The LiDAR mount calibration tool.
+#
+# The mount transform is the last unmeasured thing standing between this image
+# and a rover that can navigate: every base_link -> laser_frame offset in
+# fpms_tf.launch.py is a MEASURE ME placeholder, the unit launches it with none
+# of them supplied, and by that file's own arithmetic 1 degree of mount yaw is
+# ~10.5 mm of position error inherited IN THE SAME DIRECTION by both the
+# obstacle cone guard and the occupancy grid - so it accumulates rather than
+# averaging out. fpms-nav2 and both SLAM units refuse to start until
+# FPMS_TF_OFFSETS_MEASURED=1, and this tool is the only thing in the image that
+# can honestly produce that 1.
+#
+# An image that shipped without it boots perfectly, reports every unit fine,
+# and can never be made to navigate. Nothing else in this file looks at either
+# file, so without this section that is a silent pass.
+#
+# ONE THING HERE IS STRONGER THAN THE REST OF THIS SCRIPT, and it is worth
+# being precise about, because the header above says we execute nothing from
+# inside the image. We still do not. fpms_scanmatch.py is TEXT, not an aarch64
+# binary, so the HOST's python3 can PARSE it - ast.parse builds a tree and runs
+# none of it, imports nothing, and writes nothing. That is a genuinely stronger
+# claim than the paho and numpy checks above, which can only grep a module for
+# a symbol. It is still not an import: numpy is not resolved here, and a
+# NameError inside a function body survives this untouched.
+# --------------------------------------------------------------------------
+CALIB_AST="$(cat <<'PYEOF'
+import ast, sys
+path = sys.argv[1]
+required = sys.argv[2].split()
+try:
+    src = open(path, "rb").read().decode("utf-8")
+except (OSError, UnicodeDecodeError) as e:
+    sys.stderr.write("cannot read as UTF-8: %s" % e)
+    raise SystemExit(1)
+try:
+    mod = ast.parse(src, path)
+except SyntaxError as e:
+    sys.stderr.write("SyntaxError at line %s: %s" % (e.lineno, e.msg))
+    raise SystemExit(1)
+have = set()
+for n in mod.body:
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        have.add(n.name)
+gone = [n for n in required if n not in have]
+if gone:
+    sys.stderr.write("parses, but these top-level functions are gone: %s"
+                     % " ".join(gone))
+    raise SystemExit(1)
+sys.stdout.write("parses, %d top-level functions, all %d required present"
+                 % (len(have), len(required)))
+PYEOF
+)"
+
+check_calibration() {
+    local p="" lib="$R/$CALIB_LIB" libdir="$R/usr/local/lib/fpms"
+    local out="" mode="" sz="" pth="" hits="" f=""
+
+    # --- the node -----------------------------------------------------------
+    p="$(find_exe "$CALIB_BIN")"
+    if [ -z "$p" ]; then
+        add "calibration tool present" "$FAIL" "$CALIB_BIN not found" \
+            "It ships at overlay/usr/local/bin/$CALIB_BIN and stage 50 copies
+overlay/usr/local/** into /. Absent means the overlay copy did not run or the
+file was never committed. Without it the mount transform cannot be measured,
+FPMS_TF_OFFSETS_MEASURED stays 0, and fpms-nav2 and both SLAM units refuse to
+start on every boot. Searched /usr/local/bin, /usr/local/sbin, /usr/bin and
+/usr/sbin. See docs/CALIBRATION.md."
+        add "calibration tool executable" "$SKIP" "tool not found"
+        add "calibration tool shebang is LF" "$SKIP" "tool not found"
+    else
+        add "calibration tool present" "$PASS" "${p#"$R"}"
+
+        if [ ! -x "$p" ]; then
+            add "calibration tool executable" "$FAIL" "not +x: ${p#"$R"}" \
+                "Stage 50 chmods /usr/local/bin/* to 0755. A tool the operator
+cannot run is the same as a tool that is not there, except that it looks fine."
+        else
+            add "calibration tool executable" "$PASS" "mode $(file_mode "$p")"
+        fi
+
+        # THE CARRIAGE RETURN. Same failure as fpms-wait-net and
+        # fpms-uros-supervisor, checked the same way, for the same reason: a \r
+        # on the shebang line fails at exec as "/usr/bin/env: bad interpreter:
+        # No such file or directory", which sends the reader looking for a
+        # missing /usr/bin/env that plainly exists. This one is worse than most
+        # to diagnose because the operator meets it crouched next to a rover
+        # rather than in front of a journal.
+        if ! has_shebang "$p"; then
+            add "calibration tool shebang is LF" "$FAIL" "no #! on $CALIB_BIN" \
+                "It is installed 0755 and run by hand as
+/usr/local/bin/$CALIB_BIN. With no interpreter line the shell runs it as a
+shell script and it dies on the first python statement."
+        elif shebang_is_crlf "$p"; then
+            add "calibration tool shebang is LF" "$FAIL" \
+                "carriage return on the shebang of $CALIB_BIN" \
+                "Fails at exec with '/usr/bin/env: bad interpreter: No such file
+or directory'. /usr/bin/env exists; the interpreter name it was handed is
+'python3\\r'. Stage 50's CRLF sweep covers /usr/local/bin/fpms-* and should have
+caught this, so reaching here means the sweep did not run or the file arrived
+after it. Rebuild after git add --renormalize . and check the STAGED blob."
+        else
+            add "calibration tool shebang is LF" "$PASS" "no carriage return"
+        fi
+    fi
+
+    # --- the library --------------------------------------------------------
+    #
+    # Checked for SIZE as well as existence. A zero-byte fpms_scanmatch.py
+    # copies, chmods and mounts perfectly; it fails only at import, on the
+    # rover.
+    if [ ! -f "$lib" ]; then
+        add "scanmatch library present" "$FAIL" "/$CALIB_LIB not found" \
+            "The node imports fpms_scanmatch at start-up. It ships at
+overlay/usr/local/lib/fpms/fpms_scanmatch.py and stage 50 places it. The tool
+is two files and it needs both: this one holds every estimator, the node holds
+none of them."
+        add "scanmatch library parses" "$SKIP" "library not found"
+    else
+        sz="$(file_size "$lib")"
+        if [ "$sz" = "-" ] || [ "$sz" = "0" ]; then
+            add "scanmatch library present" "$FAIL" "/$CALIB_LIB is $sz bytes" \
+                "A zero-byte module imports without error and defines nothing,
+so the node dies on an AttributeError rather than an ImportError - which sends
+the reader to the node instead of to the copy that truncated."
+            add "scanmatch library parses" "$SKIP" "library is empty"
+        else
+            add "scanmatch library present" "$PASS" "/$CALIB_LIB ($sz bytes)"
+
+            if [ "$HAVE_PY" = 0 ]; then
+                add "scanmatch library parses" "$SKIP" \
+                    "no python3 on this host to parse it with"
+            elif out="$(python3 -c "$CALIB_AST" "$lib" "${CALIB_FUNCS[*]}" 2>&1)"; then
+                add "scanmatch library parses" "$PASS" "$out"
+            else
+                add "scanmatch library parses" "$FAIL" "$out" \
+                    "Either the file is not valid Python, or a function the node
+calls has been renamed or removed. Both fail on the rover - the first at
+import, the second at the moment the operator asks for a measurement. Stage 30
+makes the same check against the STAGED overlay and would have failed the
+build, so a failure here means the two trees disagree."
+            fi
+        fi
+    fi
+
+    # --- is the library actually importable? --------------------------------
+    #
+    # Present is not importable. /usr/local/lib/fpms is a directory no Python
+    # has ever heard of, so without a .pth in a site directory the node's
+    # `import fpms_scanmatch` raises ImportError no matter how correct both
+    # files are. Stage 30 writes that .pth and asserts sys.path in the chroot;
+    # this confirms the file survived into the artefact.
+    #
+    # The search is a find, captured whole. `find ... | grep -q` here would
+    # SIGPIPE find, pipefail would report 141, and the verdict would come out
+    # backwards - the bug class this repository has been bitten by repeatedly.
+    if [ ! -d "$libdir" ]; then
+        add "scanmatch library importable" "$FAIL" "/usr/local/lib/fpms is not a directory" \
+            "Nothing to put on sys.path. See stage 30."
+    else
+        hits="$(find "$R/usr/local/lib" "$R/usr/lib/python3" \
+                     "$R/usr/lib/python3.10" "$R/usr/lib/python3/dist-packages" \
+                     -maxdepth 4 -name '*.pth' -print 2>/dev/null || true)"
+        pth=""
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$(read_text "$f")" in
+                */usr/local/lib/fpms*) pth="$f"; break ;;
+            esac
+        done <<<"$hits"
+
+        if [ -n "$pth" ]; then
+            add "scanmatch library importable" "$PASS" \
+                "${pth#"$R"} puts /usr/local/lib/fpms on sys.path"
+        else
+            add "scanmatch library importable" "$FAIL" \
+                "no .pth names /usr/local/lib/fpms" \
+                "The module is on disk and no interpreter can find it.
+fpms-calibrate-lidar dies at import with ModuleNotFoundError: fpms_scanmatch.
+Stage 30 writes this .pth into python3's own site directory and asserts
+sys.path afterwards, so its absence here means stage 30 did not run or the site
+directory moved. Workaround on the rover:
+PYTHONPATH=/usr/local/lib/fpms /usr/local/bin/fpms-calibrate-lidar"
+        fi
+
+        # A world-writable directory on EVERY interpreter's sys.path is a place
+        # any process on the rover can drop a module that every other process
+        # then imports. The overlay is staged from a Windows filesystem where
+        # every directory reads back 0777, so this is a live possibility rather
+        # than a theoretical one - stage 30 creates the directory 0755 first and
+        # stage 50's DIR_SNAP restores it, and this checks that both worked.
+        mode="$(file_mode "$libdir")"
+        case "$mode" in
+            *[2367])
+                add "scanmatch library directory not writable by all" "$FAIL" \
+                    "/usr/local/lib/fpms is mode $mode" \
+                    "It is on sys.path for every python3 on the rover. Anything
+that can write here can inject a module into every ROS node. cp -a stamps the
+Windows source directory's 0777 onto the destination; stage 30 pre-creates it
+0755 and stage 50's DIR_SNAP block restores the mode - one of those did not
+happen." ;;
+            -)
+                add "scanmatch library directory not writable by all" "$WARN" \
+                    "could not stat /usr/local/lib/fpms" ;;
+            *)
+                add "scanmatch library directory not writable by all" "$PASS" \
+                    "mode $mode" ;;
+        esac
+    fi
+
+    # The tool is useless if nobody knows it exists. docs/ is staged into the
+    # image by build.sh's stage_all(), so the procedure travels with the rover
+    # rather than living only in a repository the operator does not have at the
+    # arena.
+    if [ -f "$R/opt/fpms-os/docs/CALIBRATION.md" ]; then
+        add "calibration procedure documented" "$PASS" \
+            "/opt/fpms-os/docs/CALIBRATION.md"
+    else
+        add "calibration procedure documented" "$WARN" \
+            "/opt/fpms-os/docs/CALIBRATION.md is not in the image" \
+            "The operator runs this crouched next to a rover, and the order of
+the steps is load-bearing: the mirror check has to come before yaw, because a
+mirror is not a rigid transform and yaw measured against a mirrored world is
+confidently wrong. Read it from the repository instead."
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
 json_escape() {
@@ -1725,6 +1983,7 @@ main() {
     check_hygiene
     check_bootpart
     check_python
+    check_calibration
 
     local i n nfail=0 nwarn=0
     n="${#R_NAME[@]}"

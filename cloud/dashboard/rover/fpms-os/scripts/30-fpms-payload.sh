@@ -377,6 +377,241 @@ fi
 # device and baud from config.env instead of hardcoding them in two places
 # that disagreed.
 
+# --- the LiDAR mount calibration tool ---------------------------------------
+#
+# NOTHING IS INSTALLED HERE, DELIBERATELY. Both halves of the tool ship in the
+# OVERLAY:
+#
+#     overlay/usr/local/bin/fpms-calibrate-lidar     the watch-only ROS 2 node
+#     overlay/usr/local/lib/fpms/fpms_scanmatch.py   the pure-numpy estimator
+#
+# and stage 50 already copies overlay/usr/local/** into /, chmods
+# /usr/local/bin/* to 0755, and sweeps /usr/local/bin/fpms-* for CRLF. A second
+# `install` here would duplicate all three and give the image two sources of
+# truth for the same two files - which is exactly how $SRC came to hold two
+# rover-agent files that had drifted apart, and why the block above has to pick
+# between them by line count.
+#
+# WHAT IS ADDED INSTEAD IS THE CHECK STAGE 50 CANNOT MAKE, plus one directory.
+#
+# THE ORDERING IS THE WHOLE REASON THIS BLOCK LOOKS BACK-TO-FRONT. build.sh
+# iterates "$MNT/opt/fpms-os/scripts/"[0-9]*.sh in glob order, so 30 runs
+# BEFORE 50: /usr/local/lib/fpms/fpms_scanmatch.py DOES NOT EXIST YET at this
+# point in the build, and a `[ -f ]` against the installed path would fail on
+# every single run - a check that is always red is a check that gets deleted.
+# What DOES exist is build.sh's staged copy of the overlay: stage_all() copies
+# scripts/ overlay/ selftest/ docs/ firstboot/ under /opt/fpms-os before any
+# stage runs. So this inspects THE SOURCE STAGE 50 IS ABOUT TO COPY FROM. A
+# file that is absent, empty or malformed there is absent, empty or malformed
+# in the image twenty minutes later - and this stage is where somebody is still
+# reading the log.
+#
+# Everything below reports its verdict through MISSING, like the rest of this
+# stage, so one run names everything that is broken instead of dying on the
+# first fault of a fourteen-hour build.
+
+CAL_OVL=/opt/fpms-os/overlay/usr/local
+CAL_LIB="$CAL_OVL/lib/fpms/fpms_scanmatch.py"
+CAL_BIN="$CAL_OVL/bin/fpms-calibrate-lidar"
+
+# The functions fpms-calibrate-lidar calls. Named one at a time rather than
+# checked as "the file parses", because a rename in the library is silent: the
+# module imports perfectly and the tool dies on an AttributeError at the moment
+# the operator has both hands on the rover.
+CAL_REQUIRED="scan_to_xy wrap_pi estimate_rotation estimate_translation \
+mirror_verdict yaw_from_straight_push lever_arm_from_rotation \
+plane_level_diagnostic"
+
+# ast.parse, NOT `python3 -m py_compile` and NOT an import.
+#
+#   - py_compile writes __pycache__/ NEXT TO THE SOURCE, i.e. inside the staged
+#     overlay, and stage 50 would then copy that bytecode into the image as
+#     /usr/local/lib/fpms/__pycache__ - build scaffolding shipped to a rover,
+#     stale the moment anyone edits the library.
+#   - an import would execute the module and drag in numpy under qemu for no
+#     extra information: the question here is whether the FILE is shaped like
+#     the library the tool expects, and stage 20 has already verified numpy.
+#
+# Heredoc-assigned so the snippet can contain quotes of both kinds without
+# fighting the shell over them.
+CAL_PY_SHAPE="$(cat <<'PYEOF'
+import ast, sys
+path, required = sys.argv[1], sys.argv[2].split()
+try:
+    src = open(path, 'rb').read().decode('utf-8')
+except (OSError, UnicodeDecodeError) as e:
+    sys.stderr.write('cannot read as UTF-8: %s' % e)
+    raise SystemExit(1)
+try:
+    mod = ast.parse(src, path)
+except SyntaxError as e:
+    sys.stderr.write('SyntaxError at line %s: %s' % (e.lineno, e.msg))
+    raise SystemExit(1)
+have = set()
+for n in mod.body:
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        have.add(n.name)
+gone = [n for n in required if n not in have]
+if gone:
+    sys.stderr.write('parses, but these top-level functions are gone: %s'
+                     % ' '.join(gone))
+    raise SystemExit(1)
+sys.stdout.write('parses, %d top-level functions, all %d the tool needs'
+                 % (len(have), len(required)))
+PYEOF
+)"
+
+if [ ! -d "$CAL_OVL" ]; then
+    echo "    MISSING: $CAL_OVL - the staged overlay has no usr/local tree." >&2
+    echo "             Not a calibration fault: stage_all() copies overlay/ to" >&2
+    echo "             /opt/fpms-os before any stage runs, so either that copy" >&2
+    echo "             did not happen or this chroot was staged by an older" >&2
+    echo "             build.sh. Stage 50 will fail on the same tree." >&2
+    MISSING=1
+else
+    # --- the library --------------------------------------------------------
+    #
+    # -s as well as -f. A zero-byte file copies, chmods and ships perfectly, and
+    # only announces itself when the operator is standing over the rover.
+    CAL_SHAPE=""
+    if [ ! -f "$CAL_LIB" ]; then
+        echo "    MISSING: overlay/usr/local/lib/fpms/fpms_scanmatch.py" >&2
+        echo "             (expected at $CAL_LIB)" >&2
+        echo "             Without it the mount transform can never be measured," >&2
+        echo "             FPMS_TF_OFFSETS_MEASURED stays 0, and fpms-nav2 and" >&2
+        echo "             both SLAM units refuse to start forever." >&2
+        MISSING=1
+    elif [ ! -s "$CAL_LIB" ]; then
+        echo "    FAILED: $CAL_LIB is zero bytes." >&2
+        MISSING=1
+    elif ! CAL_SHAPE="$(/usr/bin/python3 -c "$CAL_PY_SHAPE" "$CAL_LIB" "$CAL_REQUIRED" 2>&1)"; then
+        echo "    FAILED: fpms_scanmatch.py is not importable-shaped." >&2
+        echo "            python3 said: $CAL_SHAPE" >&2
+        echo "            fpms-calibrate-lidar imports it at start-up, so this is" >&2
+        echo "            a tool that dies on its first line, on a rover." >&2
+        MISSING=1
+    else
+        echo "    overlay lib: fpms_scanmatch.py - $CAL_SHAPE"
+    fi
+
+    # --- the node -----------------------------------------------------------
+    #
+    # The shebang is read with `read`, not with `head -c`/`grep`. This file
+    # comes off a Windows checkout, so a \r is a live possibility, and a
+    # producer piped into head or grep -q takes SIGPIPE, pipefail reports 141,
+    # and `set -e` kills the stage silently - the bug class that has killed
+    # this build three times. `read` opens the file directly: no pipeline, no
+    # producer, nothing to signal. It also keeps a trailing \r, which is the
+    # byte being looked for.
+    if [ ! -f "$CAL_BIN" ]; then
+        echo "    MISSING: overlay/usr/local/bin/fpms-calibrate-lidar" >&2
+        echo "             (expected at $CAL_BIN)" >&2
+        echo "             The library alone measures nothing - it is a set of" >&2
+        echo "             pure functions with no ROS and no I/O. This is the" >&2
+        echo "             node that subscribes to /scan_lidar and /imu." >&2
+        MISSING=1
+    elif [ ! -s "$CAL_BIN" ]; then
+        echo "    FAILED: $CAL_BIN is zero bytes." >&2
+        MISSING=1
+    else
+        CAL_FIRST=""
+        read -r CAL_FIRST < "$CAL_BIN" || true
+        case "$CAL_FIRST" in
+            '#!'*) ;;
+            *)
+                echo "    FAILED: $CAL_BIN does not start with '#!'." >&2
+                echo "            Stage 50 chmods it 0755 regardless, so it would" >&2
+                echo "            ship executable and fail at exec." >&2
+                MISSING=1 ;;
+        esac
+        # A note, not a failure: stage 50's CRLF sweep covers
+        # /usr/local/bin/fpms-* and repairs this one after the copy. Said out
+        # loud anyway, because the sweep does NOT cover /usr/local/lib/fpms,
+        # and a reader who sees this line knows which of the two was fixed.
+        case "$CAL_FIRST" in
+            *$'\r')
+                echo "    note: fpms-calibrate-lidar has a CRLF shebang in the staged" >&2
+                echo "          overlay. Stage 50 converts it; check .gitattributes." >&2 ;;
+        esac
+        echo "    overlay bin: fpms-calibrate-lidar (stage 50 installs it 0755)"
+    fi
+fi
+
+# --- /usr/local/lib/fpms must be ON THE INTERPRETER'S PATH -------------------
+#
+# fpms_scanmatch.py is a bare module in a directory no Python has ever heard
+# of. Nothing about copying it to /usr/local/lib/fpms makes `import
+# fpms_scanmatch` work, and the failure is an ImportError at start-up on the
+# rover, which is the worst possible place to discover it.
+#
+# The directory is created HERE rather than left to stage 50's `cp -a`, for two
+# reasons that both bite:
+#
+#   1. site.addpackage SILENTLY DROPS a .pth line naming a directory that does
+#      not exist. Written before the directory, the .pth below would be a file
+#      that looks completely correct and adds nothing at all - and the sys.path
+#      assertion after it would fail here, at build time, for a reason that has
+#      nothing to do with the tool.
+#   2. cp -a stamps the SOURCE directory's mode onto the destination, and this
+#      overlay is staged from a Windows filesystem where every directory reads
+#      back 0777. Creating it 0755 root:root first means stage 50's DIR_SNAP
+#      block has a real mode to snapshot and put back. A world-writable
+#      directory on every interpreter's sys.path is a place any process on the
+#      rover could drop a module that every other one then imports.
+#
+# Nothing here can shadow anything: the directory holds one module, named
+# fpms_scanmatch, which collides with no stdlib and no ROS package. It is
+# appended by site, after the stdlib, not prepended.
+install -d -m 0755 -o root -g root /usr/local/lib/fpms
+
+# Ask the interpreter where its site directories are rather than writing
+# python3.10 into this file. jammy is 3.10 today; a hardcoded path that stops
+# existing produces a .pth nothing reads, which fails in the direction of a
+# clean build log.
+CAL_PY_SITE="$(cat <<'PYEOF'
+import site, sys
+try:
+    dirs = [d for d in site.getsitepackages() if isinstance(d, str)]
+except AttributeError:
+    dirs = []
+pref = [d for d in dirs if d.startswith('/usr/local/')]
+cand = pref or dirs
+if not cand:
+    sys.stderr.write('python3 reports no site-packages directories at all')
+    raise SystemExit(1)
+sys.stdout.write(cand[0])
+PYEOF
+)"
+
+CAL_SITE=""
+if ! CAL_SITE="$(/usr/bin/python3 -c "$CAL_PY_SITE" 2>&1)"; then
+    echo "    FAILED: could not ask python3 for its site directories." >&2
+    echo "            python3 said: $CAL_SITE" >&2
+    MISSING=1
+    CAL_SITE=""
+fi
+if [ -n "$CAL_SITE" ]; then
+    install -d -m 0755 -o root -g root "$CAL_SITE"
+    printf '%s\n' /usr/local/lib/fpms > "$CAL_SITE/fpms-scanmatch.pth"
+    chmod 0644 "$CAL_SITE/fpms-scanmatch.pth"
+    chown root:root "$CAL_SITE/fpms-scanmatch.pth"
+    # VERIFY THE OUTCOME, not that the write returned 0. The only question
+    # worth asking is whether /usr/bin/python3 - the interpreter every unit
+    # runs, either directly or as `python3` after sourcing ROS's setup.bash,
+    # which changes PYTHONPATH but not the interpreter - actually has the
+    # directory on sys.path now.
+    if /usr/bin/python3 -c 'import sys; raise SystemExit(0 if "/usr/local/lib/fpms" in sys.path else 1)'; then
+        echo "    $CAL_SITE/fpms-scanmatch.pth  (/usr/local/lib/fpms is on sys.path)"
+    else
+        echo "    FAILED: wrote $CAL_SITE/fpms-scanmatch.pth and /usr/local/lib/fpms" >&2
+        echo "            is STILL not on python3's sys.path. Either that directory" >&2
+        echo "            is not a site directory this interpreter reads, or .pth" >&2
+        echo "            processing is disabled (python3 -S, or a venv). Until it" >&2
+        echo "            is fixed, fpms-calibrate-lidar must add the path itself." >&2
+        MISSING=1
+    fi
+fi
+
 # --- nav2 / slam trees ------------------------------------------------------
 #
 # fpms-tf.service has always referenced /home/ubuntu/nav2/fpms_tf.launch.py and
@@ -472,6 +707,9 @@ if [ "$MISSING" = 1 ]; then
     echo "(present, but install/cp refused) - and those want different fixes:" >&2
     echo "  MISSING -> the staging copy did not bring the file in. Check that it" >&2
     echo "             exists two levels above fpms-os/ and re-run the full build." >&2
+    echo "             EXCEPT for the two calibration files: those ship in" >&2
+    echo "             fpms-os/overlay/usr/local/ and their message names the" >&2
+    echo "             full staged path. Look there, not above fpms-os/." >&2
     echo "  FAILED  -> the file is here and the write was rejected. Check free" >&2
     echo "             space in the image and that '${FPMS_USER}:$FPMS_GROUP' resolves." >&2
     exit 1

@@ -1,0 +1,2397 @@
+#!/usr/bin/env python3
+"""fpms-calibrate-lidar - measure base_link -> laser_frame. Never moves the rover.
+
+The operator pushes and turns the rover BY HAND. This program only WATCHES:
+it subscribes to /scan_lidar and /imu, and it estimates the LiDAR mount
+transform from the way the world appears to move.
+
+============================================================================
+THIS PROGRAM PUBLISHES NOTHING. NOT TO ANY TOPIC, AT ALL.
+============================================================================
+There is no create_publisher call anywhere in this file - not /cmd_vel, not
+/cmd_duty, not even a diagnostic topic. That is a hard requirement, not a
+preference, and it buys three things:
+
+  * there is no safety surface. Nothing here can move the rover, so this needs
+    no arming, no stop authority and no motion calibration;
+  * every estimate below depends on the DIRECTION of apparent motion and never
+    on its magnitude, so counts/mm being unmeasured and disputed does not
+    matter to any number this program produces;
+  * the gyro is an independent witness, because heading comes from integrating
+    angular_velocity.z rather than from the wheels.
+
+The node self-checks this after it starts (see Listener._assert_no_publishers)
+rather than relying on the claim in this comment. Never trust a promise where
+you can verify an outcome.
+
+============================================================================
+WHAT IS BEING MEASURED, AND WHY IT IS WORTH AN EVENING
+============================================================================
+`base_link -> laser_frame` in nav2/fpms_tf.launch.py is six MEASURE ME
+placeholders, and /etc/fpms/config.env ships all six as zeros with
+FPMS_TF_OFFSETS_MEASURED=0. By the launch file's own arithmetic:
+
+    1 degree of mount yaw  ~=  10.5 mm of position error
+
+and BOTH the obstacle cone guard AND the occupancy grid inherit that error in
+the SAME direction, so it accumulates over a mission instead of averaging out.
+fpms-nav2.service and both SLAM units refuse to start until
+FPMS_TF_OFFSETS_MEASURED=1, which is the correct behaviour: navigating on an
+unmeasured mount transform produces confidently wrong positions.
+
+============================================================================
+ORDER OF OPERATIONS - THE MIRROR CHECK IS NOT OPTIONAL AND NOT LAST
+============================================================================
+  1. --mirror-check   turn ~90 deg by hand. Settles LIDAR_ROTATION_SIGN.
+  2. --level          static scan. Is the scan plane striking the floor?
+  3. --yaw            several straight pushes. THE number.
+  4. --lever          turn in place. x/y, weakly. A cross-check on a ruler.
+  5. --apply          write config.env, once, after confirming.
+  6. --verify         push again; the residual must now read ~0.
+
+Everything except --mirror-check, --level and --report REFUSES TO RUN until
+the mirror check has passed, because a mirror is NOT a rigid transform - no
+value of laser_yaw can undo one - and measuring yaw against a mirrored world
+returns a confident, plausible, wrong number. That refusal is the whole reason
+the ordering is enforced in code rather than written in a runbook.
+
+============================================================================
+THE ONE THING THIS PROGRAM CANNOT SEE
+============================================================================
+Applying FPMS_TF_LASER_YAW changes the TF TREE. It does not change one byte of
+/scan_lidar - the scan arrives in the laser frame either way. So --verify does
+NOT expect the raw measurement to move to zero. It re-measures the mount yaw
+from fresh pushes, subtracts what has actually been applied, and asserts the
+RESIDUAL is ~0:
+
+    residual = measured_mount_yaw - applied_laser_yaw   ->  must be ~0
+
+A sign error does not make that residual merely wrong, it makes it almost
+exactly TWICE the applied value, which is why --verify can name the failure
+instead of just reporting a mismatch. Sign errors are this project's signature
+failure: the odometry pose sign, the turn wire sign, the duty polarity, the
+encoder polarity and LIDAR_ROTATION_SIGN itself. Each one was silent, each one
+produced perfectly plausible numbers, and each one cost days.
+
+--verify also reads the LIVE transform off /tf_static, so "you edited
+config.env and never restarted fpms-tf" is caught as well.
+
+============================================================================
+THE CONVENTION PROBES - READ THIS BEFORE CHANGING ANY SIGN IN THIS FILE
+============================================================================
+fpms_scanmatch's docstrings define the METHOD. They do not, on their own,
+pin down which way its numbers point, and two of them do not point the way a
+first reading suggests. Measured against synthetic scans, on this build:
+
+  estimate_rotation(A, B)  returns the CHASSIS rotation, i.e. MINUS the
+      apparent rotation of the world. Feed a profile shifted so every feature
+      moves -10 degrees and it returns +10. But mirror_verdict's docstring is
+      explicit that it wants the APPARENT rotation ("every static feature
+      appears to rotate by -dtheta ... on a correctly-handed scan the two have
+      OPPOSITE signs"). Wiring one straight into the other inverts the verdict:
+      a correct scanner reports MIRRORED and a mirrored one reports OK.
+
+  estimate_translation(A, B, rot)  also wants the APPARENT rotation. Given the
+      raw return above, ICP diverges: measured 0.43 m RMS against 0.014 m with
+      the sign the other way, on the same synthetic pair.
+
+  lever_arm_from_rotation(...)  then returns MINUS the offset.
+
+  yaw_from_straight_push(...)  is correct as documented and needs no
+      correction. That is the number that actually gets written, and it was
+      checked first.
+
+So this file does NOT call estimate_rotation directly anywhere, and it does
+NOT hardcode a compensating minus sign - a hardcoded sign would silently
+invert the day somebody fixes the estimator. Instead:
+
+  * rotation_convention() shifts a synthetic profile by a KNOWN number of bins
+    and reads back which sign comes out. That probe needs no geometry, no
+    hardware and no assumptions - a feature moved from bin j+k to bin j has
+    moved by -k bins and there is nothing to argue about.
+  * fit_motion() then runs ICP with BOTH signs and keeps the one that actually
+    fits, so the alignment is decided by residual and not by belief.
+  * lever_arm() picks between +L and -L by predicting the translation each
+    would produce and comparing against the one observed.
+
+Every one of those is an outcome check. If the estimator is corrected later,
+all three follow it automatically. If it is changed into something neither
+convention explains, rotation_convention() refuses to let the tool run at all,
+which is the correct response to an estimator nobody understands any more.
+
+What it still cannot do is confirm the CONVENTION. If the whole stack agreed
+on a mirrored idea of which way is positive, every number here would be
+self-consistent and wrong together. The end of --verify prints the one physical
+check that closes that loop, and it needs eyes, not software.
+
+============================================================================
+DEPENDENCIES AND ENVIRONMENT
+============================================================================
+Python 3.10, stdlib + numpy + rclpy. The estimator lives in
+/usr/local/lib/fpms/fpms_scanmatch.py and is CALLED, never reimplemented - it
+is pure numpy specifically so it can be tested against synthetic scans on any
+machine, and duplicating its geometry here would put a second, untested copy of
+the sign conventions on the rover.
+
+    source /opt/ros/humble/setup.bash
+    ROS_DOMAIN_ID=20 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+    FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml \
+    fpms-calibrate-lidar --mirror-check
+
+Those three variables are defaulted here if unset. The DDS profile is not
+decoration: without it Fast DDS prefers shared memory, whose segments do not
+survive across process eras, and the result is discovery that succeeds while
+NO DATA FLOWS - a subscriber that sees a publisher and receives nothing, with
+no error anywhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import statistics
+import sys
+import threading
+import time
+
+# ===========================================================================
+# PATHS
+# ===========================================================================
+# Every one of these is overridable by environment so the refusal paths can be
+# exercised off-robot against a stub estimator and a scratch config, which is
+# the only way any of this got tested before the board was available.
+LIB_DIR = os.environ.get("FPMS_LIB_DIR", "/usr/local/lib/fpms")
+CONFIG = os.environ.get("FPMS_CONFIG", "/etc/fpms/config.env")
+STATE_FILE = os.environ.get("FPMS_LIDAR_CALIB_FILE",
+                            "/var/lib/fpms/lidar-calib.json")
+DDS_PROFILE = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE",
+                             "/etc/fpms/fastdds_udp_only.xml")
+
+SCAN_TOPIC = os.environ.get("FPMS_SCAN_TOPIC", "/scan_lidar")
+IMU_TOPIC = os.environ.get("FPMS_IMU_TOPIC", "/imu")
+TF_STATIC_TOPIC = "/tf_static"
+
+BASE_LINK = "base_link"
+LASER_FRAME = "laser_frame"
+
+# fpms-lidar-ros.service runs `python3 /home/ubuntu/fpms_lidar_ros.py`. That
+# file is owned by another agent: it is READ here (for LIDAR_ROTATION_SIGN and
+# LIDAR_ZERO_OFFSET_DEG) and never written.
+LIDAR_ROS_CANDIDATES = tuple(p for p in (
+    os.environ.get("FPMS_LIDAR_ROS_PY"),
+    "/home/ubuntu/fpms_lidar_ros.py",
+    "/usr/local/lib/fpms/fpms_lidar_ros.py",
+    "/opt/fpms/fpms_lidar_ros.py",
+) if p)
+
+# The six keys fpms-tf.service passes to the launch file, in launch order.
+LASER_KEYS = ("FPMS_TF_LASER_X", "FPMS_TF_LASER_Y", "FPMS_TF_LASER_Z",
+              "FPMS_TF_LASER_ROLL", "FPMS_TF_LASER_PITCH", "FPMS_TF_LASER_YAW")
+MEASURED_KEY = "FPMS_TF_OFFSETS_MEASURED"
+
+# ===========================================================================
+# THRESHOLDS - every one of them has a reason, and the reason is written down
+# ===========================================================================
+
+# --- freshness -------------------------------------------------------------
+# The agent publishes ON A TIMER, not on data, so ARRIVAL DOES NOT IMPLY
+# FRESHNESS. A dead scanner emits all-zero ranges, zero converts to inf ("no
+# return"), and the result reads as a completely clear 360 degrees. That is the
+# most dangerous possible rendering of "the sensor is broken", so this program
+# checks the scan is actually CHANGING rather than merely arriving.
+SCAN_MAX_AGE_S = 2.0          # older than this and the feed has stopped
+SCAN_IDENTICAL_LIMIT = 4      # consecutive bit-identical scans = frozen
+SCAN_MIN_FINITE_FRAC = 0.05   # below this the scan carries no geometry at all
+SCAN_MIN_BINS = 32
+
+# --- mirror check ----------------------------------------------------------
+MIRROR_TARGET_DEG = 90.0      # comfortably above the estimator's 15 deg floor
+MIRROR_WINDOW_S = 45.0
+
+# --- straight push ---------------------------------------------------------
+PUSH_TARGET_M = 0.50
+PUSH_WINDOW_S = 45.0
+PUSH_MIN_M = 0.25             # yaw_from_straight_push saturates at ~0.20 m
+PUSH_WARN_M = 0.35
+# A push that also TURNS the chassis mixes rotation into the apparent motion
+# direction, which is the whole measurement. De-rotation removes most of it;
+# these bound what is left.
+PUSH_TURN_WARN_DEG = 2.0
+PUSH_TURN_REJECT_DEG = 5.0
+# ICP quality. A push across a metre of a cluttered room loses correspondences
+# on both ends; these say when what is left stopped being a fit.
+PUSH_MAX_RMS_M = 0.06
+PUSH_MIN_INLIERS = 30
+PUSH_MIN_CONFIDENCE = 0.6     # from yaw_from_straight_push
+
+MIN_PUSHES = 3                # a median of two samples is not a median
+# Peak-to-peak spread across accepted pushes. The launch file wants mount yaw
+# known to better than ~0.5 deg; 1.5 deg peak-to-peak over >=3 pushes puts the
+# median comfortably inside that. Wider than this and the samples disagree
+# about something real - a loose mount, a rover that was steered, or a room
+# with too little structure - and no median rescues that.
+YAW_SPREAD_TIGHT_DEG = 1.5
+
+# --- settle detection ------------------------------------------------------
+# A healthy gyro on this hardware reads EXACTLY 0.0 when parked, because of a
+# +/-0.01 rad/s deadband. That is not a fault and must never be reported as
+# one; it is, however, an excellent "the operator has stopped moving it"
+# signal.
+SETTLE_RATE_RAD_S = 0.03
+SETTLE_HOLD_S = 1.2
+LIVE_HZ = 2.0                 # live guidance updates per second
+
+# --- verify ----------------------------------------------------------------
+VERIFY_RESIDUAL_PASS_DEG = 1.0
+VERIFY_TF_MATCH_DEG = 0.2     # config.env vs the live /tf_static transform
+
+MIRROR_STALE_WARN_DAYS = 7.0
+YAW_STALE_WARN_DAYS = 7.0
+
+RAD2DEG = 180.0 / math.pi
+DEG2RAD = math.pi / 180.0
+
+# ===========================================================================
+# THE ESTIMATOR
+# ===========================================================================
+# Called, not reimplemented. FPMS_LIB_DIR is prepended (not appended) so a stub
+# directory wins over the installed module during offline testing.
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
+try:
+    import fpms_scanmatch as sm
+except ImportError as _exc:  # pragma: no cover - environment failure
+    sys.stderr.write(
+        "fpms-calibrate-lidar: cannot import fpms_scanmatch from %s (%s).\n"
+        "  It ships at /usr/local/lib/fpms/fpms_scanmatch.py and needs numpy.\n"
+        "  Check:  python3 -c 'import numpy; print(numpy.__version__)'\n"
+        % (LIB_DIR, _exc))
+    raise SystemExit(1)
+
+
+# ===========================================================================
+# OUTPUT
+# ===========================================================================
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def live(msg):
+    """One rewritable line. The operator is holding a robot with both hands.
+
+    Everything time-critical goes through here rather than into a scrolling
+    wall of text they cannot read while pushing.
+    """
+    sys.stdout.write("\r    " + msg.ljust(74))
+    sys.stdout.flush()
+
+
+def live_done(msg=""):
+    sys.stdout.write("\r" + " " * 80 + "\r")
+    if msg:
+        sys.stdout.write("    " + msg + "\n")
+    sys.stdout.flush()
+
+
+def hr(title=""):
+    log("\n" + "=" * 76)
+    if title:
+        log(title)
+        log("=" * 76)
+
+
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        log("\naborted; nothing written")
+        sys.exit(1)
+
+
+def press_enter(prompt):
+    try:
+        input(prompt)
+        return True
+    except (EOFError, KeyboardInterrupt):
+        log("\naborted; nothing written")
+        sys.exit(1)
+
+
+# ===========================================================================
+# ANGLES
+# ===========================================================================
+
+def wrap_deg(d):
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def circular_median_deg(samples_deg):
+    """Median of angles, done so a mount at +/-180 does not average to zero.
+
+    A scanner bolted on backwards produces samples like +179.6 and -179.8. Their
+    arithmetic median is -0.1 degrees, which is not a small error - it is the
+    exact opposite answer, and it looks entirely reasonable. Everything is
+    unwrapped relative to the first sample first.
+
+    Returns (median_deg, spread_peak_to_peak_deg, unwrapped_samples).
+    """
+    if not samples_deg:
+        return None, None, []
+    ref = samples_deg[0]
+    un = [ref + wrap_deg(s - ref) for s in samples_deg]
+    med = statistics.median(un)
+    spread = max(un) - min(un)
+    return wrap_deg(med), spread, un
+
+
+def yaw_from_quat(x, y, z, w):
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def fmt_rad(r):
+    return "%+.5f rad (%+.2f deg)" % (r, r * RAD2DEG)
+
+
+# ===========================================================================
+# CONVENTION PROBES - measure which way the estimator points, never assume it
+# ===========================================================================
+# See "THE CONVENTION PROBES" in the module docstring for why this exists. In
+# one line: wiring estimate_rotation straight into mirror_verdict inverts the
+# verdict, and a tool that reports MIRRORED for a correct scanner is worse than
+# no tool at all.
+
+_ROT_CONVENTION = None
+_ROT_CONVENTION_DETAIL = ""
+
+# The probe shifts a synthetic profile by this many bins. Big enough to be
+# unambiguous, small enough that no sane max_shift_bins default could clip it.
+_PROBE_SHIFT_BINS = 10
+_PROBE_BINS = 360
+
+
+def rotation_convention():
+    """+1 if estimate_rotation returns the APPARENT rotation, -1 if it negates.
+
+    No geometry, no hardware, no room: build a profile, roll it by a known
+    number of bins, and read back the sign. A feature that was in bin j+k and
+    is now in bin j has moved by -k bins. There is nothing in that statement to
+    get wrong, which is exactly why the probe is built this way rather than out
+    of a simulated room whose own conventions could be as wrong as the thing it
+    is checking.
+
+    Raises SystemExit if the estimator answers something neither convention
+    explains. That is not paranoia: every measurement this program makes flows
+    through this sign, and the failure mode is a confident inverted answer.
+    """
+    global _ROT_CONVENTION, _ROT_CONVENTION_DETAIL
+    if _ROT_CONVENTION is not None:
+        return _ROT_CONVENTION
+
+    n = _PROBE_BINS
+    inc = 2.0 * math.pi / n
+    a = [2.0 + 0.9 * math.sin(3.0 * j * inc)
+         + 0.5 * math.cos(7.0 * j * inc + 1.1)
+         + 0.2 * math.sin(11.0 * j * inc) for j in range(n)]
+    k = _PROBE_SHIFT_BINS
+    # b[j] = a[j+k]: whatever sat at bearing bin j+k now sits at bin j, so
+    # every feature moved by -k bins. The apparent rotation is -k*inc.
+    b = [a[(j + k) % n] for j in range(n)]
+    want = -k * inc
+
+    try:
+        rot, conf = sm.estimate_rotation(a, b, inc)
+    except Exception as exc:
+        raise SystemExit(
+            "refuse: fpms_scanmatch.estimate_rotation raised %r on a synthetic "
+            "probe. Nothing measured against it could be trusted." % (exc,))
+
+    tol = 0.25 * abs(want)
+    if abs(rot - want) <= tol:
+        _ROT_CONVENTION = 1
+        _ROT_CONVENTION_DETAIL = (
+            "estimate_rotation returns the APPARENT rotation directly "
+            "(probe: %+.1f deg expected, %+.1f deg returned, confidence %.2f)"
+            % (want * RAD2DEG, rot * RAD2DEG, conf))
+    elif abs(rot + want) <= tol:
+        _ROT_CONVENTION = -1
+        _ROT_CONVENTION_DETAIL = (
+            "estimate_rotation returns the NEGATED apparent rotation, i.e. the "
+            "chassis rotation (probe: %+.1f deg expected, %+.1f deg returned, "
+            "confidence %.2f). Every use below is negated to match "
+            "mirror_verdict's documented convention."
+            % (want * RAD2DEG, rot * RAD2DEG, conf))
+    else:
+        raise SystemExit(
+            "refuse: the rotation probe shifted a synthetic scan by %+.1f deg "
+            "and fpms_scanmatch.estimate_rotation returned %+.1f deg "
+            "(confidence %.2f). That is neither convention, so this program "
+            "cannot know which way its own measurements point. Nothing will be "
+            "measured until that is explained."
+            % (want * RAD2DEG, rot * RAD2DEG, conf))
+    return _ROT_CONVENTION
+
+
+def convention_detail():
+    rotation_convention()
+    return _ROT_CONVENTION_DETAIL
+
+
+def apparent_rotation(ranges_a, ranges_b, angle_increment):
+    """(radians, confidence) of how far the WORLD appears to have turned.
+
+    Positive means static features swept counter-clockwise in the scan, which a
+    chassis turning clockwise produces. This is the quantity mirror_verdict
+    documents that it wants and the quantity estimate_translation needs.
+    """
+    rot, conf = sm.estimate_rotation(ranges_a, ranges_b, angle_increment)
+    return rotation_convention() * rot, conf
+
+
+def fit_motion(scan_a, scan_b, iterations=25, chassis_rot_rad=None):
+    """Rotation + translation between two scans, with the alignment sign decided
+    by which one actually fits.
+
+    The probe already says which sign to use. This runs ICP both ways anyway
+    and keeps the better residual, because a residual is an outcome and a
+    convention is a belief. When the two disagree on a rotation big enough to
+    tell them apart, that is reported rather than quietly resolved.
+    """
+    if chassis_rot_rad is not None:
+        # DE-ROTATE WITH THE GYRO, not with the scan correlation.
+        #
+        # estimate_rotation() is confounded by translation: a straight push
+        # sweeps near features past faster than far ones, and the correlation
+        # cannot tell that from a turn. Measured on synthetic scans with a
+        # known answer, over 36 pushes scored exactly as this function scores
+        # them:
+        #
+        #     de-rotation source   accepted   worst error
+        #     gyro                   30/36        0.56 deg
+        #     scan correlation        6/36        4.28 deg
+        #
+        # Worse than the average: one push passed EVERY published gate and was
+        # still 4.28 deg (45 mm) out, because the correlation reported 4.19 deg
+        # of turn on a push with no turn in it - inside PUSH_TURN_REJECT_DEG,
+        # with an rms inside PUSH_MAX_RMS_M and confidence 0.99. The gates are
+        # tuned to catch a STEERED push and cannot distinguish one from a
+        # translation-confounded estimate.
+        #
+        # The gyro does not have this failure mode: it never sees the scan. It
+        # is the same independent witness the handedness check leans on, and
+        # PUSH_TARGET_M = 0.50 is precisely where the confounding is worst.
+        rot = -float(chassis_rot_rad)   # chassis -> apparent world rotation
+        conf = 1.0
+    else:
+        rot, conf = apparent_rotation(scan_a.ranges, scan_b.ranges,
+                                      scan_b.angle_increment)
+    A, B = scan_a.xy(), scan_b.xy()
+    tried = []
+    for cand in (rot, -rot):
+        dx, dy, rms, n = sm.estimate_translation(A, B, cand,
+                                                 iterations=iterations)
+        tried.append({"rot": cand, "dx": dx, "dy": dy, "rms": rms,
+                      "inliers": n})
+    best = min(tried, key=lambda r: r["rms"])
+    other = tried[1] if best is tried[0] else tried[0]
+
+    note = ""
+    if best["rot"] != rot and abs(rot) * RAD2DEG > 2.0 and \
+            best["rms"] < 0.5 * other["rms"]:
+        note = ("the ICP fits far better with the OPPOSITE rotation sign to "
+                "the one the convention probe predicted (%.4f m vs %.4f m "
+                "residual). Something about the estimator has changed; treat "
+                "every number in this run as suspect."
+                % (best["rms"], other["rms"]))
+    return {"rot": best["rot"], "rot_confidence": conf,
+            "dx": best["dx"], "dy": best["dy"], "rms": best["rms"],
+            "inliers": best["inliers"], "alt_rms": other["rms"], "note": note}
+
+
+def lever_arm(dx, dy, rot_apparent):
+    """(lx, ly, err, detail) - the scanner offset, with its sign resolved.
+
+    fpms_scanmatch.lever_arm_from_rotation returns an answer whose sign depends
+    on which rotation convention it was handed, so the candidate and its
+    negation are both run FORWARD through the geometry and the one that
+    predicts the translation actually observed is kept:
+
+        a scanner at offset L, on a chassis rotated so the world appears to
+        turn by `rot`, sees the world translate by (R(rot) - I) * L
+
+    That forward relation is two lines of trigonometry and is checked against
+    the observed (dx, dy) rather than assumed.
+    """
+    lx, ly, err = sm.lever_arm_from_rotation(dx, dy, rot_apparent)
+    if err or lx is None:
+        return None, None, err or "no solution", ""
+    c, s = math.cos(rot_apparent), math.sin(rot_apparent)
+    best = None
+    for cand in ((lx, ly), (-lx, -ly)):
+        px = (c - 1.0) * cand[0] - s * cand[1]
+        py = s * cand[0] + (c - 1.0) * cand[1]
+        res = math.hypot(px - dx, py - dy)
+        if best is None or res < best[1]:
+            best = (cand, res)
+    (blx, bly), res = best
+    flipped = (blx, bly) != (lx, ly)
+    detail = ("forward check: the offset that predicts the observed "
+              "(%+.3f, %+.3f) m of apparent translation is (%+.3f, %+.3f), "
+              "residual %.4f m%s"
+              % (dx, dy, blx, bly, res,
+                 " (the estimator's raw sign was the other one)"
+                 if flipped else ""))
+    return blx, bly, None, detail
+
+
+# ===========================================================================
+# config.env
+# ===========================================================================
+
+def read_config(path=None):
+    """Read config.env the way the services read it: file only, no env overlay.
+
+    Deliberately NOT overlaid with os.environ. fpms-tf.service takes these
+    values from the FILE via EnvironmentFile=, so what this program reports and
+    writes has to be what the file says, not what the current shell happens to
+    export. (fpms_cored.py and fpms_charact.py overlay env on top; the mission
+    executor and this program do not. That disagreement is documented at the
+    top of config.env and it has bitten people.)
+    """
+    path = path or CONFIG
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+def config_float(cfg, key, default=None):
+    raw = cfg.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def write_config_values(updates, path=None):
+    """Set keys in config.env in place, preserving order, comments and mode.
+
+    Refuses rather than repairs on a CR: EnvironmentFile= keeps the \\r, so
+    FPMS_TF_OFFSETS_MEASURED=1\\r is not '1', fpms-tf refuses to start, and the
+    comparison that rejected it prints two strings that look identical. Adding
+    LF-only lines to a CRLF file would produce exactly that, half the time.
+
+    Returns (ok, message).
+    """
+    path = path or CONFIG
+    try:
+        with open(path, "r", newline="") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        return False, "cannot read %s (%s)" % (path, exc)
+
+    if "\r" in raw:
+        return False, (
+            "%s contains carriage returns. Writing to it would leave mixed "
+            "line endings, and a value ending in an invisible \\r is the "
+            "failure where two identical-looking strings do not compare "
+            "equal. Fix it first:  sudo sed -i 's/\\r$//' %s" % (path, path))
+
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except OSError:
+        mode = 0o640
+
+    lines = raw.split("\n")
+    remaining = dict(updates)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in remaining:
+            lines[i] = "%s=%s" % (key, remaining.pop(key))
+
+    if remaining:
+        tail = []
+        if lines and lines[-1] == "":
+            lines.pop()
+        tail.append("")
+        tail.append("# Added by fpms-calibrate-lidar on %s because the key was "
+                    "absent." % time.strftime("%Y-%m-%d"))
+        for k in updates:
+            if k in remaining:
+                tail.append("%s=%s" % (k, remaining[k]))
+        tail.append("")
+        lines.extend(tail)
+
+    body = "\n".join(lines)
+
+    # Back the file up first, at the SAME mode. It holds the broker password
+    # after first boot, so a 0644 backup would publish that to every account on
+    # the box.
+    backup = "%s.bak-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    tmp = path + ".fpms-tmp"
+    try:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w", newline="\n") as fh:
+            fh.write(raw)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w", newline="\n") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except PermissionError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, (
+            "no permission to write %s (it is root:root 0640).\n"
+            "  Re-run the same command under sudo:  sudo -E %s --apply\n"
+            "  -E matters: it keeps the sourced ROS environment."
+            % (path, sys.argv[0]))
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, "write failed (%s); %s is unchanged" % (exc, path)
+
+    # Verify the OUTCOME, not the exit status of the write. Re-read the file and
+    # confirm every key now reads back exactly as intended.
+    after = read_config(path)
+    wrong = [k for k, v in updates.items() if after.get(k) != v]
+    if wrong:
+        return False, ("wrote %s but %s did not read back as intended - the "
+                       "backup is at %s" % (path, ", ".join(wrong), backup))
+    return True, "wrote %s (backup: %s)" % (path, backup)
+
+
+# ===========================================================================
+# state file - what has been measured, and when, and from what evidence
+# ===========================================================================
+
+def read_state():
+    try:
+        with open(STATE_FILE) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    target = STATE_FILE
+    try:
+        d = os.path.dirname(target)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        tmp = target + ".tmp"
+        with open(tmp, "w", newline="\n") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, target)
+        # Running one subcommand under sudo and the next as ubuntu must not
+        # leave a file the unprivileged run cannot rewrite.
+        try:
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                st = os.stat(os.path.dirname(target) or ".")
+                os.chown(target, st.st_uid, st.st_gid)
+            os.chmod(target, 0o664)
+        except OSError:
+            pass
+        return target
+    except OSError:
+        alt = os.path.expanduser("~/.fpms_lidar_calib.json")
+        try:
+            with open(alt, "w", newline="\n") as fh:
+                json.dump(state, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            log("\n  (could not write %s; state kept in %s. Later runs will "
+                "NOT see it unless you set FPMS_LIDAR_CALIB_FILE=%s)"
+                % (target, alt, alt))
+            return alt
+        except OSError as exc:
+            log("\n  WARNING: could not save state anywhere (%s). This run's "
+                "result exists only on screen." % exc)
+            return None
+
+
+def stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def age_days(iso):
+    if not iso:
+        return None
+    try:
+        t = time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+    return max(0.0, (time.time() - t) / 86400.0)
+
+
+# ===========================================================================
+# fpms_lidar_ros.py constants - READ ONLY. That file belongs to another agent.
+# ===========================================================================
+
+def read_lidar_ros_constants():
+    """Parse LIDAR_ROTATION_SIGN / LIDAR_ZERO_OFFSET_DEG out of the source.
+
+    Parsed rather than imported: importing pulls in whatever that module does at
+    import time, and this program has no business executing another service's
+    code to read two numbers off it.
+
+    Returns (path, rotation_sign, zero_offset_deg); any element may be None.
+    """
+    for path in LIDAR_ROS_CANDIDATES:
+        try:
+            with open(path) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        sign = zero = None
+        m = re.search(r"^\s*LIDAR_ROTATION_SIGN\s*=\s*([-+]?\d+)",
+                      text, re.M)
+        if m:
+            sign = int(m.group(1))
+        m = re.search(r"^\s*LIDAR_ZERO_OFFSET_DEG\s*=\s*([-+]?[\d.]+)",
+                      text, re.M)
+        if m:
+            try:
+                zero = float(m.group(1))
+            except ValueError:
+                zero = None
+        return path, sign, zero
+    return None, None, None
+
+
+# ===========================================================================
+# ROS ENVIRONMENT
+# ===========================================================================
+
+def prepare_ros_env():
+    """Default the three variables this rover cannot work without, and refuse
+    on a domain mismatch rather than starting a node nobody can hear.
+
+    A node on the wrong ROS_DOMAIN_ID starts cleanly, subscribes successfully,
+    and talks to nobody. Same guard as fpms_tf.launch.py, fpms_odom_tf.py and
+    deadband_sweep.py, so all of them fail the same way.
+    """
+    notes = []
+    cur = os.environ.get("ROS_DOMAIN_ID")
+    if cur is None:
+        os.environ["ROS_DOMAIN_ID"] = "20"
+        notes.append("ROS_DOMAIN_ID was unset; using 20 (mandatory here)")
+    elif cur.strip() != "20":
+        raise SystemExit(
+            "refuse: ROS_DOMAIN_ID=%r in this shell but this rover is "
+            "hard-wired to 20. A node on the wrong domain starts cleanly, "
+            "publishes and subscribes successfully, and talks to nobody."
+            % (cur,))
+
+    rmw = os.environ.get("RMW_IMPLEMENTATION")
+    if not rmw:
+        os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+        notes.append("RMW_IMPLEMENTATION defaulted to rmw_fastrtps_cpp")
+    elif rmw != "rmw_fastrtps_cpp":
+        notes.append("RMW_IMPLEMENTATION=%s - the rest of the stack runs "
+                     "rmw_fastrtps_cpp; two RMWs do not interoperate" % rmw)
+
+    prof = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE")
+    if not prof:
+        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = DDS_PROFILE
+        prof = DDS_PROFILE
+        notes.append("FASTRTPS_DEFAULT_PROFILES_FILE defaulted to %s"
+                     % DDS_PROFILE)
+    if not os.path.exists(prof):
+        notes.append(
+            "WARNING: %s does not exist. Without it Fast DDS prefers shared "
+            "memory, whose segments do not survive across process eras: "
+            "discovery succeeds and NO DATA FLOWS, with no error anywhere. If "
+            "this program sees a publisher and receives nothing, that is why."
+            % prof)
+    return notes
+
+
+# ===========================================================================
+# ROS INPUT - subscriptions only
+# ===========================================================================
+
+class Scan(object):
+    """One captured scan, decoupled from the callback."""
+
+    __slots__ = ("t", "ranges", "angle_min", "angle_increment", "seq",
+                 "finite_frac")
+
+    def __init__(self, t, ranges, angle_min, angle_increment, seq):
+        self.t = t
+        self.ranges = ranges
+        self.angle_min = angle_min
+        self.angle_increment = angle_increment
+        self.seq = seq
+        n = len(ranges)
+        good = 0
+        for r in ranges:
+            if r == r and r not in (float("inf"), float("-inf")) and r > 0.0:
+                good += 1
+        self.finite_frac = (float(good) / n) if n else 0.0
+
+    def xy(self):
+        return sm.scan_to_xy(self.ranges, self.angle_min, self.angle_increment)
+
+
+class Listener(object):
+    """Subscribe-only view of the scanner and the gyro. Creates NO publisher.
+
+    Topics:
+      /scan_lidar   sensor_msgs/LaserScan  (fpms_lidar_ros.py)
+      /imu          sensor_msgs/Imu        (micro-ROS agent)
+      /tf_static    tf2_msgs/TFMessage     (read by --verify only)
+
+    QoS is BEST_EFFORT on the two sensor topics. That is the maximally
+    compatible choice: a best-effort SUBSCRIBER matches both a reliable and a
+    best-effort publisher, whereas a reliable subscriber is silently
+    incompatible with a best-effort publisher and shows up as "the topic exists
+    and I receive nothing" - which on this rover is already the signature of
+    two other faults and does not need a third source.
+    """
+
+    def __init__(self, want_tf=False):
+        import rclpy
+        from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                               HistoryPolicy)
+        from sensor_msgs.msg import Imu, LaserScan
+
+        self._rclpy = rclpy
+        rclpy.init(args=None)
+        self.node = rclpy.create_node("fpms_calibrate_lidar")
+
+        sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                durability=DurabilityPolicy.VOLATILE,
+                                history=HistoryPolicy.KEEP_LAST, depth=10)
+
+        self.lock = threading.Lock()
+        self.scan = None
+        self.scan_n = 0
+        self.scan_changed_n = 0
+        self.identical_run = 0
+        self._last_ranges = None
+
+        self.gyro_int = 0.0
+        self.gyro_z = 0.0
+        self.imu_n = 0
+        self._gyro_t = None
+
+        self.tf_static = {}          # (parent, child) -> transform dict
+        self.tf_n = 0
+
+        self.node.create_subscription(LaserScan, SCAN_TOPIC, self._on_scan,
+                                      sensor_qos)
+        self.node.create_subscription(Imu, IMU_TOPIC, self._on_imu, sensor_qos)
+
+        self.tf_available = False
+        if want_tf:
+            try:
+                from tf2_msgs.msg import TFMessage
+                # static transforms are latched: TRANSIENT_LOCAL or a
+                # subscriber that starts late sees nothing at all.
+                tf_qos = QoSProfile(
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                    history=HistoryPolicy.KEEP_LAST, depth=100)
+                self.node.create_subscription(TFMessage, TF_STATIC_TOPIC,
+                                              self._on_tf, tf_qos)
+                self.tf_available = True
+            except Exception as exc:
+                log("  (tf2_msgs unavailable: %s - the live TF cross-check "
+                    "will be skipped)" % exc)
+
+        self._stop = threading.Event()
+        self._spin = threading.Thread(target=self._spin_loop, daemon=True)
+        self._spin.start()
+
+        self.publisher_selfcheck = self._assert_no_publishers()
+
+    # -- the promise at the top of this file, verified ----------------------
+
+    def _assert_no_publishers(self):
+        """Ask the node what it publishes and exit if the answer is not 'nothing'.
+
+        rclpy gives every node /rosout and /parameter_events for free; anything
+        else on this list would mean an actuation surface exists in a program
+        whose entire safety argument is that one cannot.
+        """
+        allowed = {"/rosout", "/parameter_events"}
+        try:
+            pubs = self.node.get_publisher_names_and_types_by_node(
+                self.node.get_name(), self.node.get_namespace())
+        except Exception as exc:
+            return "not verifiable on this rclpy (%s)" % exc
+        extra = sorted(t for t, _ in pubs if t not in allowed)
+        if extra:
+            self.close()
+            raise SystemExit(
+                "refuse: this node is publishing %s. fpms-calibrate-lidar must "
+                "publish to NOTHING - that is its entire safety argument. "
+                "Something added a publisher; find it before running again."
+                % (", ".join(extra),))
+        return "verified: publishes nothing but %s" % ", ".join(sorted(allowed))
+
+    # -- callbacks ----------------------------------------------------------
+
+    def _spin_loop(self):
+        while not self._stop.is_set():
+            try:
+                self._rclpy.spin_once(self.node, timeout_sec=0.1)
+            except Exception:
+                time.sleep(0.05)
+
+    def _on_scan(self, msg):
+        ranges = tuple(float(r) for r in msg.ranges)
+        now = time.monotonic()
+        with self.lock:
+            if self._last_ranges is not None and ranges == self._last_ranges:
+                self.identical_run += 1
+            else:
+                if self._last_ranges is not None:
+                    self.scan_changed_n += 1
+                self.identical_run = 0
+            self._last_ranges = ranges
+            self.scan_n += 1
+            self.scan = Scan(now, ranges, float(msg.angle_min),
+                             float(msg.angle_increment), self.scan_n)
+
+    def _on_imu(self, msg):
+        now = time.monotonic()
+        with self.lock:
+            self.gyro_z = float(msg.angular_velocity.z)
+            if self._gyro_t is not None:
+                dt = now - self._gyro_t
+                # Bound the step: a stall in the spin thread must not integrate
+                # one sample over several seconds.
+                if 0.0 < dt < 0.5:
+                    self.gyro_int += self.gyro_z * dt
+            self._gyro_t = now
+            self.imu_n += 1
+
+    def _on_tf(self, msg):
+        with self.lock:
+            for tr in msg.transforms:
+                key = (tr.header.frame_id.lstrip("/"),
+                       tr.child_frame_id.lstrip("/"))
+                q = tr.transform.rotation
+                t = tr.transform.translation
+                self.tf_static[key] = {
+                    "x": float(t.x), "y": float(t.y), "z": float(t.z),
+                    "yaw": yaw_from_quat(float(q.x), float(q.y), float(q.z),
+                                         float(q.w)),
+                    "qx": float(q.x), "qy": float(q.y), "qz": float(q.z),
+                    "qw": float(q.w),
+                }
+                self.tf_n += 1
+
+    # -- accessors ----------------------------------------------------------
+
+    def capture(self):
+        with self.lock:
+            return self.scan
+
+    def gyro(self):
+        with self.lock:
+            return self.gyro_int, self.gyro_z, self.imu_n
+
+    def reset_gyro(self):
+        with self.lock:
+            self.gyro_int = 0.0
+            self._gyro_t = None
+
+    def tf_lookup(self, parent, child):
+        with self.lock:
+            return dict(self.tf_static.get((parent, child), {})) or None
+
+    # -- health -------------------------------------------------------------
+
+    def scan_health(self):
+        """(ok, detail). The refusal that keeps a dead scanner from being read
+        as a clear 360 degrees."""
+        with self.lock:
+            s = self.scan
+            n = self.scan_n
+            ident = self.identical_run
+            changed = self.scan_changed_n
+        if s is None:
+            return False, ("no LaserScan has arrived on %s. Check: systemctl "
+                           "status fpms-lidar-ros, and that the MQTT lidar "
+                           "feed is alive (fpms-doctor no-lidar)" % SCAN_TOPIC)
+        age = time.monotonic() - s.t
+        if age > SCAN_MAX_AGE_S:
+            return False, ("the last scan is %.1f s old; the feed has stopped. "
+                           "fpms_lidar_ros.py deliberately stops publishing "
+                           "rather than repeating a frozen scan." % age)
+        if len(s.ranges) < SCAN_MIN_BINS:
+            return False, "only %d bins in the scan; geometry needs at least %d" \
+                          % (len(s.ranges), SCAN_MIN_BINS)
+        if s.finite_frac < SCAN_MIN_FINITE_FRAC:
+            return False, (
+                "%.0f%% of ranges are finite. An all-inf scan is what a DEAD "
+                "SCANNER looks like after zero-to-inf conversion, and it reads "
+                "as a completely clear 360 degrees. Refusing to measure "
+                "against it." % (100.0 * s.finite_frac))
+        if ident >= SCAN_IDENTICAL_LIMIT:
+            return False, (
+                "the last %d scans are bit-for-bit identical. A real spinning "
+                "scanner never repeats exactly; the agent publishes ON A TIMER "
+                "so arrival does not imply freshness. This feed is frozen."
+                % (ident + 1))
+        if n >= 3 and changed == 0:
+            return False, ("%d scans arrived and not one differed from the "
+                           "previous - frozen feed" % n)
+        return True, ("scan live: %d received, %d changed, %.0f%% finite "
+                      "returns, age %.2f s"
+                      % (n, changed, 100.0 * s.finite_frac, age))
+
+    def wait_for_data(self, seconds=8.0, need_imu=True):
+        t0 = time.monotonic()
+        last = ""
+        while time.monotonic() - t0 < seconds:
+            with self.lock:
+                sn, imn = self.scan_n, self.imu_n
+            msg = "waiting for data: %d scans, %d imu" % (sn, imn)
+            if msg != last:
+                live(msg)
+                last = msg
+            if sn > 3 and (imn > 3 or not need_imu):
+                live_done()
+                return True
+            time.sleep(0.2)
+        live_done()
+        return False
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.node.destroy_node()
+        except Exception:
+            pass
+        try:
+            self._rclpy.shutdown()
+        except Exception:
+            pass
+
+
+# ===========================================================================
+# PRE-FLIGHT
+# ===========================================================================
+
+def start_listener(want_tf=False):
+    """Bring up the node, or explain in one screen why it could not."""
+    # Before any hardware: does the estimator point the way this program thinks
+    # it does? Refuses here rather than after the operator has pushed a robot
+    # around a room for ten minutes.
+    log("  probe: %s" % convention_detail())
+    notes = prepare_ros_env()
+    for n in notes:
+        log("  env: %s" % n)
+    try:
+        lis = Listener(want_tf=want_tf)
+    except ImportError as exc:
+        log("\nCannot import rclpy (%s)." % exc)
+        log("  source /opt/ros/humble/setup.bash")
+        log("  then re-run:  %s %s" % (sys.argv[0], " ".join(sys.argv[1:])))
+        return None
+    except Exception as exc:
+        log("\nCannot start a ROS node (%s)." % exc)
+        log("  source /opt/ros/humble/setup.bash")
+        log("  ROS_DOMAIN_ID=20 must match the rest of the rover.")
+        return None
+    log("  node: %s" % lis.publisher_selfcheck)
+    if not lis.wait_for_data(need_imu=True):
+        with lis.lock:
+            sn, imn = lis.scan_n, lis.imu_n
+        log("\n  NOT ENOUGH DATA after 8 s: %d scans on %s, %d messages on %s."
+            % (sn, SCAN_TOPIC, imn, IMU_TOPIC))
+        if sn == 0:
+            log("    no scan   -> systemctl status fpms-lidar-ros; "
+                "fpms-doctor no-lidar")
+        if imn == 0:
+            log("    no imu    -> systemctl status micro-ros-agent; the board "
+                "link is fragile and a re-link costs 90-225 s")
+        log("    both zero -> suspect DDS. Check "
+            "FASTRTPS_DEFAULT_PROFILES_FILE=%s is set and readable; shared "
+            "memory gives you discovery with no data." % DDS_PROFILE)
+        lis.close()
+        return None
+    ok, detail = lis.scan_health()
+    log("  %s" % detail)
+    if not ok:
+        log("\n  REFUSING: %s" % detail)
+        lis.close()
+        return None
+    return lis
+
+
+def mirror_gate(state, what):
+    """(ok, message). The gate every measuring subcommand passes through.
+
+    A mirrored scan is not a rigid transform. No value of laser_yaw undoes one,
+    so a yaw measured against a mirrored world is a confident wrong answer -
+    which is worse than no answer, because it will be believed.
+    """
+    m = state.get("mirror") or {}
+    if m.get("verdict") != "ok":
+        got = m.get("verdict") or "never run"
+        return False, (
+            "%s refuses to run: the mirror check has not passed (%s).\n"
+            "  A mirror is not a rigid transform - no value of laser_yaw can "
+            "undo one - so anything measured now would be confidently wrong.\n"
+            "  Run this first:   fpms-calibrate-lidar --mirror-check"
+            % (what, got))
+
+    path, sign, _zero = read_lidar_ros_constants()
+    was = m.get("rotation_sign")
+    if sign is not None and was is not None and sign != was:
+        return False, (
+            "%s refuses to run: the mirror check passed with "
+            "LIDAR_ROTATION_SIGN=%+d, but %s now says %+d.\n"
+            "  Flipping that constant mirrors the scan, which invalidates the "
+            "check and every measurement taken under it.\n"
+            "  Re-run:   fpms-calibrate-lidar --mirror-check"
+            % (what, was, path, sign))
+
+    d = age_days(m.get("at"))
+    if d is not None and d > MIRROR_STALE_WARN_DAYS:
+        return True, ("  note: the mirror check is %.0f days old. If the "
+                      "scanner has been unbolted since, re-run it." % d)
+    return True, ""
+
+
+# ===========================================================================
+# LIVE TRACKING - the operator has both hands on the robot
+# ===========================================================================
+
+def track_turn(lis, ref, target_rad, window_s):
+    """Watch a hand turn, narrating progress. Returns a result dict.
+
+    Ends when the rover has passed ~80% of the target AND has been still for
+    SETTLE_HOLD_S, or when the window expires. It does not ask the operator to
+    press a key at the end: they are holding a robot.
+    """
+    t0 = time.monotonic()
+    still_since = None
+    last_rot, last_conf = 0.0, 0.0
+    aborted = False
+    try:
+        while True:
+            now = time.monotonic()
+            elapsed = now - t0
+            if elapsed > window_s:
+                break
+            snap = lis.capture()
+            gyro_int, gyro_z, _ = lis.gyro()
+            if snap is not None and snap.seq != ref.seq:
+                last_rot, last_conf = apparent_rotation(
+                    ref.ranges, snap.ranges, snap.angle_increment)
+            # The gyro figure is the chassis; the scan figure is the world
+            # sweeping the other way past it. Opposite signs is what RIGHT
+            # looks like, so both are shown rather than one tidied number.
+            live("turned %+.0f deg (gyro), world swept %+.0f deg (scan) - keep "
+                 "going to %.0f deg  [%.0fs left]"
+                 % (gyro_int * RAD2DEG, last_rot * RAD2DEG,
+                    target_rad * RAD2DEG, max(0.0, window_s - elapsed)))
+            if abs(gyro_int) >= 0.8 * abs(target_rad):
+                if abs(gyro_z) < SETTLE_RATE_RAD_S:
+                    if still_since is None:
+                        still_since = now
+                    elif now - still_since >= SETTLE_HOLD_S:
+                        break
+                else:
+                    still_since = None
+            time.sleep(1.0 / LIVE_HZ)
+    except KeyboardInterrupt:
+        aborted = True
+    live_done()
+
+    end = lis.capture()
+    gyro_int, _, _ = lis.gyro()
+    rot, conf = 0.0, 0.0
+    if end is not None and ref is not None:
+        rot, conf = apparent_rotation(ref.ranges, end.ranges,
+                                      end.angle_increment)
+    return {"ref": ref, "end": end, "scan_rot": rot, "scan_conf": conf,
+            "gyro": gyro_int, "aborted": aborted,
+            "elapsed": time.monotonic() - t0}
+
+
+def track_push(lis, ref, target_m, window_s):
+    """Watch a hand push, narrating distance travelled and heading drift."""
+    t0 = time.monotonic()
+    still_since = None
+    dist = 0.0
+    aborted = False
+    try:
+        while True:
+            now = time.monotonic()
+            elapsed = now - t0
+            if elapsed > window_s:
+                break
+            snap = lis.capture()
+            gyro_int, gyro_z, _ = lis.gyro()
+            if snap is not None and snap.seq != ref.seq:
+                # Cheap ICP for the live readout only; the accepted measurement
+                # re-runs it at full iteration count.
+                fit = fit_motion(ref, snap, iterations=10)
+                dist = math.hypot(fit["dx"], fit["dy"])
+            live("pushed %.2f m, heading drift %+.1f deg - keep going to "
+                 "%.2f m  [%.0fs left]"
+                 % (dist, gyro_int * RAD2DEG, target_m,
+                    max(0.0, window_s - elapsed)))
+            if dist >= 0.85 * target_m:
+                if abs(gyro_z) < SETTLE_RATE_RAD_S:
+                    if still_since is None:
+                        still_since = now
+                    elif now - still_since >= SETTLE_HOLD_S:
+                        break
+                else:
+                    still_since = None
+            time.sleep(1.0 / LIVE_HZ)
+    except KeyboardInterrupt:
+        aborted = True
+    live_done()
+    return {"ref": ref, "end": lis.capture(), "gyro": lis.gyro()[0],
+            "aborted": aborted, "live_dist": dist}
+
+
+# ===========================================================================
+# --mirror-check
+# ===========================================================================
+
+def cmd_mirror_check(args):
+    hr("MIRROR CHECK - is the scan mirrored? Nothing else runs until this passes")
+    log("""
+The chassis turns +dtheta; every static feature must therefore APPEAR to turn
+-dtheta. Same sign in both means the scan is mirrored, and a mirror is not a
+rigid transform: no value of laser_yaw can undo one. That is why this is first.
+
+  1. Put the rover on the floor in a room with structure - walls, furniture,
+     doorways. A bare corridor cannot settle this and the tool will say so.
+  2. Press ENTER, then TURN IT ON THE SPOT by hand, about %.0f degrees, and
+     let go. Direction does not matter.
+  3. Do not lift it, do not slide it across the room. A turn, in place.
+
+The screen narrates the turn as you make it. It stops on its own once you pass
+%.0f degrees and hold still.""" % (MIRROR_TARGET_DEG,
+                                   0.8 * MIRROR_TARGET_DEG))
+
+    path, sign, zero = read_lidar_ros_constants()
+    if sign is None:
+        log("\n  NOTE: could not read LIDAR_ROTATION_SIGN from any of %s."
+            % (", ".join(LIDAR_ROS_CANDIDATES),))
+        log("        The verdict below still stands; it just cannot record "
+            "which sign it was taken under.")
+    else:
+        log("\n  %s currently has LIDAR_ROTATION_SIGN=%+d, "
+            "LIDAR_ZERO_OFFSET_DEG=%s" % (path, sign, zero))
+
+    lis = start_listener()
+    if lis is None:
+        return 2
+    try:
+        press_enter("\n  Press ENTER, then turn the rover...")
+        ref = lis.capture()
+        lis.reset_gyro()
+        # A brief settle so the reference scan is not the one taken mid-nudge.
+        time.sleep(0.3)
+        ref = lis.capture()
+        if ref is None:
+            log("  no scan to use as a reference; aborting")
+            return 2
+
+        res = track_turn(lis, ref, MIRROR_TARGET_DEG * DEG2RAD,
+                         args.window or MIRROR_WINDOW_S)
+
+        ok, detail = lis.scan_health()
+        if not ok:
+            log("\n  REFUSING: the scan went bad during the turn - %s" % detail)
+            return 1
+        if res["end"] is None or res["end"].seq == ref.seq:
+            log("\n  REFUSING: not one new scan arrived during the whole turn. "
+                "The feed is not live.")
+            return 1
+
+        scan_deg = res["scan_rot"] * RAD2DEG
+        gyro_deg = res["gyro"] * RAD2DEG
+        log("\n  world swept  : %+.1f deg   (apparent rotation of static "
+            "features, correlation confidence %.2f)"
+            % (scan_deg, res["scan_conf"]))
+        log("  chassis      : %+.1f deg   (integrated gyro angular_velocity.z)"
+            % gyro_deg)
+        log("  those two must have OPPOSITE signs. They are %s here."
+            % ("opposite" if scan_deg * gyro_deg < 0 else "THE SAME"))
+
+        if abs(gyro_deg) < 1.0 and abs(scan_deg) > 15.0:
+            log("\n  The scan says the rover turned %.0f deg and the gyro "
+                "integrated almost nothing." % abs(scan_deg))
+            log("  That IS the dead-gyro signature - but do not conclude it "
+                "from a PARKED reading: a healthy gyro on this hardware reads")
+            log("  exactly 0.0 at rest because of a +/-0.01 rad/s deadband. "
+                "Here the rover demonstrably moved, so this one counts.")
+            log("  Check:  ros2 topic echo %s --field angular_velocity"
+                % IMU_TOPIC)
+            return 1
+
+        if res["scan_conf"] < 0.15:
+            log("\n  The correlation peak is weak (%.2f). This room may be too "
+                "featureless - a bare corridor looks the same at every angle."
+                % res["scan_conf"])
+            log("  Move to somewhere with walls and furniture and re-run.")
+            return 1
+
+        verdict, why = sm.mirror_verdict(res["scan_rot"], res["gyro"])
+        log("\n  VERDICT: %s" % verdict.upper())
+        log("  %s" % why)
+
+        state = read_state()
+        state["mirror"] = {
+            "verdict": verdict, "detail": why,
+            "scan_deg": round(scan_deg, 2), "gyro_deg": round(gyro_deg, 2),
+            "scan_confidence": round(res["scan_conf"], 3),
+            "rotation_sign": sign, "zero_offset_deg": zero,
+            "lidar_ros_path": path, "at": stamp(),
+        }
+        if verdict != "ok":
+            # A failed or inconclusive check must destroy any earlier pass, or
+            # the gate below would still be open on stale evidence.
+            for key in ("yaw", "verify"):
+                if key in state:
+                    state[key + "_invalidated_by_mirror"] = state.pop(key)
+        save_state(state)
+
+        if verdict == "mirrored":
+            log("""
+  WHAT TO DO
+  ----------
+  Flip LIDAR_ROTATION_SIGN in %s from %s to %s, restart the bridge, and run
+  this check again. Do NOT try to absorb a mirror into laser_yaw - it cannot
+  be done, and the attempt produces a number that fits one direction of travel
+  and is wrong in every other.
+
+      sudo systemctl restart fpms-lidar-ros
+      fpms-calibrate-lidar --mirror-check
+
+  That file is owned by another agent: report the result, do not edit around
+  it if you are not the one who owns it.""" % (
+                path or "fpms_lidar_ros.py",
+                ("%+d" % sign) if sign is not None else "its current value",
+                ("%+d" % -sign) if sign is not None else "the other sign"))
+            return 1
+        if verdict == "inconclusive":
+            log("\n  Nothing has been settled. Re-run with a bigger, cleaner "
+                "turn on the spot.")
+            return 1
+
+        log("\n  The scan is correctly handed. --yaw, --lever and --verify are "
+            "now unlocked.")
+        log("  Next:  fpms-calibrate-lidar --level     (30 seconds, static)")
+        log("         fpms-calibrate-lidar --yaw       (the number that matters)")
+        return 0
+    finally:
+        lis.close()
+
+
+# ===========================================================================
+# --yaw   (and the measurement half of --verify)
+# ===========================================================================
+
+def one_push(lis, index, total, target_m, window_s):
+    """Run one push and return (sample_or_None, reason).
+
+    A rejected push is a rejected push. Nothing here averages a bad sample in
+    on the grounds that there is another one coming.
+    """
+    log("\n  --- push %d of %d ---" % (index, total))
+    press_enter("  Line the rover up, press ENTER, then push it STRAIGHT "
+                "forward ~%.2f m..." % target_m)
+    lis.reset_gyro()
+    time.sleep(0.3)
+    ref = lis.capture()
+    if ref is None:
+        return None, "no reference scan"
+
+    res = track_push(lis, ref, target_m, window_s)
+    end = res["end"]
+    if end is None or end.seq == ref.seq:
+        return None, "no new scan arrived during the push - the feed is frozen"
+
+    ok, detail = lis.scan_health()
+    if not ok:
+        return None, "the scan went bad during the push: %s" % detail
+
+    # The gyro reading for this push, used to de-rotate rather than the scan
+    # correlation. See fit_motion() for the 36-push measurement behind this.
+    fit = fit_motion(ref, end, chassis_rot_rad=res["gyro"])
+    rot, rot_conf = fit["rot"], fit["rot_confidence"]
+    dx, dy, rms, inliers = fit["dx"], fit["dy"], fit["rms"], fit["inliers"]
+    dist = math.hypot(dx, dy)
+    gyro_deg = res["gyro"] * RAD2DEG
+    # Reported as the chassis turn, which is what the operator did and what the
+    # gyro figure next to it means. The world swept the other way.
+    rot_deg = -rot * RAD2DEG
+
+    log("    travelled %.3f m | chassis turned %+.2f deg by scan | gyro %+.2f "
+        "deg | icp rms %.3f m over %d points"
+        % (dist, rot_deg, gyro_deg, rms, inliers))
+    if fit["note"]:
+        log("    !! %s" % fit["note"])
+
+    if dist < PUSH_MIN_M:
+        return None, ("only %.3f m of travel; below %.2f m the direction is "
+                      "dominated by scan noise" % (dist, PUSH_MIN_M))
+    if inliers < PUSH_MIN_INLIERS:
+        return None, ("ICP kept only %d points; that is not a fit" % inliers)
+    if rms > PUSH_MAX_RMS_M:
+        return None, ("ICP residual %.3f m is too high - the two scans do not "
+                      "describe the same room. Something moved, or the push "
+                      "was too long for the overlap." % rms)
+    # Gate on the GYRO, not the scan estimate. The scan estimate is confounded
+    # by translation and will report several degrees of turn on a dead-straight
+    # push, so gating on it both rejects good pushes (6/36 accepted vs 30/36)
+    # and, worse, ACCEPTS bad ones: a spurious 4.19 deg sat comfortably inside
+    # this threshold while costing 4.28 deg of mount yaw.
+    if abs(gyro_deg) > PUSH_TURN_REJECT_DEG:
+        return None, ("the gyro says the chassis turned %+.1f deg during the "
+                      "push. This measurement is the DIRECTION of apparent "
+                      "motion, so a steered push biases it directly."
+                      % gyro_deg)
+
+    yaw, conf = sm.yaw_from_straight_push(dx, dy, pushed_forward=True)
+    if conf < PUSH_MIN_CONFIDENCE:
+        return None, ("the estimator's own confidence is %.2f (needs %.2f); "
+                      "push further" % (conf, PUSH_MIN_CONFIDENCE))
+
+    warn = []
+    if dist < PUSH_WARN_M:
+        warn.append("short push (%.2f m)" % dist)
+    if abs(rot_deg) > PUSH_TURN_WARN_DEG:
+        warn.append("turned %+.1f deg while pushing" % rot_deg)
+    if rot_conf < 0.15:
+        warn.append("weak rotation correlation (%.2f) - featureless room?"
+                    % rot_conf)
+    if abs(rot_deg - gyro_deg) > PUSH_TURN_WARN_DEG:
+        warn.append("scan correlation says %+.1f deg of turn, gyro says %+.1f "
+                    "- expected on a straight push (the correlation is "
+                    "confounded by translation); the gyro was used"
+                    % (rot_deg, gyro_deg))
+    if fit["note"]:
+        warn.append(fit["note"])
+
+    log("    -> mount yaw from this push: %s  (confidence %.2f)%s"
+        % (fmt_rad(yaw), conf, ("  [" + "; ".join(warn) + "]") if warn else ""))
+
+    return {
+        "yaw_rad": yaw, "yaw_deg": yaw * RAD2DEG, "confidence": round(conf, 3),
+        "dist_m": round(dist, 4), "dx": round(dx, 4), "dy": round(dy, 4),
+        "scan_turn_deg": round(rot_deg, 3), "gyro_turn_deg": round(gyro_deg, 3),
+        "icp_rms_m": round(rms, 4), "icp_inliers": inliers,
+        "warnings": warn, "at": stamp(),
+    }, ""
+
+
+def collect_pushes(lis, n_pushes, target_m, window_s):
+    """Run n pushes; return (samples, rejects)."""
+    samples, rejects = [], []
+    attempts = 0
+    max_attempts = n_pushes + 3
+    while len(samples) < n_pushes and attempts < max_attempts:
+        attempts += 1
+        s, why = one_push(lis, len(samples) + 1, n_pushes, target_m, window_s)
+        if s is None:
+            log("    REJECTED: %s" % why)
+            rejects.append(why)
+            if attempts < max_attempts:
+                log("    (that push does not count; do it again)")
+            continue
+        samples.append(s)
+    return samples, rejects
+
+
+def summarise_yaw(samples):
+    """(median_rad, spread_deg, tight, unwrapped_deg). Circular-safe."""
+    med_deg, spread, un = circular_median_deg([s["yaw_deg"] for s in samples])
+    if med_deg is None:
+        return None, None, False, []
+    return med_deg * DEG2RAD, spread, spread <= YAW_SPREAD_TIGHT_DEG, un
+
+
+def cmd_yaw(args):
+    hr("MOUNT YAW - several straight pushes, by hand")
+    state = read_state()
+    ok, msg = mirror_gate(state, "--yaw")
+    if not ok:
+        log("\n" + msg)
+        return 1
+    if msg:
+        log(msg)
+
+    n = args.pushes
+    if n < MIN_PUSHES:
+        log("\n  refuse: --pushes %d. A median of fewer than %d samples is not "
+            "a median, and this number goes into every map the rover ever "
+            "builds." % (n, MIN_PUSHES))
+        return 1
+
+    log("""
+Push the rover STRAIGHT FORWARD, by hand, about %.2f m, %d times. Between
+pushes, put it back wherever you like - each push is measured on its own.
+
+WHY THIS WORKS WITHOUT ANY MOTION CALIBRATION: only the DIRECTION of the
+apparent motion is used, never its magnitude. counts/mm on this rover is
+unmeasured and disputed and it does not enter this measurement at all.
+
+  * straight matters, distance does not. A steered push is rejected outright.
+  * push, do not carry. Lifting the rover ends the measurement quietly.
+  * a room with structure. A bare corridor has nothing for the matcher to
+    hold on to and the tool will tell you so rather than invent a number.""" %
+        (args.push_m, n))
+
+    lis = start_listener()
+    if lis is None:
+        return 2
+    try:
+        samples, rejects = collect_pushes(lis, n, args.push_m,
+                                          args.window or PUSH_WINDOW_S)
+    finally:
+        lis.close()
+
+    return report_yaw_result(samples, rejects, n, store=True)
+
+
+def report_yaw_result(samples, rejects, wanted, store):
+    hr("RESULT")
+    if len(samples) < MIN_PUSHES:
+        log("  %d of %d pushes were usable. Refusing to conclude anything from "
+            "fewer than %d." % (len(samples), wanted, MIN_PUSHES))
+        for r in rejects:
+            log("    rejected: %s" % r)
+        log("\n  Nothing has been written. Fix whatever the rejections point "
+            "at and run --yaw again.")
+        return 1
+
+    med_rad, spread, tight, un = summarise_yaw(samples)
+    log("  samples (deg): %s" % ", ".join("%+.2f" % v for v in un))
+    log("  median       : %s" % fmt_rad(med_rad))
+    log("  spread       : %.2f deg peak-to-peak over %d pushes"
+        % (spread, len(samples)))
+    log("  position cost: %.1f mm of bias at the 0.6 m lever arm the launch "
+        "file quotes (1 deg = 10.5 mm)"
+        % (abs(med_rad * RAD2DEG) * 10.5))
+    if rejects:
+        log("  rejected     : %d push(es)" % len(rejects))
+        for r in rejects:
+            log("      %s" % r)
+
+    if tight:
+        log("\n  SPREAD IS TIGHT (<= %.1f deg). The median is trustworthy to "
+            "roughly %.2f deg, which is inside the ~0.5 deg the launch file "
+            "asks for." % (YAW_SPREAD_TIGHT_DEG, spread / 2.0))
+    else:
+        log("""
+  SPREAD IS TOO WIDE (%.2f deg, needs <= %.1f deg). REFUSING TO CONCLUDE.
+
+  The pushes disagree about something real, and a median does not fix that.
+  In rough order of likelihood:
+    * the mount is loose. Grab the scanner and try to twist it.
+    * the pushes were steered. Watch the per-push 'scan turned' figures above.
+    * the room has too little structure, or something in it moved between
+      pushes (a person counts).
+  Fix it and run --yaw again. --apply will not accept this."""
+            % (spread, YAW_SPREAD_TIGHT_DEG))
+
+    conf = [s["confidence"] for s in samples]
+    log("\n  estimator confidence per push: %s"
+        % ", ".join("%.2f" % c for c in conf))
+    warned = [w for s in samples for w in s["warnings"]]
+    if warned:
+        log("  caveats carried by accepted pushes:")
+        for w in warned:
+            log("      %s" % w)
+
+    if store:
+        state = read_state()
+        state["yaw"] = {
+            "median_rad": round(med_rad, 6),
+            "median_deg": round(med_rad * RAD2DEG, 4),
+            "spread_deg": round(spread, 4),
+            "tight": bool(tight),
+            "n": len(samples), "rejected": len(rejects),
+            "samples": samples,
+            "at": stamp(),
+        }
+        save_state(state)
+        log("\n  recorded in %s" % STATE_FILE)
+        if tight:
+            log("  Next:  fpms-calibrate-lidar --lever    (x/y cross-check)")
+            log("         fpms-calibrate-lidar --apply    (writes config.env)")
+    return 0 if tight else 1
+
+
+# ===========================================================================
+# --lever
+# ===========================================================================
+
+def cmd_lever(args):
+    hr("LEVER ARM - where the scanner sits, weakly, from a turn in place")
+    state = read_state()
+    ok, msg = mirror_gate(state, "--lever")
+    if not ok:
+        log("\n" + msg)
+        return 1
+    if msg:
+        log(msg)
+
+    log("""
+Turning the chassis about base_link's origin swings an off-centre scanner
+through an arc, and the size of that arc is the lever arm. Read the caveat
+before you believe the number:
+
+  * IT ASSUMES THE ROTATION WAS ABOUT base_link's ORIGIN. A hand-turned rover
+    pivots wherever it happens to pivot, and that is exactly the assumption
+    most likely to be false here.
+  * x and y are only PARTLY observable this way. The estimator's own docstring
+    calls this weakly observed and says to treat it as a sanity check on a
+    ruler, not a replacement for one.
+  * z is not observable AT ALL from a 2D scan. Measure it with a rule.
+
+So: turn the rover on the spot ~%.0f degrees, about its own centre, as well as
+you can by hand.""" % MIRROR_TARGET_DEG)
+
+    lis = start_listener()
+    if lis is None:
+        return 2
+    try:
+        press_enter("\n  Press ENTER, then turn the rover on the spot...")
+        lis.reset_gyro()
+        time.sleep(0.3)
+        ref = lis.capture()
+        if ref is None:
+            log("  no reference scan; aborting")
+            return 2
+        res = track_turn(lis, ref, MIRROR_TARGET_DEG * DEG2RAD,
+                         args.window or MIRROR_WINDOW_S)
+        end = res["end"]
+        if end is None or end.seq == ref.seq:
+            log("\n  REFUSING: no new scan during the turn; the feed is frozen.")
+            return 1
+        ok, detail = lis.scan_health()
+        if not ok:
+            log("\n  REFUSING: %s" % detail)
+            return 1
+
+        fit = fit_motion(ref, end)
+        rot, rot_conf = fit["rot"], fit["rot_confidence"]
+        dx, dy, rms, inliers = fit["dx"], fit["dy"], fit["rms"], fit["inliers"]
+        log("\n  turned      : %+.1f deg by scan, %+.1f deg by gyro "
+            "(correlation %.2f)"
+            % (-rot * RAD2DEG, res["gyro"] * RAD2DEG, rot_conf))
+        log("  apparent dt : dx=%+.4f m dy=%+.4f m (icp rms %.3f m, %d points)"
+            % (dx, dy, rms, inliers))
+        if fit["note"]:
+            log("  !! %s" % fit["note"])
+
+        if inliers < PUSH_MIN_INLIERS or rms > PUSH_MAX_RMS_M:
+            log("\n  REFUSING: the scan match is not good enough to derive a "
+                "lever arm from (rms %.3f m over %d points)." % (rms, inliers))
+            return 1
+
+        lx, ly, err, detail = lever_arm(dx, dy, rot)
+        if err:
+            log("\n  no lever arm: %s" % err)
+            return 1
+        log("  %s" % detail)
+
+        log("\n  scanner offset in base_link, ESTIMATED:")
+        log("      laser_x ~ %+.3f m   (%+.0f mm)" % (lx, lx * 1000.0))
+        log("      laser_y ~ %+.3f m   (%+.0f mm)" % (ly, ly * 1000.0))
+        log("""
+  CONFIDENCE: LOW, and structurally so - not because this run went badly.
+  The solve assumes the pivot was base_link's origin. If you actually turned
+  the rover about a point 50 mm off that origin, this answer is wrong by
+  roughly 50 mm and nothing in the data says so.
+
+  USE IT AS A CROSS-CHECK. Put a rule on the robot: horizontal distance from
+  the drive axle centreline to the LiDAR's OPTICAL CENTRE (the rotating mirror
+  axis, not the case edge), +x out the nose, +y to the LEFT. If the rule and
+  the estimate above disagree by more than a couple of centimetres, believe
+  the rule and distrust the turn.""")
+
+        state = read_state()
+        state["lever"] = {
+            "lx": round(lx, 4), "ly": round(ly, 4),
+            "rotation_deg": round(-rot * RAD2DEG, 2),
+            "gyro_deg": round(res["gyro"] * RAD2DEG, 2),
+            "icp_rms_m": round(rms, 4), "icp_inliers": inliers,
+            "caveat": "weakly observed; assumes rotation about base_link origin",
+            "at": stamp(),
+        }
+        save_state(state)
+        return 0
+    finally:
+        lis.close()
+
+
+# ===========================================================================
+# --level
+# ===========================================================================
+
+def cmd_level(args):
+    hr("LEVEL - is the scan plane striking the floor?")
+    log("""
+Park the rover somewhere typical and leave it alone. This reads ONE static
+scan and looks for the signature of a tilted scan plane: a band of short,
+consistent returns clustered in bearing, which is what the beam grazing the
+floor looks like from above.
+
+It DIAGNOSES. It never estimates an angle - a 2D scan carries no height
+information, so roll and pitch cannot be solved from it. What it can do is
+tell you whether to go and look, and the arithmetic behind why that matters:
+at 0.10 m above the floor, 1 degree of downward pitch puts the floor strike at
+5.7 m and 2 degrees puts it at 2.9 m. This room returns a median near 2 m, so
+1-2 degrees turns the far half of every scan into a ring of phantom obstacles
+that moves with the robot.""")
+
+    lis = start_listener()
+    if lis is None:
+        return 2
+    try:
+        # Several scans, not one: the freshness check needs to see the feed
+        # change, and one scan cannot show that.
+        time.sleep(1.5)
+        ok, detail = lis.scan_health()
+        log("\n  %s" % detail)
+        if not ok:
+            log("  REFUSING: %s" % detail)
+            return 1
+        s = lis.capture()
+        out = sm.plane_level_diagnostic(s.ranges, s.angle_min,
+                                        s.angle_increment)
+    finally:
+        lis.close()
+
+    log("\n  short-return fraction : %.1f%%" % (100.0 * out["short_frac"]))
+    log("  %s" % out["detail"])
+    if out["floor_strike_suspected"]:
+        log("""
+  FLOOR STRIKE SUSPECTED.
+
+  Do not try to correct this in laser_pitch. A tilted plane still slices the
+  room at an angle; the TF only places the returns, it cannot un-tilt them.
+  Level the mount mechanically - a small spirit level or a phone inclinometer
+  on the LiDAR's mounting face, target under 0.5 degrees - and re-run this.
+  If you cannot get it level, measure the residual and set laser_roll/pitch so
+  the returns at least land in the right place.""")
+    else:
+        log("\n  No floor strike apparent. That is not proof the mount is "
+            "level - a clutter-free room hides a small tilt - but nothing here "
+            "argues against it.")
+
+    log("\n  STILL NOT MEASURED BY ANY OF THIS: laser_z. A 2D scan has no "
+        "height information at all.")
+    log("  Measure it with a rule: (height of the optical centre above the "
+        "floor) - 0.035 m, because base_link sits at half the measured 70 mm "
+        "wheel diameter.")
+
+    state = read_state()
+    state["level"] = {
+        "floor_strike_suspected": bool(out["floor_strike_suspected"]),
+        "short_frac": round(float(out["short_frac"]), 4),
+        "detail": out["detail"], "at": stamp(),
+    }
+    save_state(state)
+    return 0
+
+
+# ===========================================================================
+# --verify
+# ===========================================================================
+
+def cmd_verify(args):
+    hr("VERIFY - after applying, the residual mount yaw must read ~0")
+    state = read_state()
+    ok, msg = mirror_gate(state, "--verify")
+    if not ok:
+        log("\n" + msg)
+        return 1
+    if msg:
+        log(msg)
+
+    cfg = read_config()
+    applied = config_float(cfg, "FPMS_TF_LASER_YAW")
+    measured_flag = cfg.get(MEASURED_KEY, "0")
+    if applied is None:
+        log("\n  refuse: FPMS_TF_LASER_YAW is absent or unparseable in %s. "
+            "There is nothing applied to verify." % CONFIG)
+        return 1
+
+    log("""
+Applying FPMS_TF_LASER_YAW changes the TF TREE. It does not change one byte of
+%s - the scan arrives in the laser frame either way. So this does NOT expect
+the raw measurement to have moved to zero. It re-measures the mount yaw from
+fresh pushes and subtracts what is actually applied:
+
+    residual = measured - applied      must read ~0 (within %.1f deg)
+
+A SIGN ERROR does not make that residual merely wrong. It makes it almost
+exactly twice the applied value, which is a signature this can name rather
+than a mismatch it can only report.
+
+  applied in %s : %s
+  %s : %s
+""" % (SCAN_TOPIC, VERIFY_RESIDUAL_PASS_DEG, CONFIG, fmt_rad(applied),
+       MEASURED_KEY, measured_flag))
+
+    if measured_flag != "1":
+        log("  NOTE: %s is %r, so fpms-tf is running with measured:=%s and "
+            "Nav2/SLAM still refuse to start. Verifying anyway - the TF value "
+            "is what it is." % (MEASURED_KEY, measured_flag, measured_flag))
+
+    n = max(MIN_PUSHES, args.pushes)
+    lis = start_listener(want_tf=True)
+    if lis is None:
+        return 2
+    tf_live = None
+    try:
+        # Give latched /tf_static a moment; it is TRANSIENT_LOCAL so it should
+        # arrive on subscription, but only if fpms-tf is actually running.
+        if lis.tf_available:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                tf_live = lis.tf_lookup(BASE_LINK, LASER_FRAME)
+                if tf_live:
+                    break
+                time.sleep(0.2)
+        samples, rejects = collect_pushes(lis, n, args.push_m,
+                                          args.window or PUSH_WINDOW_S)
+    finally:
+        lis.close()
+
+    hr("VERIFY RESULT")
+    if len(samples) < MIN_PUSHES:
+        log("  only %d usable pushes; refusing to verify anything from fewer "
+            "than %d." % (len(samples), MIN_PUSHES))
+        for r in rejects:
+            log("    rejected: %s" % r)
+        return 1
+
+    med_rad, spread, tight, un = summarise_yaw(samples)
+    residual = math.radians(wrap_deg((med_rad - applied) * RAD2DEG))
+    res_deg = residual * RAD2DEG
+
+    log("  samples (deg)  : %s" % ", ".join("%+.2f" % v for v in un))
+    log("  measured yaw   : %s  (spread %.2f deg over %d pushes)"
+        % (fmt_rad(med_rad), spread, len(samples)))
+    log("  applied yaw    : %s" % fmt_rad(applied))
+    log("  RESIDUAL       : %s" % fmt_rad(residual))
+    log("  position cost  : %.1f mm at the 0.6 m lever arm"
+        % (abs(res_deg) * 10.5))
+
+    # --- the live TF, not just the file ------------------------------------
+    log("")
+    if tf_live:
+        log("  live %s -> %s from %s:" % (BASE_LINK, LASER_FRAME,
+                                          TF_STATIC_TOPIC))
+        log("      x=%+.4f y=%+.4f z=%+.4f yaw=%s"
+            % (tf_live["x"], tf_live["y"], tf_live["z"],
+               fmt_rad(tf_live["yaw"])))
+        drift = abs(wrap_deg((tf_live["yaw"] - applied) * RAD2DEG))
+        if drift > VERIFY_TF_MATCH_DEG:
+            log("      MISMATCH: what is BROADCAST differs from %s by %.2f deg."
+                % (CONFIG, drift))
+            log("      That is the 'edited config.env, never restarted the "
+                "unit' failure. Fix it:  sudo systemctl restart fpms-tf")
+        else:
+            log("      matches config.env - fpms-tf is running the value you "
+                "think it is.")
+    elif lis.tf_available:
+        log("  NOTE: nothing arrived on %s within 3 s, so the LIVE transform "
+            "could not be checked - only the number in %s."
+            % (TF_STATIC_TOPIC, CONFIG))
+        log("        Either fpms-tf is not running (systemctl status fpms-tf), "
+            "or DDS is on shared memory again (see FASTRTPS_DEFAULT_PROFILES_"
+            "FILE). An empty /tf_static with a live publisher is a known "
+            "signature of the latter.")
+
+    # --- the verdict --------------------------------------------------------
+    log("")
+    if not tight:
+        log("  INCONCLUSIVE: this run's own spread is %.2f deg (needs <= %.1f). "
+            "The residual cannot be trusted to better than that."
+            % (spread, YAW_SPREAD_TIGHT_DEG))
+        verdict = "inconclusive"
+        rc = 1
+    elif abs(res_deg) <= VERIFY_RESIDUAL_PASS_DEG:
+        log("  PASS. The residual mount yaw is %+.2f deg, inside +/-%.1f. The "
+            "applied transform is correct in magnitude AND in sign."
+            % (res_deg, VERIFY_RESIDUAL_PASS_DEG))
+        verdict = "pass"
+        rc = 0
+    else:
+        verdict = "fail"
+        rc = 1
+        log("  FAIL. The residual is %+.2f deg - %.1f mm of bias on every fix."
+            % (res_deg, abs(res_deg) * 10.5))
+        # The sign-error signature: residual ~= 2 * measured, i.e. applied is
+        # about the negative of what was measured.
+        if abs(applied) > 0.5 * DEG2RAD and \
+                abs(wrap_deg((med_rad + applied) * RAD2DEG)) < \
+                max(1.0, 0.25 * abs(res_deg)):
+            log("""
+  THIS IS A SIGN ERROR, not a bad measurement.
+
+  The residual is almost exactly twice the measured yaw, which is what you get
+  when the correct magnitude is applied with the wrong sign. What is applied is
+  %s; what the rover is telling you it should be is %s.
+
+  Fix it and re-verify:
+      FPMS_TF_LASER_YAW=%.6f      in %s
+      sudo systemctl restart fpms-tf
+      fpms-calibrate-lidar --verify""" % (fmt_rad(applied), fmt_rad(med_rad),
+                                          med_rad, CONFIG))
+        else:
+            log("""
+  Possible causes, in order:
+    * the mount moved since --yaw was run. Grab the scanner and twist.
+    * laser_yaw was hand-edited to something other than what --apply wrote.
+    * the correction is being applied TWICE. LIDAR_ZERO_OFFSET_DEG in
+      fpms_lidar_ros.py rotates the scan in the same sense laser_yaw does;
+      correct mount yaw in exactly ONE of the two places. --report shows what
+      that constant currently is.
+  Set FPMS_TF_LASER_YAW=%.6f, restart fpms-tf, and verify again.""" % med_rad)
+
+    state = read_state()
+    state["verify"] = {
+        "verdict": verdict,
+        "applied_rad": round(applied, 6),
+        "measured_rad": round(med_rad, 6),
+        "residual_deg": round(res_deg, 4),
+        "spread_deg": round(spread, 4), "n": len(samples),
+        "tf_static_yaw_rad": (round(tf_live["yaw"], 6) if tf_live else None),
+        "at": stamp(),
+    }
+    save_state(state)
+
+    log("""
+  THE ONE CHECK THIS PROGRAM CANNOT DO FOR YOU
+  --------------------------------------------
+  Everything above is self-consistent arithmetic. If the whole stack agreed on
+  a mirrored idea of which way is positive, every number here would agree with
+  every other and all of them would be wrong together. Close that loop with
+  your eyes, once:
+
+      park the rover with a flat wall ~1 m dead ahead
+      rviz2 -> Fixed Frame: base_link, add LaserScan on %s
+      the wall must appear IN FRONT of the robot, square to it, at ~1 m
+
+  If it appears rotated, the sign convention is wrong somewhere upstream of
+  everything this tool measures.""" % SCAN_TOPIC)
+    return rc
+
+
+# ===========================================================================
+# --report
+# ===========================================================================
+
+def cmd_report(args):
+    hr("WHAT IS SET, AND WHERE EACH NUMBER CAME FROM")
+    cfg = read_config()
+    state = read_state()
+
+    log("\nconfig.env: %s" % CONFIG)
+    if not cfg:
+        log("  (unreadable or empty - every service falls back to defaults "
+            "and retries forever, with no error anywhere)")
+    for k in LASER_KEYS:
+        log("  %-22s = %s" % (k, cfg.get(k, "<unset>")))
+    log("  %-22s = %s" % (MEASURED_KEY, cfg.get(MEASURED_KEY, "<unset>")))
+    if cfg.get(MEASURED_KEY) != "1":
+        log("\n  %s is not 1, so:" % MEASURED_KEY)
+        log("     fpms-nav2.service and both SLAM units REFUSE TO START;")
+        log("     fpms-tf publishes whatever is above with measured:=0;")
+        log("     fpms-selftest reports the mount transform as unmeasured.")
+
+    path, sign, zero = read_lidar_ros_constants()
+    log("\nfpms_lidar_ros.py: %s" % (path or "not found"))
+    log("  LIDAR_ROTATION_SIGN   = %s" % ("%+d" % sign if sign is not None
+                                          else "unknown"))
+    log("  LIDAR_ZERO_OFFSET_DEG = %s" % (zero if zero is not None
+                                          else "unknown"))
+    if zero not in (None, 0.0):
+        log("  !! NON-ZERO. That constant rotates the scan in the SAME sense "
+            "as laser_yaw. Mount yaw must be corrected in exactly ONE of the "
+            "two places; applying half in each is how you end up chasing a "
+            "bias that moves whenever either file is touched.")
+
+    log("\nmeasurement state: %s" % STATE_FILE)
+    if not state:
+        log("  (nothing measured yet - start with --mirror-check)")
+    else:
+        m = state.get("mirror")
+        if m:
+            d = age_days(m.get("at"))
+            log("  mirror   : %s  (%s%s)"
+                % (m.get("verdict"), m.get("at"),
+                   ", %.0f days ago" % d if d is not None else ""))
+            log("             scan %+.1f deg vs gyro %+.1f deg, taken with "
+                "LIDAR_ROTATION_SIGN=%s"
+                % (m.get("scan_deg", 0.0), m.get("gyro_deg", 0.0),
+                   m.get("rotation_sign")))
+            log("             %s" % m.get("detail", ""))
+        else:
+            log("  mirror   : never run. Nothing else may run until it passes.")
+
+        y = state.get("yaw")
+        if y:
+            log("  yaw      : %s from %d pushes, spread %.2f deg (%s)  [%s]"
+                % (fmt_rad(y["median_rad"]), y.get("n", 0),
+                   y.get("spread_deg", 0.0),
+                   "TIGHT" if y.get("tight") else "TOO WIDE - not usable",
+                   y.get("at")))
+            for s in y.get("samples", []):
+                log("             push %.3f m -> %+.2f deg (conf %.2f, "
+                    "turn %+.2f deg, icp rms %.3f m)"
+                    % (s.get("dist_m", 0.0), s.get("yaw_deg", 0.0),
+                       s.get("confidence", 0.0), s.get("scan_turn_deg", 0.0),
+                       s.get("icp_rms_m", 0.0)))
+        else:
+            log("  yaw      : not measured")
+
+        lv = state.get("lever")
+        if lv:
+            log("  lever    : x ~ %+.3f m, y ~ %+.3f m from a %+.1f deg turn "
+                "[%s]" % (lv["lx"], lv["ly"], lv.get("rotation_deg", 0.0),
+                          lv.get("at")))
+            log("             WEAKLY OBSERVED - %s" % lv.get("caveat", ""))
+        else:
+            log("  lever    : not measured")
+
+        lvl = state.get("level")
+        if lvl:
+            log("  level    : %s [%s]"
+                % ("FLOOR STRIKE SUSPECTED" if lvl["floor_strike_suspected"]
+                   else "no floor strike apparent", lvl.get("at")))
+        else:
+            log("  level    : not checked")
+
+        v = state.get("verify")
+        if v:
+            log("  verify   : %s, residual %+.2f deg against applied %s [%s]"
+                % (v.get("verdict", "?").upper(), v.get("residual_deg", 0.0),
+                   fmt_rad(v.get("applied_rad", 0.0)), v.get("at")))
+        else:
+            log("  verify   : never run - the applied value has not been "
+                "checked against the rover")
+
+    log("\nestimator: %s" % LIB_DIR)
+    try:
+        log("  %s" % convention_detail())
+    except SystemExit as exc:
+        log("  CONVENTION PROBE FAILED: %s" % exc)
+        log("  No measuring subcommand will run until that is explained.")
+
+    log("""
+NOT MEASURABLE BY THIS TOOL, EVER
+  laser_z       a 2D scan carries no height information. Use a rule:
+                (optical centre above the floor) - 0.035 m.
+  laser_roll    only diagnosable as a floor strike (--level), never solvable.
+  laser_pitch   same. Level the mount mechanically; target under 0.5 deg.
+  laser_x/y     partly observable (--lever) and weakly. Believe a rule over it.""")
+    return 0
+
+
+# ===========================================================================
+# --apply
+# ===========================================================================
+
+def cmd_apply(args):
+    hr("APPLY - write the measured transform into config.env")
+    state = read_state()
+
+    # ---- gate 1: the mirror -------------------------------------------------
+    ok, msg = mirror_gate(state, "--apply")
+    if not ok:
+        log("\n" + msg)
+        return 1
+    if msg:
+        log(msg)
+
+    # ---- gate 2: a tight yaw measurement -----------------------------------
+    y = state.get("yaw")
+    if not y:
+        log("\n  refuse: mount yaw has never been measured. Run "
+            "fpms-calibrate-lidar --yaw first.")
+        return 1
+    if not y.get("tight"):
+        log("\n  refuse: the last --yaw run had a spread of %.2f deg (needs "
+            "<= %.1f). Writing a median of samples that disagree by that much "
+            "would publish a number nobody has any right to trust."
+            % (y.get("spread_deg", 999.0), YAW_SPREAD_TIGHT_DEG))
+        return 1
+    if y.get("n", 0) < MIN_PUSHES:
+        log("\n  refuse: only %d pushes are on record; %d is the minimum."
+            % (y.get("n", 0), MIN_PUSHES))
+        return 1
+    d = age_days(y.get("at"))
+    if d is not None and d > YAW_STALE_WARN_DAYS:
+        log("\n  note: the yaw measurement is %.0f days old. If the rover has "
+            "been knocked about since, re-run --yaw." % d)
+
+    # ---- gate 3: the double-correction trap --------------------------------
+    path, sign, zero = read_lidar_ros_constants()
+    if zero is None:
+        log("\n  note: could not read LIDAR_ZERO_OFFSET_DEG (looked in %s). "
+            "Check by hand that it is still 0.0 - it rotates the scan in the "
+            "same sense as laser_yaw." % (", ".join(LIDAR_ROS_CANDIDATES),))
+    elif zero != 0.0:
+        log("""
+  refuse: LIDAR_ZERO_OFFSET_DEG is %s in %s.
+
+  That constant rotates the scan in the SAME SENSE as laser_yaw. Writing a
+  mount yaw here as well applies the correction TWICE, which lands somewhere
+  that looks almost right and moves whenever either file is touched.
+
+  Correct mount yaw in exactly ONE place, and the launch file says which one:
+  here, in laser_yaw. Set LIDAR_ZERO_OFFSET_DEG back to 0.0, restart
+  fpms-lidar-ros, re-run --mirror-check and --yaw (the measurement was taken
+  under the old value), then apply.""" % (zero, path))
+        return 1
+
+    # ---- gate 4: a terminal and a human ------------------------------------
+    if not sys.stdin.isatty():
+        log("\n  refuse: --apply needs a terminal. It must never run from a "
+            "script, a unit file or a cron job: the whole point of this value "
+            "is that a person looked at the evidence and accepted it.")
+        return 1
+
+    med_rad = float(y["median_rad"])
+    cfg = read_config()
+    lvl = state.get("level") or {}
+    lever = state.get("lever") or {}
+
+    log("\n  EVIDENCE")
+    log("  --------")
+    log("  mirror : %s (%s)" % (state["mirror"]["verdict"],
+                                state["mirror"].get("at")))
+    log("  yaw    : %s, median of %d pushes, spread %.2f deg (%s)"
+        % (fmt_rad(med_rad), y["n"], y["spread_deg"], y.get("at")))
+    for s in y.get("samples", []):
+        log("             %.3f m push -> %+.2f deg (confidence %.2f)"
+            % (s.get("dist_m", 0.0), s.get("yaw_deg", 0.0),
+               s.get("confidence", 0.0)))
+    if lvl:
+        log("  level  : %s" % ("FLOOR STRIKE SUSPECTED - %s" % lvl.get("detail")
+                               if lvl.get("floor_strike_suspected")
+                               else "no floor strike apparent"))
+    else:
+        log("  level  : NOT CHECKED. Run --level; a tilted scan plane turns "
+            "the far half of every scan into phantom floor obstacles, and no "
+            "TF value fixes that.")
+    if lever:
+        log("  lever  : x ~ %+.3f m, y ~ %+.3f m (WEAK - %s)"
+            % (lever["lx"], lever["ly"], lever.get("caveat", "")))
+
+    if lvl.get("floor_strike_suspected"):
+        log("""
+  WARNING: the last --level run suspected a floor strike. Declaring the mount
+  MEASURED unblocks Nav2 and SLAM, and they will then map a room that contains
+  a ring of phantom obstacles which moves with the robot. Level the mount
+  first unless you know better.""")
+
+    # ---- the translation, from a rule --------------------------------------
+    log("""
+  TRANSLATION - FROM A RULE, NOT FROM THIS TOOL
+  ---------------------------------------------
+  x and y are only weakly observable from a turn and z is not observable at
+  all. Measure them: horizontal distance from base_link (chassis centreline,
+  over the drive axle, 35 mm above the floor) to the LiDAR's OPTICAL CENTRE -
+  the rotating mirror axis, not the case edge. +x out the nose, +y to the LEFT,
+  +z up from base_link, i.e. (height above floor) - 0.035.
+
+  Press ENTER at any prompt to leave that value as it is.""")
+
+    updates = {}
+    prompts = (
+        ("FPMS_TF_LASER_X", "laser_x (m, +forward)",
+         lever.get("lx")),
+        ("FPMS_TF_LASER_Y", "laser_y (m, +left)",
+         lever.get("ly")),
+        ("FPMS_TF_LASER_Z", "laser_z (m, +up from base_link)", None),
+    )
+    for key, label, hint in prompts:
+        cur = cfg.get(key, "<unset>")
+        extra = ""
+        if hint is not None:
+            extra = "  [turn-test estimate %+.3f, weak]" % hint
+        raw = ask("    %s  currently %s%s: " % (label, cur, extra))
+        if raw == "":
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            log("      not a number; leaving %s unchanged" % key)
+            continue
+        if abs(val) > 1.0:
+            log("      refuse: %.3f m. This chassis is not a metre across - "
+                "that looks like millimetres typed into a metres field. "
+                "Leaving %s unchanged." % (val, key))
+            continue
+        if hint is not None and abs(val - hint) > 0.03:
+            log("      note: the rule and the turn-test disagree by %.0f mm. "
+                "Believing the rule, as documented - but if you did not "
+                "actually measure it, stop and measure it."
+                % (abs(val - hint) * 1000.0))
+        updates[key] = "%.4f" % val
+
+    updates["FPMS_TF_LASER_YAW"] = "%.6f" % med_rad
+    updates[MEASURED_KEY] = "1"
+
+    log("\n  ABOUT TO WRITE to %s" % CONFIG)
+    for k in sorted(updates):
+        log("      %-24s %s  ->  %s" % (k, cfg.get(k, "<unset>"), updates[k]))
+    log("\n  FPMS_TF_LASER_ROLL and FPMS_TF_LASER_PITCH are NOT written. They "
+        "are not solvable from a 2D scan; level the mount and, if you have a "
+        "residual off an inclinometer, set them by hand in radians.")
+    log("""
+  Setting %s=1 unblocks fpms-nav2.service and both SLAM units, which refuse to
+  start while it is 0. Everything they produce from here on inherits these
+  numbers.""" % MEASURED_KEY)
+
+    answer = ask("\n  Type  yes  to write this, anything else to abort: ")
+    if answer.lower() != "yes":
+        log("\n  aborted; %s is untouched" % CONFIG)
+        return 1
+
+    ok, detail = write_config_values(updates)
+    if not ok:
+        log("\n  NOT WRITTEN: %s" % detail)
+        return 1
+    log("\n  %s" % detail)
+
+    st = read_state()
+    st["applied"] = {"values": updates, "at": stamp(),
+                     "from": "median of %d hand pushes, spread %.2f deg"
+                             % (y["n"], y["spread_deg"])}
+    save_state(st)
+
+    log("""
+  NOW DO THESE, IN THIS ORDER
+  ---------------------------
+      sudo systemctl restart fpms-tf
+      fpms-calibrate-lidar --verify
+
+  The restart is not optional: systemd read those values into the unit's
+  environment at start, so until fpms-tf restarts it is still broadcasting the
+  old transform while config.env claims otherwise. --verify reads the LIVE
+  transform off /tf_static and will catch exactly that.
+
+  --verify is also how a SIGN error gets caught, and sign errors are this
+  project's signature failure. Do not skip it because the number looks right.""")
+    return 0
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="fpms-calibrate-lidar",
+        description="Measure base_link -> laser_frame by hand. Publishes to "
+                    "nothing and cannot move the rover.",
+        epilog="Order: --mirror-check, --level, --yaw, --lever, --apply, "
+               "--verify. Everything but --mirror-check, --level and --report "
+               "refuses to run until the mirror check passes.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--mirror-check", action="store_true",
+                   help="turn ~90 deg by hand: is the scan mirrored? DO THIS "
+                        "FIRST - everything else refuses until it passes")
+    g.add_argument("--yaw", action="store_true",
+                   help="several straight hand pushes: the mount yaw, with "
+                        "median and spread")
+    g.add_argument("--lever", action="store_true",
+                   help="turn in place: laser x/y, weakly observed")
+    g.add_argument("--level", action="store_true",
+                   help="static scan: is the scan plane striking the floor?")
+    g.add_argument("--verify", action="store_true",
+                   help="re-measure and assert the residual now reads ~0. THE "
+                        "important one - it is how a sign error is caught")
+    g.add_argument("--report", action="store_true",
+                   help="what is set, and where each number came from")
+    g.add_argument("--apply", action="store_true",
+                   help="write the measured values into config.env, after "
+                        "gates and an interactive confirmation")
+    ap.add_argument("--pushes", type=int, default=3, metavar="N",
+                    help="pushes for --yaw / --verify (default 3, minimum %d)"
+                         % MIN_PUSHES)
+    ap.add_argument("--push-m", type=float, default=PUSH_TARGET_M,
+                    metavar="M",
+                    help="how far to push each time (default %.2f m)"
+                         % PUSH_TARGET_M)
+    ap.add_argument("--window", type=float, default=None, metavar="SEC",
+                    help="how long each hand movement may take before the "
+                         "tool stops watching (default %.0f s)" % PUSH_WINDOW_S)
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    if args.report:
+        return cmd_report(args)
+    if args.mirror_check:
+        return cmd_mirror_check(args)
+    if args.level:
+        return cmd_level(args)
+    if args.yaw:
+        return cmd_yaw(args)
+    if args.lever:
+        return cmd_lever(args)
+    if args.verify:
+        return cmd_verify(args)
+    if args.apply:
+        return cmd_apply(args)
+
+    ap.print_help()
+    log("""
+Start here:
+
+    source /opt/ros/humble/setup.bash
+    fpms-calibrate-lidar --mirror-check
+
+Nothing in this program publishes to any topic, so it cannot move the rover and
+needs no arming. You move it; it watches.""")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("\naborted; nothing written")
+        sys.exit(1)
