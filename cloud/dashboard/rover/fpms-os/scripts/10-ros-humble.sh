@@ -109,11 +109,37 @@ apt-get update -q 2>&1 | tee -a "$APT_LOG" \
 
 # apt-get update does not always exit non-zero on a repo it could not verify,
 # so prove the repo is actually usable before spending an hour on it.
-apt-cache policy ros-humble-ros-base 2>/dev/null | grep -q 'Candidate: [0-9]' \
-    || fatal "the ROS repo is configured but ros-humble-ros-base has no candidate.
+# CAPTURE, THEN MATCH. Do NOT pipe into `grep -q` here.
+#
+# This gate failed a build with the repository working perfectly. Measured
+# inside the image:
+#
+#     $ apt-cache policy ros-humble-ros-base
+#     ros-humble-ros-base:
+#       Installed: (none)
+#       Candidate: 0.10.0-1jammy.20260804.223545
+#     $ apt-cache policy ... | grep -q 'Candidate: [0-9]' ; echo $?
+#     141
+#
+# `grep -q` exits the instant it matches, apt-cache is still writing, and it
+# dies of SIGPIPE = 141. Under `set -o pipefail` the pipeline reports 141 --
+# so a SUCCESSFUL match is indistinguishable from no match, and the check
+# fires exactly backwards. Without pipefail the same line passes.
+#
+# The same trap is called out in 20-python-deps.sh and 25-npu-runtime.sh,
+# where it was avoided. It was not avoided here, and it cost a build.
+ROS_POLICY="$(apt-cache policy ros-humble-ros-base 2>/dev/null || true)"
+case "$ROS_POLICY" in
+    *"Candidate: "[0-9]*) : ;;
+    *) fatal "the ROS repo is configured but ros-humble-ros-base has no candidate.
   Almost always one of: the signing key (see above), no network, or
   packages.ros.org having dropped jammy/$(dpkg --print-architecture).
-  See $APT_LOG."
+  See $APT_LOG.
+  Before believing it, run this INSIDE the image and read the real answer:
+      apt-cache policy ros-humble-ros-base" ;;
+esac
+say "ros-humble-ros-base: $(printf '%s\n' "$ROS_POLICY" | awk '/Candidate:/{print $2; exit}')"
+
 disk
 
 # --- installing --------------------------------------------------------------

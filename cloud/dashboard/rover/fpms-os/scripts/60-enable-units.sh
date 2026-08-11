@@ -213,7 +213,9 @@ done
 # the same reason as everything else in this file.
 systemctl disable fpms-ros-settle.service >/dev/null 2>&1 || true
 find "$ETC" /lib/systemd/system "$VENDOR" -mindepth 2 -name fpms-ros-settle.service -type l -delete 2>/dev/null || true
-if find "$ETC" -mindepth 2 -name fpms-ros-settle.service -type l 2>/dev/null | grep -q .; then
+# Capture, not `find | grep -q`: pipefail turns grep -q's early exit into
+# find's SIGPIPE (141) and the condition reads backwards.
+if [ -n "$(find "$ETC" -mindepth 2 -name fpms-ros-settle.service -type l 2>/dev/null)" ]; then
     echo "FATAL: fpms-ros-settle.service is still enabled" >&2; exit 1
 fi
 echo "    installed-not-enabled: fpms-ros-settle, fpms-nav2, fpms-slam-mapping, fpms-slam-localization"

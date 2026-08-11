@@ -341,7 +341,11 @@ patch_bt() {  # patch_bt <stock-filename> <dest>
         echo "    Re-read $src before relying on recovery." >&2
         return 1
     fi
-    if grep -o 'backup_speed="[^"]*"' "$dst" | grep -qv "\"$BT_SPEED\""; then
+    # Capture, not a grep|grep pipeline: under pipefail the first grep can
+    # die of SIGPIPE and the verification silently inverts.
+    _speeds="$(grep -o 'backup_speed="[^"]*"' "$dst" || true)"
+    if printf '%s
+' "$_speeds" | grep -v "\"$BT_SPEED\"" >/dev/null 2>&1; then
         echo "    WARNING: $dst still contains a backup_speed other than $BT_SPEED" >&2
         rm -f "$dst"
         return 1

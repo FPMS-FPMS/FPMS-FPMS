@@ -67,15 +67,29 @@ log() { echo "fpms-wait-net: $*"; }
 # We deliberately ignore loopback and link-local (169.254.0.0/16, fe80::/10).
 # Link-local is what you get DURING the flap, so treating it as "up" would
 # defeat the entire point of this script.
+# CAPTURE, THEN TEST. Never `ip ... | grep -q` here.
+#
+# This file sets `pipefail`, and `grep -q` exits the moment it matches, so `ip`
+# dies of SIGPIPE and the pipeline reports 141 rather than grep's status. The
+# test then reads backwards: a host WITH an address looks like a host without
+# one, this function returns 1 forever, and the script waits out its full
+# timeout on every boot before warning that the network never came up --
+# delaying fpms-lidar-ros and fpms-tf by FPMS_WAITNET_TIMEOUT_S each time and
+# printing a warning that is simply false.
+#
+# The same construct silently failed the ROS stage of an image build. It is
+# not a style preference.
 have_address() {
+    local out
     if [ "$IFACE" = "any" ]; then
-        ip -4 -o addr show scope global 2>/dev/null | grep -qv ' lo ' && return 0
-        ip -6 -o addr show scope global 2>/dev/null | grep -qv ' lo ' && return 0
-        return 1
+        out="$(ip -4 -o addr show scope global 2>/dev/null; ip -6 -o addr show scope global 2>/dev/null)"
+    else
+        out="$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null; ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null)"
     fi
-    ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -q . && return 0
-    ip -6 -o addr show dev "$IFACE" scope global 2>/dev/null | grep -q . && return 0
-    return 1
+    # `scope global` already excludes loopback and link-local, which is the
+    # property that matters: link-local is what you hold DURING the carrier
+    # flap this whole script exists to wait out.
+    [ -n "$out" ]
 }
 
 # A fingerprint of the current address set. If this CHANGES during the stability

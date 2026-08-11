@@ -40,10 +40,25 @@ log "=========================================================="
 # --- locate the FAT boot partition ------------------------------------------
 # Ubuntu Rockchip images mount it at /boot/firmware; some at /boot. We want the
 # one an operator can see from Windows, which is the vfat one.
+# CAPTURE, THEN TEST -- not `findmnt ... | grep -qi vfat`.
+#
+# This script sets `pipefail`, and `grep -q` exits on its first match, so
+# findmnt dies of SIGPIPE and the pipeline reports 141 instead of grep's
+# status. The test reads backwards: a real FAT boot partition is not
+# recognised, BOOTDIR falls through to the rootfs /boot, and the operator's
+# fpms-wifi.conf -- which they can only have written on the FAT partition from
+# Windows -- is never found. The rover then comes up on the fallback AP and it
+# looks exactly like they mistyped their SSID.
+#
+# stat -f is also more truthful than findmnt here: findmnt reads
+# /proc/self/mountinfo, which lists host-side paths when anything runs in a
+# chroot or a mount namespace. statfs asks the kernel about the path itself.
 for cand in /boot/firmware /boot; do
-    if [ -d "$cand" ] && findmnt -no FSTYPE "$cand" 2>/dev/null | grep -qi vfat; then
-        BOOTDIR="$cand"; break
-    fi
+    [ -d "$cand" ] || continue
+    fstype="$(stat -f -c %T "$cand" 2>/dev/null || true)"
+    case "$fstype" in
+        msdos|vfat|fat|exfat) BOOTDIR="$cand"; break ;;
+    esac
 done
 [ -z "$BOOTDIR" ] && { BOOTDIR=/boot; warn "no vfat boot partition found; looking in /boot anyway"; }
 log "boot partition: $BOOTDIR"

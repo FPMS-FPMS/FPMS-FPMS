@@ -198,7 +198,9 @@ cleanup() {
             losetup -d "$LOOPDEV" 2>/dev/null && break
             sleep 1
         done
-        if losetup -j "${OUT}" 2>/dev/null | grep -q .; then
+        # Capture, do not pipe into grep -q: under pipefail that reports
+        # losetup's SIGPIPE (141), not grep's match, and the test inverts.
+        if [ -n "$(losetup -j "${OUT}" 2>/dev/null)" ]; then
             printf '\033[1;31mWARNING: %s is still attached to %s.\n' \
                    "$OUT" "$LOOPDEV" >&2
             printf '  Run: losetup -d %s   before the next build.\033[0m\n' \
