@@ -63,8 +63,21 @@ apt-get update -qq
 # apt operation runs on default priorities. A no-op pin is worse than no pin,
 # because the file reads like protection. Build the pattern from the epoch apt
 # actually reports, then check that the priority landed.
+#
+# THE AWK BELOW HAS NO `exit`, DELIBERATELY - do not "optimise" one back in.
+# `awk '...{print $2; exit}'` closes the pipe while apt-cache is still writing,
+# apt-cache dies of SIGPIPE (141), `set -o pipefail` makes the PIPELINE 141,
+# and a plain assignment ADOPTS that status - so `set -e` kills this stage with
+# no output whatsoever. This exact shape has taken this build down twice, once
+# as `| grep -q` and once as `| awk ...exit`. It is timing-dependent: it only
+# fires when the producer has not finished writing, so it passes every small
+# test and dies on the machine that matters, 14 hours in. Reading to EOF
+# removes the hazard at the source; the `|| true` is belt-and-braces, not the
+# fix. (`local x="$(...)"` would also hide it, because `local` supplies its own
+# exit status - which is why this is a bare assignment with the guard explicit.)
 NUMPY_APT_VER="$(apt-cache policy python3-numpy 2>/dev/null \
-                 | awk -F': +' '/^[[:space:]]*Candidate:/{print $2; exit}' || true)"
+                 | awk -F': +' '/^[[:space:]]*Candidate:/{if(!v)v=$2} END{if(v)print v}' \
+                 || true)"
 case "${NUMPY_APT_VER:-}" in
     *:1.*) NUMPY_PIN="${NUMPY_APT_VER%%:*}:1.*" ;;   # keep the epoch: "1:1.*"
     1.*)   NUMPY_PIN="1.*" ;;
@@ -77,6 +90,11 @@ esac
 # Pin-Priority 1001 and not 990: above 1000 is what permits a DOWNGRADE, which
 # is the whole point - if anything has already pulled a 2.x in, apt must be
 # willing to go backwards rather than just decline to go forwards.
+#
+# `install -d` first: the directory does ship with apt, but a redirect into a
+# missing directory fails the stage on the ONE line whose whole job is to make
+# apt safe, and it costs nothing to not depend on that.
+install -d -m 0755 /etc/apt/preferences.d
 cat > /etc/apt/preferences.d/fpms-numpy <<EOF
 Package: python3-numpy
 Pin: version ${NUMPY_PIN}
@@ -168,13 +186,34 @@ EOF
 #
 # When it IS available it is intentional, for the reason it always was: this IS
 # the system environment for the FPMS services, which run the system python.
-PIP_VER="$(pip3 --version 2>/dev/null | awk '{print $2}' || true)"
+PIP_VER_RAW="$(pip3 --version 2>/dev/null || true)"
+# Parsed with parameter expansion, not `pip3 --version | awk '{print $2}'`:
+# same reason as the apt-cache note above - a pipeline in a plain assignment is
+# a status this stage would adopt. There is no pipeline here to have a status.
+# "pip 22.0.2 from /usr/lib/python3/dist-packages/pip (python 3.10)" -> 22.0.2.
+PIP_VER="${PIP_VER_RAW#pip }"
+PIP_VER="${PIP_VER%% *}"
+
 PIP_HELP="$(pip3 install --help 2>/dev/null || true)"
 # Captured into a variable, not piped into `grep -q`: with `set -o pipefail` a
 # `pip3 install --help | grep -q ...` reports pip's SIGPIPE death (141), not
 # grep's match, and the test comes out backwards.
 PIP_ARGS=(--no-cache-dir --disable-pip-version-check)
 case "$PIP_HELP" in
+    "")
+        # Empty help text is NOT evidence that the flag is absent. pip3 exists
+        # (checked at the top of this stage), so empty output means pip itself
+        # is broken - and silently taking the "flag absent" branch on that
+        # evidence is a guess. On jammy the guess happens to be right; on a PEP
+        # 668 base it is wrong, and the pip install below then dies with
+        # "externally-managed-environment", which reads like a policy decision
+        # rather than a failed detection. Name it here so it doesn't have to be
+        # re-derived from that message.
+        echo "    WARNING: 'pip3 install --help' produced no output (pip ${PIP_VER:-?})." >&2
+        echo "    Could not detect --break-system-packages; continuing without it." >&2
+        echo "    If the pip install below fails with 'externally-managed-environment'," >&2
+        echo "    this detection is why, not the pin." >&2
+        ;;
     *--break-system-packages*)
         PIP_ARGS+=(--break-system-packages)
         echo "    pip ${PIP_VER:-?} has --break-system-packages (PEP 668 base); using it"
@@ -243,9 +282,15 @@ for d in "${FPMS_HOME}"/.local/lib/python3.*/site-packages/numpy*; do
 done
 for d in "${FPMS_HOME}"/.local/lib/python3.*/site-packages; do
     [ -d "$d" ] || continue
-    if [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
+    # Listed once into a variable and re-read with a herestring, not
+    # `ls -A "$d" | sed ...`. sed reads to EOF so it would not SIGPIPE today,
+    # but that was a bare pipeline in a loop body under `set -e` - the exact
+    # shape that has killed this build twice - and a herestring has no pipeline
+    # status to adopt. It also stops the directory being listed twice.
+    user_pkgs="$(ls -A "$d" 2>/dev/null || true)"
+    if [ -n "$user_pkgs" ]; then
         echo "    NOTE: ${FPMS_USER} has other user-local packages in $d" >&2
-        ls -A "$d" | sed 's/^/      /' >&2
+        sed 's/^/      /' <<<"$user_pkgs" >&2
         echo "    Anything here shadows the system copy for every FPMS service." >&2
     fi
 done
@@ -263,18 +308,30 @@ echo "--- verifying imports"
 FAILED=0
 NOTES=""
 verify() {   # verify <name> <python> <what to do about it>
-    local out
+    local out last
     if out="$(/usr/bin/python3 -c "$2" 2>&1)"; then
         echo "    ok    $1"
     else
         echo "    FAIL  $1"
         FAILED=1
+        # Last line of the traceback, by parameter expansion rather than
+        # `printf '%s' "$out" | tail -n 1`. That pipeline was the LAST statement
+        # of this function, so the function returned the pipeline's status - and
+        # every call site below is a bare `verify ...` under `set -e`. Anything
+        # non-zero there and the stage dies HERE, inside the failure path,
+        # before the NOTES block that explains the failure is ever printed: the
+        # one place whose job is to report a problem was the one place that
+        # could die without reporting it.
+        last="${out##*$'\n'}"
         NOTES="${NOTES}
   ${1}
       fix:         ${3}
       reproduce:   /usr/bin/python3 -c \"${2}\"
-      python said: $(printf '%s' "$out" | tail -n 1)"
+      python said: ${last}"
     fi
+    # Explicit, and load-bearing: this function's status means "result
+    # recorded", never "check passed". Failures travel in FAILED, not in $?.
+    return 0
 }
 verify "numpy (1.x)" \
     "import numpy,sys; print(numpy.__version__, numpy.__file__); sys.exit(0 if numpy.__version__.startswith('1.') else 1)" \
@@ -322,13 +379,21 @@ fi
 if sudo -n -u "${FPMS_USER}" /usr/bin/python3 -c 'pass' >/dev/null 2>&1; then
     USER_NUMPY="$(sudo -n -u "${FPMS_USER}" /usr/bin/python3 \
         -c 'import numpy; print(numpy.__version__, numpy.__file__)' 2>&1 || true)"
-    case "$USER_NUMPY" in
-        1.*"/usr/"*) echo "    ok    numpy as ${FPMS_USER}: ${USER_NUMPY}" ;;
+    # Match the LAST line, not the whole capture. 2>&1 is deliberate - if numpy
+    # is broken the traceback IS the diagnostic - but it also picks up whatever
+    # sudo writes before it execs, and sudo is chatty in a chroot ("sudo:
+    # unable to resolve host ..." is the usual one). A single line of that in
+    # front and the pattern below no longer matches, so a PERFECTLY GOOD numpy
+    # fails this check and takes a 14-hour build with it. Keep the full capture
+    # for context; match on the line python actually printed.
+    USER_NUMPY_LAST="${USER_NUMPY##*$'\n'}"
+    case "$USER_NUMPY_LAST" in
+        1.*"/usr/"*) echo "    ok    numpy as ${FPMS_USER}: ${USER_NUMPY_LAST}" ;;
         *)  echo "    FAIL  numpy as ${FPMS_USER}"
             FAILED=1
             NOTES="${NOTES}
   numpy as ${FPMS_USER}
-      fix:         ${FPMS_USER} imports '${USER_NUMPY}', which is not a system 1.x.
+      fix:         ${FPMS_USER} imports '${USER_NUMPY_LAST}', which is not a system 1.x.
                    Remove ${FPMS_HOME}/.local/lib/python3.*/site-packages/numpy*
       reproduce:   sudo -u ${FPMS_USER} python3 -c 'import numpy; print(numpy.__version__, numpy.__file__)'" ;;
     esac

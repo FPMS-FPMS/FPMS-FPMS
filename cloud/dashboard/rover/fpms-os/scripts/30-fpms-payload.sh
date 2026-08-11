@@ -12,58 +12,112 @@ H="${FPMS_HOME}"
 
 # --- did the payload actually arrive? ---------------------------------------
 #
-# build.sh stages this tree with:
+# THE REASON THIS CHECK EXISTS HAS CHANGED, and the old reason is now false, so
+# it is restated rather than left standing to be re-derived by the next reader.
 #
-#     cp -a "$HERE/.."/*.py "$HERE/../stack" ... "$MNT/opt/fpms-os/src/" \
-#         2>/dev/null || true
+# It used to say that build.sh's stage_all() ends its copy in
+# `2>/dev/null || true` and that THAT was the most dangerous line in the build:
+# `cp -a` from a Windows-hosted source (WSL /mnt/c) can fail to preserve
+# ownership and exit non-zero having copied everything correctly, so the `|| true`
+# was there to tolerate an uninformative status - at the price of making a copy
+# that really did fail indistinguishable from one that worked. `mkdir -p src`
+# has already run, so the directory EXISTS and is EMPTY, and a build that only
+# checked `[ -d ]` sails past it and produces a fully-booting rover with no
+# rover software on it, silently.
 #
-# THAT `|| true` IS THE MOST DANGEROUS LINE IN THE BUILD. It exists because
-# `cp -a` from a Windows-hosted source (WSL /mnt/c) routinely fails to preserve
-# ownership and exits non-zero having copied everything correctly - so the
-# status is genuinely uninformative and cannot be trusted either way. The cost
-# is that a copy which really did fail is indistinguishable from one that
-# worked: `mkdir -p src` has already run, so the directory EXISTS and is
-# EMPTY, and a build that only checked `[ -d ]` would sail past it and produce
-# a fully-booting rover with no software on it, silently.
+# RE-READ 2026-08-11 against the build.sh in this worktree: that `|| true` is
+# GONE. stage_all() now runs the copy unsilenced and ends it in
 #
-# So: check for CONTENT, not for the directory, and name the cause in the
-# error, because the person reading it will be looking at stage 30 and the
-# fault is one stage earlier.
+#     || die "could not stage the rover source tree into the image. ..."
+#
+# with the note that the old form swallowed "No space left on device" and
+# turned a disk-full into this stage's much less obvious "required rover source
+# files were missing". So the copy now reports its own failure, on the host,
+# with the real error visible - and the empirical evidence that /mnt/c -> ext4
+# `cp -a` does return 0 on this host is that stage_all() completed and stages
+# 00 and 10 ran.
+#
+# THE CHECK STAYS ANYWAY, and not out of sentiment. It is one `ls` against a
+# 14-hour build, and it still covers the cases build.sh's `|| die` cannot see:
+#   - `--stage 30` or `--from 30` against an image whose src/ was staged by an
+#     older build.sh, or emptied by hand in a `build.sh --shell` session;
+#   - a copy that succeeded into a different mount than the one now chroot'd;
+#   - anything that removes files between stage_all() and this stage.
+# Check for CONTENT, not for the directory, and name the stage that is actually
+# at fault - the person reading this will be looking at stage 30 and the fault
+# is one stage earlier.
 if [ ! -d "$SRC" ] || [ -z "$(ls -A "$SRC" 2>/dev/null)" ]; then
     cat >&2 <<EOF
 FATAL: $SRC is missing or EMPTY.
 
-build.sh's stage_all() copies the rover source tree into the image with a
-trailing "2>/dev/null || true", so a failed copy does not fail the build. This
-check is the only thing standing between that and an image that boots
-perfectly and contains no rover software at all.
+build.sh's stage_all() copies the rover source tree into the image and dies if
+that copy fails, so reaching THIS message means the tree was lost after it was
+staged, or that the image being chroot'd is not the one that was staged into.
 
 Look at, on the BUILD HOST:
     $(dirname "$SRC")            (should hold scripts/ overlay/ selftest/ src/)
 and on the host side of the repo, two levels above fpms-os/:
     *.py  stack/  nav2/  slam/  STACK.md
-Re-run the copy without the "2>/dev/null || true" to see the real error.
+Re-run the whole build, or --from 30 after confirming the staging copy ran.
 EOF
     exit 1
 fi
 
 # --- the ubuntu user must already exist -------------------------------------
 #
-# Everything below installs with `-o ubuntu -g ubuntu`. This script runs INSIDE
-# the chroot (build.sh chroots first, then execs it), so install(1) resolves
-# that name through the chroot's own /etc/passwd, not the host's - which is
-# what we want, and is why stage 00's useradd is the thing that has to have
-# run, not anything on the build machine.
+# Everything below installs with `-o ubuntu`. This script runs INSIDE the
+# chroot (build.sh chroots first, then execs it), so install(1) resolves that
+# name through the chroot's own /etc/passwd, not the host's - which is what we
+# want, and is why stage 00's useradd is the thing that has to have run, not
+# anything on the build machine. (Confirmed by reading build.sh's in_chroot():
+# `chroot "$MNT" /usr/bin/env -i ... /bin/bash -c "$*"` - the whole stage runs
+# with $MNT as /, so there is no path by which the host's passwd is consulted.)
 #
-# Checked explicitly because otherwise the first `install` fails with "invalid
-# user", the inst() wrapper turns that into MISSING=1, and the build reports
-# "required rover source files were missing" - which is a lie that costs an
-# hour.
+# Checked explicitly, and the reason is sharper than it was: a missing user
+# makes EVERY `install -o` below fail identically, and the summary at the
+# bottom then says "required rover source files were missing" - which names the
+# wrong stage, sends the reader to build.sh's staging copy, and costs an hour.
+# One getent turns that into one line naming stage 00.
 if ! getent passwd "${FPMS_USER}" >/dev/null 2>&1; then
     echo "FATAL: user '${FPMS_USER}' does not exist in the chroot's /etc/passwd." >&2
     echo "Stage 00 creates it. Run the full build, or --stage 00 first." >&2
     exit 1
 fi
+
+# --- and the GROUP is asked for, not assumed --------------------------------
+#
+# Every install below used to pass `-g "${FPMS_USER}"`, i.e. it assumed the
+# primary group is named after the user. That is true of Ubuntu's cloud image
+# and of `useradd -m` with USERGROUPS_ENAB yes, and it is exactly the
+# assumption stage 00 refuses to make: it writes
+#
+#     FPMS_GROUP="$(id -gn "${FPMS_USER}")"
+#
+# and uses THAT for ${FPMS_HOME}, ~/.ssh and ~/yolo. Two stages disagreeing
+# about the group of the same home directory is how ~/yolo ends up owned by one
+# group and the file stage 30 puts inside it by another. Ask the same question
+# stage 00 asked, and get the same answer by construction.
+#
+# It matters more here than it looks, because of the inst() bug this file used
+# to have: `install -g <nonexistent>` fails with "invalid group", and until the
+# rewrite below that failure was SWALLOWED and printed as a success line. The
+# whole payload could have gone missing while every line said OK.
+#
+# `if !`, not a bare assignment: `FPMS_GROUP="$(id -gn ...)"` adopts id's exit
+# status, and an id that fails would kill this stage with only id's own
+# one-liner between the getent check above and a stage that appeared to stop
+# for no reason.
+if ! FPMS_GROUP="$(id -gn "${FPMS_USER}")"; then
+    echo "FATAL: could not read the primary group of '${FPMS_USER}' in the chroot." >&2
+    echo "getent found the user, so /etc/group is the suspect. Stage 00 sets both." >&2
+    exit 1
+fi
+if [ -z "$FPMS_GROUP" ]; then
+    echo "FATAL: '${FPMS_USER}' has an empty primary group name." >&2
+    exit 1
+fi
+[ "$FPMS_GROUP" = "${FPMS_USER}" ] \
+    || echo "    note: ${FPMS_USER}'s primary group is '$FPMS_GROUP', not '${FPMS_USER}'"
 
 # --- CRLF: normalise the payload before anything is installed ---------------
 #
@@ -95,6 +149,43 @@ fi
 # is worse than no detector. A byte count cannot: if the file got shorter, CRs
 # came out of it. sed -i on an already-LF file is a no-op, so this is also
 # idempotent across `--stage 30` re-runs.
+#
+# THE FILE LIST IS CAPTURED AND ITS STATUS IS CHECKED. This was
+#
+#     done < <(find "$SRC" -type f \( ... \))
+#
+# and a process substitution has NO exit status the shell can see - `$?` after
+# the loop is the loop's, never find's. So a find that died (a permission
+# error, a vanished $SRC, an argument list this shell rejected) produced an
+# empty stream, the loop ran zero times, CRLF_N stayed 0, the "normalised"
+# message was correctly suppressed, and the stage reported nothing wrong while
+# normalising nothing at all. That is the same silent-no-op class as the empty
+# $SRC above, and it lands on the one job this block exists to do: an
+# unnormalised fpms-uros-supervisor is a "/usr/bin/env: bad interpreter" on a
+# rover that otherwise boots.
+#
+# Capture into a variable, check the status with `if !`, then feed the loop a
+# herestring. No pipeline, so nothing to adopt a status from and no SIGPIPE to
+# raise. The one thing a herestring cannot survive is a newline INSIDE a
+# filename - these are repository paths under our own control, and the trade is
+# deliberate: an unreportable find is the failure that actually happens here,
+# a newline in "nav2_params.yaml" is not.
+if ! CRLF_LIST="$(find "$SRC" -type f \
+    \( -name '*.py' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \
+       -o -name '*.xml' -o -name '*.md' -o -name 'fpms-*' \))"; then
+    echo "FATAL: could not list $SRC to normalise line endings." >&2
+    echo "Skipping this would ship a CRLF fpms-uros-supervisor, whose unit then" >&2
+    echo "fails with '/usr/bin/env: bad interpreter' - the drive link, silently." >&2
+    exit 1
+fi
+if [ -z "$CRLF_LIST" ]; then
+    # $SRC was already proved non-empty above, so a list with nothing in it
+    # means the payload is there but contains none of *.py/*.yaml/fpms-* -
+    # i.e. it is not the rover tree. Every inst() below would fail; say why here.
+    echo "FATAL: $SRC contains no *.py, *.yaml, *.json, *.xml, *.md or fpms-* files." >&2
+    echo "Something was staged into it, but it is not the rover source tree." >&2
+    exit 1
+fi
 CRLF_N=0
 while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -104,9 +195,7 @@ while IFS= read -r f; do
     if [ "$before" -ne "$after" ]; then
         CRLF_N=$((CRLF_N + 1))
     fi
-done < <(find "$SRC" -type f \
-    \( -name '*.py' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \
-       -o -name '*.xml' -o -name '*.md' -o -name 'fpms-*' \))
+done <<<"$CRLF_LIST"
 if [ "$CRLF_N" -gt 0 ]; then
     echo "    normalised CRLF -> LF in $CRLF_N payload files"
     echo "    (expected: the rover tree sits above fpms-os/.gitattributes' reach)"
@@ -115,16 +204,57 @@ fi
 # yolo/ is created by stage 00, but install(1) will not create a missing parent
 # and fpms_yolo26_npu.py goes into it. Make this stage stand on its own so
 # `--stage 30` against a chroot in any state does the same thing.
-install -d -m 0755 -o "${FPMS_USER}" -g "${FPMS_USER}" "$H/yolo"
+install -d -m 0755 -o "${FPMS_USER}" -g "$FPMS_GROUP" "$H/yolo"
 
-inst() {  # inst <src> <dst> <mode>
-    if [ -f "$SRC/$1" ]; then
-        install -m "$3" -o "${FPMS_USER}" -g "${FPMS_USER}" "$SRC/$1" "$2"
-        echo "    $2"
-    else
+# inst <src> <dst> <mode>
+#
+# EVERY FAILURE HERE IS SURFACED. THE PREVIOUS VERSION SWALLOWED HALF OF THEM,
+# and it is the worst bug this file has had, because it fails in the direction
+# of a clean build log. It was:
+#
+#     inst() {
+#         if [ -f "$SRC/$1" ]; then
+#             install -m "$3" -o ... "$SRC/$1" "$2"
+#             echo "    $2"                     # <-- runs even if install died
+#         else
+#             echo "    MISSING: $1" >&2
+#             return 1
+#         fi
+#     }
+#
+# `set -e` DOES NOT APPLY INSIDE THIS FUNCTION. Every call site is
+# `inst ... || MISSING=1`, and a function invoked as the left operand of `||`
+# runs with -e suppressed throughout its whole body. So a failing `install` did
+# not abort, did not return, and fell through to `echo "    $2"` - which
+# PRINTED THE DESTINATION PATH AS A SUCCESS LINE and made the function return
+# echo's 0. MISSING stayed 0, the summary at the bottom said nothing, and the
+# stage exited OK having installed nothing.
+#
+# MEASURED, not reasoned: with `install -m 0755 src /nonexistent-dir/x.py`, the
+# old function printed
+#     install: cannot create regular file '/nonexistent-dir/x.py': ...
+#     /nonexistent-dir/x.py
+# and left MISSING=0. The install error is two lines above a success line for
+# the same path, in a build log tens of thousands of lines long.
+#
+# Real cases that produce exactly that: a full image (the `install` writes into
+# a filesystem stage 90 has not shrunk yet), a $H that does not exist, and -
+# the one that motivated deriving FPMS_GROUP above - `install -g` naming a
+# group that is not in the chroot's /etc/group, which fails on EVERY file at
+# once and would have reported a completely clean build.
+#
+# Written as two guarded early returns rather than if/else so the final `echo`
+# is only ever reached on a real success, and is the function's exit status.
+inst() {
+    if [ ! -f "$SRC/$1" ]; then
         echo "    MISSING: $1  (expected at $SRC/$1)" >&2
         return 1
     fi
+    if ! install -m "$3" -o "${FPMS_USER}" -g "$FPMS_GROUP" "$SRC/$1" "$2"; then
+        echo "    FAILED: $1 -> $2  (install's own error is above this line)" >&2
+        return 1
+    fi
+    echo "    $2"
 }
 
 MISSING=0
@@ -148,6 +278,13 @@ inst STACK.md              "$H/STACK.md"        0644 || true
 
 # The masked second-writers. Installed so their units can be MASKED rather
 # than merely absent -- see the unit headers.
+#
+# `|| true` on these three (STACK.md above included) means ABSENT IS FINE, not
+# that failure is fine. Since the inst() rewrite a genuine install error still
+# reaches stderr as "FAILED: ..." with install's own message above it; what the
+# `|| true` suppresses is only the MISSING=1 that would fail the build. Keep it
+# that way round -- a masked unit's script not being in the repo is a design
+# choice, a read-only /home is not.
 inst fpms_ros_tunnel.py   "$H/fpms_ros_tunnel.py"   0755 || true
 inst fpms_rtos_follower.py "$H/fpms_rtos_follower.py" 0755 || true
 
@@ -160,14 +297,29 @@ inst fpms_rtos_follower.py "$H/fpms_rtos_follower.py" 0755 || true
 # the LONGER one, and say which, loudly -- silently picking is how they drift
 # further.
 #
-# Written as an explicit if/then rather than `[ cond ] && VAR=x` as the last
-# statement of the loop body: that idiom leaves the whole `for` compound with a
-# non-zero status whenever the final comparison is false, which under
-# `set -euo pipefail` is a stage that dies for no reason at all on exactly the
-# input we expect (the hyphen file is the longer one, so the last comparison
-# IS false). `wc -l` is likewise only ever reached for a file that exists --
-# the -f guard `continue`s first -- so a missing candidate cannot produce a
-# "wc: no such file" that gets misread as the agent being broken.
+# Written as an explicit if/then rather than `[ cond ] && VAR=x`. The reason
+# recorded here used to be that the `&&` idiom "leaves the whole `for` compound
+# with a non-zero status ... a stage that dies for no reason at all".
+#
+#   THAT IS NOT TRUE, and it is worth correcting rather than leaving as a rule
+#   this repo enforces for a reason that does not exist. MEASURED under
+#   `set -euo pipefail` (bash 5): bash exempts an AND-OR list from -e whenever
+#   the command that failed is not the one after the final `&&`/`||`, and the
+#   exemption covers the list's own status -- so `[ "$n" -gt "$AL" ] && A=$c`
+#   as the last statement of a loop body does NOT abort, and neither does the
+#   `for` around it.
+#
+#   The shape that IS fatal is a FUNCTION whose last statement is a failing
+#   AND-OR list: the function returns 1 and the -e trips at the CALL SITE, not
+#   inside. There is no such function here; `inst()` above ends in a plain
+#   `echo` precisely so it cannot become one.
+#
+# The if/then stays anyway: it says "pick the longer file" in the shape of the
+# thing it does, and it cannot be quietly converted into the fatal form by a
+# later edit that wraps this block in a function. `wc -l` is likewise only ever
+# reached for a file that exists -- the -f guard `continue`s first -- so a
+# missing candidate cannot produce a "wc: no such file" that gets misread as
+# the agent being broken.
 AGENT=""
 AGENT_LINES=0
 for cand in fpms-rover-agent.py fpms_rover_agent.py; do
@@ -183,7 +335,17 @@ if [ -n "$AGENT" ]; then
     echo "    installing agent from $AGENT ($AGENT_LINES lines)"
     echo "    NOTE: the repo carries two agent files with near-identical names."
     echo "    Confirm this is the live one before a competition."
-    install -m 0755 "$SRC/$AGENT" /usr/local/bin/fpms-rover-agent
+    # Routed through MISSING like everything else, rather than left as a bare
+    # `install` for `set -e` to catch. A bare one aborts the stage on the spot,
+    # which skips the named-file sweep further down and the FATAL summary at the
+    # bottom -- so the operator gets install's single line and has to guess
+    # whether anything else was also wrong. Collecting it means one run reports
+    # everything that is broken, which on a 14-hour build is the difference
+    # between one more build and three.
+    if ! install -m 0755 "$SRC/$AGENT" /usr/local/bin/fpms-rover-agent; then
+        echo "    FAILED: $AGENT -> /usr/local/bin/fpms-rover-agent" >&2
+        MISSING=1
+    fi
 else
     echo "    MISSING: no rover agent found (looked for fpms-rover-agent.py and" >&2
     echo "             fpms_rover_agent.py in $SRC)" >&2
@@ -197,12 +359,19 @@ fi
 # No 2>/dev/null here. Swallowing install's stderr hides the difference
 # between "the file is not in the payload" and "the destination is read-only",
 # and those want different fixes.
-if [ -f "$SRC/stack/fpms-uros-supervisor" ]; then
-    install -m 0755 "$SRC/stack/fpms-uros-supervisor" /usr/local/bin/fpms-uros-supervisor
-    echo "    /usr/local/bin/fpms-uros-supervisor"
-else
+if [ ! -f "$SRC/stack/fpms-uros-supervisor" ]; then
     echo "    MISSING: stack/fpms-uros-supervisor" >&2
     MISSING=1
+elif ! install -m 0755 "$SRC/stack/fpms-uros-supervisor" /usr/local/bin/fpms-uros-supervisor; then
+    # Same reason as the agent above. This one was NOT the swallowed shape --
+    # it sat bare inside a then-block where `set -e` is live, so a failing
+    # install did abort rather than print a false success. What it did instead
+    # was abort BEFORE the nav2/slam sweep and the FATAL summary, so a
+    # read-only /usr/local/bin cost one 14-hour run per missing file discovered.
+    echo "    FAILED: stack/fpms-uros-supervisor -> /usr/local/bin/" >&2
+    MISSING=1
+else
+    echo "    /usr/local/bin/fpms-uros-supervisor"
 fi
 # fpms-uros-agent-run comes from the OVERLAY, not the repo: FPMS-OS reads the
 # device and baud from config.env instead of hardcoding them in two places
@@ -219,19 +388,36 @@ fi
 # map from nav2/make_arena_map.py; and both slam launch files refuse to start
 # on a params_file that does not exist. A `|| echo WARNING` here turns all of
 # that into a line nobody reads in a 40-minute build log.
-install -d -o "${FPMS_USER}" -g "${FPMS_USER}" "$H/nav2" "$H/slam" "$H/slam/maps"
+install -d -o "${FPMS_USER}" -g "$FPMS_GROUP" "$H/nav2" "$H/slam" "$H/slam/maps"
+# `if ! cp -a`, not a bare `cp -a`. Note this is NOT the "cp -a exits non-zero
+# having worked" case that forced build.sh's staging copy to be tolerant: that
+# one crosses from a Windows-hosted source into the image and cannot preserve
+# ownership. THIS one is ext4 -> ext4, inside the chroot, running as root, and
+# the chown below fixes ownership regardless -- so a non-zero here is a real
+# failure (no space, an I/O error on the loop device) and is treated as one.
+#
+# Collected into MISSING rather than left to `set -e`, for the reason above:
+# the per-file sweep immediately below is the diagnostic that says WHICH of the
+# ten files stage 40 needs did not arrive, and aborting on cp's one-liner
+# throws it away on a stage that only runs after two other stages have.
 for tree in nav2 slam; do
-    if [ -d "$SRC/$tree" ]; then
-        cp -a "$SRC/$tree/." "$H/$tree/"
-        echo "    $H/$tree/"
-    else
+    if [ ! -d "$SRC/$tree" ]; then
         echo "    MISSING: $tree/ tree (expected at $SRC/$tree)" >&2
         MISSING=1
+    elif ! cp -a "$SRC/$tree/." "$H/$tree/"; then
+        echo "    FAILED: could not copy $SRC/$tree/ into $H/$tree/" >&2
+        MISSING=1
+    else
+        echo "    $H/$tree/"
     fi
 done
 
-# Name the individual files, because a partial copy is the failure mode the
-# `|| true` in build.sh makes possible and a directory check cannot see it.
+# Name the individual files. A directory check cannot see a PARTIAL copy, and
+# every one of these ten is consumed by name later: stage 40 reads
+# make_arena_map.py, nav2_params*.yaml and mapper_params_*.yaml out of $H and
+# installs them into /etc/fpms/{nav2,slam}; stage 60 puts fpms-tf.service into
+# BOOT_UNITS, and its ExecStart names fpms_tf.launch.py by absolute path. A
+# name missing here is a unit that fails on every boot of the finished image.
 for f in nav2/fpms_tf.launch.py nav2/fpms_nav2.launch.py nav2/nav2_params.yaml \
          nav2/nav2_params_slam.yaml nav2/make_arena_map.py nav2/arena_map.yaml \
          slam/fpms_slam_localization.launch.py slam/fpms_slam_mapping.launch.py \
@@ -239,7 +425,7 @@ for f in nav2/fpms_tf.launch.py nav2/fpms_nav2.launch.py nav2/nav2_params.yaml \
     [ -f "$H/$f" ] || { echo "    MISSING: $f (not in the staged payload)" >&2; MISSING=1; }
 done
 
-chown -R "${FPMS_USER}:${FPMS_USER}" "$H/nav2" "$H/slam"
+chown -R "${FPMS_USER}:$FPMS_GROUP" "$H/nav2" "$H/slam"
 
 # --- things that exist only on the old Pi -----------------------------------
 cat <<'EOF'
@@ -278,12 +464,16 @@ cat <<'EOF'
 
 EOF
 
-chown -R "${FPMS_USER}:${FPMS_USER}" "$H"
+chown -R "${FPMS_USER}:$FPMS_GROUP" "$H"
 
 if [ "$MISSING" = 1 ]; then
-    echo "FATAL: required rover source files were missing. See above." >&2
-    echo "This almost always means build.sh's staging copy was partial;" >&2
-    echo "it ends in '2>/dev/null || true' and cannot report that itself." >&2
+    echo "FATAL: required rover payload files are missing or could not be installed." >&2
+    echo "Every failing line above is prefixed MISSING: (not in \$SRC) or FAILED:" >&2
+    echo "(present, but install/cp refused) - and those want different fixes:" >&2
+    echo "  MISSING -> the staging copy did not bring the file in. Check that it" >&2
+    echo "             exists two levels above fpms-os/ and re-run the full build." >&2
+    echo "  FAILED  -> the file is here and the write was rejected. Check free" >&2
+    echo "             space in the image and that '${FPMS_USER}:$FPMS_GROUP' resolves." >&2
     exit 1
 fi
 echo "--- 30-fpms-payload OK"

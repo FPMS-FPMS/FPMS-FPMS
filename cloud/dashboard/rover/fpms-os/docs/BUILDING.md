@@ -274,12 +274,220 @@ What this changes:
   `uros_ws` between builds. It is ~14 of those hours, it does not change
   between builds unless the micro-ROS sources move, and nothing in the current
   pipeline preserves it. If this image is going to be rebuilt more than once,
-  do that first.
+  do that first. **This is now implemented — see §3.1.**
 
 A cautionary note on how this measurement was obtained: the run reached stage
 20 and was then deliberately torn down to reclaim disk, which threw all 14
 hours away. The teardown was correct and asked for — but it is worth knowing
 that `/root/fpms-build` holding an in-progress image is not scratch space.
+
+---
+
+## 3.1 The micro-ROS workspace cache
+
+> **Status: half-landed, and it says so at runtime.** The caching logic is in
+> `scripts/10-ros-humble.sh`. It needs **one two-line change to `build.sh`**,
+> which has **not** been made — `build.sh` was not in scope for the change that
+> added this. Until that lands, stage 10 prints the reason it could not cache
+> and builds from source exactly as it always did. **Nothing fails without it.**
+
+### What it does
+
+After a **verified successful** micro-ROS build, stage 10 packs
+`/home/ubuntu/uros_ws` to a directory on the **build host** — outside the
+image, so it survives `rm`-ing the `.img`. On the next build it restores that
+tarball instead of compiling, **if and only if the cache key matches**.
+
+Three files make up an entry:
+
+| File | What it is |
+|---|---|
+| `uros_ws.tar.gz` | the packed workspace: `install/` and `src/`, never `build/` or `log/` (those are deleted before the pack, and are the multi-GB part) |
+| `uros_ws.key` | the cache key, in full, as plain text. **This file is the authority.** |
+| `uros_ws.info` | human-readable provenance: when it was written, which agent binary, and the resolved commit of every source repo. Read by people; never used to decide a hit. |
+
+An entry is only usable when **both** the tarball and the key are present.
+Publishing writes them in the order key-deleted → tarball-moved → key-written,
+so a build killed mid-write leaves a **miss**, never a mismatch. That matters
+here: this build has been killed three times.
+
+### What it saves, honestly
+
+The cache removes the colcon C++ build. It does **not** remove the ROS/Nav2
+apt install, which still runs on every build. So stage 10 goes from a
+**measured** 859m57s to *the apt time alone* — "tens of minutes to a couple of
+hours" per the table in §3, which is an **estimate**, not a stopwatch figure.
+Roughly 13–14 hours of the 14h20m come back; the stage does not become
+instant.
+
+Packing costs a `tar -czf` of a few hundred MB **under emulation** — an
+**estimated** ten to twenty minutes, paid once, on the build that populates it.
+
+### The `build.sh` change this needs
+
+The chroot cannot see the host. `/opt/fpms-os` is a `cp -a` **copy** made by
+`stage_all()`, not a mount — anything written there lands inside the image and
+dies with it. The only writable host path a stage can reach is one `build.sh`
+mounts. Two lines:
+
+```sh
+# in enter_chroot_mounts(), alongside the other bind mounts:
+mkdir -p "$CACHE/uros" "$MNT/opt/fpms-cache"
+mount --bind "$CACHE" "$MNT/opt/fpms-cache"
+
+# in cleanup()'s unmount loop — it MUST be released before "$MNT" itself:
+for m in opt/fpms-cache dev/pts dev proc sys run boot/firmware; do
+```
+
+`$CACHE` is already `$HERE/.cache`, where the base image lives. Add
+`opt/fpms-cache` to `release_stale()`'s loop too, for the same reason the
+other mounts are there.
+
+**One hazard worth stating**, because §5 row D already warns about the
+related case: while this is mounted, the host cache is reachable from inside
+`.build/mnt`. If cleanup fails to unmount it, an `rm -rf .build` walks into
+your cache — exactly as it can already walk into `/dev` and `/proc`. Unmount
+before any `rm -rf`, and check with `mount | grep fpms-cache`.
+
+Stage 10 also honours `$FPMS_UROS_CACHE_DIR` if it is set, which is how to use
+the cache from inside `build.sh --shell` without the bind mount.
+
+### What the key covers
+
+The key is recomputed from scratch on every build and compared **byte for
+byte** against the stored one. Any difference is a miss and a full rebuild.
+
+| Key line | Why it is in the key |
+|---|---|
+| `schema` | bumped by hand when the cache *format* changes, so an entry written by older code can never be misread by newer code |
+| `distro` | `$ROS_DISTRO` |
+| `arch`, `machine` | `dpkg --print-architecture` and `uname -m`. An x86_64 tarball unpacked into an aarch64 image is the nightmare case |
+| `os` | `ID-VERSION_ID` of the base rootfs — the glibc/libstdc++ era. `build.sh` pins the base by sha256, so this moves only when someone changes the base deliberately |
+| `gcc` | the compiler that produced the objects |
+| `pkg:ros-humble-fastrtps` | **Fast-DDS.** The library the agent links and whose headers it compiled against |
+| `pkg:ros-humble-fastcdr` | Fast-CDR, same reasoning |
+| `pkg:ros-humble-rmw-fastrtps-cpp` | the RMW the image actually runs (`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`) |
+| `pkg:ros-humble-rmw-fastrtps-shared-cpp` | its shared half, versioned separately |
+| `pkg:ros-humble-rclcpp` | the rest of the C++ ABI the agent is built against |
+| `micro_ros_setup` | the exact commit. Resolved with `git ls-remote` *before* the clone when deciding whether to restore, and re-read with `git rev-parse HEAD` from the real checkout when an entry is *written* — so a stored key always names the commit that was really built |
+
+If the commit cannot be resolved (no network), **no restore happens**. An
+entry that cannot be keyed is never used.
+
+### What the key does **not** cover
+
+`create_agent_ws.sh` vcs-imports Micro-XRCE-DDS-Agent, micro-ROS-Agent and
+micro_ros_msgs **by branch**, from a `.repos` file inside `micro_ros_setup`.
+Pinning that repo's commit pins the *file*, not where the branches it names
+point today. So a cache entry can hold an agent built from slightly older
+upstream commits than a fresh build would produce.
+
+That is staleness of **degree, not of ABI**. It cannot produce the
+wrong-Fast-DDS failure below, because every library the agent links comes from
+the apt packages that *are* keyed. The resolved commit of every imported repo
+is recorded in `uros_ws.info` and printed on every restore, so it is visible
+rather than assumed. When upstream moves and you want it, clear the cache.
+
+### Clearing it, and turning it off
+
+```sh
+# clear it entirely — the next build pays the ~14 hours and repopulates
+rm -rf fpms-os/.cache/uros
+
+# keep the tarball but force a rebuild anyway (the file is checked first)
+touch fpms-os/.cache/uros/NOCACHE      # works from the host, today
+rm    fpms-os/.cache/uros/NOCACHE      # ...and puts it back
+
+# the env-var opt-out, honoured by both restore and populate
+FPMS_UROS_NOCACHE=1
+```
+
+**On the env var, specifically:** `build.sh`'s `in_chroot()` uses `env -i` with
+an explicit variable list, and `FPMS_UROS_NOCACHE` is not on it — so exporting
+it in your shell does **not** reach stage 10. It works when you run the stage
+by hand inside `build.sh --shell`, and it would work if it were added to
+`CHROOT_ENV`. **The `NOCACHE` marker file is the switch that works from the
+host today**, which is exactly why it exists.
+
+### Proving a restore was used rather than a rebuild
+
+Three independent ways, cheapest first.
+
+**1. The build log.** Stage 10 prints exactly one of these:
+
+```
+    micro-ROS workspace: RESTORED FROM THE HOST CACHE - no C++ was compiled
+    micro-ROS workspace: already present in this image (resumed build)
+    micro-ROS workspace: built from source
+```
+
+and, on the way there, `cache: HIT`/`cache: MISS` with a reason. On a miss it
+prints **both keys**, so the differing line names the cause:
+
+```sh
+grep -E 'cache: |micro-ROS workspace:' .build/build-*.log
+```
+
+**2. The stage's own elapsed time**, from `build.sh`:
+
+```
+==> stage 10-ros-humble.sh OK in 859m57s      <- compiled
+==> stage 10-ros-humble.sh OK in 41m18s       <- restored (illustrative)
+```
+
+**3. The finished artefact.** A restored workspace says so in its stamp file,
+and the agent binary can be checked for architecture directly:
+
+```sh
+cat /tmp/chk/home/ubuntu/uros_ws/.fpms-built
+# 2026-08-11T02:14:07Z (restored from cache 2026-08-12T19:40:55Z)
+
+AGENT=$(find /tmp/chk/home/ubuntu/uros_ws/install -type f -name micro_ros_agent)
+od -An -tx1 -N20 "$AGENT"
+#  7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
+#  03 00 b7 00
+#              ^^^^^ b7 00 = EM_AARCH64. 3e 00 would be x86-64.
+```
+
+Stage 10 makes that same check itself, on both paths, and **fails the build**
+rather than shipping a wrong-architecture agent.
+
+### What a stale cache would look like on the rover
+
+This is the failure the key exists to prevent, and it is worth knowing by
+sight because **nothing on the rover will say "stale cache"**.
+
+An agent compiled against different Fast-DDS headers than the image ships is
+not a build error. It is either:
+
+- **A clean loader failure** — `micro-ros-agent.service` restarts in a loop and
+  `journalctl -u micro-ros-agent` shows
+  `error while loading shared libraries: libfastrtps.so.2.6: cannot open
+  shared object file`. This one is merciful: it names itself.
+  Confirm with `ldd "$(command -v micro_ros_agent)"` — look for `not found`.
+- **Or, much worse, a link that never establishes.** The agent starts, the
+  ESP32 connects at 230400 baud, and no micro-ROS topics ever appear.
+  `ros2 node list` is empty of the rover's nodes, `/cmd_vel` is accepted and
+  goes nowhere, and the rover simply does not move. This looks identical to
+  a cable fault, a wrong serial device, an ESP32 that did not reset, and the
+  Fast DDS shared-memory failure in `docs/DDS.md` — all of which this project
+  has spent real time on.
+
+**If the micro-ROS link misbehaves after a rebuild, clear the cache and
+rebuild before diagnosing anything else.** It costs fourteen hours and it
+removes an entire class of cause:
+
+```sh
+rm -rf fpms-os/.cache/uros
+```
+
+### Disk
+
+The entry is an **estimated** 100–200 MB compressed, and it lives beside the
+~837 MB base `.img.xz` in `.cache/`. Add it to §2's budget. Stage 10 reports
+the free space on the host filesystem holding the cache after it writes —
+that number is *not* the same as the `disk:` lines elsewhere in the stage,
+which report the **image's** filesystem.
 
 ---
 
@@ -333,6 +541,10 @@ and they are the ones worth knowing about:
 | **I** | `/usr/bin/env: bad interpreter: No such file or directory` running a stage script that plainly exists | CRLF line endings on a script, from a Windows checkout | `sed -i 's/\r$//'` the offending file; check `.gitattributes` is being honoured (`git config core.autocrlf`) |
 | **J** | `FATAL: the Fast DDS profile does not parse` (stage 40), or `useBuiltinTransports is not false` | The DDS profile was edited and broken | Fix `overlay/etc/fpms/fastdds_udp_only.xml`. This check is doing its job — read `docs/DDS.md` before changing it |
 | **K** | `MISSING: fpms_missions.py` and friends, stage 30 | `build.sh:226`'s copy of the parent `rover/` tree found nothing, and swallowed the error with `2>/dev/null || true` | The `fpms-os/` directory must sit inside a full `rover/` tree. See §1, WSL |
+| **L** | Stage 10 says `cache: NOT populated - no cache directory is visible in the chroot`, and every build pays 14 hours | The `build.sh` bind mount in §3.1 has not been added. This is **not** an error — the stage builds normally and the image is correct | Add the two lines in §3.1. Until then the message is accurate and expected |
+| **M** | Stage 10 says `cache: MISS - the key moved` and prints two keys | A keyed input changed: a Fast-DDS/rmw/rclcpp package version, the base OS, gcc, or the `micro_ros_setup` commit | Nothing to fix. **This is the cache working.** The differing line names the cause; the build recompiles and writes a fresh entry |
+| **N** | `micro_ros_agent was built, but it is not an aarch64 ELF64` | A host toolchain leaked into the chroot, or binfmt is misconfigured, and the agent was compiled for the build host | Row **A**. Do not work around it — an x86_64 agent in an aarch64 image is undetectable on the rover except as a link that never comes up |
+| **O** | The rover's micro-ROS link never establishes after an otherwise-successful rebuild, with no error naming a cause | Possibly a stale `uros_ws` cache: an agent linked against different Fast-DDS than the image ships | `rm -rf .cache/uros` and rebuild **before** diagnosing cables, the ESP32, or DDS. See §3.1, "What a stale cache would look like on the rover" |
 
 ### The worked example: a pinned URL that rotted
 
@@ -579,6 +791,24 @@ umount /tmp/chk && losetup -d "$LOOP" && rm /tmp/check.img
 build silently produced nothing, the wrapper dies instantly and the drive link
 never comes up — with no useful message. Stage 10 asserts this at line 99; check
 it again on the artefact.
+
+**But `setup.bash` alone is not enough, and never was.** The *first* colcon
+build — `micro_ros_setup` itself — creates it, so it exists even when the agent
+never built. The thing `fpms-uros-agent-run` actually execs is the
+`micro_ros_agent` executable, so check for that, and check its architecture:
+
+```sh
+AGENT=$(find /tmp/chk/home/ubuntu/uros_ws/install -type f -name micro_ros_agent)
+echo "${AGENT:?no micro_ros_agent in the image}"
+od -An -tx1 -N20 "$AGENT"      # byte 4 = 02, bytes 18-19 = b7 00 (EM_AARCH64)
+
+# and where this workspace came from — source build, or restored cache (§3.1)
+cat /tmp/chk/home/ubuntu/uros_ws/.fpms-built
+```
+
+Stage 10 enforces both of these itself now, on every path including a cache
+restore, and fails the build rather than shipping a workspace that does not
+verify.
 
 **4. Then `docs/FLASHING.md`,** and `fpms-selftest` on the board.
 

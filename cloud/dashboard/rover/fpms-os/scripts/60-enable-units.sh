@@ -74,17 +74,47 @@ unit_path() {
 # Print "wants <target>" / "requires <target>" for every install target in the
 # unit's [Install] section. This is the whole of what `systemctl enable` does
 # for these units -- none of them use Alias= or Also=, which would need more.
+# (Re-checked against overlay/etc/systemd/system: no Alias=, no Also=, no
+# RequiredBy=, no DefaultInstance=, and no templates.)
+#
+# Handles all three shapes systemd accepts, because a target this misses is a
+# unit that prints as enabled below and never starts on the rover:
+#   - repeated WantedBy= lines (six units here do this);
+#   - several targets on one line, space separated;
+#   - a line CONTINUED with a trailing backslash. That last one used to be
+#     actively dangerous rather than merely unsupported: "WantedBy=a.target \"
+#     split the literal backslash out as its own target, so the loop below
+#     created /etc/systemd/system/\.wants/ and then dropped the real target on
+#     the continuation line entirely -- silently, in both directions.
+#
+# No backslash inside an awk regex constant. gawk's lexer collapses "\\" before
+# the regex compiler sees it, so /\\[ \t]*$/ does NOT match a line ending in a
+# backslash (measured on gawk 5.4 against a real unit line). substr() is
+# unambiguous and needs no quoting archaeology.
 install_targets() {
     awk '
-        /^[[:space:]]*\[/ { ininstall = ($0 ~ /^[[:space:]]*\[Install\][[:space:]]*$/); next }
+        /^[[:space:]]*\[/ {
+            ininstall = ($0 ~ /^[[:space:]]*\[Install\][[:space:]]*$/); cont = 0; next
+        }
         !ininstall { next }
-        /^[[:space:]]*WantedBy[[:space:]]*=/   { kind = "wants" }
-        /^[[:space:]]*RequiredBy[[:space:]]*=/ { kind = "requires" }
-        kind != "" {
-            line = $0; sub(/^[^=]*=/, "", line)
+        {
+            line = $0
+            if (cont) { kind = contkind }
+            else {
+                kind = ""
+                if (line ~ /^[[:space:]]*WantedBy[[:space:]]*=/)   kind = "wants"
+                if (line ~ /^[[:space:]]*RequiredBy[[:space:]]*=/) kind = "requires"
+                if (kind == "") next
+                sub(/^[^=]*=/, "", line)
+            }
+            cont = 0
+            sub(/[ \t]+$/, "", line)
+            if (length(line) > 0 && substr(line, length(line)) == "\\") {
+                line = substr(line, 1, length(line) - 1)
+                cont = 1; contkind = kind
+            }
             n = split(line, a, /[ \t]+/)
             for (i = 1; i <= n; i++) if (a[i] != "") print kind, a[i]
-            kind = ""
         }
     ' "$1"
 }
@@ -108,20 +138,57 @@ for u in "${BOOT_UNITS[@]}"; do
 
     systemctl enable "$u" >/dev/null 2>&1 || true
 
-    n=0; missing=""
+    n=0; missing=""; bogus=""
     while read -r kind tgt; do
         [ -n "${tgt:-}" ] || continue
+        # $tgt is about to become a DIRECTORY NAME under /etc/systemd/system.
+        # Check it looks like a unit before letting it near mkdir -p: a parse
+        # slip that yields "\", "..", or a path fragment would otherwise create
+        # a junk directory on the image and count as a successful enable. The
+        # parser above is careful, but this is the cheap check that turns any
+        # future parser bug into a build failure instead of a rover that boots
+        # without its mission executor.
+        case "$tgt" in
+            *[!A-Za-z0-9@:._-]*|*/*)
+                bogus="$bogus '$tgt'"; continue ;;
+            *.target|*.service|*.socket|*.timer|*.path|*.mount|*.slice) ;;
+            *) bogus="$bogus '$tgt'"; continue ;;
+        esac
         n=$((n + 1))
         link="$ETC/${tgt}.${kind}/$u"
-        if [ ! -L "$link" ]; then
+        # Three ways this link can be wrong, and only the first is obvious:
+        #   - not a symlink at all: nothing enabled the unit;
+        #   - a symlink that DANGLES: systemd skips it in silence at boot, so
+        #     the unit is listed here as "enabled" and never starts. `systemctl
+        #     enable` can leave one if it resolved the unit body to a path we
+        #     did not, which is exactly the chroot behaviour we do not trust;
+        #   - a symlink to some OTHER path: stale, from a build where the body
+        #     lived elsewhere -- e.g. before the mask section moved a unit into
+        #     $VENDOR.
+        # One `ln -sfn` repairs all three and is idempotent.
+        if [ ! -L "$link" ] || [ ! -e "$link" ] \
+           || [ "$(readlink "$link")" != "$path" ]; then
             mkdir -p "$ETC/${tgt}.${kind}"
-            ln -sf "$path" "$link"
+            # -n so that if $link is somehow a symlink TO A DIRECTORY, ln
+            # replaces it instead of quietly dropping the new link INSIDE it
+            # (where systemd would never look). `|| true` because the check on
+            # the next line is the verdict -- ln's stderr still reaches the log,
+            # and an ln that failed shows up as a missing link with a name
+            # attached, which is a better report than a bare exit at hour 15.
+            ln -sfn "$path" "$link" || true
         fi
-        [ -L "$link" ] || missing="$missing $link"
+        # -e follows the link: "exists AND resolves". A dangling link is not a
+        # working enable and must not be counted as one.
+        [ -L "$link" ] && [ -e "$link" ] || missing="$missing $link"
     done <<EOF
 $(install_targets "$path")
 EOF
 
+    if [ -n "$bogus" ]; then
+        echo "FATAL: $u [Install] yielded target name(s) that are not units:$bogus" >&2
+        echo "  Either the unit file is malformed or install_targets() mis-parsed it." >&2
+        fail=1; continue
+    fi
     if [ "$n" = 0 ]; then
         # `systemctl enable` on a unit with no [Install] prints "The unit files
         # have no installation config" and changes nothing. It would sit in
@@ -130,12 +197,20 @@ EOF
         fail=1; continue
     fi
     if [ -n "$missing" ]; then
-        echo "FATAL: could not create .wants symlink(s) for $u:$missing" >&2
+        echo "FATAL: missing or dangling .wants symlink(s) for $u:$missing" >&2
         fail=1; continue
     fi
     echo "    enabled  $u  ($n link(s))"
 done
-[ "$fail" = 0 ] || { echo "FATAL: one or more boot units could not be enabled" >&2; exit 1; }
+
+# NOT `[ "$fail" = 0 ] || exit 1` here.
+#
+# This is the last substantive stage of a build that takes the better part of a
+# day, and every early exit costs a whole run to learn about the next problem.
+# Nothing after this point depends on the enable loop having succeeded -- the
+# mask section touches different units, and the verify section only reads --
+# so keep going, collect everything, and fail ONCE at the bottom with the full
+# list. One run, one complete answer.
 
 # --- masked, permanently ----------------------------------------------------
 #
@@ -170,7 +245,10 @@ for u in fpms-ros-tunnel.service fpms-rtos-follower.service; do
         chmod 0644 "$VENDOR/$u"; chown root:root "$VENDOR/$u"
         echo "    moved    $u -> $VENDOR (so /etc can hold the mask)"
     fi
-    [ -f "$VENDOR/$u" ] || { echo "FATAL: $u is not shipped anywhere - nothing to mask" >&2; exit 1; }
+    [ -f "$VENDOR/$u" ] || {
+        echo "FATAL: $u is not shipped anywhere - nothing to mask" >&2
+        fail=1; continue
+    }
 
     # Drop any .wants/.requires symlink first. `mask` does not remove those,
     # and a dangling one in multi-user.target.wants is noise in every boot log.
@@ -182,16 +260,25 @@ for u in fpms-ros-tunnel.service fpms-rtos-follower.service; do
     # Verify the symlink, not the exit code, and not `systemctl is-enabled` --
     # which needs the same environment we already decided not to trust.
     if [ ! -L "$ETC/$u" ] || [ "$(readlink "$ETC/$u")" != /dev/null ]; then
-        ln -sf /dev/null "$ETC/$u"
+        ln -sfn /dev/null "$ETC/$u" || true
     fi
     [ -L "$ETC/$u" ] && [ "$(readlink "$ETC/$u")" = /dev/null ] \
-        || { echo "FATAL: could not mask $u ($ETC/$u is not a symlink to /dev/null)" >&2; exit 1; }
+        || { echo "FATAL: could not mask $u ($ETC/$u is not a symlink to /dev/null)" >&2
+             fail=1; continue; }
 
-    # If systemctl IS working here, its opinion is a free second check.
+    # If systemctl IS working here, its opinion is a free second check -- but
+    # only a check, never a verdict. This line used to `exit 1` on any answer
+    # it did not like, which contradicts the doctrine at the top of this file
+    # and hands systemctl exactly the power to kill a sixteen-hour build that
+    # the rest of the stage is written to deny it. A systemctl that cannot
+    # resolve the unit under qemu answers "not-found" and exits 4; the mask
+    # symlink verified two lines above is still on the disk the rover boots.
     state="$(systemctl is-enabled "$u" 2>/dev/null || true)"
     case "$state" in
         masked|masked-runtime|"") ;;
-        *) echo "FATAL: $u masked on disk but systemctl reports '$state'" >&2; exit 1 ;;
+        *) echo "    WARNING: $u is masked on disk but systemctl says '$state'." >&2
+           echo "    The on-disk symlink is what the flashed image boots with;" >&2
+           echo "    treating this as commentary, not as a failure." >&2 ;;
     esac
     echo "    masked   $u"
 done
@@ -208,17 +295,40 @@ done
 #   map cannot ship in an image. Their [Install] sections are absent so they
 #   cannot drift into the boot path by accident.
 #
-# fpms-ros-settle DOES have an [Install], so "not enabled" is a state that has
-# to be actively checked rather than assumed. Delete the symlink directly for
-# the same reason as everything else in this file.
-systemctl disable fpms-ros-settle.service >/dev/null 2>&1 || true
-find "$ETC" /lib/systemd/system "$VENDOR" -mindepth 2 -name fpms-ros-settle.service -type l -delete 2>/dev/null || true
-# Capture, not `find | grep -q`: pipefail turns grep -q's early exit into
-# find's SIGPIPE (141) and the condition reads backwards.
-if [ -n "$(find "$ETC" -mindepth 2 -name fpms-ros-settle.service -type l 2>/dev/null)" ]; then
-    echo "FATAL: fpms-ros-settle.service is still enabled" >&2; exit 1
-fi
-echo "    installed-not-enabled: fpms-ros-settle, fpms-nav2, fpms-slam-mapping, fpms-slam-localization"
+# "not enabled" is a state that has to be actively CHECKED rather than assumed,
+# and that goes for all four, not just fpms-ros-settle.
+#
+# fpms-ros-settle has an [Install] and so is one edit away from being enabled.
+# The other three have none TODAY -- but "their [Install] sections are absent"
+# is a claim about files this stage does not own, and the whole doctrine of
+# this file is that a claim printed to the log is worth nothing next to a check
+# against the disk. Adding a WantedBy= to fpms-nav2.service is exactly the sort
+# of well-meant edit that would put an unmeasured LiDAR transform into the boot
+# path, and until now this stage would have printed
+# "installed-not-enabled: ... fpms-nav2 ..." over the top of it.
+#
+# `disable` is called on all four; it is a no-op on a unit with no [Install]
+# and is only ever advisory here anyway. The find/delete is what actually does
+# the work, for the same reason as everything else in this file.
+for u in fpms-ros-settle.service fpms-nav2.service \
+         fpms-slam-mapping.service fpms-slam-localization.service; do
+    systemctl disable "$u" >/dev/null 2>&1 || true
+    find "$ETC" /lib/systemd/system "$VENDOR" -mindepth 2 -name "$u" -type l -delete 2>/dev/null || true
+    # Capture, not `find | grep -q`: pipefail turns grep -q's early exit into
+    # find's SIGPIPE (141) and the condition reads backwards. Inside `[ -n ... ]`
+    # the substitution's own exit status is discarded, so there is no pipeline and
+    # nothing for pipefail to act on.
+    #
+    # Search the same three roots the delete above swept, not just $ETC: a .wants
+    # link under the vendor tree enables the unit exactly as well as one under
+    # /etc, so checking only /etc would report success over a live symlink.
+    if [ -n "$(find "$ETC" "$VENDOR" /lib/systemd/system -mindepth 2 \
+                  -name "$u" -type l 2>/dev/null)" ]; then
+        echo "FATAL: $u is still enabled" >&2
+        fail=1; continue
+    fi
+    echo "    installed-not-enabled: $u"
+done
 
 # --- verify -----------------------------------------------------------------
 #
@@ -226,11 +336,46 @@ echo "    installed-not-enabled: fpms-ros-settle, fpms-nav2, fpms-slam-mapping, 
 # `systemctl is-enabled` is printed alongside it only as commentary; a "?" here
 # means systemctl could not answer in the chroot, NOT that the unit is broken.
 echo "--- enable state (on disk | systemctl):"
+#
+# Counted with a GLOB, not with `find | wc -l`. That pipeline was the last
+# instance in this file of the bug class that has killed this build twice:
+# under `set -o pipefail` a find that returns non-zero for any reason at all
+# (an unreadable subdirectory is enough) makes the whole `links="$(...)"`
+# assignment non-zero, `set -e` takes the stage down, and 2>/dev/null has
+# already thrown away the only clue -- on the very last screenful of a
+# sixteen-hour build. Measured: `n="$(find /nosuchdir | wc -l)"` under
+# `set -euo pipefail` exits 1 and prints nothing.
+#
+# An unmatched glob here expands to the literal path containing '*', which is
+# not a symlink, so it counts as zero. No nullglob needed, no subshell, no
+# pipeline, nothing for pipefail to act on.
 for u in "${BOOT_UNITS[@]}"; do
-    links="$(find "$ETC" -mindepth 2 -name "$u" -type l 2>/dev/null | wc -l | tr -d ' ')"
+    links=0; dangling=""
+    for l in "$ETC"/*.wants/"$u" "$ETC"/*.requires/"$u"; do
+        [ -L "$l" ] || continue
+        # -e follows the link. A .wants entry pointing at a unit file that is
+        # not there is skipped in silence by systemd at boot: the unit would
+        # print as enabled here and never start on the rover.
+        if [ -e "$l" ]; then links=$((links + 1)); else dangling="$dangling $l"; fi
+    done
     printf '    %-36s %s link(s) | %s\n' \
         "$u" "$links" "$(systemctl is-enabled "$u" 2>/dev/null || echo '?')"
-    [ "$links" -ge 1 ] || { echo "FATAL: $u ended with no .wants symlink" >&2; exit 1; }
+    # Collected, not exited on. This loop walks every boot unit; exiting at the
+    # first bad one meant learning about exactly one broken unit per build, and
+    # a build is fifteen hours. Print the whole table, flag every fault in it,
+    # and decide once at the bottom.
+    [ -z "$dangling" ] \
+        || { echo "FATAL: $u has dangling .wants symlink(s):$dangling" >&2; fail=1; }
+    [ "$links" -ge 1 ] || { echo "FATAL: $u ended with no .wants symlink" >&2; fail=1; }
 done
+
+# The one and only exit. Everything above records into $fail and keeps going,
+# so a single run reports every fault it can see rather than the first one.
+[ "$fail" = 0 ] || {
+    echo "FATAL: 60-enable-units found faults above. The image is NOT bootable as" >&2
+    echo "  intended - at least one unit would be missing at boot with nothing at" >&2
+    echo "  runtime to say so. Fix them all, then resume with: sudo ./build.sh --from 50" >&2
+    exit 1
+}
 
 echo "--- 60-enable-units OK"

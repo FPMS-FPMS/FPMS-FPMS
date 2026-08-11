@@ -49,7 +49,18 @@ find_wifi_iface() {
         [ -e "$d/wireless" ] && { basename "$d"; return 0; }
     done
     # Fall back to iw's own view, in case a driver does not populate sysfs.
-    iw dev 2>/dev/null | awk '/^\tInterface/ {print $2; exit}'
+    #
+    # Capture then filter -- NOT `iw dev | awk '...exit'`. This script sets
+    # `pipefail`, and awk's `exit` closes the pipe while iw is still writing, so
+    # iw dies of SIGPIPE and the pipeline reports 141 rather than awk's result.
+    # Without `set -e` that does not kill the script, it just corrupts the
+    # status -- which is arguably worse here, because this is the fallback path
+    # that runs precisely when sysfs did not name the interface, so the failure
+    # would only ever appear on the hardware where the first method already
+    # failed. Same shape has taken the image build down twice.
+    local out
+    out="$(iw dev 2>/dev/null || true)"
+    awk '/^[[:space:]]*Interface/ {print $2; exit}' <<<"$out" || true
 }
 
 power_save_state() {

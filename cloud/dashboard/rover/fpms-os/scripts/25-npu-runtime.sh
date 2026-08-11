@@ -10,21 +10,29 @@
 #
 # It supersedes the "--- the NPU" block in 20-python-deps.sh.
 #
-#   !! Stage 20 still contains that block. It is now REDUNDANT. This stage runs
-#   !! after it (build.sh globs scripts/[0-9]*.sh, so 25 sorts after 20) and
-#   !! overwrites both halves, so the image is correct either way - but the
-#   !! duplicate download should be deleted from stage 20 by its owner.
-#   !! Do NOT fix it from here: scripts/20-python-deps.sh is not this agent's
-#   !! file, and two agents editing one script is how this repo gets a third
-#   !! near-identical copy of something.
+#   BOTH HANDOVERS TO STAGE 20'S OWNER HAVE BEEN TAKEN UP. Re-read 2026-08-11,
+#   so the warnings that used to stand here are deleted rather than left to rot
+#   into a lie that a later reader has to disprove:
 #
-#   !! HANDOVER TO STAGE 20'S OWNER, measured 2026-08-10 (see "PIP AND
-#   !! --break-system-packages" below): stage 20 line 66 and line 81 pass
-#   !! --break-system-packages unconditionally. Ubuntu 22.04 ships pip 22.0.2;
-#   !! that option was added in pip 23.0.1. On this base those lines fail with
-#   !! "no such option", under `set -e`, and the build dies in stage 20 before
-#   !! it ever reaches here. This stage now DETECTS the flag instead of
-#   !! assuming it; stage 20 must do the same.
+#     - the duplicate download is GONE. scripts/20-python-deps.sh says
+#       "WHAT IT NO LONGER OWNS: the NPU", and its "--- the NPU" block is a
+#       pointer to this stage with no wget in it. There is exactly one
+#       librknnrt.so download in this repository now, and it is below.
+#     - --break-system-packages is DETECTED in stage 20 too - same
+#       `pip3 install --help` probe as the one below, under its
+#       "--- how to talk to this pip" heading - so the build no longer dies in
+#       stage 20 on pip 22.0.2 before it can reach here.
+#
+#   NO LINE NUMBERS INTO STAGE 20 ANY MORE, and that is a correction, not a
+#   style preference. This block used to cite "line 210 onward" and "lines
+#   178-187"; re-checked 2026-08-11 those are line 249 and lines 175-228. The
+#   references rotted within days of being written and a reader who followed
+#   them landed in the middle of the paho-mqtt note. Cite the headings instead:
+#   they are greppable, and they move with the text they name.
+#     grep -n 'the NPU\|how to talk to this pip' scripts/20-python-deps.sh
+#
+#   Still do NOT edit stage 20 from here. Two agents editing one script is how
+#   this repo gets a third near-identical copy of something.
 #
 # WHY A SEPARATE STAGE AT ALL
 # ===========================
@@ -49,20 +57,45 @@ JSON=/etc/fpms/npu-versions.json
 SO_URL_USED="$SO_URL_CONF"
 WHEEL_URL_USED="$WHEEL_URL_CONF"
 
-TMP="$(mktemp -d)"
+# `if !`, not a bare `TMP="$(mktemp -d)"`. A plain assignment ADOPTS the exit
+# status of its command substitution, so under `set -e` a failing mktemp kills
+# this stage on its fourth line - before the trap below exists, before anything
+# has been echoed, and with only mktemp's own one-liner on stderr to explain a
+# stage that appeared to do nothing at all. This is the same shape that has
+# killed this build twice; it is spelled out everywhere else in this file and
+# it had no business being unguarded here.
+if ! TMP="$(mktemp -d)"; then
+    echo "FATAL: mktemp -d failed inside the chroot." >&2
+    echo "This stage stages a 7 MB download through it. Check /tmp exists and the" >&2
+    echo "image has free space (build.sh's report_space prints the numbers)." >&2
+    exit 1
+fi
 trap 'rm -rf "$TMP"' EXIT
 
 # /etc/fpms must exist NOW. The overlay that creates it is applied in stage 50,
 # which runs LATER, so this stage cannot rely on it.
 #
-# VERIFIED 2026-08-10: scripts/00-base-system.sh line 124 does
+# RE-VERIFIED 2026-08-11: scripts/00-base-system.sh line 583 does
 # `install -d -m 0755 /etc/fpms`, so on a full build the directory is already
-# there. This line is kept anyway and is NOT redundant belt-and-braces: build.sh
-# --stage 25 runs this stage ALONE against a freshly copied base image (main()
-# always calls prepare_image()), so stage 00 has not run and /etc/fpms does not
-# exist. Without this line the single-stage re-run - the exact command every
-# error message in this file tells the operator to type - fails at the last
-# line with "No such file or directory".
+# there.
+#
+# THE REASON THIS LINE EXISTS HAS CHANGED, and the old reason is now wrong, so
+# it is restated rather than left standing. build.sh no longer calls
+# prepare_image() for --stage/--from: main() (build.sh line 1016) calls
+# resume_image() (line 611), which re-attaches the EXISTING $OUT image instead
+# of re-copying the vendor base - precisely so that a stage failing 90 minutes
+# in can be re-run without throwing away stage 00 and stage 10. So on the
+# ordinary `--stage 25` re-run, /etc/fpms is already there and this line is a
+# no-op.
+#
+# It is still NOT redundant, because of `--fresh`. build.sh line 1019-1027:
+# --stage/--from with no image present REQUIRES --fresh, and --fresh takes the
+# prepare_image() branch - a pristine base rootfs on which stage 00 has never
+# run - and then runs ONLY this stage. Without this line
+# `sudo ./build.sh --stage 25 --fresh` fails at write_json with "No such file
+# or directory", ~15 minutes of download after the last thing it printed.
+# `install -d` is idempotent, so the cost of being right in both worlds is one
+# syscall.
 install -d -m 0755 /etc/fpms
 
 # ---------------------------------------------------------------------------
@@ -109,7 +142,17 @@ install -d -m 0755 /etc/fpms
 # file) and to build.sh's in_chroot() env list, and this stage will record it.
 write_json() {   # write_json <status>
     local status="$1"
-    python3 - "$JSON" "$status" <<'PY'
+    # The exit status of this heredoc IS consulted (`if ! python3 ...`), which
+    # it was not before 2026-08-11. It used to be a bare command: a python that
+    # died left `chmod 0644 "$JSON"` to fail on a file that was never created,
+    # and the operator got "chmod: cannot access" as the diagnosis for "the
+    # build record could not be written".
+    #
+    # And this is FATAL even on the ALLOW_NPU_MISSING path that calls it from
+    # npu_fail. An image with no NPU and no record saying so is exactly the
+    # artifact this stage exists to make impossible - indistinguishable from a
+    # good one. If we cannot write the record, we do not ship the image.
+    if ! python3 - "$JSON" "$status" <<'PY'
 import json, os, sys, time
 
 out, status = sys.argv[1], sys.argv[2]
@@ -214,10 +257,23 @@ doc = {
     "doc": "fpms-os/npu/versions/README.md",
 }
 
-with open(out, "w") as fh:
+# encoding= is explicit, and not decoration. build.sh's in_chroot() runs
+# `env -i ... LC_ALL=C`, and what python does with a C locale is a moving
+# target across versions and build options (PEP 538 locale coercion is skipped
+# when LC_ALL is set; PEP 540 UTF-8 mode then usually rescues it - "usually"
+# being the operative word). Naming the codec means this stage does not depend
+# on which of those two applies. json.dump defaults to ensure_ascii=True, so
+# the bytes written are ASCII either way; this only pins how they get there.
+with open(out, "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2)
     fh.write("\n")
 PY
+    then
+        echo "FATAL: could not write the NPU build record $JSON" >&2
+        echo "An image whose NPU state is unrecorded is indistinguishable from a good" >&2
+        echo "one. Refusing to continue. Check that /etc/fpms exists and is writable." >&2
+        exit 1
+    fi
     chmod 0644 "$JSON"
     echo "    $JSON  (status=$status)"
 }
@@ -245,45 +301,56 @@ PY
 # The stream-only image is still buildable, but only DELIBERATELY, and it
 # records that it is crippled so it can never be mistaken for a good one.
 #
-# THE MARKER FILE HAS MOVED, AND THE OLD INSTRUCTIONS COULD NOT WORK.
-# This block used to say:
+# HOW TO ACTUALLY SET IT. This used to say
 #
 #     sudo touch .build/mnt/opt/fpms-os/ALLOW_NPU_MISSING
-#     sudo ./build.sh --stage 25
 #
-# Read build.sh before believing that. TWO separate things destroy the marker
-# between the touch and this line:
+# which could not work, because stage_all() opens with
+# `rm -rf '$MNT/opt/fpms-os'` and re-copies the repo's tree over it. RE-READ
+# 2026-08-11: build.sh has since closed BOTH halves of that hole, so the
+# mechanism below is checked against the build.sh in this worktree rather than
+# against the one that existed when the escape hatch was written.
 #
-#   1. stage_all() opens with `rm -rf '$MNT/opt/fpms-os'` and then re-copies
-#      the repo's scripts/ overlay/ selftest/ docs/ firstboot/ into it. Anything
-#      the operator put in /opt/fpms-os is deleted at the start of every run,
-#      including a --stage run.
-#   2. main() runs prepare_image() unconditionally, which does
-#      `cp --sparse=always <base> $OUT` and re-mounts. `--stage 25` is not a
-#      re-run against the existing chroot at all - it rebuilds the rootfs from
-#      the pristine base image first. So .build/mnt is a different filesystem
-#      by the time the stage runs.
+#   1. build.sh line 819-826 now saves the marker across its own wipe:
+#          local keep_npu_marker=0
+#          [ -e "$MNT/opt/fpms-os/ALLOW_NPU_MISSING" ] && keep_npu_marker=1
+#          run "rm -rf '$MNT/opt/fpms-os'" ; ... ; touch it back
+#      so the second candidate path below survives.
+#   2. build.sh line 797 now passes FPMS_ALLOW_NPU_MISSING through the `env -i`
+#      list in CHROOT_ENV, so the environment variable is live on the normal
+#      path and not only inside `build.sh --shell`.
 #
-# The consequence is that NO path inside the chroot can be pre-created by the
-# operator. The marker has to arrive from the HOST, through something build.sh
-# copies in - and scripts/ is exactly that. So the marker is a file in the
-# repository's own scripts/ directory:
+# THREE ways in, all checked below, in the order they are looked for:
 #
-#     touch scripts/ALLOW_NPU_MISSING          # in the repo, on the host
-#     sudo ./build.sh                          # or --stage 25
-#     rm scripts/ALLOW_NPU_MISSING             # afterwards, deliberately
+#   a. touch scripts/ALLOW_NPU_MISSING       # in the repo, on the host
+#      sudo ./build.sh                       # or --stage 25
+#      rm scripts/ALLOW_NPU_MISSING          # afterwards, deliberately
 #
-# It lands at /opt/fpms-os/scripts/ALLOW_NPU_MISSING in the chroot. build.sh
-# globs scripts/[0-9]*.sh, so a file with no leading digit is never executed as
-# a stage. It shows up in `git status`, which is the point: a deliberately
-# crippled image should be hard to produce by accident and impossible to
-# produce without leaving a trace.
+#      Lands at /opt/fpms-os/scripts/ALLOW_NPU_MISSING because build.sh copies
+#      the whole scripts/ directory in. build.sh globs scripts/[0-9]*.sh, so a
+#      file with no leading digit is never executed as a stage, and
+#      `chmod +x .../scripts/*.sh` does not touch it either. PREFER THIS ONE:
+#      it shows up in `git status`, which is the point. A deliberately crippled
+#      image should be hard to produce by accident and impossible to produce
+#      without leaving a trace.
 #
-# (A marker FILE, not an environment variable, because build.sh's in_chroot()
-# runs `env -i` with an explicit variable list. FPMS_ALLOW_NPU_MISSING is
-# accepted below for anyone running a stage by hand inside `build.sh --shell`,
-# but it is DEAD on the normal path - `env -i` strips it, and adding it to
-# in_chroot() means editing build.sh, which is not this agent's file.)
+#   b. sudo touch .build/mnt/opt/fpms-os/ALLOW_NPU_MISSING
+#      Now works, per (1) - but only for runs that resume this image, and it
+#      leaves no trace in the repository. It is honoured, not recommended.
+#
+#   c. sudo FPMS_ALLOW_NPU_MISSING=1 ./build.sh --stage 25
+#      NOTE THE PLACEMENT. It must be on the sudo command line: sudo's default
+#      env_reset drops an exported FPMS_ALLOW_NPU_MISSING from the operator's
+#      shell before build.sh ever sees it, and build.sh then substitutes its
+#      `${FPMS_ALLOW_NPU_MISSING:-0}` default. `export FPMS_...=1; sudo ./build.sh`
+#      silently does nothing.
+#
+# The third path, /etc/fpms/ALLOW_NPU_MISSING, is inside the rootfs itself. It
+# survives a resume but not a --fresh, and unlike (a) and (b) it would SHIP in
+# the finished image (stage 50 chmods everything in /etc/fpms and removes
+# nothing). Do not use it deliberately; it is checked because an older
+# procedure told people to create it and a marker that is silently ignored is
+# worse than one that is honoured.
 #
 # When the marker is present the stage writes npu-versions.json with
 # "status": "ABSENT".
@@ -352,8 +419,22 @@ EOF
 #
 # These use plain `exit 1`, NOT npu_fail: a chroot that is not aarch64/3.10 is
 # not an NPU problem and ALLOW_NPU_MISSING must not wave it through.
+#
+# PYV IS CAPTURED THROUGH AN `if !`, not a bare assignment. `PYV="$(python3
+# ...)"` adopts python3's exit status, so a python that is missing or that
+# segfaults under qemu-user takes the stage out HERE - three lines before the
+# message that would have named the problem, and with nothing of ours on
+# stderr. That is the precise failure this block exists to prevent, and the
+# block was committing it itself. `uname -m` is left as a plain assignment: it
+# is a builtin-grade syscall wrapper with no failure mode short of a broken
+# coreutils, and an unreadable arch is caught by the string compare below.
 ARCH="$(uname -m)"
-PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if ! PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"; then
+    echo "FATAL: could not run python3 in the chroot to read its version." >&2
+    echo "Every stage from 20 onward needs it, and this stage needs cp310 exactly." >&2
+    echo "Check that qemu-aarch64 binfmt is registered and that stage 00 completed." >&2
+    exit 1
+fi
 [ "$ARCH" = "aarch64" ] || { echo "FATAL: chroot reports arch '$ARCH', expected aarch64." >&2
     echo "The rknn-toolkit-lite2 wheel is aarch64-only. Is qemu-aarch64 binfmt registered?" >&2; exit 1; }
 [ "$PYV" = "3.10" ] || { echo "FATAL: chroot python is $PYV, expected 3.10." >&2
@@ -416,13 +497,39 @@ Python is the interpreter itself.
 import re
 import sys
 import json
+import time
 import urllib.error
 import urllib.request
+
+# Diagnostics must never be the thing that kills the resolver. Under
+# `env -i ... LC_ALL=C` sys.stdout can come up with a strict ASCII codec, and a
+# single non-ASCII byte in an upstream path or an exception message would then
+# raise UnicodeEncodeError out of a sys.stderr.write() - turning "here are the
+# eight URLs I tried" into a traceback. stderr already defaults to
+# backslashreplace; this says so for both streams instead of relying on it.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="backslashreplace")
+    except Exception:                                       # noqa: BLE001
+        pass
 
 UA = "fpms-os-25-npu-runtime"
 TIMEOUT = 30
 API = "https://api.github.com"
 
+# TERMINATION, stated as numbers rather than hoped for. candidates() is finite
+# by construction (a fixed 3x2 path grid, then two non-recursive directory
+# listings), but "finite" is not the same as "finishes before the operator goes
+# home": every candidate is a network probe with a 30 s timeout, and an upstream
+# directory that grew could make that a lot of probes. These two caps make the
+# worst case arithmetic instead of an argument.
+MAX_CANDIDATES = 24
+DEADLINE_S = 300
+STARTED = time.monotonic()
+
+if len(sys.argv) != 3 or sys.argv[1] not in ("so", "wheel"):
+    sys.stderr.write("usage: resolve_url.py <so|wheel> <configured-url>\n")
+    sys.exit(2)
 kind, configured = sys.argv[1], sys.argv[2]
 tried = []
 
@@ -471,11 +578,20 @@ def content_ok(head):
 
 
 def check(url):
+    # A URL we cannot even emit as ASCII is not a URL wget can be handed, and
+    # printing it is how this function reports. Reject it here, with a note, so
+    # it appears in the tried list like any other miss.
+    try:
+        url.encode("ascii")
+    except UnicodeEncodeError:
+        tried.append((url, "not an ASCII URL; refusing to hand it to wget"))
+        return False
     ok, size, head, note = probe(url)
     if ok and not content_ok(head):
         ok, note = False, "%s but the bytes are not a %s (first 16: %r)" % (
             note, "aarch64 ELF64" if kind == "so" else "zip/wheel", head[:16])
-    tried.append((url, note if not ok else "%s, %s bytes  <-- USED" % (note, size)))
+    tried.append((url, note if not ok else "%s, %s bytes  <-- USED" % (
+        note, size if size is not None else "unknown")))
     return ok
 
 
@@ -506,6 +622,16 @@ def api_listdir(owner, repo, ref, path):
         return []
 
 
+def dirs(entries):
+    """Directory entries that carry both the fields the caller goes on to use.
+    Filtering here is what lets the callers below index d["path"]/sub["name"]
+    without a KeyError."""
+    for e in entries:
+        if (isinstance(e, dict) and e.get("type") == "dir"
+                and e.get("path") and e.get("name")):
+            yield e
+
+
 def candidates():
     """The configured URL first, always."""
     yield configured
@@ -527,15 +653,19 @@ def candidates():
         # (Not the recursive trees API: rknn-toolkit2 is large enough that a
         # recursive tree can come back truncated, and a truncated tree that
         # happens not to contain the file is indistinguishable from absence.)
-        for d in api_listdir(owner, repo, ref, "rknpu2/runtime"):
-            if d.get("type") != "dir":
-                continue
-            for sub in api_listdir(owner, repo, ref, "%s/librknn_api" % d["path"]):
-                if sub.get("type") != "dir":
-                    continue
+        # .get() with a default on EVERY field, never d["path"]. The contents
+        # API is a fallback that runs precisely when things are already wrong,
+        # and one unexpected entry shape raising KeyError out of this generator
+        # would abort the loop below BEFORE it prints the tried list - losing
+        # the one diagnostic this resolver exists to produce.
+        for d in dirs(api_listdir(owner, repo, ref, "rknpu2/runtime")):
+            for sub in dirs(api_listdir(
+                    owner, repo, ref, "%s/librknn_api" % d["path"])):
                 if "arch64" not in sub["name"] and sub["name"] != "arm64":
                     continue
                 for f in api_listdir(owner, repo, ref, sub["path"]):
+                    if not isinstance(f, dict) or not f.get("path"):
+                        continue
                     if f.get("name") == "librknnrt.so":
                         yield raw(owner, repo, ref, f["path"])
     else:
@@ -545,15 +675,36 @@ def candidates():
         # aarch64.
         parent = path.rsplit("/", 1)[0]
         for f in api_listdir(owner, repo, ref, parent):
+            if not isinstance(f, dict) or not f.get("path"):
+                continue
             n = f.get("name", "")
             if n.endswith(".whl") and "cp310" in n and "aarch64" in n:
                 yield raw(owner, repo, ref, f["path"])
 
 
+def safe_candidates():
+    """candidates() with a fence around it. Anything that escapes the generator
+    becomes a stderr line and an early end of the list, NOT a traceback that
+    replaces the report at the bottom of this file."""
+    try:
+        for u in candidates():
+            yield u
+    except Exception as e:                                  # noqa: BLE001
+        sys.stderr.write("    (candidate enumeration stopped: %s: %s)\n"
+                         % (type(e).__name__, e))
+
+
 seen = set()
-for url in candidates():
+for url in safe_candidates():
     if url in seen:
         continue
+    if len(seen) >= MAX_CANDIDATES:
+        sys.stderr.write("    (stopping after %d candidates - the cap)\n"
+                         % MAX_CANDIDATES)
+        break
+    if time.monotonic() - STARTED > DEADLINE_S:
+        sys.stderr.write("    (stopping after %d s - the budget)\n" % DEADLINE_S)
+        break
     seen.add(url)
     if check(url):
         print(url)
@@ -622,7 +773,15 @@ echo "    fetching librknnrt.so"
 # build. GitHub's /raw/ path redirects to raw.githubusercontent.com; wget
 # follows that by default, and the resolver above has already followed it once
 # and validated the bytes on the other side.
-if ! wget -q --tries=3 --timeout=30 -O "$TMP/librknnrt.so" "$SO_URL_USED"; then
+#
+# -nv, NOT -q. `-q` is TOTALLY silent: on a 404, a TLS failure or a DNS failure
+# it writes nothing at all, so npu_fail's "could not download librknnrt.so"
+# below would be the entire diagnosis and the operator would have to re-run the
+# fetch by hand to learn which of those three it was. -nv suppresses the
+# progress bar (the only thing that made -q attractive - it is noise in a build
+# log) and keeps the error line and the resolved redirect target, which is
+# exactly the pair worth having when a Rockchip path moves.
+if ! wget -nv --tries=3 --timeout=30 -O "$TMP/librknnrt.so" "$SO_URL_USED"; then
     npu_fail "could not download librknnrt.so from $SO_URL_USED" \
              "sudo wget -O $SO_DEST $SO_URL_USED && sudo ldconfig"
 fi
@@ -674,11 +833,52 @@ install -m 0644 -o root -g root "$TMP/librknnrt.so" "$SO_DEST"
 # VERIFIED 2026-08-10: the v2.3.0 artifact does carry DT_SONAME=librknnrt.so,
 # so it is a file ldconfig can legitimately index and the warning below is a
 # real signal rather than a permanent false alarm.
-ldconfig
+#
+# `|| echo`, not a bare `ldconfig`. A bare one is a `set -e` trip-wire, and it
+# is the wrong policy in this exact spot: eight lines below, this file argues
+# that librknnrt.so being absent from the ld.so cache is NOT fatal, because the
+# runtime may dlopen it by absolute path - and the verify step at the bottom of
+# this stage does precisely that, `ctypes.CDLL("/usr/lib/librknnrt.so")`. So a
+# cache the loader could not rebuild must not be a harder failure than a cache
+# that simply lacks the entry. ldconfig under qemu-user is also the kind of
+# thing that emits a non-zero for an unrelated malformed entry inherited from
+# the vendor rootfs, which would have killed the stage one line after the .so
+# installed correctly.
+ldconfig || echo "    WARNING: ldconfig exited non-zero; the ld.so cache may be stale" >&2
 # NOT `ldconfig -p | grep -q`. Under `set -o pipefail`, grep -q exits the
 # instant it matches, ldconfig takes SIGPIPE, and the pipeline's status becomes
 # 141 - so the SUCCESS case would have printed the failure warning. Capture
 # first, match second.
+#
+# SWEPT 2026-08-11, because a rule written down in one place is not a rule.
+#
+#   RE-SWEPT the same day, because the sweep was WRONG. This comment used to
+#   claim "THERE ARE NOW NO PIPELINES AT ALL IN THIS FILE" and listed
+#   SO_SHA="$(sha256sum "$SO_DEST" | awk '{print $1}')" among the three it had
+#   removed. That line was still there, ~70 lines below this one, exactly as
+#   written. A sweep that certifies itself is worth nothing; verify it:
+#
+#     grep -nE '\|[^|]' scripts/25-npu-runtime.sh
+#
+#   (the surviving hits are comment text and JSON string literals - the
+#   `strings ... | grep` recipes this file tells an operator to run on the
+#   board, which are documentation, not pipelines this shell executes.)
+#
+# The four that existed were
+#
+#     SO_VER="$(printf ... | sed -n 1p)"
+#     SO_VER_FULL="$(printf ... | sed -n 2p)"
+#     SO_SHA="$(sha256sum "$SO_DEST" | awk '{print $1}')"
+#     WHEEL_VER/NUMPY_VER/... via five separate python3 -c calls
+#
+# and none of them was the SIGPIPE variant - `sed -n Np` without `q` and
+# `awk '{print $1}'` without `exit` both drain their input, so neither could
+# raise 141. They are gone anyway, replaced by shell builtins and by parameter
+# expansion, on the grounds that this build has now died twice to a pipeline
+# inside a plain assignment and the cheapest way to never make that mistake a
+# fourth time is to leave no pipeline in an assignment for a later edit to make
+# early-exiting. (It also removes forks per run, which under qemu-user is an
+# emulator start-up each.)
 LDCACHE="$(ldconfig -p 2>/dev/null || true)"
 case "$LDCACHE" in
     *librknnrt.so*) : ;;
@@ -704,19 +904,44 @@ esac
 # ONE python invocation reading the file ONCE, not two reading it twice. Under
 # qemu-user each interpreter start-up is an emulator start-up and this is a
 # 7 MB read plus a regex scan; there is no reason to pay for it twice.
-SO_VERS="$(python3 - "$SO_DEST" <<'PY'
+#
+# The file is opened "rb" and the decodes below are "backslashreplace", NOT
+# "replace": "replace" yields U+FFFD, and printing U+FFFD on a stdout that came
+# up as strict ASCII (`env -i ... LC_ALL=C`) raises UnicodeEncodeError - which
+# would turn "this .so has an odd version string" into a dead stage.
+# backslashreplace produces \xNN, which is ASCII by construction.
+#
+# And the exit status IS checked. This was a bare `SO_VERS="$(python3 ...)"`,
+# which is the assignment-adopts-the-status shape that has killed this build
+# twice; a python that died here would have taken the stage with it and the
+# only clue would have been a traceback with no line of our own around it.
+# Failing to READ a version is not a reason to fail the build, so it warns.
+if ! SO_VERS="$(python3 - "$SO_DEST" <<'PY'
 import re
 import sys
 with open(sys.argv[1], "rb") as fh:
     data = fh.read()
 short = re.search(rb"librknnrt version:?\s*([0-9][0-9A-Za-z._-]*)", data, re.I)
 full = re.search(rb"librknnrt version[^\x00]{0,160}", data, re.I)
-print(short.group(1).decode("ascii", "replace") if short else "")
-print(full.group(0).decode("ascii", "replace").strip() if full else "")
+print(short.group(1).decode("ascii", "backslashreplace") if short else "")
+print(full.group(0).decode("ascii", "backslashreplace").strip() if full else "")
 PY
-)"
-SO_VER="$(printf '%s\n' "$SO_VERS" | sed -n 1p)"
-SO_VER_FULL="$(printf '%s\n' "$SO_VERS" | sed -n 2p)"
+)"; then
+    echo "    WARNING: the version scan of $SO_DEST failed (see the error above);" >&2
+    echo "    librknnrt.version will be null in $JSON" >&2
+    SO_VERS=""
+fi
+# Split with the shell, no `| sed -n Np`. `read` returns non-zero at EOF, so
+# each one is paired with a `|| assignment` - the read is then not the final
+# command of a `||` list and `set -e` leaves it alone, and the group's own exit
+# status is the assignment's 0. Verified with `set -euo pipefail` before it went
+# in; the two-empty-lines case (no version string found) is the one that ends
+# at EOF on the second read.
+SO_VER=""
+SO_VER_FULL=""
+{   IFS= read -r SO_VER      || SO_VER=""
+    IFS= read -r SO_VER_FULL || SO_VER_FULL=""
+} <<<"$SO_VERS"
 if [ -z "$SO_VER" ]; then
     # Not fatal: the .so is a valid aarch64 ELF and may simply have a version
     # string this pattern does not match. But it means the record is
@@ -728,9 +953,32 @@ else
     echo "    librknnrt version: $SO_VER"
 fi
 
-SO_SHA="$(sha256sum "$SO_DEST" | awk '{print $1}')"
-SO_SIZE="$(stat -c %s "$SO_DEST")"
-echo "    librknnrt.so  $SO_SIZE bytes  sha256 $SO_SHA"
+# THE PIPELINE THE SWEEP ABOVE MISSED. It was
+#
+#     SO_SHA="$(sha256sum "$SO_DEST" | awk '{print $1}')"
+#
+# a pipeline inside a plain assignment, which is the exact shape that has taken
+# this build down twice. `awk '{print $1}'` drains its input so it could not
+# raise the SIGPIPE/141 variant - but sha256sum returning non-zero (the file
+# vanished, an I/O error on the loop device) would still be adopted by the
+# assignment and kill the stage silently, one line after a successful install
+# and with no output of its own. Split with parameter expansion instead:
+# "<64 hex> *<path>" -> the field before the first space. No fork, no pipe, no
+# status to adopt.
+#
+# Neither of these is fatal: a build record with a null sha or size is worse
+# than a complete one but far better than a dead stage, and the .so has already
+# been proved to be a whole aarch64 ELF by this point.
+if ! SO_SHA_RAW="$(sha256sum "$SO_DEST")"; then
+    echo "    WARNING: sha256sum failed on $SO_DEST; librknnrt.sha256 will be null" >&2
+    SO_SHA_RAW=""
+fi
+SO_SHA="${SO_SHA_RAW%% *}"
+if ! SO_SIZE="$(stat -c %s "$SO_DEST")"; then
+    echo "    WARNING: stat failed on $SO_DEST; librknnrt.size_bytes will be null" >&2
+    SO_SIZE=""
+fi
+echo "    librknnrt.so  ${SO_SIZE:-?} bytes  sha256 ${SO_SHA:-?}"
 
 # Exported NOW, not at the end. If the wheel half of this stage fails under
 # ALLOW_NPU_MISSING, npu_fail writes the record immediately - and an ABSENT
@@ -765,14 +1013,47 @@ export SO_VER SO_VER_FULL SO_SHA SO_SIZE SO_URL_USED
 # So the flag is DETECTED, not assumed - because the day this image is rebased
 # onto 24.04 the marker WILL be there and the flag WILL be required, and a
 # stage that hardcodes either answer is wrong on one of the two bases.
-PIP_HELP="$(pip3 install --help 2>&1 || true)"
+#
+# THE PROBE IS NOW BYTE-FOR-BYTE STAGE 20'S, and the two differences it used to
+# have were both wrong in this direction:
+#
+#   - it captured `2>&1`, merging pip's STDERR into the text it then searches
+#     for the literal "--break-system-packages". Anything pip writes to stderr
+#     is thereby evidence: a deprecation notice, a "new release of pip is
+#     available" banner, or - the case that actually matters - a pip that
+#     rejects the flag while NAMING it ("no such option:
+#     --break-system-packages"). A detector that reads its own failure message
+#     as a positive is worse than no detector, because the flag then goes on
+#     the pip3 command line below and jammy's pip 22.0.2 exits 2. Stage 20 uses
+#     2>/dev/null for exactly this reason; so does this now.
+#   - it had no arm for EMPTY output. Empty help is not evidence the flag is
+#     absent, it is evidence pip is broken, and silently taking the "absent"
+#     branch on it is a guess that happens to be right on jammy and wrong on
+#     any PEP 668 base - where the install below then dies with
+#     "externally-managed-environment", which reads like a policy decision
+#     rather than a failed detection. Stage 20 says so out loud; so does this.
+#
+# The pip version is read the same way stage 20 reads it, by parameter
+# expansion off `pip3 --version` - "pip 22.0.2 from /usr/... (python 3.10)" ->
+# 22.0.2 - so the message names the pip that was actually probed rather than
+# leaving the reader to infer it. No pipeline, nothing to adopt a status from.
+PIP_VER_RAW="$(pip3 --version 2>/dev/null || true)"
+PIP_VER="${PIP_VER_RAW#pip }"
+PIP_VER="${PIP_VER%% *}"
+
+PIP_HELP="$(pip3 install --help 2>/dev/null || true)"
 PIP_FLAGS=()
 case "$PIP_HELP" in
+    "")
+        echo "    WARNING: 'pip3 install --help' produced no output (pip ${PIP_VER:-?})." >&2
+        echo "    Could not detect --break-system-packages; continuing without it." >&2
+        echo "    If the wheel install below fails with 'externally-managed-environment'," >&2
+        echo "    this detection is why, not the URL and not the numpy pin." >&2 ;;
     *--break-system-packages*)
         PIP_FLAGS+=(--break-system-packages)
-        echo "    pip supports --break-system-packages (PEP 668 base); using it" ;;
+        echo "    pip ${PIP_VER:-?} has --break-system-packages (PEP 668 base); using it" ;;
     *)
-        echo "    pip has no --break-system-packages (pip < 23.0.1); not using it" ;;
+        echo "    pip ${PIP_VER:-?} has no --break-system-packages (pip < 23.0.1); not needed on jammy" ;;
 esac
 
 # NUMPY CONSTRAINT. rknn-toolkit-lite2's METADATA declares, verbatim:
@@ -915,19 +1196,67 @@ then
              "python3 -c \"import ctypes; ctypes.CDLL('$SO_DEST').rknn_init; from rknnlite.api import RKNNLite; RKNNLite()\""
 fi
 
-jget() {   # jget <key> - read one string field out of the verify result
-    python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' \
-            "$VERIFY_OUT" "$1"
-}
-jflag() {  # jflag <key> - 1/0, for the build record
-    python3 -c 'import json,sys; print(1 if json.load(open(sys.argv[1])).get(sys.argv[2]) else 0)' \
-            "$VERIFY_OUT" "$1"
-}
-WHEEL_VER="$(jget wheel_version)"
-NUMPY_VER="$(jget numpy_version)"
-DLOPEN_OK="$(jflag dlopen_ok)"
-IMPORT_OK="$(jflag import_ok)"
-CONSTRUCT_OK="$(jflag rknnlite_constructible)"
+# ONE python invocation for all five fields, read out with the same
+# capture-then-split idiom used for the version string above.
+#
+# THIS REPLACES jget()/jflag(), which were five separate
+#
+#     WHEEL_VER="$(jget wheel_version)"
+#
+# lines - five plain assignments, each adopting the exit status of its own
+# `python3 -c`. A malformed or truncated $VERIFY_OUT (the verify step was
+# SIGKILLed by the OOM killer after writing half its json, say) makes
+# json.load raise, and the FIRST of those five assignments then takes the whole
+# stage out with a traceback and no line of ours around it - after the .so and
+# the wheel both installed correctly, and before the numpy gate that is the
+# only remaining reason this stage exists. It is also five interpreter
+# start-ups, which under qemu-user is five emulator start-ups to read five
+# fields out of one small file this stage wrote itself moments ago.
+#
+# Failing to PARSE the verify record is not the same as failing verification -
+# verification already passed, above, on that python's own exit status. So this
+# warns and leaves the record's fields null rather than failing the build. The
+# one field that must not be silently null is numpy, and it is not: an empty
+# NUMPY_VER falls into the FATAL arm of the case below, deliberately.
+if ! VERIFY_FIELDS="$(python3 - "$VERIFY_OUT" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception as exc:                                    # noqa: BLE001
+    sys.stderr.write("    could not parse the verify record: %s: %s\n"
+                     % (type(exc).__name__, exc))
+    sys.exit(1)
+# Order is load-bearing: the reads below are positional.
+print(d.get("wheel_version") or "")
+print(d.get("numpy_version") or "")
+print(1 if d.get("dlopen_ok") else 0)
+print(1 if d.get("import_ok") else 0)
+print(1 if d.get("rknnlite_constructible") else 0)
+PY
+)"; then
+    echo "    WARNING: could not read $VERIFY_OUT back (see the error above);" >&2
+    echo "    the measured flags in $JSON will be null and the numpy gate below" >&2
+    echo "    will fail the build rather than guess." >&2
+    VERIFY_FIELDS=""
+fi
+WHEEL_VER=""
+NUMPY_VER=""
+DLOPEN_OK=""
+IMPORT_OK=""
+CONSTRUCT_OK=""
+# `read` returns non-zero at EOF, so each is paired with a `|| assignment`: the
+# read is then not the final command of its `||` list, `set -e` leaves it
+# alone, and the group's own status is the assignment's 0. Proved under
+# `set -euo pipefail` before it went in, including the all-fields-empty case
+# (VERIFY_FIELDS="") that ends at EOF on the first read.
+{   IFS= read -r WHEEL_VER    || WHEEL_VER=""
+    IFS= read -r NUMPY_VER    || NUMPY_VER=""
+    IFS= read -r DLOPEN_OK    || DLOPEN_OK=""
+    IFS= read -r IMPORT_OK    || IMPORT_OK=""
+    IFS= read -r CONSTRUCT_OK || CONSTRUCT_OK=""
+} <<<"$VERIFY_FIELDS"
 echo "    rknn-toolkit-lite2 ${WHEEL_VER:-(version unknown)}  numpy ${NUMPY_VER:-?}"
 echo "    librknnrt.so dlopen ok, rknn_init present"
 

@@ -184,7 +184,11 @@ cleanup() {
     set +e
     sync 2>/dev/null
 
-    for m in dev/pts dev proc sys run boot/firmware; do
+    # opt/fpms-cache FIRST. It is a bind mount of the HOST's .cache; if it is
+    # still attached when $MNT goes away -- or worse, when .build is deleted --
+    # the delete reaches through it into the real cache and throws away the
+    # fourteen hours it exists to preserve.
+    for m in opt/fpms-cache dev/pts dev proc sys run boot/firmware; do
         umount_quietly "$MNT/$m"
     done
     umount_quietly "$MNT"
@@ -223,7 +227,7 @@ trap 'cleanup; exit 143' TERM
 release_stale() {
     [ "$DRY" = 1 ] && return 0
     local m stale
-    for m in dev/pts dev proc sys run boot/firmware ''; do
+    for m in opt/fpms-cache dev/pts dev proc sys run boot/firmware ''; do
         mountpoint -q "$MNT/$m" 2>/dev/null && {
             note "releasing stale mount: $MNT/$m"
             umount_quietly "$MNT/$m"
@@ -641,6 +645,26 @@ enter_chroot_mounts() {
     run "mount --bind /dev    '$MNT/dev'"
     run "mount --bind /dev/pts '$MNT/dev/pts'"
     run "mount -t tmpfs tmpfs '$MNT/run'"
+
+    # --- the host build cache, visible inside the chroot --------------------
+    #
+    # THE 14-HOUR LINE. Stage 10 was measured at 859m57s, and essentially all
+    # of it is the micro-ROS agent's C++ compiling under qemu-user emulation.
+    # That work is byte-identical between builds unless the micro-ROS sources
+    # or the Fast-DDS packages move, so stage 10 caches the finished uros_ws.
+    #
+    # It cannot do that on its own: /opt/fpms-os is a `cp -a` COPY made by
+    # stage_all(), so anything a stage writes there lands INSIDE the image and
+    # dies with it. A bind mount is the only writable host path a stage can
+    # reach, and this is it. Without these two lines stage 10 prints
+    # "cache: NOT populated - no cache directory is visible in the chroot"
+    # and every rebuild pays the fourteen hours again.
+    #
+    # Released in cleanup() BEFORE $MNT itself -- see the note there. A cache
+    # still bind-mounted when the work directory is deleted is a cache inside
+    # `rm -rf .build`'s reach.
+    run "mkdir -p '$CACHE/uros' '$MNT/opt/fpms-cache'"
+    run "mount --bind '$CACHE' '$MNT/opt/fpms-cache'"
 
     setup_qemu
 

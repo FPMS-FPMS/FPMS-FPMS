@@ -16,6 +16,19 @@
 # apt's dpkg unpack, ldconfig, python bytecode compilation, and - the big one -
 # a full colcon C++ build of the micro-ROS agent. Expect HOURS, not minutes.
 #
+# MEASURED, 2026-08-11, on a WSL2/x86_64 host:
+#     ==> stage 10-ros-humble.sh OK in 859m57s
+# Fourteen hours and twenty minutes for this one stage, essentially all of it
+# create_agent_ws.sh and build_agent.sh compiling Micro-XRCE-DDS-Agent,
+# Fast-CDR and Fast-DDS from C++ source under emulation. That work is
+# IDENTICAL between builds unless the micro-ROS sources or the Fast-DDS
+# packages they link against move, and nothing used to preserve it - so every
+# rebuild paid the fourteen hours again, and this build has been killed three
+# times by unrelated causes without once reaching stage 20.
+#
+# It is now CACHED on the build host. See "micro-ROS workspace cache" below,
+# and docs/BUILDING.md section 3.1 for the operator-facing half.
+#
 # Everything in here that used to end in `>/dev/null` now goes to
 # /var/log/fpms-build/. A stage that can burn four hours and then die with no
 # diagnostic is worse than a stage that fails fast, so every step that can fail
@@ -292,9 +305,63 @@ UROS_STAMP="$UROS_WS/.fpms-built"
 
 # Where colcon puts a node executable for an ament_cmake package, without
 # assuming the install layout.
+#
+# `find | head -n1` SIGPIPEs find, and under pipefail the pipeline reports 141;
+# the trailing `|| true` binds to the whole pipeline and is what makes this
+# safe. Do not remove it. (See apt_group() for the version of this that killed
+# a build.)
 uros_agent_bin() {
     find "$UROS_WS/install" -type f -name micro_ros_agent -perm -u+x 2>/dev/null \
         | head -n1 || true
+}
+
+# Is this file an aarch64 ELF64?
+#
+# Checked BY BYTES, the same four facts 25-npu-runtime.sh checks on
+# librknnrt.so: \x7fELF, ELFCLASS64, little-endian, and e_machine == 183
+# (EM_AARCH64) in the two bytes at offset 18. `file` is not installed in this
+# chroot; od is coreutils and cannot be missing.
+#
+# No pipeline anywhere: od writes a fixed twenty bytes, so the capture is
+# already-complete data and `set --` word-splits it into positional parameters.
+# ${19} and ${20} MUST be braced - $19 means $1 followed by a literal 9, which
+# would silently compare "7f9" against "b7" and pass nothing, ever.
+elf_is_aarch64() {
+    local f="$1" hex
+    [ -f "$f" ] || return 1
+    if ! command -v od >/dev/null 2>&1; then
+        echo "WARNING: od is not installed, so the architecture of" >&2
+        echo "         $f cannot be verified. Treating it as UNVERIFIED," >&2
+        echo "         which counts as a failure - a wrong-architecture agent" >&2
+        echo "         binary is the exact thing this check exists to stop." >&2
+        return 1
+    fi
+    hex="$(od -An -tx1 -N20 -- "$f" 2>/dev/null || true)"
+    [ -n "$hex" ] || return 1
+    set -- $hex
+    [ "$#" -eq 20 ] || return 1                 # shorter than an ELF header
+    [ "$1$2$3$4" = "7f454c46" ] || return 1     # \x7fELF
+    [ "$5" = "02" ] || return 1                 # ELFCLASS64
+    [ "$6" = "01" ] || return 1                 # ELFDATA2LSB
+    if [ "${19}" = "b7" ] && [ "${20}" = "00" ]; then return 0; fi
+    return 1                                    # e_machine is not EM_AARCH64
+}
+
+# THE definition of "this workspace is usable", used by the resume check, by
+# the cache restore, and by the cache write.
+#
+# Checking install/setup.bash is not enough and never was: the FIRST colcon
+# build - micro_ros_setup itself - creates it, so it exists even when the agent
+# never built. /usr/local/bin/fpms-uros-agent-run execs
+# `ros2 run micro_ros_agent micro_ros_agent`, so THAT executable, and its
+# architecture, is the whole claim.
+uros_ws_ok() {
+    local b
+    [ -f "$UROS_WS/install/setup.bash" ] || return 1
+    b="$(uros_agent_bin)"
+    [ -n "$b" ] || return 1
+    elf_is_aarch64 "$b" || return 1
+    return 0
 }
 
 # Dump whatever colcon actually said. This is the whole point of the rewrite:
@@ -331,14 +398,435 @@ export CMAKE_BUILD_PARALLEL_LEVEL="$UROS_JOBS"
 say "colcon: 1 package at a time, ${UROS_JOBS} compile job(s) per package"
 say "log: $UROS_LOG"
 
-# Idempotency, and it is worth real money here: `build.sh --stage 10` re-run
-# after a later stage failed must not spend another four hours rebuilding a
+# --- micro-ROS workspace cache ------------------------------------------------
+#
+# WHY
+# ===
+# 859m57s, measured. Essentially all of it is the two colcon invocations below,
+# and the result is a pure function of its inputs. Nothing preserved it, so
+# every rebuild paid it again. It is now packed to the BUILD HOST and restored
+# when the inputs are unchanged, turning fourteen hours into a few minutes.
+#
+# WHERE IT LIVES, AND THE ONE build.sh CHANGE THIS NEEDS
+# ======================================================
+# The cache MUST live outside the image: a cache inside the image dies with the
+# image, which is the thing being rebuilt. The chroot can only see the host
+# through a mount, and this stage does not get to create one - build.sh owns
+# the mounts, and build.sh is not this file's to edit. Note that
+# /opt/fpms-os is a `cp -a` COPY made by stage_all(), not a mount: anything
+# written there lands inside the image and is lost with it.
+#
+# So the directory is DISCOVERED, in this order, and its absence is not an
+# error:
+#
+#   $FPMS_UROS_CACHE_DIR      explicit; for a hand run inside `build.sh --shell`
+#   /opt/fpms-cache/uros      the bind mount build.sh should provide
+#   /opt/fpms-os/.cache/uros  if .cache is ever added to stage_all()'s cp list
+#                             (restore only - see uros_cache_external)
+#
+# The build.sh change, which is two lines and has NOT been made here:
+#
+#     # enter_chroot_mounts(), alongside the other bind mounts:
+#     mkdir -p "$CACHE/uros" "$MNT/opt/fpms-cache"
+#     mount --bind "$CACHE" "$MNT/opt/fpms-cache"
+#
+#     # cleanup()'s unmount loop, which must release it BEFORE "$MNT" itself:
+#     for m in opt/fpms-cache dev/pts dev proc sys run boot/firmware; do
+#
+# Until that lands, restore misses and populate is skipped, each with a printed
+# reason, and this stage builds from source exactly as it always did. Caching
+# is an accelerator; it is never a dependency.
+#
+# WHAT THE KEY COVERS, AND WHY EACH LINE IS IN IT
+# ===============================================
+# A stale uros_ws is far worse than a slow build. An agent linked against
+# different Fast-DDS headers than the ones the image ships does not fail here -
+# it fails on the rover, as a micro-ROS link that never establishes, which is a
+# diagnosis this project has repeatedly got wrong. So the key is the actual ABI
+# surface, not a timestamp:
+#
+#   schema      bumped by hand when the cache FORMAT changes, so entries
+#               written by older code can never be misread by newer code
+#   distro      $ROS_DISTRO
+#   arch        dpkg architecture, and uname -m as `machine`. An x86_64 tarball
+#   machine     restored into an aarch64 image is the nightmare case; it is
+#               keyed out here AND re-checked on the binary itself, by bytes.
+#   os          ID-VERSION_ID of the base rootfs: the glibc/libstdc++ era.
+#               build.sh pins the base image by sha256, so this moves only when
+#               someone changes the base on purpose.
+#   gcc         the compiler that produced the objects
+#   fastrtps    Fast-DDS, and fastcdr with it: the libraries the agent links
+#   fastcdr     and whose headers it compiled against. THE point of this key.
+#   rmw-fastrtps-cpp
+#   rmw-fastrtps-shared-cpp
+#   rclcpp      the rest of the C++ ABI the agent is built against
+#   micro_ros_setup   the exact commit. Resolved with `git ls-remote` BEFORE
+#               the clone when deciding whether to restore, and re-read with
+#               `rev-parse HEAD` from the real checkout when an entry is
+#               WRITTEN - so a stored key always names the commit that was
+#               actually built, not the one we hoped for.
+#
+# WHAT THE KEY DOES NOT COVER, stated plainly rather than left to be discovered
+# on the rover:
+#   create_agent_ws.sh vcs-imports Micro-XRCE-DDS-Agent, micro-ROS-Agent and
+#   micro_ros_msgs BY BRANCH, from a .repos file inside micro_ros_setup.
+#   Pinning micro_ros_setup's commit pins that file, but not where the branches
+#   it names point today. A cache entry can therefore hold an agent built from
+#   slightly older upstream commits than a fresh build would produce. That is
+#   staleness of DEGREE, not of ABI - it cannot produce the linked-against-the-
+#   wrong-Fast-DDS failure above, because every library the agent links comes
+#   from the apt packages that ARE keyed. The resolved commit of every imported
+#   repo is recorded in the entry's .info file and printed on every restore.
+#   When upstream moves and you want it: delete the entry, or FPMS_UROS_NOCACHE=1.
+UROS_CACHE_SCHEMA=1
+UROS_SETUP_URL="https://github.com/micro-ROS/micro_ros_setup.git"
+UROS_SETUP_BRANCH="humble"
+UROS_CACHE_DIR=""
+UROS_CACHE_TAR=""
+UROS_CACHE_KEYFILE=""
+UROS_CACHE_INFO=""
+UROS_CACHE_KEY=""
+UROS_FROM_CACHE=0
+UROS_SOURCE="built from source"
+
+uros_cache_paths() {
+    UROS_CACHE_TAR="$UROS_CACHE_DIR/uros_ws.tar.gz"
+    UROS_CACHE_KEYFILE="$UROS_CACHE_DIR/uros_ws.key"
+    UROS_CACHE_INFO="$UROS_CACHE_DIR/uros_ws.info"
+}
+
+uros_cache_locate() {
+    local d
+    for d in "${FPMS_UROS_CACHE_DIR:-}" /opt/fpms-cache/uros /opt/fpms-os/.cache/uros; do
+        [ -n "$d" ] || continue
+        [ -d "$d" ] || continue
+        UROS_CACHE_DIR="$d"; uros_cache_paths; return 0
+    done
+    # The bind mount is there but empty: this is the first build on this host.
+    if [ -d /opt/fpms-cache ]; then
+        mkdir -p /opt/fpms-cache/uros 2>/dev/null || return 1
+        UROS_CACHE_DIR=/opt/fpms-cache/uros; uros_cache_paths; return 0
+    fi
+    return 1
+}
+
+# "Outside the image" is not a promise anyone made - it is a property that can
+# be MEASURED. A host directory reached through a bind mount is on a different
+# filesystem from the image's /, so its st_dev differs. If they match, the
+# directory is inside the image: writing a few hundred MB of tarball there
+# would ship it in the .img, cache nothing, and die with the image. Refuse.
+uros_cache_external() {
+    local a b
+    a="$(stat -c %d "$UROS_CACHE_DIR" 2>/dev/null || true)"
+    b="$(stat -c %d / 2>/dev/null || true)"
+    [ -n "$a" ] || return 1
+    [ -n "$b" ] || return 1
+    [ "$a" != "$b" ] || return 1
+    return 0
+}
+
+# dpkg-query exits 1 for an unknown package and 0-with-empty-output for a known
+# but uninstalled one. Capture, then decide; neither may kill the stage.
+# The single quotes on -f are load-bearing: ${Version} is dpkg's, not bash's.
+uros_pkg_ver() {
+    local p="$1" v
+    v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || true)"
+    [ -n "$v" ] || v="absent"
+    printf 'pkg:%s=%s\n' "$p" "$v"
+}
+
+# The commit the clone WILL resolve to. `git ls-remote` prints
+# "<sha>\trefs/heads/humble"; strip at the first non-hex character instead of
+# piping into awk or cut, then gate on the length - 40 (sha1) or 64 (sha256).
+# Anything else, including git's own error text on a network failure, fails the
+# gate, and a key that cannot be computed means NO RESTORE. That direction is
+# deliberate: an unkeyable cache must never be used.
+uros_remote_sha() {
+    local out sha
+    out="$(git ls-remote "$UROS_SETUP_URL" "refs/heads/${UROS_SETUP_BRANCH}" 2>/dev/null || true)"
+    sha="${out%%[!0-9a-f]*}"
+    case "${#sha}" in 40|64) printf '%s\n' "$sha"; return 0 ;; esac
+    return 1
+}
+
+# The commit that was ACTUALLY cloned. Used when WRITING an entry, so that a
+# race between ls-remote and the clone cannot store a key naming the wrong tree.
+uros_local_sha() {
+    local sha
+    sha="$(git -C "$UROS_WS/src/micro_ros_setup" rev-parse HEAD 2>/dev/null || true)"
+    case "${#sha}" in 40|64) printf '%s\n' "$sha"; return 0 ;; esac
+    return 1
+}
+
+uros_cache_key() {   # uros_cache_key [<micro_ros_setup sha>]
+    local sha="${1:-}" arch mach os gccv k p
+    if [ -z "$sha" ]; then sha="$(uros_remote_sha || true)"; fi
+    if [ -z "$sha" ]; then return 1; fi
+    arch="$(dpkg --print-architecture 2>/dev/null || true)"; [ -n "$arch" ] || arch="unknown"
+    mach="$(uname -m 2>/dev/null || true)";                  [ -n "$mach" ] || mach="unknown"
+    gccv="$(gcc -dumpfullversion 2>/dev/null || true)";      [ -n "$gccv" ] || gccv="absent"
+    # The -r guard inside the subshell is not defensive padding: dash's `.` on
+    # a missing file exits ON THE SPOT, taking the printf - and therefore the
+    # fallback value - with it. Proved in a scratch shell before it went in.
+    os="$(sh -c 'if [ -r /etc/os-release ]; then . /etc/os-release; fi
+                 printf "%s-%s" "${ID:-unknown}" "${VERSION_ID:-unknown}"' || true)"
+    [ -n "$os" ] || os="unknown"
+
+    k="schema=${UROS_CACHE_SCHEMA}
+distro=${ROS_DISTRO:-humble}
+arch=${arch}
+machine=${mach}
+os=${os}
+gcc=${gccv}"
+    for p in fastrtps fastcdr rmw-fastrtps-cpp rmw-fastrtps-shared-cpp rclcpp; do
+        k="${k}
+$(uros_pkg_ver "ros-${ROS_DISTRO:-humble}-${p}")"
+    done
+    printf '%s\nmicro_ros_setup=%s\n' "$k" "$sha"
+}
+
+# Human-readable provenance, written alongside the entry. NOT authoritative:
+# the .key file is what decides a hit, and this is what a person reads when
+# they want to know where an agent binary came from.
+uros_cache_info() {
+    local b g d s
+    b="$(uros_agent_bin)"
+    printf 'micro-ROS workspace cache entry\n'
+    printf '  written    %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '  workspace  %s\n' "$UROS_WS"
+    printf '  agent      %s\n' "${b:-<none>}"
+    printf '  sources    (resolved commits. The key pins micro_ros_setup only -\n'
+    printf '              the repos it imports track branches, so these are\n'
+    printf '              recorded rather than keyed.)\n'
+    while IFS= read -r g; do
+        [ -n "$g" ] || continue
+        d="${g%/.git}"
+        s="$(git -C "$d" rev-parse HEAD 2>/dev/null || true)"
+        printf '    %-34s %s\n' "${d#"$UROS_WS/src/"}" "${s:-<not a git checkout>}"
+    done < <(find "$UROS_WS/src" -maxdepth 4 -name .git 2>/dev/null || true)
+    return 0
+}
+
+# Restore. Returns 0 only when a verified workspace is on disk; every other
+# path returns 1 with a printed reason and leaves nothing behind, so the caller
+# falls through to a normal build.
+#
+# Called from an `if` condition, which suppresses errexit for the whole body -
+# so every command that can fail carries its own guard rather than relying on
+# `set -e` to be either present or absent.
+uros_cache_restore() {
+    local rc=0 stored b
+    if [ "${FPMS_UROS_NOCACHE:-0}" = "1" ]; then
+        say "cache: restore disabled by FPMS_UROS_NOCACHE=1"
+        return 1
+    fi
+    if ! uros_cache_locate; then
+        say "cache: no cache directory is visible in the chroot - building from source."
+        say "cache: build.sh needs one bind mount for this; docs/BUILDING.md 3.1."
+        return 1
+    fi
+    if [ -e "$UROS_CACHE_DIR/NOCACHE" ]; then
+        say "cache: $UROS_CACHE_DIR/NOCACHE exists - restore disabled by the operator"
+        return 1
+    fi
+    say "cache: $UROS_CACHE_DIR"
+
+    # Existence first, key second: computing the key costs a `git ls-remote`
+    # round trip, and there is nothing to compare it against on the first build
+    # on a host. An entry is only complete when BOTH files are present - see
+    # the publish order in uros_cache_store for why that is the safe half.
+    if [ ! -f "$UROS_CACHE_TAR" ] || [ ! -f "$UROS_CACHE_KEYFILE" ]; then
+        say "cache: MISS - no complete entry yet. This build will write one."
+        return 1
+    fi
+
+    UROS_CACHE_KEY="$(uros_cache_key || true)"
+    if [ -z "$UROS_CACHE_KEY" ]; then
+        say "cache: cannot resolve ${UROS_SETUP_BRANCH} of micro_ros_setup (network?),"
+        say "cache: so no entry can be keyed. Refusing to restore on an unknown commit."
+        return 1
+    fi
+
+    stored="$(cat "$UROS_CACHE_KEYFILE" 2>/dev/null || true)"
+    if [ "$stored" != "$UROS_CACHE_KEY" ]; then
+        say "cache: MISS - the key moved. Building from source (14+ hours)."
+        say "cache: the two keys follow; the differing line is the reason."
+        printf '      cached key:\n' >&2
+        printf '%s\n' "$stored" | sed 's/^/        /' >&2
+        printf '      current key:\n' >&2
+        printf '%s\n' "$UROS_CACHE_KEY" | sed 's/^/        /' >&2
+        return 1
+    fi
+
+    say "cache: HIT - the stored key matches the current one byte for byte"
+    if [ -f "$UROS_CACHE_INFO" ]; then
+        sed 's/^/      /' "$UROS_CACHE_INFO" >&2 || true
+    fi
+
+    # colcon bakes ABSOLUTE paths into setup.bash and the installed .cmake
+    # files, so this tree may only ever be restored to the directory it was
+    # packed from. The tarball holds one top-level "uros_ws" and is unpacked at
+    # $FPMS_HOME, which makes that structural rather than a convention.
+    rm -rf "$UROS_WS"
+    mkdir -p "$FPMS_HOME"
+    rc=0
+    tar -xzf "$UROS_CACHE_TAR" -C "$FPMS_HOME" >>"$UROS_LOG" 2>&1 || rc=$?
+    if [ "$rc" != 0 ]; then
+        say "cache: tar exited ${rc} unpacking the entry - discarding it and building."
+        tail -n 10 "$UROS_LOG" >&2 || true
+        rm -rf "$UROS_WS"
+        return 1
+    fi
+
+    # VERIFY WHAT CAME BACK. A tarball that unpacked cleanly proves nothing
+    # whatever about what is inside it.
+    if ! uros_ws_ok; then
+        say "cache: the restored workspace FAILED verification - discarding it."
+        if [ -f "$UROS_WS/install/setup.bash" ]; then
+            say "cache:   install/setup.bash: present"
+        else
+            say "cache:   install/setup.bash: MISSING"
+        fi
+        b="$(uros_agent_bin)"
+        if [ -n "$b" ]; then
+            say "cache:   micro_ros_agent:   $b (not an aarch64 ELF64)"
+        else
+            say "cache:   micro_ros_agent:   MISSING"
+        fi
+        rm -rf "$UROS_WS"
+        return 1
+    fi
+
+    b="$(uros_agent_bin)"
+    say "cache: RESTORED $UROS_WS"
+    say "cache: agent: $b"
+    say "cache: verified: install/setup.bash present, micro_ros_agent is an aarch64 ELF64"
+    UROS_FROM_CACHE=1
+    # Provenance the artefact carries: the resume check prints this stamp, and
+    # so does anyone who mounts the finished .img and cats it.
+    printf '%s (restored from cache %s)\n' \
+        "$(cat "$UROS_STAMP" 2>/dev/null || echo unknown)" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$UROS_STAMP" || true
+    return 0
+}
+
+# Populate. Never fatal: a build that produced a correct image must not fail
+# because a cache could not be written. Every refusal says why.
+uros_cache_store() {
+    local rc=0 tmp sha size
+    if [ "${FPMS_UROS_NOCACHE:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ "$UROS_FROM_CACHE" = "1" ]; then
+        return 0                       # it came from there; rewriting it buys nothing
+    fi
+    if [ -z "$UROS_CACHE_DIR" ]; then
+        if ! uros_cache_locate; then
+            say "cache: NOT populated - no cache directory is visible in the chroot."
+            say "cache: this build's ~14 hours will have to be paid again next time."
+            say "cache: docs/BUILDING.md 3.1 has the two-line build.sh change."
+            return 0
+        fi
+    fi
+    if [ -e "$UROS_CACHE_DIR/NOCACHE" ]; then
+        say "cache: not populated - $UROS_CACHE_DIR/NOCACHE exists"
+        return 0
+    fi
+    # ONLY AFTER A VERIFIED BUILD. Writing an entry for a workspace we have not
+    # just proved good is the one mistake this whole design exists to prevent.
+    if ! uros_ws_ok; then
+        say "cache: not populated - the workspace does not verify"
+        return 0
+    fi
+    if ! uros_cache_external; then
+        say "cache: $UROS_CACHE_DIR is on the image's own filesystem, not the host's."
+        say "cache: NOT populating - the tarball would be shipped inside the .img and"
+        say "cache: would be deleted with it. Provide the bind mount instead."
+        return 0
+    fi
+    if [ ! -w "$UROS_CACHE_DIR" ]; then
+        say "cache: not populated - $UROS_CACHE_DIR is not writable"
+        return 0
+    fi
+
+    # Key on the commit that was ACTUALLY built, falling back to the remote
+    # only if this workspace has no git checkout to ask.
+    sha="$(uros_local_sha || true)"
+    if [ -z "$sha" ]; then sha="$(uros_remote_sha || true)"; fi
+    UROS_CACHE_KEY="$(uros_cache_key "$sha" || true)"
+    if [ -z "$UROS_CACHE_KEY" ]; then
+        say "cache: not populated - the key could not be computed"
+        return 0
+    fi
+    if [ -f "$UROS_CACHE_KEYFILE" ] && [ -f "$UROS_CACHE_TAR" ]; then
+        if [ "$(cat "$UROS_CACHE_KEYFILE" 2>/dev/null || true)" = "$UROS_CACHE_KEY" ]; then
+            say "cache: the stored entry is already current - nothing to write"
+            return 0
+        fi
+    fi
+
+    phase "cache: packing the workspace for the next build"
+    say "cache: -> $UROS_CACHE_TAR"
+    tmp="$UROS_CACHE_DIR/.uros_ws.$$.tmp"
+    rm -f "$tmp"
+    rc=0
+    tar -czf "$tmp" -C "$FPMS_HOME" uros_ws || rc=$?
+    # tar exits 1 for "some files differ / changed as we read them" and 2 for
+    # fatal. NEITHER is good enough to publish. An entry we are unsure of is
+    # worse than no entry at all - the cost of no entry is time, and the cost
+    # of a wrong entry is a rover whose micro-ROS link never comes up.
+    if [ "$rc" != 0 ]; then
+        say "cache: tar exited ${rc} - NOT publishing an entry we cannot vouch for"
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # Publish in the order that makes any torn write a MISS rather than a
+    # mismatch: drop the key first, move the tarball into place, write the key
+    # last. Restore demands BOTH files AND a byte-identical key, so every
+    # intermediate state here fails safe - including a build killed mid-write,
+    # which this build has been three times.
+    rm -f "$UROS_CACHE_KEYFILE"
+    if ! mv -f "$tmp" "$UROS_CACHE_TAR"; then
+        say "cache: could not move the new tarball into place - entry left absent"
+        rm -f "$tmp"
+        return 0
+    fi
+    uros_cache_info > "$UROS_CACHE_INFO" 2>/dev/null || true
+    if ! printf '%s\n' "$UROS_CACHE_KEY" > "$UROS_CACHE_KEYFILE"; then
+        say "cache: could not write the key file; the entry stays unusable (a MISS)"
+        rm -f "$UROS_CACHE_KEYFILE"
+        return 0
+    fi
+
+    size="$(stat -c %s "$UROS_CACHE_TAR" 2>/dev/null || true)"
+    [ -n "$size" ] || size=0
+    say "cache: WROTE $(( size / 1048576 )) MB"
+    say "cache: the next build whose key matches skips ~14 hours of compiling"
+    # NOT disk(): that reports the IMAGE's filesystem, and the cache is on the
+    # host's. This is the number that fills up and kills the next build.
+    printf '    cache disk: %s\n' \
+        "$(df -Pm "$UROS_CACHE_DIR" 2>/dev/null \
+           | awk 'NR==2 {printf "%d MB free on the host filesystem holding the cache", $4}' || true)"
+    return 0
+}
+
+# Idempotency, and it is worth real money here: `build.sh --from 10` re-run
+# after a later stage failed must not spend another fourteen hours rebuilding a
 # workspace that is already good. The stamp is written ONLY after the agent
 # executable has been verified, so a half-built workspace is never mistaken
 # for a finished one.
-if [ -f "$UROS_STAMP" ] && [ -f "$UROS_WS/install/setup.bash" ] && [ -n "$(uros_agent_bin)" ]; then
+#
+# Three ways to arrive at a built workspace, most-local first:
+#   1. it is already in this image  (a resumed build)
+#   2. it is in the host cache and the key matches
+#   3. compile it, which is the fourteen hours
+if [ -f "$UROS_STAMP" ] && uros_ws_ok; then
     say "workspace already built on $(cat "$UROS_STAMP") - skipping"
     say "delete $UROS_STAMP to force a rebuild"
+    UROS_SOURCE="already present in this image (resumed build)"
+elif uros_cache_restore; then
+    UROS_SOURCE="RESTORED FROM THE HOST CACHE - no C++ was compiled"
 else
     rm -rf "$UROS_WS"; mkdir -p "$UROS_WS/src"
 
@@ -358,8 +846,12 @@ else
         return 0
     }
 
-    retry git clone -q --depth 1 -b humble \
-        https://github.com/micro-ROS/micro_ros_setup.git "$UROS_WS/src/micro_ros_setup" \
+    # URL and branch come from the variables the cache key is computed from.
+    # If these two ever disagree, the key would name a commit on a repo that
+    # was never cloned - which is precisely the class of silent staleness the
+    # cache is built to make impossible.
+    retry git clone -q --depth 1 -b "$UROS_SETUP_BRANCH" \
+        "$UROS_SETUP_URL" "$UROS_WS/src/micro_ros_setup" \
         || fatal "could not clone micro_ros_setup (network? github?)"
 
     # rosdep is NOT optional and its failure must not be silent. create_agent_ws.sh
@@ -457,7 +949,20 @@ else
         || { uros_dump_failure
              fatal "micro-ROS workspace built but there is no micro_ros_agent executable.
       fpms-uros-agent-run would fail at 'ros2 run micro_ros_agent micro_ros_agent'."; }
-    say "agent: $AGENT_BIN"
+    # And it must be for the TARGET, not the host. Under a broken binfmt setup,
+    # or a colcon that picked up a host toolchain, this stage can produce an
+    # x86_64 binary that is present, executable, and useless on the rover. It
+    # is also the gate that decides whether this workspace is fit to be cached.
+    elf_is_aarch64 "$AGENT_BIN" \
+        || { uros_dump_failure
+             fatal "micro_ros_agent was built, but it is not an aarch64 ELF64.
+      $AGENT_BIN
+      Something compiled for the build host, not the target. Check that
+      qemu-aarch64 binfmt is registered and that no host toolchain leaked
+      into the chroot. Read the first bytes yourself:
+          od -An -tx1 -N20 '$AGENT_BIN'
+      Byte 4 must be 02 (ELF64) and bytes 18-19 must be 'b7 00' (EM_AARCH64)."; }
+    say "agent: $AGENT_BIN (aarch64 ELF64, verified)"
 
     date -u '+%Y-%m-%dT%H:%M:%SZ' > "$UROS_STAMP"
 
@@ -468,6 +973,15 @@ else
     rm -rf "$UROS_WS/build" "$UROS_WS/log"
     say "install tree: $(du -sh "$UROS_WS/install" 2>/dev/null | cut -f1)"
 fi   # end of the build-if-not-already-built block
+
+# Hand the next build the fourteen hours. Guarded with `|| true` on top of a
+# function that already returns 0 on every refusal: a finished, verified image
+# must never fail because a cache could not be written.
+uros_cache_store || true
+
+# One line, in the build log, that settles "did it rebuild or did it restore?"
+# without anyone having to read timings or guess.
+say "micro-ROS workspace: ${UROS_SOURCE}"
 
 chown -R "${FPMS_USER}:${FPMS_USER}" "$UROS_WS"
 disk
