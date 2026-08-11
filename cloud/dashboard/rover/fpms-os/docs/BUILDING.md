@@ -245,9 +245,41 @@ top -b -n1 | head -20            # expect qemu-aarch64-static burning a core
 ls -l --time-style=+%H:%M:%S .build/mnt/home/ubuntu/uros_ws/build 2>/dev/null
 ```
 
-A whole-build figure on a typical laptop is **3–8 hours**. That is a judgement
-from the stage table above, not a timing anyone has recorded here. Record a
-real one when you have it — this line should be replaced by a measurement.
+## MEASURED, 2026-08-11 — not an estimate
+
+Stage 10 completed on a WSL2 host (x86_64, qemu-user emulation) in:
+
+```
+==> stage 10-ros-humble.sh OK in 859m57s
+```
+
+**14 hours 20 minutes, for that one stage.** The estimate above said "one to
+several hours" for the colcon build. It was wrong by roughly a factor of four,
+and the table is left in place unchanged so the gap between a reasoned guess
+and a stopwatch stays visible.
+
+Stage 00 was measured at **20 minutes** on the same host.
+
+What this changes:
+
+- **Plan for a whole build in the region of 16–20 hours**, not 3–8. Start it
+  when you can leave it overnight and then some.
+- **Do not casually kill a build.** Fourteen hours is not something you
+  re-run because a log looked quiet. Check it is compiling (see above) before
+  concluding anything.
+- **`--from N` is not a convenience, it is the difference between a two-minute
+  retry and another overnight run.** Every stage failure after this point
+  should be fixed and resumed, never restarted.
+- **The single highest-value optimisation available** is caching the built
+  `uros_ws` between builds. It is ~14 of those hours, it does not change
+  between builds unless the micro-ROS sources move, and nothing in the current
+  pipeline preserves it. If this image is going to be rebuilt more than once,
+  do that first.
+
+A cautionary note on how this measurement was obtained: the run reached stage
+20 and was then deliberately torn down to reclaim disk, which threw all 14
+hours away. The teardown was correct and asked for — but it is worth knowing
+that `/root/fpms-build` holding an in-progress image is not scratch space.
 
 ---
 
