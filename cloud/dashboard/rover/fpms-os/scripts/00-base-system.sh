@@ -73,6 +73,40 @@ if ! getent hosts ports.ubuntu.com >/dev/null 2>&1 \
     warn "into /run, build.sh's copy went into the tmpfs and apt has no DNS."
 fi
 
+# --- repair an interrupted dpkg --------------------------------------------
+#
+# THIS IS THE RESUME PATH'S MOST COMMON FAILURE, and it is self-inflicted.
+#
+# Every time a build is killed mid-`apt-get install` -- a session ending, a
+# laptop hibernating, an operator pressing ctrl-C -- dpkg is left with a
+# half-configured package and writes /var/lib/dpkg/updates. The NEXT apt
+# command in that image then refuses outright:
+#
+#     E: dpkg was interrupted, you must manually run 'dpkg --configure -a'
+#        to correct the problem.
+#
+# apt exits non-zero, the retry loop below burns all three attempts against a
+# condition no retry can fix, and the stage dies five minutes in reporting
+# "apt-get update failed three times" -- which points at DNS and the network,
+# neither of which is wrong. The real fault is a state left inside the image by
+# the previous run, and `--from 00` is precisely the command an operator uses
+# to recover from that, so it must repair it rather than trip over it.
+#
+# Detected by asking dpkg to audit itself rather than by grepping apt's error,
+# so it also catches a half-unpacked package that has not yet produced one.
+if [ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null || true)" ] \
+   || [ -n "$(dpkg --audit 2>/dev/null || true)" ]; then
+    warn "dpkg was interrupted by a previous run - repairing before apt"
+    if dpkg --configure -a 2>&1 | sed 's/^/      /'; then
+        note "dpkg --configure -a completed"
+    else
+        # Not fatal on its own: a package that cannot configure here may well
+        # be one apt is about to replace. Say so and let apt render judgement.
+        warn "dpkg --configure -a did not fully succeed; continuing so that apt"
+        warn "can report which package is actually wedged"
+    fi
+fi
+
 # A retry, because one lost packet during a 20-minute emulated build should not
 # cost the whole build. Still fatal after three: an image built on a partial
 # package list is worse than no image.
