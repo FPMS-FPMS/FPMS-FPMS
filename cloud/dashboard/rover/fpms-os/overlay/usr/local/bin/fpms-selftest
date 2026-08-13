@@ -82,6 +82,10 @@ BOOT_UNITS = [
     "fpms-npud", "fpms-npu-tune", "fpms-model-provision",
     # ROS-level hardware verification: LiDAR, camera and the ESP32 link.
     "fpms-hwcheck",
+    # MQTT -> ROS mirror for camera and NPU health. Without it the
+    # dashboard has no ROS source for either and says so; with it down,
+    # it says so too -- but only if something is checking it is up.
+    "fpms-telemetry-ros",
 ]
 
 # Deliberately NOT in the list above, and named here so nobody "fixes" it by

@@ -136,6 +136,7 @@ BOOT_UNITS=(
     fpms-selftest.service
     fpms-dashboard.service
     fpms-hwcheck.service
+    fpms-telemetry-ros.service
 )
 
 # Both can write /cmd_vel. They are SHIPPED so they can be masked - masking a
