@@ -90,5 +90,24 @@ SUBSYSTEM=="tty", SUBSYSTEMS=="usb", KERNELS=="1-1.2:1.0", \
 # rather than trusting isOpened().
 #
 # ATTR{index}=="0" selects the capture node rather than the metadata nodes.
+#
+# ENV{FPMS_IS_THERMAL}!="1" IS LOAD-BEARING AND SO IS THE FILENAME THAT SETS IT.
+# ==========================================================================
+# This rule matches ANY USB capture node. With one camera that is the intent.
+# The moment a thermal camera is attached it matches that too, and udev's
+# SYMLINK+= APPENDS - it does not replace - so /dev/fpms-cam would resolve to
+# whichever device was processed last. There is no error and no warning; the
+# name simply starts meaning something different between boots.
+#
+# The tag comes from 98-fpms-thermal.rules, and that file is numbered 98 rather
+# than 99 FOR THIS LINE. udev processes rules files in LEXICAL ORDER, so a
+# 99-fpms-thermal.rules would run AFTER this one, ENV{FPMS_IS_THERMAL} would
+# still be unset here, and this guard would silently pass for every device -
+# a guard that is always true, which is worse than no guard because it reads
+# as protection. A later rule also cannot remove a symlink an earlier rule
+# added, so this cannot be repaired downstream.
+#
+# If that file is ever renamed to sort after this one, this guard dies quietly.
 SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ATTR{index}=="0", \
+  ENV{FPMS_IS_THERMAL}!="1", \
   SYMLINK+="fpms-cam", GROUP="video", MODE="0660"

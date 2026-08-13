@@ -1,0 +1,252 @@
+# /etc/udev/rules.d/98-fpms-thermal.rules
+#
+# Distinct, persistent names for the RGB camera and the thermal camera.
+#
+#   /dev/fpms-cam-rgb       the colour webcam that fpms_rover_agent streams
+#                           and runs detect_fire() over
+#   /dev/fpms-cam-thermal   the thermal camera that corroborates it
+#
+# THE PROBLEM THIS SOLVES
+# =======================
+# fpms_rover_agent.py:474 opens the camera with `cv2.VideoCapture(idx)` from
+# FPMS_CAMERA_INDEX=0, then falls back to scanning /dev/video* for any node
+# that yields a frame. With ONE camera that is merely fragile - it has already
+# failed in the field, when a USB re-enumeration (error -71) turned /dev/video0
+# into /dev/video1 mid-run. With TWO cameras it is a correctness bug with no
+# error path anywhere:
+#
+#   * thermal enumerates first  -> the fire detector hunts for flame HUE in a
+#     greyscale or false-colour thermal image. detect_fire() does not raise.
+#     It returns (False, 0.0, []) forever, on a rover whose product thesis is
+#     fire detection.
+#   * rgb enumerates into the thermal slot -> colour webcam bytes are read as
+#     16-bit thermal counts and every "temperature" is a reinterpretation of
+#     packed YUYV. Plausible, stable, entirely fictional.
+#
+# Neither failure logs anything. Both leave every systemd unit reporting active.
+#
+# This project has already been bitten by exactly this class of ambiguity: both
+# onboard CP2102 serial adapters report an IDENTICAL ID_SERIAL of "0001", so
+# /dev/serial/by-id can only ever name one of the pair and it is a coin flip
+# which. 99-fpms-serial.rules therefore keys on USB TOPOLOGY (KERNELS==) and
+# fpms_duty_driver.validate_port() actively REFUSES any path that is not under
+# /dev/serial/by-path/. The cameras get the same discipline here.
+#
+# fpms_thermal.require_distinct_bindings() refuses an integer index, a bare
+# /dev/videoN, and the same path used for both cameras - so a service that
+# ignores these symlinks and hardcodes an index is refused in code as well as
+# discouraged here.
+#
+# ############################################################################
+# # !! ONE CHANGE IS STILL NEEDED IN A FILE THIS RULE SET DOES NOT OWN !!    #
+# #                                                                          #
+# # 99-fpms-serial.rules ends with an UNCONDITIONAL camera rule:              #
+# #                                                                          #
+# #   SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ATTR{index}=="0", \        #
+# #     SYMLINK+="fpms-cam", GROUP="video", MODE="0660"                       #
+# #                                                                          #
+# # That matches ANY USB capture node, so with a thermal camera attached BOTH #
+# # cameras match it and /dev/fpms-cam lands on whichever was processed last. #
+# # It is an index bug wearing a stable-looking name. udev processes          #
+# # 99-fpms-serial.rules BEFORE this file (same numeric prefix, alphabetical  #
+# # order), and a later rule cannot remove a SYMLINK an earlier one added, so #
+# # it cannot be fixed from here.                                             #
+# #                                                                          #
+# # Required change in 99-fpms-serial.rules - add the guard added below, i.e. #
+# # append  ENV{FPMS_IS_THERMAL}!="1"  to that rule, or delete it in favour   #
+# # of the fpms-cam-rgb rule here. Until then treat /dev/fpms-cam as unsafe   #
+# # and move every consumer to /dev/fpms-cam-rgb.                             #
+# ############################################################################
+#
+# ############################################################################
+# # !! EVERY VID:PID BELOW IS UNVERIFIED !!                                  #
+# #                                                                          #
+# # No thermal camera has ever been connected to this rover. These ids come   #
+# # from docs/THERMAL_HARDWARE.md, which sourced them from open-source driver #
+# # code and vendor pages, not from an lsusb on this hardware. Confirm with:  #
+# #                                                                          #
+# #     lsusb                                                                 #
+# #     udevadm info -a -n /dev/video0 | grep -m4 -e idVendor -e idProduct    #
+# #     v4l2-ctl --list-devices                                               #
+# #     v4l2-ctl -d /dev/videoN --list-formats-ext                            #
+# #                                                                          #
+# # The last one is the important one: it is what tells you whether a camera  #
+# # offers a 16-bit format or a double-height mode at all, i.e. whether it    #
+# # can measure anything. fpms-selftest FAILS if the symlinks did not         #
+# # materialise, so a wrong id here cannot fail silently.                     #
+# ############################################################################
+
+
+# ===========================================================================
+# STAGE 1 -- TAG THE THERMAL DEVICES
+#
+# Tag first, act second. Doing it in two stages is what lets the RGB rule
+# below say "any capture node that is NOT one of these" - udev has no
+# and-of-negations over a vendor/product PAIR, and excluding a whole vendor
+# would be wrong here (see the Realtek note).
+#
+# ENV{FPMS_THERMAL_KEY} names an entry in /etc/fpms/thermal_devices.json.
+# fpms_thermal.resolve() takes that key as AUTHORITATIVE, which matters for
+# devices whose real capability is invisible over USB. It is set ONLY where
+# the identity really does determine the entry.
+# ===========================================================================
+
+# --- InfiRay P2 Pro / Xtherm family -----------------------------------------
+#
+# Survey rank #1: radiometric, arm64-clean, ~$200-350, 25 Hz, and a ~550 C
+# ceiling that does not saturate on a flame. The device most likely to
+# actually be attached.
+#
+# !! 0bda IS REALTEK. !!  That VID is shared with an enormous number of
+# ordinary USB webcams, card readers and hubs. THE PRODUCT ID IS NOT OPTIONAL
+# HERE: a rule matching ATTRS{idVendor}=="0bda" alone would tag an unrelated
+# RGB webcam as the thermal camera - which is the precise failure this file
+# exists to prevent, arriving through the fix for it. Never widen this rule.
+SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", \
+  ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="5830", \
+  ENV{FPMS_IS_THERMAL}="1", ENV{FPMS_THERMAL_KEY}="infiray-p2pro"
+
+# --- FLIR Lepton on a PureThermal / GroupGets carrier ------------------------
+#
+# NOTE THE DELIBERATE ABSENCE OF ENV{FPMS_THERMAL_KEY} ON THIS RULE.
+#
+# 1e4e:0100 is presented identically by:
+#   * a radiometric Lepton 3.5/2.5 in TLinear at 0.01 K per count,
+#   * the same part in TLinear at 0.1 K per count,
+#   * a PICTURE-ONLY Lepton 3.0/2.0,
+#   * any of the above streaming its AGC greyscale format instead.
+# The module variant, the TLinear scale and whether TLinear is on at all are
+# runtime state and a physical part number. NONE of it is in the USB
+# descriptor. Setting a key here would be a guess that scales every
+# temperature by ten, or invents temperatures from a picture.
+#
+# So the device gets a stable name and NO identity claim. fpms_thermal.resolve()
+# then finds three candidate entries for this id and REFUSES, and the operator
+# sets FPMS_THERMAL_DEVICE in /etc/fpms/config.env after confirming what the
+# camera actually is. That refusal is the designed behaviour, not a gap.
+SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", \
+  ATTRS{idVendor}=="1e4e", ATTRS{idProduct}=="0100", \
+  ENV{FPMS_IS_THERMAL}="1"
+
+# --- TOPDON TC001 -----------------------------------------------------------
+#
+# COMMENTED OUT BECAUSE ITS VID:PID IS NOT RECORDED ANYWHERE THIS PROJECT
+# TRUSTS. The survey gives an id only for the P2 Pro. Guessing one here would
+# either match nothing (harmless but confusing) or match something else
+# (not harmless). Run lsusb on the actual unit and uncomment.
+#
+# If it turns out to be 0bda:5830 as well, DELETE the key from the P2 Pro rule
+# above rather than adding a second key here: two entries would then share one
+# id, resolve() would refuse the ambiguity, and the operator picks - which is
+# correct, because TC001/TC001 Plus/TC002 are different SKUs and whether all of
+# them expose the raw 16-bit half is UNVERIFIED per SKU.
+#
+#SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", \
+#  ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", \
+#  ENV{FPMS_IS_THERMAL}="1", ENV{FPMS_THERMAL_KEY}="topdon-tc001"
+
+# --- Xtherm T2S+ / HTI HT-301 ------------------------------------------------
+#
+# Also commented out, also for want of a confirmed id: the open drivers for
+# this family locate it by product string rather than VID:PID and the survey
+# recorded no numbers. Uncomment with the real ids from lsusb.
+#
+# Note that this family needs a vendor control (CAP_PROP_ZOOM = 0x8004) to
+# unlock its raw 16-bit plane at all, which no udev rule can do - it is why the
+# database marks it radiometry "possible" rather than "yes".
+#
+#SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", \
+#  ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", \
+#  ENV{FPMS_IS_THERMAL}="1", ENV{FPMS_THERMAL_KEY}="infiray-t2splus-ht301"
+
+# --- DOCUMENTED FALLBACK: BIND BY USB TOPOLOGY -------------------------------
+#
+# For a camera whose VID:PID is unknown, unstable, or shared with the RGB
+# webcam, fall back to the discriminator this project already trusts for its
+# two identical CP2102 adapters: THE PHYSICAL USB PORT. Plug the thermal camera
+# into one specific port, permanently, and key on it.
+#
+# This is strictly better than an index and strictly worse than a VID:PID: it
+# survives re-enumeration and reboots, and it breaks the day somebody moves the
+# cable. Label the port if you use it.
+#
+# Find the port with:
+#     udevadm info -a -n /dev/video0 | grep -m2 KERNELS
+#     udevadm info -q path -n /dev/video0
+# and substitute below. The bus index has NOT been confirmed on the Orange Pi
+# 5B - the by-path strings the serial services use are known good
+# (platform-fc880000.usb-usb-0:1.3:1.0-port0) but the corresponding kernel
+# device name depends on the enumerated bus number.
+#
+#SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", KERNELS=="1-1.4:1.0", \
+#  ENV{FPMS_IS_THERMAL}="1", ENV{FPMS_THERMAL_KEY}="generic-uvc-agc-thermal"
+
+
+# ===========================================================================
+# STAGE 2 -- CREATE THE TWO SYMLINKS
+#
+# ATTR{index}=="0" selects the CAPTURE node. Several nodes exist on the same
+# physical device that are METADATA ONLY: they open fine, report isOpened(),
+# and never produce a frame. That is why fpms_rover_agent's find_camera()
+# already requires a successful read() with a non-empty frame rather than
+# trusting isOpened(), and why the symlink must not land on one of them.
+# ===========================================================================
+
+# --- The thermal camera ------------------------------------------------------
+SUBSYSTEM=="video4linux", ENV{FPMS_IS_THERMAL}=="1", ATTR{index}=="0", \
+  SYMLINK+="fpms-cam-thermal", GROUP="video", MODE="0660"
+
+# --- The RGB camera: any USB capture node that is NOT tagged thermal ---------
+#
+# NO VID:PID FOR THE RGB CAMERA ON PURPOSE. The webcam on this rover is not
+# identified anywhere in the repo (its FOV is not even measured - see the
+# survey's §7 open questions), and this rule must keep working when it is
+# replaced. "Everything that is not the thermal camera" is the honest rule, and
+# it is exactly as specific as our actual knowledge.
+#
+# IT ASSUMES ONE RGB CAMERA. Attach a third USB camera and this becomes
+# ambiguous again, in the same way /dev/fpms-cam already is. At that point tag
+# it explicitly the way the thermal devices are tagged above; do not add
+# another wildcard.
+SUBSYSTEM=="video4linux", SUBSYSTEMS=="usb", ENV{FPMS_IS_THERMAL}!="1", \
+  ATTR{index}=="0", \
+  SYMLINK+="fpms-cam-rgb", GROUP="video", MODE="0660"
+
+
+# ===========================================================================
+# STAGE 3 -- NON-UVC THERMAL DEVICES
+#
+# Not every thermal camera is a video node, and pretending otherwise produces
+# rules that can never match.
+# ===========================================================================
+
+# --- Seek Thermal Compact family: PERMISSIONS ONLY, NO VIDEO SYMLINK ---------
+#
+# The Seek Compact speaks a PROPRIETARY USB PROTOCOL and never appears as
+# /dev/video* at all; it is driven through libusb (libseek-thermal) or the
+# vendor SDK. A video4linux rule for it would never fire, and would look like a
+# broken rule rather than an impossible one - so this grants raw USB access and
+# nothing else.
+#
+# The database declares it radiometry "no" even though it streams 16-bit
+# frames: libseek-thermal states that the raw-to-temperature function is not
+# known. BIT DEPTH IS NOT RADIOMETRICITY. It cannot corroborate anything.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="289d", ATTRS{idProduct}=="0010", \
+  GROUP="video", MODE="0660", ENV{FPMS_THERMAL_KEY}="seek-compact"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="289d", ATTRS{idProduct}=="0011", \
+  GROUP="video", MODE="0660"
+
+# --- MLX90640 / MLX90641 / AMG8833 -------------------------------------------
+#
+# NO RULE IS POSSIBLE AND NONE SHOULD BE WRITTEN. These are I2C parts on the
+# 40-pin header. There is no USB device, no VID:PID and no enumeration event to
+# match; the binding is (bus, address) - 0x33 for the Melexis parts, 0x69
+# (jumperable to 0x68) for the Grid-EYE - and discovery is an i2cdetect scan.
+# fpms_thermal.ThermalDevice REFUSES an I2C entry that carries a USB id for
+# exactly this reason, so the impossibility is enforced in code rather than
+# left as a comment somebody might act on.
+#
+# What IS needed for them is group access to the bus node, which the base image
+# already provides via the i2c group:
+#     usermod -aG i2c ubuntu
+# and confirm the bus with `i2cdetect -y -r <bus>`.

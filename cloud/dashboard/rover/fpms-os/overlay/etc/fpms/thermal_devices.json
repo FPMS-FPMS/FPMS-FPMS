@@ -1,0 +1,377 @@
+{
+  "schema": 1,
+
+  "_README": [
+    "/etc/fpms/thermal_devices.json - the thermal camera database for FPMS-OS.",
+    "",
+    "ADDING A CAMERA IS A JSON EDIT, NOT A CODE CHANGE. fpms_thermal.py holds no",
+    "device knowledge at all; everything about a specific camera lives here.",
+    "",
+    "NOTHING IN THIS FILE HAS BEEN MEASURED. No thermal camera has ever been",
+    "connected to this rover. Every entry is status UNVERIFIED and every",
+    "conversion carries verified:false, which travels outward on every reading.",
+    "Do not upgrade a status or a verified flag without doing the measurement.",
+    "The full evidence for each entry is docs/THERMAL_HARDWARE.md.",
+    "",
+    "THE FIELD THAT MATTERS MOST IS `radiometry`, AND IT IS A TRI-STATE:",
+    "  \"yes\"      - the device identity alone establishes that temperature is",
+    "               recoverable.",
+    "  \"possible\" - the hardware MIGHT measure and the identity cannot say.",
+    "               FPMS treats this EXACTLY as \"no\" until an operator asserts",
+    "               the variant or a known-reference probe proves it. This is",
+    "               not timidity: a FLIR Lepton 3.5 (radiometric) and a 3.0",
+    "               (picture-only) present the SAME USB identity and look",
+    "               identical, so any entry that asserted radiometry from",
+    "               VID:PID would be making a claim the OS cannot verify - on",
+    "               exactly the device class where being wrong manufactures",
+    "               false confidence in a fire alert.",
+    "  \"no\"       - proven picture-only. NOTE that 16-bit output does not imply",
+    "               radiometric: the Seek Compact streams 16 bits that its own",
+    "               open driver says cannot be converted to temperature.",
+    "",
+    "THE LOADER REFUSES A DISHONEST ENTRY. An entry is dropped (and the reason",
+    "kept, so `resolve()` reports the refusal rather than 'unknown device') if:",
+    "  * radiometry is yes/possible and there is no `conversion`;",
+    "  * radiometry is \"no\" and there IS a `conversion` (the direction that",
+    "    would let an AGC camera report temperatures);",
+    "  * radiometry is yes/possible on an AGC-only pixel_format (GREY, YUYV);",
+    "  * a `conversion` has no `max_measurable_c`;",
+    "  * a device_metadata conversion also carries a linear slope;",
+    "  * a split frame has no frame_layout.raw slice.",
+    "",
+    "`max_measurable_c` IS REQUIRED AND IT OUTRANKS RESOLUTION HERE. A flame is",
+    "400 C+. An AMG8833 saturates at 80 and a default high-gain Lepton at 140,",
+    "so both can say 'at least this hot' and neither can measure a fire - and a",
+    "saturated field looks identical to a merely-warm one at the top of its",
+    "range unless something says SATURATED. A reading at or above this ceiling",
+    "reports celsius:null, never a clamped number.",
+    "",
+    "`height` IS THE DELIVERED FRAME HEIGHT, INCLUDING EVERY PLANE. The InfiRay",
+    "P2 Pro's sensor is 256x192 and its height here is 384, because that is what",
+    "a buffer length must match. frame_layout says which rows are the picture,",
+    "which are the measurement, and which are calibration metadata."
+  ],
+
+  "devices": {
+
+    "infiray-p2pro": {
+      "display_name": "InfiRay P2 Pro (Xtherm family)",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": "0bda", "product_id": "5830" },
+      "pixel_format": "YUYV_RAW16",
+      "byte_order": "<",
+      "width": 256,
+      "height": 384,
+      "fps": 25.0,
+      "radiometry": "yes",
+      "frame_layout": {
+        "agc": { "row_offset": 0, "rows": 192 },
+        "raw": { "row_offset": 192, "rows": 192 }
+      },
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 0.015625,
+        "kelvin_at_zero_counts": 0.0,
+        "max_measurable_c": 550.0,
+        "min_measurable_c": -20.0,
+        "verified": false,
+        "requires_shutter_sync": true,
+        "scene_dependent": true,
+        "source": "community reverse engineering (LeoDJ/P2Pro-Viewer and derivatives): T(C) = raw/64 - 273.15, i.e. 1/64 K per count. UNVERIFIED against any vendor document, and the sources DISAGREE: P2Pro-Viewer's own code extracts the raw uint16 array and applies NO conversion at all, listing 'switch to actual raw sensor readings' as future work, while secondary write-ups state the /64 form plus an environmental correction from device metadata. Both can be true - the divide-by-64 is likely correct as a first-order mapping with vendor emissivity/ambient terms layered on top."
+      },
+      "notes": [
+        "RANKED FIRST IN THE SURVEY and the device most likely to actually be attached: radiometric, arm64-clean (pure Python + OpenCV + V4L2, no vendor binaries), ~$200-350, 25 Hz, and a ~550-600 C ceiling that does NOT saturate on a flame.",
+        "0bda IS A REALTEK VID SHARED WITH COUNTLESS WEBCAMS AND CARD READERS. Any udev rule or match here MUST use vendor AND product together; matching 0bda alone would bind an unrelated RGB webcam as the thermal camera, which is precisely the failure fpms_thermal exists to prevent.",
+        "The picture half and the measurement half arrive in ONE frame, perfectly co-registered, which is an unusually good deal - normalise() attaches the picture as `companion_agc` on the radiometric frame.",
+        "CAVEAT ON THE COMPANION PICTURE: this entry declares the whole buffer as packed 16-bit, so the AGC half is reinterpreted as uint16 and rescaled for display rather than being properly YUY2-decoded. It is legible enough to confirm framing and it is display-only anyway. Whoever writes the capture node may prefer to decode the top half as YUY2 separately.",
+        "The 300 K gap between a sunlit cone and a flame is far larger than any plausible error in this conversion. That margin is why a reverse-engineered driver is acceptable for THIS job and would not be for metrology."
+      ]
+    },
+
+    "infiray-t2splus-ht301": {
+      "display_name": "Xtherm T2S+ / HTI HT-301 (metadata-coefficient family)",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": null, "product_id": null },
+      "pixel_format": "YUYV_RAW16",
+      "byte_order": "<",
+      "width": 256,
+      "height": 196,
+      "fps": 25.0,
+      "radiometry": "possible",
+      "frame_layout": {
+        "raw": { "row_offset": 0, "rows": 192 },
+        "metadata": { "row_offset": 192, "rows": 4 }
+      },
+      "controls": [
+        {
+          "purpose": "unlock_raw_16bit",
+          "property": "CAP_PROP_ZOOM",
+          "value": 32772,
+          "note": "0x8004. This family hijacks the V4L2 ZOOM control as a general command channel (register position + byte). WITHOUT THIS THE CAMERA STREAMS A PERFECTLY GOOD PICTURE AND NO DATA - which is exactly why this entry is radiometry \"possible\" rather than \"yes\": whether the raw plane appears is a runtime outcome, not an identity."
+        },
+        {
+          "purpose": "trigger_ffc_shutter",
+          "property": "CAP_PROP_ZOOM",
+          "value": 32768,
+          "note": "0x8000 fires a calibration (shutter/FFC). Frames captured during one are an image of the shutter: uniform, plausible, wrong."
+        },
+        {
+          "purpose": "persist_parameters",
+          "property": "CAP_PROP_ZOOM",
+          "value": 33023,
+          "note": "0x80ff persists parameters to the device."
+        }
+      ],
+      "conversion": {
+        "kind": "device_metadata",
+        "max_measurable_c": 450.0,
+        "verified": false,
+        "requires_shutter_sync": true,
+        "scene_dependent": true,
+        "source": "stawel/ht301_hacklib and derivatives (diminDDL/IR-Py-Thermal, CEAD-group/ht301_t2s_plus_python), read from source. Temperature comes from PER-DEVICE CALIBRATION COEFFICIENTS carried in the four metadata rows, through a device-specific lookup plus a Stefan-Boltzmann-form computation with distance, atmospheric and emissivity terms and a range-correction pair (normal m=1 b=0; high-range m=1.17 b=-40.9). That is a decoder, not a slope. max_measurable_c 450 is the family's high-range figure and is UNVERIFIED for this specific SKU."
+      },
+      "notes": [
+        "DECLARED device_metadata ON PURPOSE, WHICH MEANS fpms_thermal REFUSES TO PRODUCE A TEMPERATURE FROM IT. The honest options were 'ship a linear approximation beside a comment saying the real conversion is elsewhere' or 'refuse until somebody writes the decoder'. The first one is how the approximation becomes what gets used, silently, forever. The frame still hands out `metadata_rows` undecoded so the decoder can be written.",
+        "This path is BETTER DOCUMENTED than the P2 Pro path and exposes emissivity explicitly - it is the strongest candidate for a real radiometric pipeline once the decoder exists.",
+        "NO USB ID RECORDED. The open drivers find this family by product string, not VID:PID, and the survey did not record one. Fill it in from `lsusb` on the actual unit rather than guessing - a guessed VID:PID in a udev rule binds the wrong device.",
+        "The four metadata rows are COEFFICIENTS, not pixels. Reading them as counts yields wild values that look exactly like a fire, which is why frame_layout.metadata exists and why the loader refuses a split frame with no explicit raw slice."
+      ]
+    },
+
+    "topdon-tc001": {
+      "display_name": "TOPDON TC001 (InfiRay-family clone)",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": null, "product_id": null },
+      "pixel_format": "YUYV_RAW16",
+      "byte_order": "<",
+      "width": 256,
+      "height": 384,
+      "fps": 25.0,
+      "radiometry": "possible",
+      "frame_layout": {
+        "agc": { "row_offset": 0, "rows": 192 },
+        "raw": { "row_offset": 192, "rows": 192 }
+      },
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 0.015625,
+        "kelvin_at_zero_counts": 0.0,
+        "max_measurable_c": 550.0,
+        "min_measurable_c": -20.0,
+        "verified": false,
+        "requires_shutter_sync": true,
+        "scene_dependent": true,
+        "source": "assumed identical to the InfiRay P2 Pro (same sensor + USB bridge family; leswright1977/PyThermalCamera credits LeoDJ's P2 Pro reverse engineering directly). UNVERIFIED for this SKU."
+      },
+      "notes": [
+        "radiometry \"possible\" RATHER THAN \"yes\", DELIBERATELY. The survey records it as UNVERIFIED whether TC001, TC001 Plus and TC002 all expose the raw half identically - they are different SKUs. Assuming they do is exactly the assume-the-better-variant mistake the tri-state exists to prevent, and here it would cost nothing to check: read the raw half against a known reference once and assert it.",
+        "NO USB ID RECORDED - the survey gives one only for the P2 Pro. Fill it in from `lsusb`. If it turns out to be 0bda:5830 as well, `resolve()` will refuse the ambiguity against infiray-p2pro and the operator must set FPMS_THERMAL_DEVICE, which is the correct outcome."
+      ]
+    },
+
+    "flir-lepton-purethermal-tlinear-10mk": {
+      "display_name": "FLIR Lepton on PureThermal, TLinear @ 0.01 K/count",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": "1e4e", "product_id": "0100" },
+      "pixel_format": "Y16",
+      "byte_order": "<",
+      "width": 160,
+      "height": 120,
+      "fps": 8.7,
+      "radiometry": "possible",
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 0.01,
+        "kelvin_at_zero_counts": 0.0,
+        "max_measurable_c": 140.0,
+        "min_measurable_c": -10.0,
+        "gain_mode": "HIGH gain (the factory default), roughly -10..140 C. Low gain reaches ~450 C but whether PureThermal exposes gain switching over UVC without dropping to the Lepton CCI is UNVERIFIED.",
+        "count_min": 1,
+        "count_max": 65535,
+        "verified": false,
+        "scene_dependent": true,
+        "requires_shutter_sync": true,
+        "source": "FLIR Lepton engineering datasheet via docs/THERMAL_HARDWARE.md 2.1: with Radiometry and TLinear enabled (the factory default for radiometric SKUs), each 16-bit pixel is absolute temperature in kelvin at 0.01 K resolution. Accuracy high gain: greater of +/-5 C or 5% typical, against a blackbody at 25 cm at equilibrium and corrected for emissivity - field accuracy is worse."
+      },
+      "notes": [
+        "radiometry \"possible\" AND THIS IS THE ENTRY THE TRI-STATE EXISTS FOR. Lepton 3.5 and 2.5 are radiometric; 3.0 and 2.0 are picture-only; ON A PURETHERMAL CARRIER ALL FOUR PRESENT THE SAME USB IDENTITY AND LOOK IDENTICAL. Buying a 3.0 by accident is the single most likely way this project ends up with a picture-only sensor while believing it bought a thermometer, and no amount of JSON can tell them apart. Prove it: operator assertion naming the part read off the module, or evaluate_radiometry_probe() against a known reference (a radiometric part in TLinear reads ~29315 counts at 20 C; a 3.0 reads 14-bit scene flux with no fixed relation to temperature, so the two separate by a huge margin).",
+        "THE 140 C CEILING IS THE FIRE-RELEVANT NUMBER. A radiometric Lepton left in its default high gain SATURATES ON AN ACTUAL FLAME and reports a flat ceiling. It still says 'very hot', which distinguishes a fire from a cone - but any attempt to report a flame temperature from high-gain data is wrong, and check_threshold() will refuse a 150 C threshold against this entry.",
+        "count_min 1 catches an ALL-ZERO frame from a disconnected or mis-bound sensor, which would otherwise convert to a perfectly plausible uniform -273 C field. It is a sanity gate, not a calibration.",
+        "8.7 Hz of UNIQUE frames (VoSPI clocks at ~27 Hz but each unique frame repeats three times; a naive driver reading at 27 Hz triple-counts every event). At 1 rad/s yaw that is 6.6 degrees of rotation between frames on a 57-degree HFOV - corroborate stopped, and associate RGB to thermal by timestamp, never by arrival order."
+      ]
+    },
+
+    "flir-lepton-purethermal-tlinear-100mk": {
+      "display_name": "FLIR Lepton on PureThermal, TLinear @ 0.1 K/count",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": "1e4e", "product_id": "0100" },
+      "pixel_format": "Y16",
+      "byte_order": "<",
+      "width": 160,
+      "height": 120,
+      "fps": 8.7,
+      "radiometry": "possible",
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 0.1,
+        "kelvin_at_zero_counts": 0.0,
+        "max_measurable_c": 140.0,
+        "min_measurable_c": -10.0,
+        "gain_mode": "HIGH gain (factory default). See the 10mk entry.",
+        "count_min": 1,
+        "count_max": 65535,
+        "verified": false,
+        "scene_dependent": true,
+        "requires_shutter_sync": true,
+        "source": "The Lepton's TLinear resolution is a RUNTIME REGISTER with two settings, 0.01 and 0.1 K per count, and NOTHING IN THE USB DESCRIPTOR REPORTS WHICH IS ACTIVE. This entry is the 0.1 setting."
+      },
+      "notes": [
+        "THIS ENTRY EXISTS TO MAKE resolve() REFUSE. It shares 1e4e:0100 with the 10mk entry and the AGC entry, so a USB match returns three candidates and resolve() refuses rather than picking one. That is the designed behaviour: choosing wrong between 0.01 and 0.1 scales EVERY temperature by ten, and 30000 counts is either 26.9 C or 2726.9 C. Set FPMS_THERMAL_DEVICE (or ENV{FPMS_THERMAL_KEY} in the udev rule) after confirming the mode the camera is actually in.",
+        "Do not 'fix' the ambiguity by deleting one of these entries. The ambiguity is real and lives in the hardware; deleting an entry only hides it and makes the surviving one a silent guess."
+      ]
+    },
+
+    "flir-lepton-purethermal-agc": {
+      "display_name": "FLIR Lepton on PureThermal, AGC greyscale stream",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": "1e4e", "product_id": "0100" },
+      "pixel_format": "GREY",
+      "width": 160,
+      "height": 120,
+      "fps": 8.7,
+      "radiometry": "no",
+      "notes": [
+        "THE SAME PHYSICAL CAMERA AS THE TWO ENTRIES ABOVE, in its AGC output mode. PureThermal exposes an AGC'd colour/greyscale stream (BGRA / RGB565 / GRAY8 / UYVY depending on board and firmware) AND a raw 16-bit stream; which one you get is a format selection, and with radiometry or TLinear disabled the 16 bits carry 14-bit scene FLUX which is not temperature and has no fixed mapping to it.",
+        "Carrying this as its own entry is what makes 'the camera is streaming AGC' expressible rather than being inferred from a temperature that looks odd. It has no conversion, so the loader would refuse it if anyone added one - which is the rule that stops a slope being attached to an AGC stream and called corroboration."
+      ]
+    },
+
+    "mlx90640": {
+      "display_name": "Melexis MLX90640 (32x24 I2C thermopile array)",
+      "status": "UNVERIFIED",
+      "transport": "i2c",
+      "i2c_address": "0x33",
+      "pixel_format": "RAW_COUNTS",
+      "width": 32,
+      "height": 24,
+      "fps": 8.0,
+      "radiometry": "yes",
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 1.0,
+        "kelvin_at_zero_counts": 273.15,
+        "max_measurable_c": 300.0,
+        "min_measurable_c": -40.0,
+        "verified": false,
+        "emissivity_applied_upstream": true,
+        "source": "The Melexis reference driver reads the device EEPROM calibration and computes per-pixel OBJECT TEMPERATURE `To` in degrees celsius, taking emissivity and reflected ambient `Ta` as its own explicit parameters. So the values reaching fpms_thermal are ALREADY degrees celsius and already emissivity-corrected: this 'conversion' is a unit change only (C -> K), and emissivity_applied_upstream is true so that applying EmissivityCompensation again is REFUSED rather than double-correcting."
+      },
+      "notes": [
+        "radiometry \"yes\": temperature is not inferred from an identity here, it is what the sensor's own published maths produces. There is no picture-only variant of this part.",
+        "RANKED SECOND IN THE SURVEY, as the INDEPENDENT CHECK on a UVC camera: different physics, different bus, different failure modes, and cheap enough to fit both. That is the only kind of redundancy worth having.",
+        "emissivity_applied_upstream=true IS LOAD-BEARING. Passing a non-unity emissivity to fpms_thermal for this device is refused, because the driver already applied one - correcting twice is a silent, physically-shaped error that no residual plot distinguishes from a miscalibrated sensor. Pass emissivity to the DRIVER and use 1.0 here to say so.",
+        "8 FPS assumes a 400 kHz bus; 1 MHz would give up to 32 FPS but whether the RK3588S header I2C runs reliably at 1 MHz over dupont wiring is UNVERIFIED.",
+        "FOV VARIANTS DIFFER ENORMOUSLY: BAA is 110x75 degrees, BAB is 55x35. Choose deliberately - this is the parameter that decides how badly it mismatches the RGB camera.",
+        "SUBPAGE CAVEAT: the device reads out in two interleaved chessboard subpages and a full frame is two reads. On a MOVING rover the two subpages sample different scenes and the interleave shows as a checker artefact. Read while stopped, which is the same operational rule the 8.7 Hz cameras impose for a different reason.",
+        "300 C ceiling: survives a modest fire, saturates on a large one."
+      ]
+    },
+
+    "mlx90641": {
+      "display_name": "Melexis MLX90641 (16x12 I2C thermopile array)",
+      "status": "UNVERIFIED",
+      "transport": "i2c",
+      "i2c_address": "0x33",
+      "pixel_format": "RAW_COUNTS",
+      "width": 16,
+      "height": 12,
+      "fps": 8.0,
+      "radiometry": "yes",
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 1.0,
+        "kelvin_at_zero_counts": 273.15,
+        "max_measurable_c": 300.0,
+        "min_measurable_c": -40.0,
+        "verified": false,
+        "emissivity_applied_upstream": true,
+        "source": "Same family and same calibration philosophy as the MLX90640; the driver outputs object temperature in celsius. The 300 C ceiling is carried over from the 90640 and is UNVERIFIED for this part."
+      },
+      "notes": [
+        "Quarter the pixels of the 90640, with correspondingly larger per-pixel IFOV and better per-pixel SNR. Choose it over the 90640 only if range matters more than shape - 16x12 is barely an image.",
+        "Fewer libraries than the 90640; the Rust mlx9064x crate covers both, Python support is thinner."
+      ]
+    },
+
+    "amg8833": {
+      "display_name": "Panasonic AMG8833 Grid-EYE (8x8 I2C)",
+      "status": "UNVERIFIED",
+      "transport": "i2c",
+      "i2c_address": "0x69",
+      "pixel_format": "RAW_COUNTS",
+      "width": 8,
+      "height": 8,
+      "fps": 10.0,
+      "radiometry": "yes",
+      "conversion": {
+        "kind": "linear",
+        "kelvin_per_count": 0.25,
+        "kelvin_at_zero_counts": 273.15,
+        "max_measurable_c": 80.0,
+        "min_measurable_c": 0.0,
+        "verified": false,
+        "source": "Panasonic datasheet: each of the 64 pixels reports a temperature directly, 12-bit two's complement with a 0.25 C LSB, accuracy +/-2.5 C, range 0..80 C. kelvin_per_count 0.25 converts the raw register LSB; if the driver in use already returns celsius, use kelvin_per_count 1.0 and say so in a separate entry rather than editing this one."
+      },
+      "notes": [
+        "READ THE CEILING AGAIN: 80 C. A flame, an ember bed or a hot exhaust PINS THIS SENSOR AT ITS CEILING. It can report 'something here is at least 80 C' - which is not nothing, since a cone in the sun does not reach 80 - but it cannot rank two hot things, cannot measure a fire, and cannot tell a fire from a car engine. check_threshold() will refuse any threshold at or above 80, which leaves a usable band of roughly 60-80 C.",
+        "64 PIXELS IS NOT AN IMAGE. It is a presence-and-bearing detector with 8 columns of angular resolution. It cannot be aligned to an RGB bounding box in any meaningful way (one pixel covers a huge solid angle, so a flame and a sunlit rock in the same sector are ONE pixel), cannot distinguish two adjacent hot objects, cannot produce a shape or area, and cannot support tracking. Its honest use is a cheap always-on 'something warm ahead' gate that raises the PRIORITY of a colour hit without claiming to localise it. Do not build a corroboration path that pretends otherwise.",
+        "arm64 support is trivial: generic /dev/i2c-N, several independent library implementations."
+      ]
+    },
+
+    "seek-compact": {
+      "display_name": "Seek Thermal Compact / CompactPRO",
+      "status": "UNVERIFIED",
+      "transport": "libusb",
+      "usb": { "vendor_id": "289d", "product_id": "0010" },
+      "pixel_format": "Y16",
+      "byte_order": "<",
+      "width": 208,
+      "height": 156,
+      "fps": 9.0,
+      "radiometry": "no",
+      "notes": [
+        "THE ENTRY THAT PROVES BIT DEPTH IS NOT RADIOMETRICITY. This device streams SIXTEEN-BIT frames and is declared radiometry \"no\", because libseek-thermal states plainly that it does not support absolute temperature: the raw-16-bit-to-temperature function is not known. Contributors have fitted linear approximations claimed accurate to about +/-1 C after warm-up while simultaneously admitting the mapping is unknown and more calibration data is needed - those two claims cannot both be robust, and FPMS does not get to pick the flattering one.",
+        "NOT UVC. The Compact family speaks a proprietary USB protocol and never appears as /dev/video*; access is libseek-thermal (libusb) or the vendor SDK. transport \"libusb\" is declared so no descriptor implies a video node that will never exist, and so the udev rule for it grants access rather than creating a video symlink.",
+        "The OEM Mosaic/Micro Core modules MAY be radiometric via the official SDK, but '16-bit filtered pre-AGC' is not the same claim as 'temperature', which SKUs unlock true thermography is UNVERIFIED, and the SDK ships prebuilt binaries whose arm64 availability the survey could not confirm (developer portal returned HTTP 403). If one is ever obtained it needs its own entry, not an edit to this one.",
+        "The survey's verdict is AVOID: highest integration effort for the weakest guarantee. 208x156 geometry is UNVERIFIED and includes the status/telemetry rows some drivers report.",
+        "289d:0011 (CompactPRO) needs its own entry if one is obtained; do not widen this one's product id to match both, since their geometry differs."
+      ]
+    },
+
+    "generic-uvc-agc-thermal": {
+      "display_name": "Unidentified UVC thermal dongle (picture-only fallback)",
+      "status": "UNVERIFIED",
+      "transport": "uvc",
+      "usb": { "vendor_id": null, "product_id": null },
+      "pixel_format": "YUYV",
+      "width": 256,
+      "height": 192,
+      "fps": 25.0,
+      "radiometry": "no",
+      "notes": [
+        "THE DOCUMENTED FALLBACK, and it is deliberately the pessimistic one. Many HTI SKUs and effectively all unbranded Amazon/AliExpress 'thermal camera' dongles output ONLY an AGC'd MJPEG or 8-bit YUYV image: no raw half, no Y16, no metadata rows. An unbranded dongle with no named sensor is a novelty.",
+        "SELECT THIS ENTRY EXPLICITLY (FPMS_THERMAL_DEVICE=generic-uvc-agc-thermal) for a camera that is not in this database. It has no USB id ON PURPOSE, so it can never be auto-matched: a wildcard fallback that matched by default would eventually swallow a real radiometric camera and silently downgrade it.",
+        "PROMOTE A SPECIFIC SKU OUT OF THIS ENTRY ONLY ON EVIDENCE: `v4l2-ctl --list-formats-ext` showing a 16-bit format or a double-height mode. Then give it its own entry with its own VID:PID, its own geometry, and radiometry \"possible\" until a known-reference probe promotes it to \"yes\".",
+        "The 256x192 geometry here is a common shape, not a measurement. If the real dongle differs, normalise() will refuse on the byte count rather than reshaping - which is the correct outcome and is how you discover the real geometry."
+      ]
+    }
+
+  }
+}

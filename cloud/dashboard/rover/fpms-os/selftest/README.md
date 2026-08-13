@@ -14,6 +14,29 @@ checks can pass on an image that has never had a kernel run against it. Only
 the third one has ever seen the hardware, and even it defers the last word to
 the operator's eyes.
 
+## Run them all
+
+```sh
+for t in test_shell_hazards test_image_offline test_boot_graph \
+         test_motion_plant test_thermal test_scanmatch; do
+    printf '%-24s ' "$t"
+    python3 "selftest/$t.py" >/dev/null 2>&1 && echo PASS || echo FAIL
+done
+```
+
+All six are offline and take a few seconds together. **`test_thermal.py` and
+`test_scanmatch.py` need numpy** and SKIP loudly with a non-zero exit without
+it — a build host that lacks numpy reports them as failures rather than
+quietly passing, which is deliberate. `apt-get install -y python3-numpy`.
+
+| | Checks | Guards |
+|---|---|---|
+| `test_shell_hazards.py` | the build scripts | the SIGPIPE class: `cmd \| grep -q` in an assignment under `pipefail` returns 141, and `local x="$(…)"` hides it |
+| `test_boot_graph.py` | the unit graph | ordering cycles, and units enabled without their dependencies |
+| `test_motion_plant.py` | `fpms_motion.py` | the turn bias, against a plant model written independently of the controller |
+| `test_thermal.py` | `fpms_thermal.py` | that a camera which cannot measure temperature cannot be made to report one |
+| `test_scanmatch.py` | `fpms_scanmatch.py` | the LiDAR mount estimator's sign conventions |
+
 ## The source tree — on the build machine, before the build
 
 ```sh
