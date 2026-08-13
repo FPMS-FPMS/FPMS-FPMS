@@ -32,9 +32,6 @@ topic read fpms/+/events/#
 # exception, below.
 # ---------------------------------------------------------------------------
 
-pattern write fpms/%u/telemetry/#
-pattern write fpms/%u/events/#
-pattern read  fpms/%u/commands/#
 
 # fpms-cored re-publishes commands/stop at QoS 1 as one of its four
 # independent stop paths -- the case where the executor missed the original
@@ -43,9 +40,6 @@ pattern read  fpms/%u/commands/#
 #
 # This is deliberately narrow: it is the three stop verbs and nothing else.
 # A rover service cannot publish a mission or a jog to itself.
-pattern write fpms/%u/commands/stop
-pattern write fpms/%u/commands/estop
-pattern write fpms/%u/commands/auto_off
 
 # ---------------------------------------------------------------------------
 # The operator laptop (the bridge user).
@@ -59,8 +53,36 @@ pattern write fpms/%u/commands/auto_off
 # the DRIVE topics off the browser entirely.
 # ---------------------------------------------------------------------------
 user fpms
-topic readwrite fpms/#
+# THE THING NAME IS WRITTEN OUT, not templated. See the note above: %u expands
+# to the USERNAME, and every service on this rover authenticates as `fpms`, so
+# `fpms/%u/...` expanded to `fpms/fpms/...` and matched nothing at all. The
+# rules that looked like per-rover isolation were dead lines, and the blanket
+# `topic readwrite fpms/#` underneath them was doing all the work.
+#
+# Naming rover1 explicitly is less elegant and actually restrictive: a STOP
+# addressed to the wrong thing is now REFUSED by the broker instead of being
+# accepted and read by nobody, which is the failure this file exists to stop.
+# It also means this file is part of the identity - see docs/IDENTITY.md.
+topic readwrite fpms/rover1/#
+
+# The bridge to the operator laptop carries the same traffic in both
+# directions, and the console legitimately issues every command verb. The real
+# control on that side is the rosbridge whitelist, which keeps the DRIVE topics
+# off the browser entirely.
 topic read $SYS/broker/#
+
+# ---------------------------------------------------------------------------
+# WHAT THIS STILL DOES NOT DO
+# ---------------------------------------------------------------------------
+#
+# It does not isolate one rover from another, because it cannot: every service
+# in this image authenticates as the single user `fpms`, so the broker has no
+# way to tell rover1's mission executor from rover2's. Real per-rover isolation
+# needs per-rover broker credentials (user `rover1`, user `rover2`), at which
+# point `pattern` rules start working as written.
+#
+# That is a fleet decision, not an image one, and it is written down here
+# rather than implied by rules that look like they do it.
 
 # ---------------------------------------------------------------------------
 # NOT restricted, and why

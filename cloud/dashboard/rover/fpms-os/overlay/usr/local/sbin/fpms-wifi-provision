@@ -40,6 +40,30 @@ AP_SSID="${FPMS_AP_SSID:-FPMS-Rover-Setup}"
 AP_PASS="${FPMS_AP_PASS:-fpmsrover}"
 SCAN_WAIT_S="${FPMS_WIFI_SCAN_WAIT_S:-45}"
 
+CONFIG=/etc/fpms/config.env
+
+# Read ONE key out of config.env.
+#
+# Deliberately NOT `. /etc/fpms/config.env`. That file holds FPMS_MQTT_PASS,
+# and sourcing it would put the broker password into the environment of every
+# nmcli child this script spawns - readable in /proc/<pid>/environ by anything
+# running as this user for as long as the process lives. A WiFi provisioner has
+# no business holding the broker credential at all.
+#
+# No pipeline into an early-exiting consumer either: `sed -n .../p` reads the
+# whole file, and the substitution is captured rather than piped. Under
+# `pipefail` a `| head -1` here would report SIGPIPE (141) instead of the
+# value, and this script sets pipefail.
+cfg_get() {
+    local key="$1" line
+    [ -r "$CONFIG" ] || return 0
+    line="$(sed -n "s/^[[:space:]]*${key}=//p" "$CONFIG" 2>/dev/null || true)"
+    line="${line%%$'
+'*}"
+    line="${line%\"}"; line="${line#\"}"
+    printf '%s' "$line"
+}
+
 log()  { echo "fpms-wifi-provision: $*"; }
 warn() { echo "fpms-wifi-provision: WARNING: $*"; }
 
@@ -96,6 +120,30 @@ fi
 # Higher autoconnect-priority wins, so the FIRST line in the file gets the
 # highest number. That is what makes "put the hotspot first" actually mean
 # something.
+# --- the network baked into the image ---------------------------------------
+#
+# Appended LAST, so it lands at the LOWEST autoconnect priority: anything the
+# operator wrote in fpms-wifi.conf wins over the built-in default, which is the
+# behaviour the boot-partition README promises them.
+#
+# Skipped if the operator already named the same SSID, so their password (which
+# may be the current one) is not shadowed by the baked-in value (which may be
+# stale). A duplicate NM profile for one SSID is also just a mess.
+BAKED_SSID="$(cfg_get FPMS_WIFI_SSID)"
+BAKED_PASS="$(cfg_get FPMS_WIFI_PASS)"
+if [ -n "$BAKED_SSID" ]; then
+    _dup=0
+    for _s in ${SSIDS+"${SSIDS[@]}"}; do
+        [ "$_s" = "$BAKED_SSID" ] && _dup=1
+    done
+    if [ "$_dup" = 1 ]; then
+        log "image default '$BAKED_SSID' also listed by the operator - using theirs"
+    else
+        SSIDS+=("$BAKED_SSID"); PASSES+=("$BAKED_PASS")
+        log "adding the image's built-in network '$BAKED_SSID' (lowest priority)"
+    fi
+fi
+
 prio=$(( ${#SSIDS[@]} + 10 ))
 for i in "${!SSIDS[@]}"; do
     ssid="${SSIDS[$i]}"; pass="${PASSES[$i]}"
@@ -172,7 +220,7 @@ if nmcli connection add type wifi ifname "$WIFI_DEV" con-name fpms-setup-ap \
     log " FALLBACK ACCESS POINT IS UP"
     log "   SSID:     $AP_SSID"
     log "   password: $AP_PASS"
-    log " Join it, then open  http://fpms-pi.local:8090/"
+    log " Join it, then open  http://$(hostname).local:8090/"
     log " or ssh ubuntu@10.42.0.1 and re-run fpms-wifi-provision."
     log "=========================================================="
 else

@@ -62,19 +62,19 @@ but it is not free. This is the complete list of what it moves.
 
 | Where | What happens |
 |---|---|
-| `backend/ros_bridge.py` | defaults `FPMS_ROS_HOST=fpms-pi.local` (line 121). Left alone it dials a name that no longer exists: **connection failure**, not a cosmetic wrong label. Set `FPMS_ROS_HOST=fpms-rover1.local` or point it at the IP. The same file also defaults `FPMS_ROS_THING="rover2"` (line 126) — see §5. |
-| `scripts/Resolve-Broker.ps1` | `[string[]]$Names = @('fpms-pi.local')` is the default it resolves the broker by, and `Start-FPMS-Dashboard.template.cmd` falls back to `FPMS_MQTT_HOST=fpms-pi.local` when that script is missing. Two independent paths to the old name. |
-| `fpms_console/Open-FPMS-Console.cmd`, `foxglove/Open-FPMS-Foxglove.ps1` | `set HOST=fpms-pi.local` / `$PRIMARY_HOST = "fpms-pi.local"`. These are the shortcuts the operator actually double-clicks. |
-| `rover/deploy_rover.py` | `fpms-pi.local` is the first SSH candidate in its host list. It falls through to hardcoded IPs, so this degrades to slow rather than broken. |
-| `fpms_console/fpms_console.py` | builds its printed URL from `socket.gethostname() + ".local"`, so it now *advertises* `fpms-rover1.local:8090`. That is correct and self-updating — but it means the console's own output no longer matches any document that says `fpms-pi.local`. |
+| `backend/ros_bridge.py` | defaults `FPMS_ROS_HOST=fpms-rover1.local` (line 121). Left alone it dials a name that no longer exists: **connection failure**, not a cosmetic wrong label. Set `FPMS_ROS_HOST=fpms-rover1.local` or point it at the IP. The same file also defaults `FPMS_ROS_THING="rover2"` (line 126) — see §5. |
+| `scripts/Resolve-Broker.ps1` | `[string[]]$Names = @('fpms-rover1.local')` is the default it resolves the broker by, and `Start-FPMS-Dashboard.template.cmd` falls back to `FPMS_MQTT_HOST=fpms-rover1.local` when that script is missing. Two independent paths to the old name. |
+| `fpms_console/Open-FPMS-Console.cmd`, `foxglove/Open-FPMS-Foxglove.ps1` | `set HOST=fpms-rover1.local` / `$PRIMARY_HOST = "fpms-rover1.local"`. These are the shortcuts the operator actually double-clicks. |
+| `rover/deploy_rover.py` | `fpms-rover1.local` is the first SSH candidate in its host list. It falls through to hardcoded IPs, so this degrades to slow rather than broken. |
+| `fpms_console/fpms_console.py` | builds its printed URL from `socket.gethostname() + ".local"`, so it now *advertises* `fpms-rover1.local:8090`. That is correct and self-updating — but it means the console's own output no longer matches any document that says `fpms-rover1.local`. |
 | `overlay/usr/local/sbin/fpms-firstboot` | hardcodes `WANT_HOST=fpms-pi` and runs **after** the image's hostname is set. **Unchanged, it sets the hostname straight back to `fpms-pi` on first boot and `FPMS_HOSTNAME` in `fpms-os.conf` is never seen.** This is the one that makes the change a no-op. |
-| `overlay/usr/local/sbin/fpms-wifi-provision` | the fallback-AP banner tells the operator to open `http://fpms-pi.local:8090/` — printed at exactly the moment they have no other way in. |
-| `overlay/usr/local/bin/fpms-doctor` | runs `ping fpms-pi.local` as a diagnostic. It will now report a failure that is not a failure, on the tool people reach for when something is wrong. |
+| `overlay/usr/local/sbin/fpms-wifi-provision` | the fallback-AP banner tells the operator to open `http://fpms-rover1.local:8090/` — printed at exactly the moment they have no other way in. |
+| `overlay/usr/local/bin/fpms-doctor` | runs `ping fpms-rover1.local` as a diagnostic. It will now report a failure that is not a failure, on the tool people reach for when something is wrong. |
 | `scripts/90-finalise.sh` | prints `http://${FPMS_HOSTNAME}.local:8090/` — self-updating, correct, listed here so the build banner change is expected rather than alarming. |
 | Desktop shortcuts / `.cmd` / `.ps1` launchers | anything with the old name baked in stops working. Nothing warns; the browser just fails to resolve. |
 
-**Breaks (documentation):** every `ssh ubuntu@fpms-pi.local`, `scp` and
-`http://fpms-pi.local:8090/` in `README.md`, `SPEC.md`, `docs/FLASHING.md`,
+**Breaks (documentation):** every `ssh ubuntu@fpms-rover1.local`, `scp` and
+`http://fpms-rover1.local:8090/` in `README.md`, `SPEC.md`, `docs/FLASHING.md`,
 `docs/RUNBOOK.md`, `docs/FAILURE_MODES.md`, `firstboot/README.md`,
 `npu/README.md`, `npu/convert/README.md`, `npu/convert/convert_yolo26.sh`,
 `scripts/30-fpms-payload.sh`. These are copy-paste instructions; a wrong one
@@ -230,14 +230,14 @@ if you deliberately want them to share one broker password.
 **A dashboard subscribed to the wrong root sees nothing, and reports nothing.**
 This is the headline. `FPMS_THING_NAME` is the MQTT topic root — every
 `fpms/<thing>/telemetry/...`, `commands/...` and `events/...` moves with it, in
-one step. A consumer still on `fpms/rover2/#` connects, authenticates, stays
+one step. A consumer still on `fpms/rover1/#` connects, authenticates, stays
 connected, and receives nothing forever. Every unit is `active`, the broker is
 up, the bridge is up, and the rover is silent. **Check the topic root before
 believing a silence.** `mosquitto_sub -t 'fpms/#' -v` on the laptop settles it
 in one command: it shows you which root is actually in use.
 
 The command direction is worse than the telemetry direction. A **STOP published
-to `fpms/rover2/commands/stop` is accepted by the broker** (see §1a — the ACL
+to `fpms/rover1/commands/stop` is accepted by the broker** (see §1a — the ACL
 grants `fpms/#`) **and read by nobody.** No error reaches the operator. Treat a
 thing-name mismatch as a safety defect, not a configuration one.
 

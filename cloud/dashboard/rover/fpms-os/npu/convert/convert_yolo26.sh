@@ -335,9 +335,9 @@ cat <<EOF
     fpms_yolo26_npu.py; do not rename it.
 
       scp $WORKDIR/$RKNN_NAME \\
-          ubuntu@fpms-pi.local:/home/ubuntu/yolo/
+          ubuntu@fpms-rover1.local:/home/ubuntu/yolo/
       scp $WORKDIR/$RKNN_NAME.json \\
-          ubuntu@fpms-pi.local:/home/ubuntu/yolo/
+          ubuntu@fpms-rover1.local:/home/ubuntu/yolo/
 
     Use the name, never an IP. This rover's address has changed more than
     seven times and every note that wrote one down was wrong the next day.

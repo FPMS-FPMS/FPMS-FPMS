@@ -80,7 +80,7 @@ wire:
 
 ```sh
 mosquitto_sub -h 127.0.0.1 -u fpms -P "$FPMS_MQTT_PASS" \
-  -t 'fpms/rover2/telemetry/camera' -C 20
+  -t 'fpms/rover1/telemetry/camera' -C 20
 ```
 
 A non-empty `detections` array, from a frame you controlled, is the only

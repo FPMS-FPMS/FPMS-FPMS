@@ -363,7 +363,7 @@ if ! grep -qE "^127\.0\.1\.1[[:space:]]+${FPMS_HOSTNAME}" /etc/hosts; then
     echo "127.0.1.1 ${FPMS_HOSTNAME}" >> /etc/hosts
 fi
 
-# avahi is what makes fpms-pi.local resolve, and it is assumed by the console,
+# avahi is what makes fpms-rover1.local resolve, and it is assumed by the console,
 # rosbridge, Foxglove and every deploy script in this project. NOTHING in the
 # repository ever installed it - that gap is why "the rover's IP has changed
 # more than seven times and every note that wrote one down was wrong the next

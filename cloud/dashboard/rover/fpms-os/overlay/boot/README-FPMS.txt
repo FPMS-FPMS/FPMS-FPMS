@@ -102,7 +102,7 @@ ALWAYS TYPE THE NAME, NOT AN IP ADDRESS. The rover's IP address changes; the
 name does not. This project has had that bite it more than seven times.
 
 If that address does not open, older printouts, shortcuts and notes for this
-project all say  fpms-pi.local . That was the single-rover name and it is no
+project all say  fpms-rover1.local . That was the single-rover name and it is no
 longer this rover. Nothing forwards the old name to the new one.
 
 The rover checks itself about 90 seconds after boot. To see the result:

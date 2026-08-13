@@ -96,13 +96,16 @@ on Windows it appears as a drive letter. On it you will find
    Put the **Windows Mobile Hotspot first**. That is the `192.168.137.x`
    subnet the mosquitto bridge points at.
 
+   **You may not need this file at all.** `FPMS_Net` is already baked into the
+   image, at the lowest priority — anything you list here is tried first.
+
 3. Eject properly, put the card in, power on.
 
 Optional files on the same partition, all one line each:
 
 | File | Purpose |
 |---|---|
-| `fpms-hostname` | rover name, default `fpms-pi`. Change only if running two rovers at once. |
+| `fpms-hostname` | rover name. This image ships as `fpms-rover1`; set this only to override it (e.g. building a second rover from the same image). |
 | `fpms-broker-host` | operator laptop IP, default `192.168.137.1` |
 | `fpms-mqtt-password` | reuse an existing broker password instead of generating one |
 
@@ -134,7 +137,7 @@ cannot be hurried.
 ## Verify
 
 ```sh
-ssh ubuntu@fpms-pi.local
+ssh ubuntu@fpms-rover1.local
 fpms-selftest
 ```
 
@@ -148,7 +151,7 @@ correct, not faults:
 - **`NPU model present: FAIL`** — the `.rknn` model is not in the repository.
   Copy it from the old Pi.
 
-Then open **`http://fpms-pi.local:8090/`**. Always the name, never an IP.
+Then open **`http://fpms-rover1.local:8090/`**. Always the name, never an IP.
 
 ---
 
@@ -157,7 +160,7 @@ Then open **`http://fpms-pi.local:8090/`**. Always the name, never an IP.
 **No lights, no boot at all.** Re-flash; verify the checksum. If you flashed
 eMMC, put a known-good SD card in — the board prefers it and you get a shell.
 
-**Boots but `fpms-pi.local` does not resolve.** mDNS resolution is per-resolver,
+**Boots but `fpms-rover1.local` does not resolve.** mDNS resolution is per-resolver,
 not per-machine — in one session it worked from .NET and failed from Python's
 `getaddrinfo` on the same box at the same time. So "ping works" does not prove
 your tool will resolve it. Find the IP from your router or hotspot's client
@@ -182,11 +185,11 @@ retries forever without logging an error.
 These are the only files worth keeping off a rover:
 
 ```sh
-scp ubuntu@fpms-pi.local:/etc/fpms/calibration.json          .
-scp ubuntu@fpms-pi.local:/etc/fpms/config.env                .
-scp ubuntu@fpms-pi.local:~/.fpms_teleop_origin.json          .
-scp -r ubuntu@fpms-pi.local:~/yolo                           .
-scp -r ubuntu@fpms-pi.local:~/slam/maps                      .
+scp ubuntu@fpms-rover1.local:/etc/fpms/calibration.json          .
+scp ubuntu@fpms-rover1.local:/etc/fpms/config.env                .
+scp ubuntu@fpms-rover1.local:~/.fpms_teleop_origin.json          .
+scp -r ubuntu@fpms-rover1.local:~/yolo                           .
+scp -r ubuntu@fpms-rover1.local:~/slam/maps                      .
 ```
 
 Everything else is in the image or in git — which is the entire point of

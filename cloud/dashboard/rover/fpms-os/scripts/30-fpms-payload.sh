@@ -682,8 +682,8 @@ cat <<'EOF'
      These live only on the old Pi. Copy them across before relying on
      detection or the console:
 
-       scp -r ubuntu@<old-pi>:~/yolo ubuntu@fpms-pi.local:~/
-       scp -r ubuntu@<old-pi>:~/fpms_console ubuntu@fpms-pi.local:~/
+       scp -r ubuntu@<old-pi>:~/yolo ubuntu@fpms-rover1.local:~/
+       scp -r ubuntu@<old-pi>:~/fpms_console ubuntu@fpms-rover1.local:~/
 
      config.env sets FPMS_YOLO_VARIANT=v26 so the agent uses the decode
      path that IS in the repo. Left at the code default (v8) it would

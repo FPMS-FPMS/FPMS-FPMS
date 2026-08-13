@@ -13,7 +13,7 @@ $ journalctl -u fpms-rover-agent
    camera found on /dev/video1 (640x480)
    camera negotiated: 6.0 fps, 640x480
    NPU unavailable (...); streaming without detection
-$ mosquitto_sub -t 'fpms/rover2/telemetry/camera'
+$ mosquitto_sub -t 'fpms/rover1/telemetry/camera'
    {"jpeg":"/9j/4AAQ...", "detections":[], "fps":5.9}
 ```
 
@@ -439,7 +439,7 @@ python3 /opt/fpms/npu/bench/fpms_npu_bench.py --seconds 180
 
 # 7. The end-to-end proof: point the camera at a person and watch the wire.
 mosquitto_sub -h 127.0.0.1 -u fpms -P "$FPMS_MQTT_PASS" \
-  -t 'fpms/rover2/telemetry/camera' -C 20 | python3 -c '
+  -t 'fpms/rover1/telemetry/camera' -C 20 | python3 -c '
 import sys, json
 for line in sys.stdin:
     d = json.loads(line).get("detections", [])

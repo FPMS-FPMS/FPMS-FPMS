@@ -61,7 +61,7 @@ reproducible, and the image verifies itself on every boot.
 | **DDS shared memory** | discovery succeeds, no data flows; papered over with a 75 s sleep and a blind restart | `fastdds_udp_only.xml` forces UDPv4 and removes the cause |
 | **Serial device identity** | both CP2102s report `ID_SERIAL 0001`; by-id is a coin flip | udev keyed on **USB topology**, ModemManager purged |
 | **`paho-mqtt`** | apt's 1.6.1 has no `CallbackAPIVersion`; five files import it unguarded, incl. the STOP authority | pinned `>=2.0`, and the build **verifies every import** |
-| **`avahi`** | `fpms-pi.local` assumed everywhere, installed by nothing | installed and enabled |
+| **`avahi`** | `fpms-rover1.local` assumed everywhere, installed by nothing | installed and enabled |
 | **WiFi** | no credential mechanism anywhere in the repo | a text file on the FAT boot partition, plus a fallback AP |
 | **Broker password** | shared, and flagged as exposed | generated per board at first boot; no default is ever baked in |
 | **`map→odom`** | two publishers the moment SLAM starts, forbidden by a comment | `Conflicts=`, enforced by systemd |
@@ -87,7 +87,7 @@ reproducible, and the image verifies itself on every boot.
 5. About 90 seconds in, **`fpms-selftest`** runs and publishes its verdict to
    `telemetry/health`.
 
-Then open **`http://fpms-pi.local:8090/`**.
+Then open **`http://fpms-rover1.local:8090/`**.
 
 > Always type the name, never an IP. The rover's address has changed more than
 > seven times in this project and every note that wrote one down was wrong the

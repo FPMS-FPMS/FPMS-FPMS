@@ -1,0 +1,258 @@
+{
+  "schema": 1,
+
+  "_file": "/etc/fpms/zones.json - mode 0644 root:root. Installed by fpms-os/scripts/50-overlay.sh (the `cp -a \"$OVL\"/* /` at line 72-75 copies the whole overlay; the loop at line 337-341 chmods every /etc/fpms/* file that is not config.env). No build-script edit was needed to ship this file, and none should be added.",
+
+  "_why_this_file_exists": "So that 'plan to zone A' works on a rover that has been flashed and never configured. The three zone centres and the start pose were already correct in fpms_missions.py (lines 520-548), derived from ARENA_MM and two fractions - but they were correct only inside one Python file. This file makes them first-class, preloaded, inspectable without reading source, and diffable against the other three places the same arithmetic lives.",
+
+  "_this_is_a_mirror_not_a_source": "frontend/src/lib/arena.ts is the single source of truth for arena geometry. This file mirrors its DERIVATION (arena_mm and the two fractions), and publishes the derived centres ONLY so a consumer can CHECK its own arithmetic against them. A consumer that reads cx_mm/cy_mm and uses them directly has created the fifth independent copy of these numbers, which is the exact failure the derivation-not-output rule exists to prevent. See docs/PLANNING.md, 'What fpms_missions.py would need'.",
+
+  "_no_comments_by_design": "calibration.json.example carries // comments because it is an EXAMPLE and is never parsed. This file IS parsed, so JSON's lack of comments is load-bearing: every piece of provenance below is a data field with a `status`, and can therefore be read, published to telemetry and asserted on by a test - which a comment cannot.",
+
+  "number_status": {
+    "_legend": "The same four words config.env and calibration.json.example use. Do not upgrade a status without doing the work.",
+    "MEASURED": "somebody put an instrument on it, and when",
+    "DERIVED": "computed exactly from other numbers in this file; no instrument was involved and none is owed",
+    "ASSUMED": "a plausible default nobody has checked",
+    "UNMEASURED": "explicitly not known; do not infer one from a nearby value"
+  },
+
+  "frame": {
+    "_definition": "Origin at the arena's BOTTOM-LEFT floor corner. +x right, +y up. Millimetres here; map metres are these millimetres divided by 1000 with the SAME origin corner, so nav2 (0.228, 0.972) IS arena (228, 972) and no conversion exists anywhere.",
+    "_heading": "psi is degrees CCW from +x. +y is up the arena, so 'forward' is exactly 90 and nothing else.",
+    "_canvas_warning": "The frontend's worldToCanvasY flip is a CANVAS concern only (canvas +y points down). It must never be applied to a coordinate in this file.",
+    "units": "mm",
+    "origin_corner": "bottom-left",
+    "x_axis": "+x right",
+    "y_axis": "+y up",
+    "heading_convention": "degrees CCW from +x",
+    "map_metres_per_mm": 0.001,
+    "map_origin_offset_mm": [0.0, 0.0]
+  },
+
+  "arena": {
+    "arena_mm": 1200.0,
+    "arena_mm_status": "ASSUMED",
+    "arena_mm_note": "1200 x 1200 mm walled square interior. Stated as a known fixed dimension in nav2/make_arena_map.py, NAV2_BRIEF.md section 6 and arena.ts, and consistent across all four - but no tape measure reading is recorded anywhere in this repo, so it is a shared assumption held four times, not a measurement. The arena WALL THICKNESS is separately UNMEASURED; make_arena_map.py's BORDER_PX=10 (100 mm) is its own docstring's words 'a generous, round stand-in ... NOT a measurement of the real wall'.",
+
+    "zone_side_frac": 0.30,
+    "zone_margin_frac": 0.04,
+    "frac_status": "DERIVED",
+    "frac_note": "arena.ts `const Z = 0.3 * ARENA_MM` and `const M = 0.04 * ARENA_MM` (arena.ts:201-204). Mirrored identically by nav2/make_arena_map.py Z_FRAC/M_FRAC (lines 106-107) and fpms_missions.py ZONE_FRAC/MARGIN_FRAC (lines 521-522). Rescaling the arena stays a ONE-number change because these are fractions.",
+
+    "zone_side_mm": 360.0,
+    "zone_margin_mm": 48.0,
+    "zone_side_mm_status": "DERIVED",
+    "zone_side_mm_derivation": "zone_side_mm = zone_side_frac * arena_mm = 0.30 * 1200 = 360.0 ; zone_margin_mm = zone_margin_frac * arena_mm = 0.04 * 1200 = 48.0"
+  },
+
+  "zones": {
+    "_shape": "Rects anchored BOTTOM-LEFT, with the centre alongside. Deliberately the same key names as the sidecar nav2/make_arena_map.py emits (x_mm, y_mm, w_mm, h_mm, cx_mm, cy_mm) so `python3 nav2/make_arena_map.py --out /tmp/arena` and this file can be diffed field for field.",
+    "_all_centres_status": "DERIVED - exact, from arena_mm and the two fractions. Verified 2026-08-13 against four independent sources; see verification below.",
+
+    "zone-a": {
+      "label": "ZONE A",
+      "corner": "TOP-LEFT",
+      "role": "FIRE ZONE",
+      "mission": "m1",
+      "x_mm": 48.0,
+      "y_mm": 792.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 228.0,
+      "cy_mm": 972.0,
+      "derivation": "x = margin = 48 ; y = arena - margin - side = 1200 - 48 - 360 = 792 ; centre = (48+180, 792+180) = (228, 972)",
+      "map_m": [0.228, 0.972],
+
+      "approach_heading_deg": 180.0,
+      "approach_heading_status": "DERIVED",
+      "approach_heading_note": "The bearing of the leg that reaches this zone on the `patrol` route (zone-b (972,972) -> zone-a (228,972)): atan2(0, -744) = 180 deg exactly. This is INFORMATIONAL - it is what the rover will already be facing on a clean arena, not an instruction. It is not what a mission commands.",
+
+      "final_heading_deg": null,
+      "final_heading_status": "DERIVED",
+      "final_heading_note": "null means NO arrival turn is required, which is exactly what fpms_missions.py mission_target('m1') returns today (line 564-566). This must stay null. A non-null value adds one turn on arrival, and a turn on this chassis costs 391 mm of equivalent driving plus the measured +/-1-4 deg of heading error that every later leg inherits and the retrace must give back. Only `home` has a heading requirement, and it has one for a reason.",
+
+      "keep_out_radius_mm": null,
+      "keep_out_status": "UNMEASURED",
+      "keep_out_note": "null means no keep-out is applied - behaviour identical to today. It is null and not 0.0 because 0.0 would be a number, and no number has been measured: nothing has ever been placed in this zone and its footprint recorded. To fill it, measure the largest horizontal extent of whatever stands in the zone, halve it, and record the date and the object. Do NOT infer one from zone_side_mm; a 360 mm zone rect is a painted region, not an object.",
+
+      "clearance_to_wall_mm": 58.0,
+      "clearance_status": "DERIVED",
+      "clearance_note": "How much margin the rover CENTRE has at this zone centre under the full wall pad. min(228, 1200-972) = 228 mm to the nearest wall, minus FPMS_MISSION_ROBOT_RADIUS_MM = 170 mm, leaves 58.0 mm. The same 58 mm is quoted independently by NAV2_PLAN.md line 37 and by fpms_missions.py's WALL_BAND_MM note (line 1911-1913). This is the entire budget for pose error at the target, and it is why 60 mm of LiDAR range noise was once enough to make the planner refuse a corridor it could drive."
+    },
+
+    "zone-b": {
+      "label": "ZONE B",
+      "corner": "TOP-RIGHT",
+      "role": "FIRE ZONE",
+      "mission": "m2",
+      "x_mm": 792.0,
+      "y_mm": 792.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 972.0,
+      "cy_mm": 972.0,
+      "derivation": "x = y = arena - margin - side = 1200 - 48 - 360 = 792 ; centre = (972, 972)",
+      "map_m": [0.972, 0.972],
+
+      "approach_heading_deg": 90.0,
+      "approach_heading_status": "DERIVED",
+      "approach_heading_note": "start (972,228) -> zone-b (972,972): atan2(744, 0) = 90 deg exactly. This zone is STRAIGHT AHEAD of the start box, which is why the `patrol` route drives it first: leg 1 needs no turn at all. Informational only.",
+
+      "final_heading_deg": null,
+      "final_heading_status": "DERIVED",
+      "final_heading_note": "As zone-a. mission_target('m2') returns None today (line 567-569) and must keep doing so.",
+
+      "keep_out_radius_mm": null,
+      "keep_out_status": "UNMEASURED",
+      "keep_out_note": "As zone-a.",
+
+      "clearance_to_wall_mm": 58.0,
+      "clearance_status": "DERIVED",
+      "clearance_note": "min(1200-972, 1200-972) = 228 mm to the nearest wall, minus 170 mm robot radius = 58.0 mm. This is the m2 corridor the WALL_BAND_MM fix was written for: it runs up x = 972 with the right wall at x = 1200.",
+
+      "gate": {
+        "_what": "The project's planner regression, and the reason fpms_missions.py was not rewritten when the stack was reorganised.",
+        "from_start_pose": true,
+        "distance_mm": 744.0,
+        "turn_deg": 0.0,
+        "segments": 10,
+        "waypoints": 11,
+        "status": "MEASURED",
+        "note": "744.0 mm exactly, on a clear arena, checked by test_stack.py line 96 with a 0.05 mm tolerance. 744 = 972 - 228. If shipping this file ever changes that number, this file is wrong - not the gate."
+      }
+    },
+
+    "water-station": {
+      "label": "WATER",
+      "corner": "BOTTOM-LEFT",
+      "role": "REFILL",
+      "mission": "water",
+      "x_mm": 48.0,
+      "y_mm": 48.0,
+      "w_mm": 360.0,
+      "h_mm": 360.0,
+      "cx_mm": 228.0,
+      "cy_mm": 228.0,
+      "derivation": "x = y = margin = 48 ; centre = (228, 228)",
+      "map_m": [0.228, 0.228],
+
+      "approach_heading_deg": 270.0,
+      "approach_heading_status": "DERIVED",
+      "approach_heading_note": "zone-a (228,972) -> water-station (228,228): atan2(-744, 0) = -90 deg = 270 deg exactly. Informational only. Note this is the bearing on the `patrol` route; a single-target `water` mission is reached from the start box on a different bearing (atan2(0, -744) = 180 deg), which is why this field is informational and not a contract.",
+
+      "final_heading_deg": null,
+      "final_heading_status": "DERIVED",
+      "final_heading_note": "As zone-a. mission_target('water') returns None today (line 570-572).",
+
+      "keep_out_radius_mm": null,
+      "keep_out_status": "UNMEASURED",
+      "keep_out_note": "This is the one zone where a keep-out would be most tempting and would be most wrong: the rover must DRIVE INTO the refill point, so a keep-out radius here is a keep-out around the destination. If a physical water rig is ever placed here, the number that is owed is a DOCK STANDOFF (how far short of the centre the rover must stop), not a keep-out - and it belongs in dock_standoff_mm below, not here.",
+
+      "clearance_to_wall_mm": 58.0,
+      "clearance_status": "DERIVED",
+      "clearance_note": "min(228, 228) = 228 mm to the nearest wall, minus 170 mm robot radius = 58.0 mm."
+    }
+  },
+
+  "start_pose": {
+    "_two_different_claims": "The COORDINATES are DERIVED and exact. The claim that the rover IS here is ASSUMED and always has been - nothing localises this rover. fpms_missions.py's Anchor defaults to assumed=True with source 'assumed start pose', and the dashboard already renders a POSE: SIMULATED badge for exactly this case. Do not let the exactness of the number imply anything about the belief.",
+    "corner": "BOTTOM-RIGHT",
+    "label": "START",
+    "mission": "home",
+    "x_mm": 972.0,
+    "y_mm": 228.0,
+    "x_m": 0.972,
+    "y_m": 0.228,
+    "coordinates_status": "DERIVED",
+    "coordinates_derivation": "x = arena - margin - side/2 = 1200 - 48 - 180 = 972 ; y = margin + side/2 = 48 + 180 = 228. The start box is the bottom-right member of the same four-corner family as the three zones, but it is deliberately NOT a zone: zones are destinations, this is where the operator is asked to PLACE the rover.",
+    "placement_status": "ASSUMED",
+
+    "heading_deg": 90.0,
+    "heading_rad": 1.5707963267948966,
+    "heading_status": "DERIVED",
+    "heading_note": "arena.ts FORWARD_HEADING_DEG = 90: +y is up the arena and psi is CCW from +x, so 'nose forward' is 90 and no other value satisfies it in this frame.",
+
+    "final_heading_deg": 90.0,
+    "final_heading_status": "DERIVED",
+    "final_heading_note": "The ONE non-null final heading. mission_target('home') returns 90.0 (line 573-574) because coming home means coming home facing the way you started, not merely standing in the right square.",
+
+    "anchor_coupling": {
+      "_what": "config.env FPMS_ARENA_ANCHOR_X/Y/YAW feed fpms-map-anchor.service, the static map->odom transform. They are these same numbers in metres and radians.",
+      "config_env_x": 0.972,
+      "config_env_y": 0.228,
+      "config_env_yaw": 1.5707963,
+      "agreement": "exact on x and y",
+      "yaw_truncation_rad": 2.679e-8,
+      "yaw_truncation_status": "DERIVED",
+      "yaw_truncation_note": "config.env writes 1.5707963; pi/2 is 1.5707963267948966. The difference is 2.679e-8 rad, which over the 1200 mm arena diagonal is 3.2e-5 mm. It is a decimal truncation, NOT a disagreement, and it is recorded here only so that nobody later 'discovers' it and treats it as a finding.",
+      "invalidation_warning": "This anchor is coupled to ~/.fpms_teleop_origin.json, which records 'odom was here, the arena was there'. Changing FPMS_MISSION_ODOM_POSE_SIGN reflects that anchor through the origin, and BOTH sign conventions then produce perfectly plausible numbers. Re-zero with set_coordinate after any sign change. Nothing in this file can detect that having happened."
+    }
+  },
+
+  "missions": {
+    "_what": "Which single-target mission id means which region. MIRROR ONLY - fpms_missions.py MISSIONS/mission_target (lines 559-575) is the definition. Present so an operator can answer 'which corner is m1' without reading Python.",
+    "_the_trap": "The mission ids are historical and do NOT line up with what an operator says out loud. Standing behind the rover at the start box, the zone STRAIGHT AHEAD (top-right, zone-b) is mission `m2`, and the FAR zone (top-left, zone-a) is mission `m1`. So an operator's spoken 'Zone 1' is the code's `m2`. Nothing is renumbered - renaming ids to match one operator's vocabulary would silently change what every stored command, log line and dashboard button means. Every operator-facing string names the CORNER instead, because a corner is the one description that cannot be read two ways.",
+    "m1": "zone-a",
+    "m2": "zone-b",
+    "water": "water-station",
+    "home": "start_pose"
+  },
+
+  "routes": {
+    "_what": "MIRROR ONLY, and INFORMATIONAL. This is not a knob. The order below is reasoned in fpms_missions.py ROUTES (lines 608-628) and a consumer must NOT take route order from this file.",
+    "_why_this_order": "Two orders tie for shortest at 2232 mm of outbound travel: m2->m1->water and water->m1->m2. Both walk three sides of the perimeter with two 90 deg turns; every other permutation needs a diagonal and costs 300-600 mm more. The tie is broken by the FIRST leg: the rover starts at (972,228) facing 90 deg, which points exactly at m2, so leg 1 needs NO turn at all. Each turn is worth +/-1-4 deg of heading error that every later leg inherits.",
+    "patrol": {
+      "legs": ["m2", "m1", "water"],
+      "outbound_mm": 2232.0,
+      "outbound_mm_status": "DERIVED",
+      "outbound_mm_derivation": "744 (start->zone-b) + 744 (zone-b->zone-a) + 744 (zone-a->water) = 2232.0",
+      "returns": "retrace of the whole path back to the start box"
+    }
+  },
+
+  "planner_contract": {
+    "_what": "Numbers that decide what 'arrived at a zone' means. MIRRORED from fpms_missions.py defaults so this file is self-contained for a reader; the executor's own constants remain authoritative and config.env remains the place to change them.",
+    "arrive_tol_mm": 25.0,
+    "arrive_tol_status": "DERIVED",
+    "arrive_tol_note": "fpms_missions.py ARRIVE_TOL_MM (line 975): closer than this and another leg is noise, not progress.",
+    "dock_standoff_mm": 150.0,
+    "dock_standoff_status": "ASSUMED",
+    "dock_standoff_note": "fpms_missions.py DOCK_APPROACH_MM default (line 966). The last 150 mm into any target is always driven by the bounded-burst primitive regardless of backend, because Nav2's controller cannot dock on this chassis - its velocity profile assumes a machine that can express slow motion, and this one cannot (see FPMS_MISSION_MIN_PULSE_S).",
+    "robot_radius_mm": 170.0,
+    "robot_radius_status": "ASSUMED",
+    "robot_radius_note": "fpms_missions.py ROBOT_RADIUS_MM default (line 1763) - half-width INCLUDING the overhang, not the wheelbase. NAV2_PLAN.md derives 0.166 from sqrt(0.12^2 + 0.115^2) and says plainly 'Measure the chassis before setting this'. It has not been measured. KNOWN DISAGREEMENT: nav2/nav2_params.yaml sets robot_radius: 0.15 in BOTH costmap blocks (lines 558 and 668), which is 20 mm smaller than the executor's own figure. NAV2_PLAN.md item 2 already flags it. Nav2 is planning-only and not on the critical path today, so the two have not been reconciled - but they must not be assumed to agree.",
+    "grid_mm": 50.0,
+    "grid_cells": 576,
+    "grid_status": "DERIVED",
+    "grid_note": "FPMS_MISSION_GRID_MM default 50 mm; n = ceil(1200/50) = 24, so the planner's occupancy grid is 24 x 24 = 576 cells. This is the number the D* Lite question turns on - see docs/PLANNING.md."
+  },
+
+  "verification": {
+    "_what": "These centres were checked against every other place in the repo that states them, rather than taken from any one of them. Re-run this check after any change to arena.ts.",
+    "date": "2026-08-13",
+    "result": "ALL FOUR SOURCES AGREE EXACTLY. Zero disagreements found on any zone centre, on the start pose, or on the arena size.",
+    "sources": [
+      "frontend/src/lib/arena.ts:201-204,228-263,280,294-352 - the single source of truth (ARENA_MM=1200, Z=0.3*ARENA_MM, M=0.04*ARENA_MM, three zone rects, FORWARD_HEADING_DEG=90, START_BOX/ROVER_START)",
+      "nav2/make_arena_map.py:103-162 - independent mirror of the same derivation; compute_zones() and compute_start_pose() reproduce (228,972) (972,972) (228,228) and (972,228)/90 deg",
+      "nav2/arena_map.yaml:36-46 - states the frame identity in prose and quotes zone-a as arena (228,972) = nav2 (0.228,0.972); resolution 0.01, origin [-0.10,-0.10,0.0], 140x140 px",
+      "fpms_missions.py:520-548 - the executor's own ARENA_MM/ZONE_FRAC/MARGIN_FRAC/ZONES/ROVER_START",
+      "fpms-os/overlay/etc/fpms/config.env:217-219 - FPMS_ARENA_ANCHOR_X=0.972 Y=0.228 YAW=1.5707963",
+      "rover/rescued/arena_zones.json - a previously generated make_arena_map.py sidecar; byte-for-byte agreement on all three centres and the start pose"
+    ],
+    "recomputation": "arena_mm=1200, side=0.30*1200=360, margin=0.04*1200=48. zone-a=(48+180, 1200-48-360+180)=(228,972). zone-b=(1200-48-360+180, same)=(972,972). water=(48+180, 48+180)=(228,228). start=(1200-48-180, 48+180)=(972,228), heading 90 deg = 1.5707963267948966 rad.",
+    "reachability_check": "Under the full wall pad (WALL_PAD_MM defaults to ROBOT_RADIUS_MM = 170 mm) the rover CENTRE may occupy [170, 1030] on both axes. All three zone centres and the start pose lie inside that box, with 58.0 mm to spare at the tightest point of each. Every target in this file is reachable at FULL margin - none of them needs the relaxation ladder on a clean arena.",
+    "non_disagreements_recorded_so_nobody_rediscovers_them": [
+      "config.env FPMS_ARENA_ANCHOR_YAW=1.5707963 is pi/2 truncated at 7 decimals: 2.679e-8 rad, 3.2e-5 mm over the arena. Not a disagreement.",
+      "nav2/make_arena_map.py BORDER_PX=10 puts the map origin at (-0.10,-0.10). That is the image's bottom-left corner, not the arena's - the arena interior still starts at exactly (0,0). Not a disagreement.",
+      "nav2/nav2_params.yaml robot_radius 0.15 vs the executor's 0.17 IS a real disagreement, but it is about the CHASSIS, not about the zones. It is recorded in planner_contract above and in NAV2_PLAN.md item 2."
+    ]
+  },
+
+  "consumption": {
+    "_status": "NOT YET CONSUMED. As of 2026-08-13 nothing reads this file. fpms_missions.py still computes these values from its own constants and is byte-identical in behaviour with or without this file present. That is deliberate: shipping the data first, and wiring it second, means the wiring can be proved to change nothing.",
+    "_the_only_safe_contract": "A consumer must recompute the centres from arena_mm, zone_side_frac and zone_margin_frac and REFUSE this whole file if any published cx_mm/cy_mm disagrees by more than 0.05 mm - the same tolerance test_stack.py uses on the 744.0 mm gate. Zone coordinates cannot be sanity-ranged into safety the way calibration values can: a zone 100 mm from where it should be is a perfectly plausible number that drives the rover to the wrong place, silently and forever. The gate has to be self-consistency, not plausibility.",
+    "_what_a_missing_file_must_do": "Nothing. Absent file -> built-in constants, no note, no fault. Exactly as load_calibration() treats a missing calibration.json. A file that must exist for the rover to work is a new way for the rover to stop working.",
+    "_see": "fpms-os/docs/PLANNING.md, section 'What fpms_missions.py would need to consume this file'."
+  }
+}

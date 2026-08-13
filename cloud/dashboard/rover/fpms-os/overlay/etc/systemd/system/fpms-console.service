@@ -5,7 +5,7 @@ Documentation=file:/home/ubuntu/fpms_console/README.md
 # The console is served FROM THE ROVER so the operator needs nothing installed
 # and nothing started on the laptop. Open:
 #
-#     http://fpms-pi.local:8090/
+#     http://fpms-rover1.local:8090/
 #
 # ALWAYS TYPE THE NAME, NEVER AN IP. The rover's address has changed more than
 # seven times in this project and every note that wrote one down was wrong the

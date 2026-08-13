@@ -283,7 +283,7 @@ exception, logs one line, and streams video forever with every unit reporting
   settle it is to run this and compare against the Pi's copy:
 
   ```sh
-  ssh ubuntu@fpms-pi.local sha256sum /home/ubuntu/yolo/yolo26n-rk3588.rknn
+  ssh ubuntu@fpms-rover1.local sha256sum /home/ubuntu/yolo/yolo26n-rk3588.rknn
   ```
 
   A byte-identical result is not expected (build timestamps, toolkit
@@ -330,8 +330,8 @@ pipeline regenerates it.
 ## Getting it onto the rover
 
 ```sh
-scp yolo26n-rk3588.rknn      ubuntu@fpms-pi.local:/home/ubuntu/yolo/
-scp yolo26n-rk3588.rknn.json ubuntu@fpms-pi.local:/home/ubuntu/yolo/
+scp yolo26n-rk3588.rknn      ubuntu@fpms-rover1.local:/home/ubuntu/yolo/
+scp yolo26n-rk3588.rknn.json ubuntu@fpms-rover1.local:/home/ubuntu/yolo/
 ```
 
 **Do not rename the file.** `fpms_yolo26_npu.py` hardcodes

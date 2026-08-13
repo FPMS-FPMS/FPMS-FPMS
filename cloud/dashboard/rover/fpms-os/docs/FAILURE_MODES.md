@@ -245,7 +245,7 @@ A mismatched RMW discovers nothing and reports no error.
 
 ### F4. `avahi` was assumed by four components and installed by nothing
 
-`fpms-pi.local` is the documented address for the console, rosbridge, Foxglove
+`fpms-rover1.local` is the documented address for the console, rosbridge, Foxglove
 and every deploy script. The Pi's address changed more than seven times.
 
 **Fixed:** installed and enabled; `/etc/hosts` and the hostname set at first

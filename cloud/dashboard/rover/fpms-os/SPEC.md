@@ -41,7 +41,7 @@ exists so that never happens again.
 | Nav2 | ≥ 1.1.20 | version validated on this hardware |
 | slam_toolbox | 2.6.10 | configs diffed against this exact version |
 | User | **`ubuntu`**, home **`/home/ubuntu`** | hardcoded in every unit and in three Python files with no override |
-| Hostname | **`fpms-pi`** | `fpms_console.py` derives the mDNS URL from `socket.gethostname()`; every doc says `fpms-pi.local` |
+| Hostname | **`fpms-rover1`** | this image is Rover 1. `fpms_console.py` derives the mDNS URL from `socket.gethostname()`, so the hostname IS the address; see `docs/IDENTITY.md` |
 | `ROS_DOMAIN_ID` | **20**, everywhere, no exceptions | the ESP32 declares domain 20 in its CREATE_PARTICIPANT; on any other domain every topic list is empty and looks exactly like dead hardware |
 | `RMW_IMPLEMENTATION` | **`rmw_fastrtps_cpp`** on *every* ROS unit | today `fpms-teleop` omits it — a silent no-data failure |
 | OS source root | `cloud/dashboard/rover/fpms-os/` | |
@@ -316,7 +316,7 @@ from the laptop is the only direction that works. Nothing may bind loopback-only
   `commands/stop`. Ship an ACL that restricts by client id.
 - **avahi-daemon must be installed and enabled.** `.local` resolution is assumed
   by the console, rosbridge, Foxglove, and every deploy script — and avahi is
-  installed by nothing in the repo. Also needs `127.0.1.1 fpms-pi` in `/etc/hosts`.
+  installed by nothing in the repo. Also needs `127.0.1.1 <hostname>` in `/etc/hosts` — avahi publishes the `.local` name from there, so that line is not decoration.
   Do not disable IPv6: the Pi's mDNS has historically answered over link-local.
 - **rosbridge's whitelist is the safety mechanism.** `/cmd_vel` and `/cmd_duty`
   are absent from `topics_glob` **by construction**, so a stray click or a stale

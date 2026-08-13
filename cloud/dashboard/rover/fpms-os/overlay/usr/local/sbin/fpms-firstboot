@@ -102,7 +102,7 @@ fi
 
 # --- 3. hostname and mDNS ----------------------------------------------------
 # fpms_console.py builds the URL it prints from socket.gethostname() + ".local",
-# and every document in this project says fpms-pi.local. A different hostname
+# and every document in this project says fpms-rover1.local. A different hostname
 # silently breaks all of them.
 #
 # The operator can override it with a file on the boot partition, because a
@@ -118,9 +118,10 @@ fi
 # comes up, answers to the wrong name, and every URL in the docs still works,
 # so nothing looks broken until a second rover appears and they collide.
 #
-# mDNS collision is the reason to care. Two rovers both claiming fpms-pi.local
-# does not error - avahi renames ONE of them, at random, to fpms-pi-2.local.
-# Which one is not stable across boots.
+# mDNS collision is the reason to care. Two rovers both claiming the same
+# .local name does not error - avahi renames ONE of them, at random, by
+# appending a suffix. Which one gets renamed is not stable across boots, so
+# the rover you reach by name today may not be the one you reach tomorrow.
 WANT_HOST=""
 if [ -r "$BOOTDIR/fpms-hostname" ]; then
     WANT_HOST="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-hostname")"

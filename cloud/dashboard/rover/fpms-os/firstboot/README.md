@@ -60,7 +60,7 @@ Notepad. See `overlay/boot/README-FPMS.txt` — that is the operator-facing copy
 | File | Default |
 |---|---|
 | `fpms-wifi.conf` | none — falls back to an AP |
-| `fpms-hostname` | `fpms-pi` |
+| `fpms-hostname` | the image's own name (`fpms-rover1`) |
 | `fpms-broker-host` | `192.168.137.1` |
 | `fpms-mqtt-password` | generated |
 

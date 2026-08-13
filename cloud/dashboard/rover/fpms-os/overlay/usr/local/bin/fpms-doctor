@@ -204,7 +204,7 @@ wrong-distance)
 
 no-network)
     hdr "From the laptop"
-    cmd "ping fpms-pi.local"
+    cmd "ping fpms-rover1.local"
     say "mDNS resolution is PER-RESOLVER, not per-machine. It has worked from"
     say "one language's resolver and failed from another's on the same box at"
     say "the same time. So 'ping works' does not prove your tool will resolve"

@@ -7,11 +7,11 @@ Short on purpose. You are meant to be able to use this under pressure.
 ## The 30-second pre-run check
 
 ```sh
-ssh ubuntu@fpms-pi.local
+ssh ubuntu@fpms-rover1.local
 fpms-selftest
 ```
 
-Then look at the console at `http://fpms-pi.local:8090/` and confirm:
+Then look at the console at `http://fpms-rover1.local:8090/` and confirm:
 
 - the LiDAR ring is **moving**, and the age counter is under a second
 - the battery reads something plausible
@@ -136,7 +136,7 @@ In order of likelihood:
 
 ```sh
 mosquitto_sub -h 127.0.0.1 -u fpms -P "$(sudo cat /var/lib/fpms/broker-password)" \
-  -t 'fpms/rover2/telemetry/lidar' -C 1 | jq '{health,hz,stale,seq}'
+  -t 'fpms/rover1/telemetry/lidar' -C 1 | jq '{health,hz,stale,seq}'
 ```
 
 - `seq` climbing while `stale: true` → **the scanner** is at fault. Check the
