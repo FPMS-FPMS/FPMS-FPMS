@@ -1,0 +1,34 @@
+# The dashboard is authored on Windows and served to browsers from a Linux
+# rover. Force LF in the working tree.
+#
+# WHY, AND WHY IT IS NOT COSMETIC HERE
+# ====================================
+# This is the third place in this repository to need this file. The rover tree
+# got one after every payload file was found to be CRLF, which put a "\r" on
+# the shebang of the script a systemd unit ExecStarts for the drive link -- and
+# the resulting error names a file that plainly exists:
+#
+#     /usr/bin/env: bad interpreter: No such file or directory
+#
+# For the dashboard the failure is quieter but the same shape: any .sh or
+# .py helper here that ends up executed on the rover fails the same way, and a
+# CRLF in a served .js is a byte-level difference that survives every visual
+# inspection.
+#
+# `git ls-files --eol` is the check. `i/lf w/crlf attr/` means the committed
+# bytes are fine and the WORKING TREE is not -- and the working tree is what
+# gets copied into an image or served by a static file server.
+*               text eol=lf
+
+# Never touch binary payloads.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pgm           binary
+*.woff          binary
+*.woff2         binary
+*.pdf           binary
+*.rknn          binary
+*.onnx          binary
