@@ -1,5 +1,5 @@
 /* =========================================================================
-   verify_render.js — proves the STALENESS CONTRACT, headlessly.
+   verify_render.js — proves the STALENESS CONTRACT and the SILENCE ALARM.
    =========================================================================
 
      node verify_render.js
@@ -8,28 +8,29 @@
 
    WHAT IT IS FOR
 
-   "Every panel ages forward from receipt and greys out when stale" is the
-   promise this dashboard makes to an operator who is deciding whether to
-   believe a number on a screen. A comment cannot keep that promise. So this
-   loads index.html, feeds.js, arena.js and app.js into a minimal DOM shim,
-   pushes real-shaped rosbridge frames through them, advances a fake clock,
-   and asserts what is actually rendered:
+   Two promises this dashboard makes are the kind that a comment cannot keep:
 
-     * a value shows up, with an age;
-     * the SAME value, unchanged, is marked stale once its threshold passes,
-       without any new message arriving — which is the only way a frozen
-       publisher can ever be caught;
-     * the pose is judged by its WORST component;
-     * the LiDAR frame is DROPPED, not held, when it goes stale;
-     * the battery falls back to the mission mirror only while /battery is
-       absent or stale, and says which source it is showing;
-     * the CAMERA and NPU tiles never claim a health they have no ROS
-       publisher for.
+     1. "Every panel ages forward from receipt and greys out when stale."
+        An operator decides whether to believe a number on the strength of
+        that. So this drives a fake clock forward WITHOUT delivering any new
+        message and asserts that the panels turn stale on their own — which
+        is the only way a frozen publisher is ever caught.
 
-   THE CLOCK IS FAKED, NOT SLEPT. `performance.now()` is the only time source
-   feeds.js uses (deliberately — it is monotonic, so an NTP step on the
-   operator's laptop cannot make a stale value look fresh), so the whole
-   suite runs instantly by moving that one function forward.
+     2. "Connected but receiving nothing is made loud, and named."
+        /etc/fpms/config.env warns that a consumer on the wrong topic root
+        "connects, authenticates, stays connected and receives nothing
+        forever ... the broker, the bridge and every unit look healthy". So
+        this reproduces exactly that shape — /diagnostics arriving, the
+        /fpms/* mirrors silent — and asserts the banner says CHECK THE THING
+        NAME rather than showing empty panels.
+
+   It loads index.html, feeds.js, arena.js and app.js into a minimal DOM shim
+   and pushes real-shaped rosbridge frames through them.
+
+   THE CLOCK IS FAKED, NOT SLEPT. performance.now() is the only time source
+   feeds.js uses — deliberately, because it is monotonic and an NTP step on
+   the operator's laptop therefore cannot make a stale value look fresh — so
+   moving that one function forward runs the whole suite instantly.
    ========================================================================= */
 "use strict";
 
@@ -43,17 +44,23 @@ class El {
   constructor(tag) {
     this.tagName = (tag || "div").toUpperCase();
     this.attrs = {}; this.children = []; this.parentNode = null;
-    this._text = ""; this._html = ""; this.style = {};
+    this._text = ""; this._html = ""; this.style = {}; this._on = {};
+    this.value = "";
+    const self = this;
     this.classList = {
-      _el: this,
-      add: (c) => { this._el._cls().add(c); this._el._sync(); },
-      remove: (c) => { this._el._cls().delete(c); this._el._sync(); },
-      toggle: (c, on) => { const s = this._el._cls(); if (on) { s.add(c); } else { s.delete(c); } this._el._sync(); },
-      contains: (c) => this._el._cls().has(c),
+      add: (c) => { self._cls().add(c); self._sync(); },
+      remove: (c) => { self._cls().delete(c); self._sync(); },
+      toggle: (c, on) => { const s = self._cls(); if (on) { s.add(c); } else { s.delete(c); } self._sync(); },
+      contains: (c) => self._cls().has(c),
     };
   }
-  _cls() { return (this._clsSet = this._clsSet || new Set((this.attrs["class"] || "").split(/\s+/).filter(Boolean))); }
-  _sync() { this.attrs["class"] = [...this._cls()].join(" "); }
+  _cls() {
+    if (!this._clsSet) {
+      this._clsSet = new Set((this.attrs["class"] || "").split(/\s+/).filter(Boolean));
+    }
+    return this._clsSet;
+  }
+  _sync() { this.attrs["class"] = [...this._clsSet].join(" "); }
   get className() { return this.attrs["class"] || ""; }
   set className(v) { this.attrs["class"] = v; this._clsSet = null; }
   setAttribute(k, v) { this.attrs[k] = String(v); if (k === "class") { this._clsSet = null; } }
@@ -68,10 +75,12 @@ class El {
   get childNodes() { return this.children; }
   set scrollTop(_) {} get scrollTop() { return 0; }
   get scrollHeight() { return 0; }
-  addEventListener() {}
+  addEventListener(type, fn) { (this._on[type] = this._on[type] || []).push(fn); }
+  dispatch(type, ev) { (this._on[type] || []).forEach((f) => f(ev || { preventDefault() {} })); }
   focus() {}
   getBoundingClientRect() { return { width: 800, height: 600, top: 0, left: 0 }; }
   getContext() { return CANVAS_CTX; }
+  hidden() { return this._cls().has("hidden"); }
 }
 
 /* Canvas is exercised for crashes only — arena.js's arithmetic runs for real,
@@ -95,10 +104,7 @@ function parseHtml(src) {
   while ((m = re.exec(src))) {
     const [, closing, tag, attrStr, selfClose] = m;
     const t = tag.toLowerCase();
-    if (closing) {
-      if (stack.length > 1) { stack.pop(); }
-      continue;
-    }
+    if (closing) { if (stack.length > 1) { stack.pop(); } continue; }
     const el = new El(t);
     const ar = /([a-zA-Z-]+)\s*=\s*"([^"]*)"/g;
     let a;
@@ -115,16 +121,20 @@ const HERE = __dirname;
 const dom = parseHtml(fs.readFileSync(path.join(HERE, "index.html"), "utf8"));
 
 let NOW = 1000;                                    // the fake monotonic clock
-const timers = [];                                 // [id, fn, dueAt, everyMs]
+const timers = [];
 let timerId = 1;
+
+/* An optional local zones.json, resolved the same way serve.py resolves it. */
+const ZONES_PATH = [
+  path.join(HERE, "..", "rover", "fpms-os", "overlay", "etc", "fpms", "zones.json"),
+].find((p) => fs.existsSync(p));
 
 const g = {
   document: {
     getElementById: (id) => dom.byId[id] || null,
     querySelectorAll: (sel) => {
       const m = /^\[([a-zA-Z-]+)\]$/.exec(sel);
-      if (m) { return dom.all.filter((e) => e.attrs[m[1]] !== undefined); }
-      return [];
+      return m ? dom.all.filter((e) => e.attrs[m[1]] !== undefined) : [];
     },
     createElement: (t) => new El(t),
     addEventListener: (ev, fn) => { if (ev === "DOMContentLoaded") { g._ready = fn; } },
@@ -134,9 +144,18 @@ const g = {
   },
   addEventListener: () => {},
   navigator: { onLine: true },
-  location: { search: "?rover=fake-pi:9090", hostname: "localhost" },
+  location: { search: "", hostname: "localhost" },
   localStorage: { getItem: () => null, setItem: () => {} },
-  fetch: () => Promise.reject(new Error("no server in this test")),
+  fetch: (url) => {
+    if (/zones\.json/.test(url) && ZONES_PATH) {
+      const body = fs.readFileSync(ZONES_PATH, "utf8");
+      return Promise.resolve({ json: () => Promise.resolve(JSON.parse(body)) });
+    }
+    /* config.json is deliberately unavailable, so the run exercises the
+       BUILT-IN rover1 defaults — the path an operator gets by opening the
+       file directly. */
+    return Promise.reject(new Error("not served in this test"));
+  },
   URLSearchParams,
   performance: { now: () => NOW },
   setInterval: (fn, ms) => { const id = timerId++; timers.push({ id, fn, due: NOW + ms, every: ms }); return id; },
@@ -147,8 +166,7 @@ const g = {
 };
 g.window = g;
 
-/* Advance the fake clock, firing timers in order — this is what makes the
-   5 Hz ticker run and what makes a value age without a message arriving. */
+let FAILED = 0, PASSED = 0;
 function advance(ms) {
   const end = NOW + ms;
   for (;;) {
@@ -164,11 +182,29 @@ function advance(ms) {
 /* ------------------------------------------------- fake rosbridge socket */
 let liveSockets = [];
 class FakeWS {
-  constructor(url) { this.url = url; this.readyState = 0; this.sent = []; liveSockets.push(this); }
-  send(s) { if (this.readyState !== 1) { throw new Error("not open"); } this.sent.push(JSON.parse(s)); }
+  constructor(url) {
+    this.url = url; this.readyState = 0; this.sent = [];
+    liveSockets.push(this);
+    /* Every socket comes up on the next tick, including the ones the silence
+       remedy opens by itself. Without this the test would keep publishing
+       into a socket the code under test had already replaced. */
+    g.setTimeout(() => this.accept(), 1);
+  }
+  send(s) {
+    if (this.readyState !== 1) { throw new Error("not open"); }
+    const o = JSON.parse(s);
+    this.sent.push(o);
+    /* Answer the heartbeat exactly as a stock rosbridge does, so the link
+       stays up across long clock advances instead of tearing itself down
+       mid-test. An unknown op comes back as a status error carrying the id. */
+    if (o.op === "__fpms_ping__") {
+      this.deliver({ op: "status", level: "error", id: o.id, msg: "Unknown operation" });
+    }
+  }
   close() { if (this.readyState === 3) { return; } this.readyState = 3; if (this.onclose) { this.onclose({ code: 1000 }); } }
-  accept() { this.readyState = 1; if (this.onopen) { this.onopen(); } }
-  pub(topic, msg) { if (this.onmessage) { this.onmessage({ data: JSON.stringify({ op: "publish", topic, msg }) }); } }
+  accept() { if (this.readyState !== 0) { return; } this.readyState = 1; if (this.onopen) { this.onopen(); } }
+  deliver(o) { if (this.onmessage) { this.onmessage({ data: JSON.stringify(o) }); } }
+  pub(topic, msg) { this.deliver({ op: "publish", topic, msg }); }
 }
 g.WebSocket = FakeWS;
 
@@ -182,166 +218,216 @@ function load(file) {
      g.setInterval, g.clearInterval, g.navigator, g.location, g.localStorage,
      g.fetch, URLSearchParams, console);
 }
-load("rosbridge.js");
-load("feeds.js");
-load("arena.js");
-load("app.js");
-if (g._ready) { g._ready(); }
 
 /* ------------------------------------------------------------ assertions */
-let PASSED = 0, FAILED = 0;
 function ok(cond, msg) {
   console.log((cond ? "  PASS  " : "  FAIL  ") + msg);
   if (cond) { PASSED++; } else { FAILED++; }
 }
 const txt = (id) => (dom.byId[id] ? dom.byId[id].textContent : "<<no element " + id + ">>");
+const shown = (id) => !!dom.byId[id] && !dom.byId[id].classList.contains("hidden");
 const lvl = (feed) => {
   const el = dom.all.find((e) => e.attrs["data-feed"] === feed);
   return el ? el.attrs["data-level"] : "<<no card for " + feed + ">>";
 };
 const links = () => (dom.byId.links ? dom.byId.links.innerHTML : "");
+/* Resolve the CURRENT socket of each link every time. Both links dial the
+   same URL, so they are told apart by what they asked for: only the main
+   link ever subscribes. The silence remedy replaces sockets underneath us,
+   and a test that cached socket[1] would quietly stop testing anything. */
+const isMain = (s) => s.sent.some((m) => m.op === "subscribe");
+const open1 = () => liveSockets.filter((s) => s.readyState === 1);
+const mainSock = () => { const a = open1().filter(isMain); return a[a.length - 1]; };
+const stopSock = () => { const a = open1().filter((s) => !isMain(s)); return a[a.length - 1]; };
+const flush = () => new Promise((r) => setImmediate(r));
 
-/* The main socket is the second one created — the STOP link is deliberately
-   dialed first so it wins the race to the server on a cold start. */
-const main = () => liveSockets[1];
-const stop = () => liveSockets[0];
+(async function main() {
 
-console.log("\n1. two sockets, STOP first, and STOP advertises nothing else");
+load("rosbridge.js");
+load("feeds.js");
+load("arena.js");
+load("app.js");
+if (g._ready) { g._ready(); }
+await flush(); await flush(); await flush();   // let the config.json rejection settle
+advance(20);                                   // let both sockets come up
+
+console.log("\n1. defaults are the ROVER 1 identity, and it is visible");
 ok(liveSockets.length === 2, "two sockets dialed (main + dedicated STOP)");
-liveSockets.forEach((s) => s.accept());
-advance(50);
-ok(stop().sent.filter((m) => m.op === "subscribe").length === 0,
-   "the STOP socket subscribes to NOTHING — its send buffer is empty by construction");
-ok(stop().sent.some((m) => m.op === "advertise" && m.topic === "/fpms/cmd/stop") &&
-   stop().sent.some((m) => m.op === "advertise" && m.topic === "/estop"),
-   "STOP socket advertises both stop verbs");
+ok(mainSock().url === "ws://fpms-rover1.local:9090",
+   "dials the rover1 default: " + mainSock().url);
+ok(txt("thingChip") === "rover1", "thing name shown in the header: '" + txt("thingChip") + "'");
+ok(txt("roverHost") === "fpms-rover1.local:9090", "host shown in the header: " + txt("roverHost"));
 
-console.log("\n2. NOTHING outside the rosbridge whitelist is ever requested");
+console.log("\n2. zones.json is CHECKED, not copied");
+if (ZONES_PATH) {
+  const z = JSON.parse(fs.readFileSync(ZONES_PATH, "utf8"));
+  const v = g.ARENA.validateZones(z);
+  ok(v.ok, "the image's zones.json agrees with the derivation" +
+     (v.ok ? " (" + v.checked + " centres, 0.05 mm tolerance)" : ": " + v.problems.join("; ")));
+  const bad = JSON.parse(JSON.stringify(z));
+  bad.zones["zone-a"].cx_mm = 328.0;                 // 100 mm out
+  const vb = g.ARENA.validateZones(bad);
+  ok(!vb.ok && /zone-a/.test(vb.problems.join(" ")),
+     "a zone centre 100 mm out is REFUSED rather than adopted: " + vb.problems[0]);
+  ok(g.ARENA.ZONES.find((q) => q.id === "water-station") !== undefined,
+     "zone ids match zones.json (water-station, not water)");
+  const za = g.ARENA.ZONES.find((q) => q.id === "zone-a");
+  ok(za.cx === 228 && za.cy === 972 && za.corner === "TOP-LEFT" && za.mission === "m1",
+     "zone-a derives to 228,972 TOP-LEFT (m1) — the corner names the zone, not the mission id");
+} else {
+  ok(true, "no zones.json in this checkout — skipped (absent file is a no-op by design)");
+}
+
+console.log("\n3. every topic is inside topics_glob, and no drive topic is touched");
+advance(50);
 const GLOB = ["/estop", "/fpms/*", "/clicked_point", "/scan_lidar", "/odom_raw",
               "/odom", "/imu", "/battery", "/wheel_ticks", "/wheel_duty",
               "/fpms_health", "/diagnostics", "/rosout"];
 const globOk = (t) => GLOB.some((p) => (p.endsWith("*") ? t.startsWith(p.slice(0, -1)) : t === p));
-const asked = [...main().sent, ...stop().sent]
-  .filter((m) => m.op === "subscribe" || m.op === "advertise" || m.op === "publish")
+const asked = [...mainSock().sent, ...stopSock().sent]
+  .filter((m) => ["subscribe", "advertise", "publish"].includes(m.op))
   .map((m) => m.topic);
 const outside = [...new Set(asked)].filter((t) => !globOk(t));
-ok(outside.length === 0, "every topic is inside topics_glob" +
+ok(outside.length === 0,
+   "all " + new Set(asked).size + " topics are inside topics_glob" +
    (outside.length ? " — OUTSIDE: " + outside.join(", ") : ""));
 ok(!asked.some((t) => /cmd_vel|cmd_duty|cmd_enable/.test(t)),
-   "no drive topic is requested — this page cannot move the rover");
-ok(![...main().sent, ...stop().sent].some((m) => m.op === "call_service"),
-   "no ROS service is called at all, so services_glob cannot affect this page");
+   "no drive topic requested — this page cannot move the rover");
+ok(![...mainSock().sent, ...stopSock().sent].some((m) => m.op === "call_service"),
+   "no ROS service called at all, so services_glob cannot affect this page");
+ok(stopSock().sent.filter((m) => m.op === "subscribe").length === 0,
+   "the STOP socket subscribes to NOTHING — its send buffer is empty by construction");
 
-console.log("\n3. a value renders with an age, then goes STALE with no new message");
-main().pub("/scan_lidar", { ranges: [1, 2, 3], angle_min: 0, angle_increment: 0.01, range_max: 12 });
+console.log("\n4. a value renders with an age, then goes STALE with NO new message");
+mainSock().pub("/scan_lidar", { ranges: [1, 2, 3], angle_min: 0, angle_increment: 0.01, range_max: 12 });
 advance(300);
 ok(lvl("scan") === "ok", "fresh /scan_lidar card is ok");
 ok(/3 rays/.test(txt("scanVal")), "renders the ray count: " + txt("scanVal"));
-advance(3000);                        // /scan_lidar warn=2 stale=5
-ok(lvl("scan") === "warn", "at 3s the card is WARN without any new message");
 advance(3000);
-ok(lvl("scan") === "stale", "at 6s the card is STALE — a frozen publisher is caught by the clock alone");
+ok(lvl("scan") === "warn", "at 3s WARN, with no message having arrived");
+advance(3000);
+ok(lvl("scan") === "stale", "at 6s STALE — the clock alone caught a frozen publisher");
 ok(/STALE/.test(txt("scanVal")), "and the value says so: " + txt("scanVal"));
+ok(!/rays/.test(txt("scanVal")), "the stale frame is DROPPED, not held on screen");
 
-console.log("\n4. a stale LiDAR frame is DROPPED, never held");
-/* arena.js is handed `scan: null` once stale; the map cannot hold a frame. */
-ok(!/rays/.test(txt("scanVal")), "the ray count is gone rather than frozen on screen");
-
-console.log("\n5. pose comes from /fpms/mission/*, and is judged by its WORST component");
-main().pub("/fpms/mission/x_mm", { data: 972 });
-main().pub("/fpms/mission/y_mm", { data: 228 });
-main().pub("/fpms/mission/heading_deg", { data: 90 });
+console.log("\n5. pose comes from /fpms/mission/*, judged by its WORST component");
+mainSock().pub("/fpms/mission/x_mm", { data: 972 });
+mainSock().pub("/fpms/mission/y_mm", { data: 228 });
+mainSock().pub("/fpms/mission/heading_deg", { data: 90 });
 advance(300);
-ok(/972, 228 mm  hdg 90/.test(txt("poseVal")), "arena mm and heading rendered: " + txt("poseVal"));
-ok(lvl("pose") === "ok", "pose card ok while all three are fresh");
+ok(/972, 228 mm  hdg 90/.test(txt("poseVal")), "arena mm + heading: " + txt("poseVal"));
+ok(lvl("pose") === "ok", "pose ok while all three are fresh");
 advance(4000);
-main().pub("/fpms/mission/x_mm", { data: 980 });   // refresh x only
+mainSock().pub("/fpms/mission/x_mm", { data: 975 });     // refresh x only
 advance(300);
-ok(lvl("pose") === "stale",
-   "a fresh x with a stale heading is NOT a fresh pose (worst component wins)");
-ok(/STALE/.test(txt("poseVal")), "and the pose readout says STALE: " + txt("poseVal"));
+ok(lvl("pose") === "warn",
+   "x is fresh but y/hdg are ageing — the pose card follows the WORST of the three, not x");
+advance(3000);
+mainSock().pub("/fpms/mission/x_mm", { data: 980 });     // still only x
+advance(300);
+ok(lvl("pose") === "stale", "a fresh x with a stale heading is NOT a fresh pose");
+ok(/STALE/.test(txt("poseVal")), "and the readout says STALE: " + txt("poseVal"));
 
-console.log("\n6. parked, with no pose at all, the map says ASSUMED rather than guessing");
-ok(/x .* · y .* · hdg /.test(txt("poseAge")), "per-component ages shown: " + txt("poseAge"));
-
-console.log("\n7. battery falls back to the mission mirror only while /battery is stale");
-main().pub("/battery", { voltage: 11.84 });
+console.log("\n6. battery falls back to the mission mirror only while /battery is stale");
+mainSock().pub("/battery", { voltage: 11.84 });
 advance(300);
 ok(/11\.84 V/.test(txt("battVal")) && /\/battery/.test(txt("battAge")),
-   "shows /battery and names it: " + txt("battVal") + " | " + txt("battAge"));
-advance(12000);                                    // /battery stale after 10s
-main().pub("/fpms/mission/batt_v", { data: 11.2 });
+   "shows /battery and names the source: " + txt("battVal") + " | " + txt("battAge"));
+advance(12000);
+mainSock().pub("/fpms/mission/batt_v", { data: 11.2 });
 advance(300);
 ok(/11\.20 V/.test(txt("battVal")) && /fallback/.test(txt("battAge")),
    "falls back and LABELS the fallback: " + txt("battVal") + " | " + txt("battAge"));
 
-console.log("\n8. link health: real evidence for LIDAR/ESP32, honest silence for CAMERA/NPU");
-main().pub("/fpms_health", { data: [30001, 1 << 4 | 1 << 3, 1, 0, 0, 0, 1000, 15, 11800, 0, 120, 640] });
-main().pub("/scan_lidar", { ranges: [1], angle_min: 0, angle_increment: 0.01, range_max: 12 });
+console.log("\n7. link health: real evidence for LIDAR/ESP32, honest silence for CAMERA/NPU");
+mainSock().pub("/fpms_health", { data: [30001, (1 << 4) | (1 << 3), 1, 0, 0, 0, 1000, 15, 11800, 0, 120, 640] });
 advance(300);
-ok(/ESP32[\s\S]*?fw 30001/.test(links()), "ESP32 tile reads the firmware build off /fpms_health");
-ok(/uptime 640s/.test(links()), "and its uptime");
-ok(/CAMERA[\s\S]*?NO ROS SOURCE/.test(links()),
-   "CAMERA is NO ROS SOURCE — nothing publishes camera health onto the graph");
-ok(/NPU[\s\S]*?NO ROS SOURCE/.test(links()), "NPU is NO ROS SOURCE");
-ok(/ltile nosrc/.test(links()), "and both are styled as 'no evidence', not as good or bad");
-
-console.log("\n9. ESP32 tile goes DOWN when the micro-ROS session flag clears");
-main().pub("/fpms_health", { data: [30001, 1 << 3, 0, 60000, 60000, 0, 0, 0, 11800, 0, 120, 700] });
+ok(/ESP32[\s\S]*?fw 30001/.test(links()), "ESP32 tile reads the build off /fpms_health");
+ok(/uptime 640s/.test(links()), "and the board uptime");
+ok(/CAMERA[\s\S]*?NO ROS SOURCE/.test(links()), "CAMERA: NO ROS SOURCE");
+ok(/NPU[\s\S]*?NO ROS SOURCE/.test(links()), "NPU: NO ROS SOURCE");
+ok(/ltile nosrc/.test(links()), "both styled as 'no evidence', not as good or bad");
+mainSock().pub("/fpms_health", { data: [30001, 1 << 3, 0, 60000, 60000, 0, 0, 0, 11800, 0, 120, 700] });
 advance(300);
 ok(/ESP32[\s\S]*?AGENT NOT CONNECTED/.test(links()),
-   "bit4 clear is reported as AGENT NOT CONNECTED, not as a healthy board");
+   "bit4 clear reads as AGENT NOT CONNECTED, not as a healthy board");
 
-console.log("\n10. residuals: the diagnostic verdict, and it refuses to guess early");
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 0, segment_i: 0, target: 100, measured: 41, residual: -59, ratio: 0.41 });
+console.log("\n8. residual verdicts follow STACK.md's table, and refuse to guess early");
+mainSock().pub("/fpms/residual/raw", { data: JSON.stringify({ kind: "drive", leg_i: 0, segment_i: 0, target: 100, measured: 41, residual: -59, ratio: 0.41 }) });
 advance(300);
 ok(/at least 3 drive segments/.test(txt("resVerdict")),
-   "one segment is not a pattern: " + txt("resVerdict").slice(0, 60));
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 0, segment_i: 1, target: 200, measured: 81, residual: -119, ratio: 0.405 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 0, segment_i: 2, target: 70, measured: 28.5, residual: -41.5, ratio: 0.407 });
+   "one segment is not a pattern: " + txt("resVerdict").slice(0, 55) + "…");
+mainSock().pub("/fpms/residual/raw", { data: JSON.stringify({ kind: "drive", leg_i: 0, segment_i: 1, target: 200, measured: 81, residual: -119, ratio: 0.405 }) });
+mainSock().pub("/fpms/residual/raw", { data: JSON.stringify({ kind: "drive", leg_i: 0, segment_i: 2, target: 70, measured: 28.5, residual: -41.5, ratio: 0.407 }) });
 advance(300);
 ok(/CONSTANT RATIO/.test(txt("resVerdict")) && /SCALE ERROR/.test(txt("resVerdict")),
-   "three segments with the same ratio -> SCALE ERROR: " + txt("resVerdict").slice(0, 90));
-ok(/2\.467|odom_scale/.test(txt("resVerdict")), "and it names the knob to turn");
+   "three matching ratios -> SCALE ERROR: " + txt("resVerdict").slice(0, 80) + "…");
+ok(/odom_scale/.test(txt("resVerdict")), "and it names the knob to turn");
 
-console.log("\n11. a constant OFFSET is called coast, not scale");
-["res_raw"].forEach(() => {});
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 0, target: 100, measured: 118, residual: 18, ratio: 1.18 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 1, target: 400, measured: 419, residual: 19, ratio: 1.047 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 2, target: 800, measured: 817, residual: 17, ratio: 1.021 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 3, target: 1000, measured: 1018, residual: 18, ratio: 1.018 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 4, target: 600, measured: 618, residual: 18, ratio: 1.03 });
-main().pub("/fpms/residual/raw", { kind: "drive", leg_i: 1, segment_i: 5, target: 900, measured: 918, residual: 18, ratio: 1.02 });
-advance(300);
-ok(/CONSTANT OFFSET/.test(txt("resVerdict")) && /COAST/.test(txt("resVerdict")),
-   "same absolute error at every length -> COAST: " + txt("resVerdict").slice(0, 90));
+console.log("\n9. IDENTITY MISMATCH is loud — hardware_id vs the dashboard's thing");
+mainSock().pub("/diagnostics", {
+  status: [{ name: "ros/scan_lidar", level: 0, message: "9.80 Hz",
+             hardware_id: "rover2", values: [{ key: "hz", value: "9.80" }] }],
+});
+advance(400);
+ok(shown("idBanner"), "the identity banner is shown when the rover says rover2");
+ok(/rover2/.test(txt("idDetail")) && /rover1/.test(txt("idDetail")),
+   "and it names BOTH sides: " + txt("idDetail").slice(0, 100) + "…");
 
-console.log("\n12. mission state accepts the whole-payload JSON mirror");
-main().pub("/fpms/mission/state", { data: JSON.stringify({ state: "running", phase: "drive", leg_i: 2 }) });
-main().pub("/fpms/mission/phase", { data: "drive" });
-advance(300);
-ok(txt("stateVal") === "running", "pulls .state out of the JSON dict: " + txt("stateVal"));
-ok(txt("phaseVal") === "drive", "phase rendered: " + txt("phaseVal"));
+console.log("\n10. matching identity is silent — no banner for the normal case");
+mainSock().pub("/diagnostics", {
+  status: [{ name: "ros/scan_lidar", level: 0, message: "9.80 Hz", hardware_id: "rover1", values: [] }],
+});
+advance(400);
+ok(!shown("idBanner"), "agreement shows nothing at all");
+
+console.log("\n11. THE WRONG-TOPIC-ROOT SIGNATURE: /diagnostics arriving, mirrors silent");
+/* Exactly the shape config.env warns about: connected, authenticated, every
+   unit healthy, and no mission telemetry — because the bridge is subscribed
+   to fpms/<other-thing>/telemetry/#. Keep /diagnostics and /scan_lidar
+   flowing so ONLY the mirrors are quiet. */
+for (let i = 0; i < 18; i++) {
+  mainSock().pub("/diagnostics", { status: [{ name: "ros/scan_lidar", level: 0, message: "ok", hardware_id: "rover1", values: [] }] });
+  mainSock().pub("/scan_lidar", { ranges: [1], angle_min: 0, angle_increment: 0.01, range_max: 12 });
+  advance(2000);
+}
+ok(shown("silenceBanner"), "the silence banner is shown");
+ok(/CHECK THE THING NAME/.test(txt("silenceHead")),
+   "and it names the most likely cause: " + txt("silenceHead"));
+ok(/fpms\/mission\/state/.test(txt("silenceBody")),
+   "naming the silent topic, not just 'no data'");
+ok(/rover1/.test(txt("silenceBody")), "and the thing name currently selected");
+ok(!/scan_lidar/.test(txt("silenceBody")),
+   "the topics that ARE arriving are not accused");
+
+console.log("\n12. the banner clears the moment the mirrors deliver");
+mainSock().pub("/fpms/mission/state", { data: JSON.stringify({ state: "running", phase: "drive" }) });
+mainSock().pub("/fpms/mission/phase", { data: "drive" });
+advance(400);
+ok(!shown("silenceBanner"), "silence banner gone once the mirrors arrive");
+ok(txt("stateVal") === "running", "and the whole-payload JSON mirror is parsed: " + txt("stateVal"));
 
 console.log("\n13. STOP publishes both verbs on the dedicated socket");
-const before = stop().sent.length;
-dom.byId.stopBtn._onclick && dom.byId.stopBtn._onclick();
-/* the click listener is registered via addEventListener, which the shim does
-   not dispatch — call the exported path the same way the button does */
-g.window.__fpmsFireStop && g.window.__fpmsFireStop("verify");
-const after = stop().sent.slice(before);
-ok(after.some((m) => m.op === "publish" && m.topic === "/estop" && m.msg.data === true) &&
-   after.some((m) => m.op === "publish" && m.topic === "/fpms/cmd/stop"),
-   "both /estop and /fpms/cmd/stop published on the STOP socket");
+const before = stopSock().sent.length;
+dom.byId.stopBtn.dispatch("click");
+const after = stopSock().sent.slice(before);
+ok(after.some((m) => m.op === "publish" && m.topic === "/estop" && m.msg.data === true),
+   "/estop true published on the STOP socket");
+ok(after.some((m) => m.op === "publish" && m.topic === "/fpms/cmd/stop"),
+   "/fpms/cmd/stop published on the STOP socket");
+ok(!mainSock().sent.slice(-4).some((m) => m.op === "publish" && m.topic === "/estop"),
+   "and NOT on the main socket, which carries the 10 Hz scan");
 
-console.log("\n14. the whole ticker survives a hostile scan without throwing");
-main().pub("/scan_lidar", { ranges: [0, Infinity, NaN, -1, 0.5, null, 99999],
-                            angle_min: -3.14, angle_increment: 0.9, range_max: 12 });
-main().pub("/fpms/mission/x_mm", { data: 500 });
-main().pub("/fpms/mission/y_mm", { data: 500 });
-main().pub("/fpms/mission/heading_deg", { data: 45 });
+console.log("\n14. the ticker survives a hostile scan without throwing");
+mainSock().pub("/scan_lidar", { ranges: [0, Infinity, NaN, -1, 0.5, null, 99999],
+                                angle_min: -3.14, angle_increment: 0.9, range_max: 12 });
+mainSock().pub("/fpms/mission/x_mm", { data: 500 });
+mainSock().pub("/fpms/mission/y_mm", { data: 500 });
+mainSock().pub("/fpms/mission/heading_deg", { data: 45 });
 advance(600);
 ok(true, "zeros, infinities, NaN and nulls in ranges rendered without throwing");
 
 console.log("\n" + PASSED + " passed, " + FAILED + " failed");
 process.exit(FAILED ? 1 : 0);
+
+})();

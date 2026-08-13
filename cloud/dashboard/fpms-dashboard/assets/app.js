@@ -120,6 +120,10 @@ function connect() {
   resHistory = [];
   route = [];
   scan = null;
+  diagStatus = {};
+  healthWords = null;
+  reportedThing = null;    // the new rover must re-state its own identity
+  silenceSticky = null;    // and re-earn any accusation of silence
 
   stopLink = new global.RosLink({
     url: wsUrl(), label: "stop", expectsData: false, onlog: log
@@ -387,12 +391,46 @@ function fireStop(why) {
    Each verdict names the check to run, in order of how likely it is to be
    the answer. None of them says "unknown".
    ====================================================================== */
+/* Which feed key carries each topic that can declare an expectS. Needed
+   because the LINK's silence bookkeeping is per-socket and resets whenever
+   the remedy ladder reconnects — so if the banner were driven straight off
+   it, a wrong thing name would make the alarm flicker off for 25 s after
+   every automatic reconnect, which is worse than not having it. The FEED
+   registry survives reconnects (it ages from receipt, monotonically), so a
+   diagnosis is only cleared when the named topics genuinely start arriving
+   again — never merely because a socket was replaced. */
+var TOPIC_FEED = {
+  "/scan_lidar": "scan",
+  "/diagnostics": "diag",
+  "/fpms/mission/state": "state",
+  "/fpms/mission/phase": "phase"
+};
+
+var silenceSticky = null;
+
 function diagnoseSilence(snap) {
   var silent = snap.silent || [];
-  if (!silent.length) { return null; }
+
+  if (!silent.length) {
+    if (!silenceSticky) { return null; }
+    /* Clear only once EVERY topic we accused is demonstrably delivering. */
+    var recovered = silenceSticky.names.every(function (n) {
+      var k = TOPIC_FEED[n];
+      return k && !F.isStale(k);
+    });
+    if (recovered) { silenceSticky = null; return null; }
+    return silenceSticky;      // hold the diagnosis across the reconnect
+  }
 
   var names = silent.map(function (s) { return s.topic; });
-  var worst = Math.max.apply(null, silent.map(function (s) { return s.silentS; }));
+  var worst = Math.max.apply(null, silent.map(function (s) {
+    /* Prefer the FEED's age. It is measured from the last time this browser
+       actually saw the topic, across every socket — which is what the
+       operator means by "how long has it been quiet". The link's own figure
+       restarts at each reconnect and would under-report. */
+    var k = TOPIC_FEED[s.topic];
+    return (k && F.seen(k)) ? F.age(k) : s.silentS;
+  }));
   var diagSilent = names.indexOf("/diagnostics") >= 0;
   var mirrorsSilent = names.some(function (n) { return n.indexOf("/fpms/") === 0; });
   var lidarSilent = names.indexOf("/scan_lidar") >= 0;
@@ -430,8 +468,9 @@ function diagnoseSilence(snap) {
            "publisher for each, the thing name (" + target.thing + "), and " +
            "whether rosbridge started before the publishers.";
   }
-  return { head: head, body: body, names: names, worst: worst,
-           remedy: snap.wedgeRemedy };
+  silenceSticky = { head: head, body: body, names: names, worst: worst,
+                    remedy: snap.wedgeRemedy };
+  return silenceSticky;
 }
 
 /* The rover's own idea of its identity, from DiagnosticStatus.hardware_id,
@@ -860,6 +899,14 @@ function tick() {
       "  opens " + ss.counters.opens + "  closes " + ss.counters.closes +
       "  probes " + ss.counters.probes + " (" + ss.counters.probeFails + " failed)" + "\n" +
     "url    " + ms.url + "\n" +
+    "thing  " + target.thing + " (dashboard)  vs  " +
+      (reportedThing || "not yet reported") + " (rover /diagnostics hardware_id)\n" +
+    "zones  " + (zonesCheck
+      ? (zonesCheck.ok
+          ? "zones.json cross-checked OK, " + zonesCheck.checked + " centres within 0.05 mm"
+          : "zones.json REFUSED — " + zonesCheck.problems.join("; ") + " (using the built-in derivation)")
+      : "no zones.json served — using the built-in derivation (no fault)") + "\n" +
+    "expect " + (ms.expecting || []).join(" ") + "\n" +
     "ages are measured in THIS browser from the moment each frame arrived; " +
     "no payload timestamp is used for freshness.";
 }

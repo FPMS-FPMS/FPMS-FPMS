@@ -269,8 +269,14 @@ RosLink.prototype._connect = function () {
     self.lastMsgAt = {};
     self.silent = [];
     self.probeId = null;
-    self.wedgeRemedy = 0;
     self.connectDueAt = 0;
+    /* NOTE: wedgeRemedy is deliberately NOT reset here. Remedy 2 IS a
+       reconnect, so resetting the ladder on open would restart it on the
+       socket it just created — an endless 25-second reconnect cycle that
+       drops /scan_lidar and blanks the map every time round, for a fault
+       (wrong topic root, or a publisher that started after rosbridge) that
+       no amount of reconnecting can fix. The ladder is cleared in one place
+       only: when the silent topics actually start delivering. */
     self._setPhase(PHASE.OPEN, "socket open");
 
     /* Replay EVERYTHING. rosbridge has no memory of the previous socket. */
