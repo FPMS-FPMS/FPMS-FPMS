@@ -1,13 +1,32 @@
-# FPMS-OS WiFi setup
+# FPMS-OS WiFi setup   -   ROVER 1
 #
-# RENAME THIS FILE TO  fpms-wifi.conf  (drop the .example) AND EDIT IT.
+# YOU PROBABLY DO NOT NEED THIS FILE.
+#
+# This image already has the competition network baked in:
+#
+#     FPMS_Net
+#
+# so a freshly flashed card joins it with no boot-partition file at all. That
+# default lives in /etc/fpms/config.env inside the image, not out here, because
+# this partition is FAT and every Windows machine mounts it automatically.
+#
+# USE THIS FILE TO ADD OR PREFER A DIFFERENT NETWORK.
+#
+# RENAME IT TO  fpms-wifi.conf  (drop the .example) AND EDIT IT.
 #
 # One network per line:      SSID:PASSWORD
 # Order matters - the first line is tried first.
 # Lines starting with # are ignored. Blank lines are ignored.
 #
+# THIS FILE WINS. Everything you list here is registered at a HIGHER
+# NetworkManager autoconnect priority than the baked-in FPMS_Net, which is
+# appended last. So this file adds to the built-in network rather than
+# competing with it, and you never have to re-list FPMS_Net to keep it.
+#
 # Put your Windows Mobile Hotspot FIRST. The rover's telemetry link expects the
 # operator laptop to be on 192.168.137.1, which is what that hotspot uses.
+# FPMS_Net is a venue network and will NOT put the laptop on that subnet, so if
+# you are working off a hotspot, list it here.
 #
 # For an open network with no password, leave the part after the colon empty:
 #     OpenNetwork:

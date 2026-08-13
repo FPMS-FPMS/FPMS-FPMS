@@ -107,9 +107,30 @@ fi
 #
 # The operator can override it with a file on the boot partition, because a
 # two-rover fleet needs two names.
-WANT_HOST=fpms-pi
-[ -r "$BOOTDIR/fpms-hostname" ] && WANT_HOST="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-hostname")"
-[ -z "$WANT_HOST" ] && WANT_HOST=fpms-pi
+# PRECEDENCE, and it matters: the operator's file wins, then the name the IMAGE
+# was built with, and only then a fallback.
+#
+# This used to be a hardcoded `WANT_HOST=fpms-pi`. That is wrong the moment the
+# image is built for a named rover: stage 00 writes FPMS_HOSTNAME into
+# /etc/hostname inside the chroot, and then this script - which runs on every
+# first boot, AFTER that - set it straight back to fpms-pi. The image's own
+# identity would never have been seen, and the failure is silent: the rover
+# comes up, answers to the wrong name, and every URL in the docs still works,
+# so nothing looks broken until a second rover appears and they collide.
+#
+# mDNS collision is the reason to care. Two rovers both claiming fpms-pi.local
+# does not error - avahi renames ONE of them, at random, to fpms-pi-2.local.
+# Which one is not stable across boots.
+WANT_HOST=""
+if [ -r "$BOOTDIR/fpms-hostname" ]; then
+    WANT_HOST="$(tr -d ' \t\r\n' < "$BOOTDIR/fpms-hostname")"
+    [ -n "$WANT_HOST" ] && log "hostname from the boot partition: $WANT_HOST"
+fi
+if [ -z "$WANT_HOST" ] && [ -r /etc/hostname ]; then
+    WANT_HOST="$(tr -d ' \t\r\n' < /etc/hostname)"
+    [ -n "$WANT_HOST" ] && log "hostname from the image: $WANT_HOST"
+fi
+[ -z "$WANT_HOST" ] && { WANT_HOST=fpms-pi; warn "no hostname anywhere; falling back to $WANT_HOST"; }
 
 if [ "$(hostname)" != "$WANT_HOST" ]; then
     log "setting hostname to $WANT_HOST"

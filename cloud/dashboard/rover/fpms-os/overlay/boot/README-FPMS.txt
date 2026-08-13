@@ -2,26 +2,44 @@
  FPMS-OS  -  set up your rover before you switch it on
 ========================================================================
 
+            THIS CARD IS  ROVER 1.   Its name is  fpms-rover1
+            You reach it at  http://fpms-rover1.local:8090/
+
+If you have a second rover, it is a DIFFERENT card with a different name, and
+the two must never be given the same one. See section 2.
+
 You are looking at the boot partition of an FPMS rover's memory card. You can
 edit these files from Windows, Mac or Linux with any text editor (Notepad is
 fine). Everything here is read ONCE, the first time the rover boots.
 
-If you do nothing at all, the rover still boots. It just will not be able to
-join your WiFi, so you would need to plug in an Ethernet cable or connect to
-the rover's own fallback network. Two minutes now saves that.
+If you do nothing at all, this card is already set up for the competition
+network  FPMS_Net  and should come up on it by itself. You only need the
+files below if you are somewhere else, or something is wrong.
 
 
 ------------------------------------------------------------------------
- 1. WIFI  ->  edit  fpms-wifi.conf
+ 1. WIFI  ->  already set up; edit  fpms-wifi.conf  to change it
 ------------------------------------------------------------------------
 
-Rename  fpms-wifi.conf.example  to  fpms-wifi.conf  and put your networks in
-it, one per line, like this:
+This rover ALREADY KNOWS one network:
+
+    FPMS_Net
+
+You do not have to do anything to use it. Nobody has watched this particular
+card join that network yet, though, so if it comes up on its own fallback
+network instead (section 4), the first thing to check is that FPMS_Net is
+actually on the air and spelled that way.
+
+TO ADD OR PREFER A DIFFERENT NETWORK - for example at home, or on a laptop
+hotspot - rename  fpms-wifi.conf.example  to  fpms-wifi.conf  and put your
+networks in it, one per line, like this:
 
     MyHotspot:mypassword123
     HomeWiFi:anotherpassword
 
-ORDER MATTERS. The first line is tried first.
+ORDER MATTERS. The first line is tried first. Anything you write here is
+tried BEFORE the built-in FPMS_Net, so this file always wins - it adds to the
+built-in network, it does not have to fight it.
 
 Put your WINDOWS MOBILE HOTSPOT FIRST if you use one. That is what the rover
 expects the operator laptop to be on, and the whole telemetry link is
@@ -42,10 +60,16 @@ reboot.
 ------------------------------------------------------------------------
 
 fpms-hostname
-    One line, the rover's name. Defaults to  fpms-pi , which means you reach
-    it at  http://fpms-pi.local:8090/
-    Change this ONLY if you are running two rovers at once, otherwise both
-    will answer to the same name and confuse each other.
+    One line, the rover's name. This card is  fpms-rover1 , which means you
+    reach it at  http://fpms-rover1.local:8090/
+    Leave this file out unless you are deliberately renaming the rover.
+    NEVER give two rovers the same name. They do not simply share it - one of
+    them gets quietly renamed to something like fpms-rover1-2 by the network
+    itself, and from then on you cannot tell which rover you are driving.
+    The rover's identity ALSO includes the name its telemetry travels under,
+    which for this card is  rover1 . That one is not on this partition; it is
+    set inside the image and the dashboard has to be pointed at the same word
+    or it will show you an empty screen and no error at all.
 
 fpms-broker-host
     One line, the IP address of the operator laptop, e.g.  192.168.137.1
@@ -72,14 +96,18 @@ After that, every boot is fast.
 
 Then, from a laptop on the same network, open:
 
-    http://fpms-pi.local:8090/
+    http://fpms-rover1.local:8090/
 
 ALWAYS TYPE THE NAME, NOT AN IP ADDRESS. The rover's IP address changes; the
 name does not. This project has had that bite it more than seven times.
 
+If that address does not open, older printouts, shortcuts and notes for this
+project all say  fpms-pi.local . That was the single-rover name and it is no
+longer this rover. Nothing forwards the old name to the new one.
+
 The rover checks itself about 90 seconds after boot. To see the result:
 
-    ssh ubuntu@fpms-pi.local
+    ssh ubuntu@fpms-rover1.local
     fpms-selftest
 
 If something is wrong, it tells you what and what to do about it.
@@ -89,13 +117,17 @@ If something is wrong, it tells you what and what to do about it.
  4. IF IT DOES NOT COME UP ON WIFI
 ------------------------------------------------------------------------
 
-The rover starts its own network so you can still reach it:
+If FPMS_Net is not in range - or is not spelled the way this card expects -
+the rover starts its own network so you can still reach it:
 
     network:  FPMS-Rover-Setup
     password: fpmsrover
 
-Join that from a laptop or phone, then open  http://fpms-pi.local:8090/
+Join that from a laptop or phone, then open  http://fpms-rover1.local:8090/
 or  ssh ubuntu@10.42.0.1
+
+Seeing this network at a venue that HAS working WiFi is the symptom of a
+wrong SSID or password, not of broken WiFi hardware.
 
 An Ethernet cable also always works.
 
