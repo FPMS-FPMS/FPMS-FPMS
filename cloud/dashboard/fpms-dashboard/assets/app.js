@@ -367,6 +367,87 @@ function fireStop(why) {
 }
 
 /* ======================================================================
+   3b. DIAGNOSING SILENCE — turning "no data" into a specific instruction.
+   ----------------------------------------------------------------------
+   The link layer reports WHICH topics have gone quiet. This turns that into
+   the one sentence an operator can act on, using the fact that /diagnostics
+   and the /fpms/* mirrors come from the SAME NODE:
+
+     /diagnostics silent too      -> the link or rosbridge itself. Nothing
+                                     from the bridge is reaching us at all.
+     /diagnostics ARRIVING but
+     the mirrors silent           -> the bridge is alive and its MQTT side is
+                                     empty. That is the wrong-topic-root
+                                     signature: the bridge subscribes
+                                     fpms/<thing>/telemetry/#, so a thing-name
+                                     mismatch produces exactly this and
+                                     nothing errors anywhere.
+     only /scan_lidar silent      -> the LiDAR publisher, not the link.
+
+   Each verdict names the check to run, in order of how likely it is to be
+   the answer. None of them says "unknown".
+   ====================================================================== */
+function diagnoseSilence(snap) {
+  var silent = snap.silent || [];
+  if (!silent.length) { return null; }
+
+  var names = silent.map(function (s) { return s.topic; });
+  var worst = Math.max.apply(null, silent.map(function (s) { return s.silentS; }));
+  var diagSilent = names.indexOf("/diagnostics") >= 0;
+  var mirrorsSilent = names.some(function (n) { return n.indexOf("/fpms/") === 0; });
+  var lidarSilent = names.indexOf("/scan_lidar") >= 0;
+
+  var head, body;
+  if (diagSilent && mirrorsSilent && lidarSilent) {
+    head = "CONNECTED BUT NO DATA AT ALL.";
+    body = "The socket is up and rosbridge is answering, yet not one " +
+           "subscribed topic has delivered a message in " + worst.toFixed(0) + "s. " +
+           "Check, in this order: (1) is the rover's ROS_DOMAIN_ID still 20; " +
+           "(2) did rosbridge start BEFORE the publishers — it only ever " +
+           "delivers topics whose publisher already existed, so " +
+           "sudo systemctl restart fpms-rosbridge on the Pi; " +
+           "(3) is this the right rover at all.";
+  } else if (!diagSilent && mirrorsSilent) {
+    head = "CONNECTED BUT NO MISSION DATA — CHECK THE THING NAME.";
+    body = "/diagnostics IS arriving, so the Pi-side bridge is alive and " +
+           "this link is fine — but " + names.filter(function (n) { return n.indexOf("/fpms/") === 0; }).join(", ") +
+           " has been silent for " + worst.toFixed(0) + "s. That bridge subscribes " +
+           "fpms/<thing>/telemetry/# on MQTT, so a thing-name mismatch " +
+           "produces exactly this and errors nowhere. This dashboard is set " +
+           "to thing '" + target.thing + "'" +
+           (reportedThing ? "; the rover reports '" + reportedThing + "'" : "") +
+           ". Check FPMS_THING_NAME in /etc/fpms/config.env, then that " +
+           "fpms-missions is actually running.";
+  } else if (lidarSilent && !mirrorsSilent) {
+    head = "CONNECTED, BUT NO LIDAR.";
+    body = "/scan_lidar has delivered nothing for " + worst.toFixed(0) + "s while other " +
+           "topics are arriving, so the link is fine and the publisher is not. " +
+           "Check fpms-lidar-ros and fpms-rover-agent on the Pi. The map is " +
+           "drawing no returns, which is the honest picture — not a clear arena.";
+  } else {
+    head = "CONNECTED BUT SILENT ON: " + names.join(", ");
+    body = "Quiet for " + worst.toFixed(0) + "s while the link is up. Check the " +
+           "publisher for each, the thing name (" + target.thing + "), and " +
+           "whether rosbridge started before the publishers.";
+  }
+  return { head: head, body: body, names: names, worst: worst,
+           remedy: snap.wedgeRemedy };
+}
+
+/* The rover's own idea of its identity, from DiagnosticStatus.hardware_id,
+   against the dashboard's. Silent agreement is the normal case and shows
+   nothing; disagreement is loud, because every number on the screen then
+   belongs to a different robot than the label says. */
+function checkIdentity() {
+  if (!reportedThing || F.isStale("diag")) { return null; }
+  if (reportedThing === target.thing) { return null; }
+  return "IDENTITY MISMATCH: this dashboard is set to '" + target.thing +
+         "' but the rover on " + target.host + " reports '" + reportedThing +
+         "'. Everything on this screen belongs to '" + reportedThing +
+         "'. Fix the selection in the header, or you are watching the wrong robot.";
+}
+
+/* ======================================================================
    4. LINK HEALTH TILES
    ----------------------------------------------------------------------
    FOUR subsystems were asked for. Two of them have a ROS source and two do
@@ -658,14 +739,24 @@ function tick() {
   chip("chipMain", ms);
   chip("chipStop", ss);
 
-  /* Wedge banner. */
-  var wedged = (ms.phase === P.WEDGED);
-  document.getElementById("wedgeBanner").classList.toggle("hidden", !wedged);
-  if (wedged) {
-    document.getElementById("wedgeDetail").textContent =
-      " — socket up " + ms.upS.toFixed(0) + "s, " + ms.counters.frames +
-      " frames, " + ms.counters.data + " topic messages. Automatic remedy " +
-      ms.wedgeRemedy + "/2 attempted.";
+  /* --- the two banners. Silence first: it is the failure that otherwise
+         looks exactly like a healthy dashboard. ------------------------- */
+  var idErr = checkIdentity();
+  var idBan = document.getElementById("idBanner");
+  idBan.classList.toggle("hidden", !idErr);
+  if (idErr) { document.getElementById("idDetail").textContent = idErr; }
+
+  var d = diagnoseSilence(ms);
+  var ban = document.getElementById("silenceBanner");
+  ban.classList.toggle("hidden", !d);
+  if (d) {
+    document.getElementById("silenceHead").textContent = d.head;
+    document.getElementById("silenceBody").textContent = d.body;
+    document.getElementById("silenceDetail").textContent =
+      "socket up " + ms.upS.toFixed(0) + "s · " + ms.counters.frames + " frames · " +
+      ms.counters.data + " topic messages · automatic remedy " +
+      Math.min(d.remedy, 2) + "/2 attempted" +
+      (d.remedy >= 3 ? " and stopped — retrying further would only drop the topics that DO work" : "");
   }
 
   /* --- staleness classes first, so every value below is styled by them -- */
@@ -813,8 +904,10 @@ function fmt(n) {
    7. BOOT
    ====================================================================== */
 function openModal() {
-  document.getElementById("hostInput").value = target.host || "";
-  document.getElementById("portInput").value = target.port || 9090;
+  document.getElementById("hostInput").value = target.host || DEFAULT_HOST;
+  document.getElementById("portInput").value = target.port || DEFAULT_PORT;
+  document.getElementById("thingInput").value = target.thing || DEFAULT_THING;
+  document.getElementById("ipInput").value = "";
   document.getElementById("roverModal").classList.remove("hidden");
   document.getElementById("hostInput").focus();
 }
@@ -842,35 +935,75 @@ function boot() {
     document.getElementById("roverModal").classList.add("hidden");
   });
   document.getElementById("roverSave").addEventListener("click", function () {
-    var t = parseTarget(document.getElementById("hostInput").value + ":" +
-                        document.getElementById("portInput").value);
+    /* The IP override wins when it is filled in. mDNS is per-resolver, not
+       per-machine — the name can work everywhere else on this laptop and
+       still fail inside the browser — so the raw address is a first-class
+       input, not a troubleshooting afterthought. */
+    var ip = document.getElementById("ipInput").value.trim();
+    var host = ip || document.getElementById("hostInput").value;
+    var t = parseTarget(host + ":" + document.getElementById("portInput").value,
+                        document.getElementById("thingInput").value);
     if (!t) { return; }
     target = t;
-    try { localStorage.setItem(LS_KEY, t.host + ":" + t.port); } catch (e) {}
+    try { localStorage.setItem(LS_KEY, JSON.stringify(t)); } catch (e) {}
     document.getElementById("roverModal").classList.add("hidden");
-    log("target changed to " + t.host + ":" + t.port + " — every feed cleared");
+    log("target changed to " + t.host + ":" + t.port + " thing " + t.thing +
+        " — every feed cleared" + (ip ? " (IP override in use)" : ""));
+    reportedThing = null;
     connect();
   });
 
   setInterval(tick, 200);   // 5 Hz, the only renderer
 
-  /* Resolve the target, then connect. */
-  var q = parseTarget(new URLSearchParams(location.search).get("rover"));
+  /* A copy of /etc/fpms/zones.json, if serve.py can see one. Optional by
+     design: absent file -> built-in derivation, no note, no fault, exactly
+     as zones.json itself specifies. Present file -> we recompute and REFUSE
+     it on disagreement rather than adopting its numbers. */
+  fetch("zones.json", { cache: "no-store" }).then(function (r) { return r.json(); })
+    .then(function (j) {
+      zonesCheck = global.ARENA.validateZones(j);
+      if (zonesCheck.ok) {
+        log("zones.json cross-check OK — " + zonesCheck.checked +
+            " centres agree with the derivation to within 0.05 mm");
+      } else {
+        log("ZONES.JSON REFUSED: " + zonesCheck.problems.join("; ") +
+            " — keeping the built-in derivation");
+      }
+    })
+    .catch(function () { /* no file; nothing to say */ });
+
+  /* Resolve the target, then connect. Unlike the host, the THING NAME never
+     falls back silently: it is stamped in the header on every path. */
+  var qs = new URLSearchParams(location.search);
+  var q = parseTarget(qs.get("rover"), qs.get("thing"));
   if (q) { target = q; connect(); return; }
 
   var saved = null;
-  try { saved = parseTarget(localStorage.getItem(LS_KEY)); } catch (e) {}
+  try {
+    var raw = localStorage.getItem(LS_KEY);
+    if (raw && raw.charAt(0) === "{") {
+      var o = JSON.parse(raw);
+      saved = parseTarget(o.host + ":" + o.port, o.thing);
+    } else if (raw) {
+      saved = parseTarget(raw);          // pre-thing-name format
+    }
+  } catch (e) {}
   if (saved) { target = saved; connect(); return; }
 
-  /* serve.py answers this with whatever FPMS_ROVER_HOST it was started with.
-     A failure here is normal (the page also works opened straight from
-     file://), so it falls through to asking rather than to an error. */
+  /* serve.py answers this with whatever it was started with. A failure here
+     is normal — the page also works opened straight from file:// — and it
+     falls through to the built-in rover1 defaults, NOT to a prompt: an
+     operator who has just flashed this image should get a live dashboard by
+     opening a URL, and a wrong guess is now loud rather than silent. */
   fetch("config.json", { cache: "no-store" }).then(function (r) { return r.json(); })
     .then(function (j) {
-      var t = parseTarget(j.rover_host ? (j.rover_host + ":" + (j.rosbridge_port || 9090)) : null);
-      if (t) { target = t; connect(); } else { openModal(); }
+      var t = parseTarget(
+        (j.rover_host || DEFAULT_HOST) + ":" + (j.rosbridge_port || DEFAULT_PORT),
+        j.thing_name);
+      target = t || target;
+      connect();
     })
-    .catch(function () { openModal(); });
+    .catch(function () { connect(); });
 }
 
 if (document.readyState === "loading") {

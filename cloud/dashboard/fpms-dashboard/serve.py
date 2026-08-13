@@ -39,12 +39,33 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The rover the page should dial by default. NO DEFAULT HOST IS SUPPLIED on
-# purpose: a dashboard that silently dials "localhost" and shows a dead link
-# looks exactly like a dashboard pointed at a rover that is switched off. With
-# nothing set, the page asks the operator.
-ROVER_HOST = os.environ.get("FPMS_ROVER_HOST", "")
+# THIS IMAGE IS ROVER 1 (changed from rover2 on 2026-08-13). The hostname is
+# fpms-rover1 (fpms-os/config/fpms-os.conf FPMS_HOSTNAME) and the MQTT topic
+# root is rover1 (/etc/fpms/config.env FPMS_THING_NAME).
+#
+# THE THING NAME IS NOT A LABEL. config.env puts it plainly: a consumer left on
+# the wrong root "connects, authenticates, stays connected and receives nothing
+# forever. The rover looks dead; the broker, the bridge and every unit look
+# healthy." The page therefore shows this value at all times and cross-checks
+# it against the hardware_id the rover publishes on /diagnostics.
+ROVER_HOST = os.environ.get("FPMS_ROVER_HOST", "fpms-rover1.local")
 ROSBRIDGE_PORT = int(os.environ.get("FPMS_ROSBRIDGE_PORT", "9090"))
+THING_NAME = os.environ.get("FPMS_THING_NAME", "rover1")
+
+# An OPTIONAL copy of /etc/fpms/zones.json. The page recomputes every zone
+# centre from arena_mm and the two fractions and REFUSES the file if a
+# published centre disagrees by more than 0.05 mm — which is what zones.json
+# itself demands of a consumer, because reading cx_mm/cy_mm directly would
+# create yet another independent copy of numbers that must not drift.
+#
+# Absent file: nothing happens. Built-in derivation, no note, no fault —
+# again, exactly what zones.json specifies. A file that must exist for the
+# dashboard to work would be a new way for the dashboard to stop working.
+ZONES_FILE = os.environ.get("FPMS_ZONES_FILE", "") or next(
+    (p for p in (
+        "/etc/fpms/zones.json",
+        os.path.join(HERE, "..", "rover", "fpms-os", "overlay", "etc", "fpms", "zones.json"),
+    ) if os.path.isfile(p)), "")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -62,13 +83,36 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         super().end_headers()
 
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = posixpath.normpath(self.path.split("?", 1)[0])
         if path in ("/config.json", "/config.json/"):
-            body = json.dumps({
+            self._json({
                 "rover_host": ROVER_HOST,
                 "rosbridge_port": ROSBRIDGE_PORT,
-            }).encode()
+                "thing_name": THING_NAME,
+                "zones_file": ZONES_FILE,
+            })
+            return
+        if path in ("/zones.json", "/zones.json/"):
+            # 404 is the correct, expected answer when no file was found. The
+            # page treats it as "use the built-in derivation" and says nothing.
+            if not ZONES_FILE:
+                self.send_error(404, "no zones.json configured")
+                return
+            try:
+                with open(ZONES_FILE, "rb") as f:
+                    body = f.read()
+            except OSError as e:
+                self.send_error(404, f"zones.json unreadable: {e}")
+                return
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -113,11 +157,16 @@ def main():
     # wifi works. Pass --bind 127.0.0.1 to keep it to this machine.
     ap.add_argument("--bind", default=os.environ.get("FPMS_DASHBOARD_BIND", "0.0.0.0"))
     ap.add_argument("--rover", default=None,
-                    help="rosbridge host the page should dial (else FPMS_ROVER_HOST, "
-                         "else the page asks)")
+                    help="rosbridge host[:port] the page should dial "
+                         "(default fpms-rover1.local:9090; an IP is fine and is "
+                         "the answer when mDNS does not resolve in the browser)")
+    ap.add_argument("--thing", default=None,
+                    help="FPMS_THING_NAME the page should display and check "
+                         "against the rover's own /diagnostics hardware_id "
+                         "(default rover1)")
     args = ap.parse_args()
 
-    global ROVER_HOST
+    global ROVER_HOST, THING_NAME
     if args.rover:
         if ":" in args.rover and not args.rover.startswith("["):
             host, _, port = args.rover.rpartition(":")
@@ -125,14 +174,18 @@ def main():
             globals()["ROSBRIDGE_PORT"] = int(port)
         else:
             ROVER_HOST = args.rover
+    if args.thing:
+        THING_NAME = args.thing
 
     httpd = ThreadingHTTPServer((args.bind, args.port), Handler)
     httpd.daemon_threads = True
 
     print(f"FPMS dashboard serving {HERE}")
     print(f"  bind        {args.bind}:{args.port}")
-    print(f"  rover       {ROVER_HOST or '(unset — the page will ask)'}"
-          f":{ROSBRIDGE_PORT}")
+    print(f"  rover       {ROVER_HOST}:{ROSBRIDGE_PORT}")
+    print(f"  thing       {THING_NAME}   (checked against the rover's own "
+          f"/diagnostics hardware_id)")
+    print(f"  zones.json  {ZONES_FILE or '(none found — built-in derivation, no fault)'}")
     print()
     print(f"  http://localhost:{args.port}/")
     for a in local_addresses():

@@ -70,8 +70,18 @@ button.linkish {
 }
 .banner b { color: #ff4b70; letter-spacing: 1px; }
 .banner code { background: #12030a; padding: 1px 5px; border-radius: 4px; color: #ffbf00; }
-.banner-detail { color: #c48f9c; }
+.banner-detail { color: #c48f9c; display: block; margin-top: 3px; font-size: 11px; }
+/* Identity mismatch is the loudest thing on the page: every number on screen
+   belongs to a different robot than the header says. */
+.banner.id { background: #3a0a00; border-bottom-color: #ff8a3d; color: #ffdcc7; }
+.banner.id b { color: #ff8a3d; }
 .hidden { display: none !important; }
+
+/* The thing name. Always visible, never behind a settings panel. */
+.thing {
+  font-size: 13px; font-weight: 900; letter-spacing: 2px; color: #040911;
+  background: #00b7ff; padding: 3px 9px; border-radius: 7px; white-space: nowrap;
+}
 
 /* -------------------------------------------------------------- layout -- */
 .main {
@@ -79,7 +89,12 @@ button.linkish {
   display: grid; grid-template-columns: minmax(0, 1fr) 420px;
   gap: 8px; padding: 8px;
 }
-body:has(.banner:not(.hidden)) .main { height: calc(100% - 62px - 54px); }
+/* Banners push the layout down rather than overlaying it — an alarm that
+   covers the map is an alarm the operator dismisses. */
+body:has(.banner:not(.hidden)) .main { height: calc(100% - 62px - 92px); }
+body:has(#idBanner:not(.hidden)):has(#silenceBanner:not(.hidden)) .main {
+  height: calc(100% - 62px - 184px);
+}
 
 .panel {
   background: #071629; border: 1px solid #28506f; border-radius: 12px;

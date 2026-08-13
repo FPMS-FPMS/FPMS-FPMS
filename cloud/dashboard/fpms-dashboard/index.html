@@ -32,9 +32,15 @@
 <header class="top">
   <div class="brand">
     <h1>FPMS</h1>
+    <!-- The thing name is HERE, always, never behind a settings panel. It is
+         the MQTT topic root, and a dashboard on the wrong root connects,
+         stays connected and receives nothing forever with no error anywhere.
+         A two-rover fleet is coming; which robot these numbers belong to is
+         not a detail. -->
+    <span class="thing" id="thingChip" title="FPMS_THING_NAME — the MQTT topic root this dashboard believes it is watching">…</span>
     <div class="sub">
       operator dashboard &middot; ROS-native over rosbridge
-      &middot; rover <b id="roverHost">…</b>
+      &middot; <b id="roverHost">…</b>
       <button id="btnRover" class="linkish" title="Point this dashboard at a different rover">change</button>
     </div>
   </div>
@@ -48,17 +54,23 @@
   <button id="stopBtn" title="Publishes /estop and /fpms/cmd/stop on a dedicated socket. Spacebar fires it too.">STOP</button>
 </header>
 
-<!-- The wedge banner. Hidden unless the link is up and delivering nothing —
-     see rosbridge.js (6) and ROS_PORT.md. It names the real remedy because
-     no amount of retrying in the browser can fix a server-side discovery
-     failure, and pretending otherwise wastes the operator's time. -->
-<div id="wedgeBanner" class="banner hidden">
-  <b>LINK UP, ZERO DATA.</b>
-  rosbridge is accepting this connection and delivering nothing. This is the
-  known wedge: <i>rosbridge only delivers topics whose publisher already
-  existed when rosbridge started.</i> Reconnecting the browser will not fix
-  it. On the Pi: <code>sudo systemctl restart fpms-rosbridge</code>
-  <span id="wedgeDetail" class="banner-detail"></span>
+<!-- IDENTITY MISMATCH. The rover states its own thing name in every
+     DiagnosticStatus.hardware_id; if that disagrees with what this dashboard
+     is set to, every number on screen belongs to a different robot. -->
+<div id="idBanner" class="banner id hidden">
+  <b>WRONG ROVER.</b> <span id="idDetail"></span>
+</div>
+
+<!-- SILENCE. Hidden unless the link is up and something that should be
+     arriving is not. This is the failure that otherwise looks exactly like a
+     healthy dashboard: connected, subscribed, silent, no error anywhere —
+     caused either by a wrong topic root or by rosbridge having started
+     before its publishers. The text is written by diagnoseSilence(), which
+     names the specific check rather than saying "no data". -->
+<div id="silenceBanner" class="banner hidden">
+  <b id="silenceHead">CONNECTED BUT NO DATA.</b>
+  <span id="silenceBody"></span>
+  <span id="silenceDetail" class="banner-detail"></span>
 </div>
 
 <main class="main">
@@ -221,13 +233,32 @@
 <div id="roverModal" class="modal hidden">
   <div class="modal-box">
     <div class="h">POINT AT A ROVER</div>
-    <label>rosbridge host <input id="hostInput" spellcheck="false" placeholder="fpms-pi.local"></label>
+    <label>rosbridge host <input id="hostInput" spellcheck="false" placeholder="fpms-rover1.local"></label>
+    <label>
+      IP override (wins over the host above)
+      <input id="ipInput" spellcheck="false" placeholder="e.g. 192.168.1.42 — leave blank to use the name">
+    </label>
     <label>port <input id="portInput" spellcheck="false" value="9090"></label>
+    <label>
+      thing name (FPMS_THING_NAME — the MQTT topic root)
+      <input id="thingInput" spellcheck="false" placeholder="rover1">
+    </label>
     <div class="tiny">
+      <b>The IP override is not a troubleshooting afterthought.</b> mDNS
+      resolution is per-resolver, not per-machine — <code>fpms-rover1.local</code>
+      has resolved from one language's resolver and failed from another's on
+      the same box at the same time, so "ping works" does not prove the
+      browser will resolve it. Find the address on your router or hotspot's
+      client list.
+      <br><br>
+      The thing name does not appear in any ROS topic name — it is the MQTT
+      root the Pi-side bridge subscribes, and it is checked against the
+      <code>hardware_id</code> the rover publishes on <code>/diagnostics</code>.
+      <br><br>
       The browser dials this address directly. On WSL that connection does not
       traverse the WSL network at all — only this page is served from WSL.
-      Saved in this browser's localStorage; <code>?rover=host:port</code> in
-      the URL overrides it for one visit.
+      Saved in this browser's localStorage;
+      <code>?rover=host:port&amp;thing=name</code> overrides it for one visit.
     </div>
     <div class="modal-actions">
       <button id="roverCancel">cancel</button>

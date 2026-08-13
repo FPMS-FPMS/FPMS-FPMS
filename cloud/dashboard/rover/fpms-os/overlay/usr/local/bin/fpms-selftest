@@ -51,11 +51,46 @@ STATE_DIR = "/var/lib/fpms"
 DDS_PROFILE = "/etc/fpms/fastdds_udp_only.xml"
 PLACEHOLDER = "__FPMS_FIRSTBOOT_WILL_REPLACE_THIS__"
 
+# THIS LIST MUST MATCH scripts/60-enable-units.sh's BOOT_UNITS.
+#
+# It drifted, and drift here is expensive in both directions:
+#
+#   a unit listed that is DELIBERATELY disabled reports a permanent false
+#   failure -- fpms-console was in this list after it was superseded by
+#   fpms-dashboard, so every boot report would have carried a FAIL for a unit
+#   that is off on purpose;
+#
+#   a unit MISSING from this list is never checked at all, which is the
+#   quieter and worse half. fpms-missions was once found active-but-disabled
+#   on the running Pi and came back absent after a reboot; a checker that does
+#   not name a unit cannot notice that.
+#
+# Either way the cost is the same: a boot report that is wrong twice is what
+# teaches an operator to stop reading it, and being believed is the whole
+# purpose of this file.
 BOOT_UNITS = [
     "fpms-cored", "fpms-rover-agent", "fpms-lidar-ros", "fpms-tf",
     "fpms-map-anchor", "fpms-odom-tf", "fpms-teleop", "fpms-missions",
     "fpms-uros-supervisor", "fpms-wifi-powersave-hold",
-    "micro-ros-agent", "fpms-rosbridge", "fpms-console",
+    "micro-ros-agent", "fpms-rosbridge",
+    # The dashboard the rover serves itself, on :8090. Replaced fpms-console,
+    # whose payload is in no repository and which is now disabled on purpose.
+    "fpms-dashboard",
+    # The NPU layer: the inference daemon, the thermal/core reporter, and the
+    # boot-time model provisioning that is the only thing standing between a
+    # missing .rknn and a rover that streams video and detects nothing.
+    "fpms-npud", "fpms-npu-tune", "fpms-model-provision",
+    # ROS-level hardware verification: LiDAR, camera and the ESP32 link.
+    "fpms-hwcheck",
+]
+
+# Deliberately NOT in the list above, and named here so nobody "fixes" it by
+# adding them back: fpms-console (superseded, payload absent), fpms-ros-settle
+# (the DDS fallback), and the Nav2/SLAM units (blocked on an unmeasured LiDAR
+# mount). All four are shipped and disabled on purpose.
+DELIBERATELY_DISABLED = [
+    "fpms-console", "fpms-ros-settle",
+    "fpms-nav2", "fpms-slam-mapping", "fpms-slam-localization",
 ]
 MUST_BE_MASKED = ["fpms-ros-tunnel", "fpms-rtos-follower"]
 

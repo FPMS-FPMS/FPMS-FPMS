@@ -85,7 +85,31 @@ fpms-mqtt-password
 
 
 ------------------------------------------------------------------------
- 3. WHAT HAPPENS WHEN YOU POWER ON
+ 3. THE DETECTION MODEL  ->  drop  yolo26n-rk3588.rknn  on this card
+------------------------------------------------------------------------
+
+The rover can drive, map and stream video without this. It cannot DETECT
+anything without it - no fire, no wildlife, no obstacles by camera.
+
+The file is called
+
+    yolo26n-rk3588.rknn
+
+and it is NOT on this card, because it is not in the project's source code
+either. It lives on the old rover. Copy it onto this card next to this README
+and the rover installs and checks it on first boot.
+
+If you do not, the rover still boots and still works - but it will report
+"no detection model" on every boot, and it will keep saying so until you fix
+it. That is deliberate. A fire-watching robot that quietly stopped watching
+for fire is the one failure this whole system is built to make impossible.
+
+The rover never deletes your copy from this card. It is very likely the only
+copy in existence, so leaving it here means a re-flash still has it.
+
+
+------------------------------------------------------------------------
+ 4. WHAT HAPPENS WHEN YOU POWER ON
 ------------------------------------------------------------------------
 
 First boot takes a few minutes, because the rover is resizing its own storage,
@@ -114,7 +138,7 @@ If something is wrong, it tells you what and what to do about it.
 
 
 ------------------------------------------------------------------------
- 4. IF IT DOES NOT COME UP ON WIFI
+ 5. IF IT DOES NOT COME UP ON WIFI
 ------------------------------------------------------------------------
 
 If FPMS_Net is not in range - or is not spelled the way this card expects -
@@ -133,7 +157,7 @@ An Ethernet cable also always works.
 
 
 ------------------------------------------------------------------------
- 5. A SAFETY NOTE, BECAUSE IT MATTERS
+ 6. A SAFETY NOTE, BECAUSE IT MATTERS
 ------------------------------------------------------------------------
 
 This rover will not drive itself the moment it boots. Missions must be armed

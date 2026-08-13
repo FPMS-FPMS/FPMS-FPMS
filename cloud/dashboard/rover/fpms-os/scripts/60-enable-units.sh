@@ -72,6 +72,13 @@ BOOT_UNITS=(
     # Shipped-but-not-enabled is the exact failure this project already has on
     # record for fpms-missions, so it goes in the boot set, not beside it.
     fpms-hwcheck.service
+    # Boot-time detection-model provisioning. Installs a .rknn the operator
+    # dropped on the FAT boot partition from Windows -- the only realistic
+    # delivery path for a file that cannot live in git -- verifies its output
+    # shape, and FAILS THE UNIT if there is no usable model. That failure is
+    # the point: without it the agent logs "NPU unavailable; streaming without
+    # detection" once and runs blind forever with every unit reporting active.
+    fpms-model-provision.service
     fpms-selftest.service
 )
 
