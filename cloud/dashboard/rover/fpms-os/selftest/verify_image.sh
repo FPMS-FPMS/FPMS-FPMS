@@ -1673,6 +1673,46 @@ the cause."
         add "no shadowing user-local numpy" "$PASS" "none"
     fi
 
+    # A pip numpy in /usr/local SHADOWS apt's for every service too, and this
+    # one defeats the whole apt-side policy silently.
+    #
+    # /usr/local/lib/python3.10/dist-packages precedes /usr/lib/python3/
+    # dist-packages on sys.path, and pip does NOT remove apt's copy. So after
+    # one `pip install -U numpy`:
+    #   - every ROS process imports 2.x and breaks
+    #   - `apt-cache policy python3-numpy` still says 1.21.5
+    #   - /etc/apt/preferences.d/fpms-numpy-ceiling still reports satisfied
+    #   - the dist-info branch below still reads apt's 1.x and says PASS
+    # Four checks agreeing on the wrong answer, because all four are looking at
+    # the copy that lost. This one looks at the copy that WINS.
+    localnp=""
+    for d in "$R"/usr/local/lib/python3*/dist-packages/numpy \
+             "$R"/usr/local/lib/python3*/site-packages/numpy; do
+        [ -d "$d" ] && localnp="$d" && break
+    done
+    if [ -n "$localnp" ]; then
+        lv="$(find "${localnp%/numpy}" -maxdepth 1 -type d -name 'numpy-*.dist-info' \
+              -printf '%f\n' 2>/dev/null || true)"
+        lv="${lv%%$'\n'*}"
+        case "$lv" in
+            numpy-2.*|numpy-3.*)
+                add "no pip numpy shadowing apt's" "$FAIL" "${localnp#"$R"} is $lv" \
+                    "This WINS over apt's 1.x on sys.path and breaks every ROS C
+extension, while every apt-side check keeps reporting 1.21.5. Remove it:
+  sudo pip3 uninstall numpy      (repeat until 'not installed')
+and confirm with the only test that answers the question:
+  python3 -c 'import numpy; print(numpy.__version__, numpy.__file__)'" ;;
+            *)
+                add "no pip numpy shadowing apt's" "$WARN" \
+                    "${localnp#"$R"} exists${lv:+ ($lv)}" \
+                    "A pip numpy in /usr/local takes precedence over apt's for
+every service. It appears to be 1.x so nothing is broken today, but it is now
+outside the apt pin's control and a later 'pip install -U' walks over it." ;;
+        esac
+    else
+        add "no pip numpy shadowing apt's" "$PASS" "/usr/local has no numpy"
+    fi
+
     # Read the version off the dist-info directory NAME rather than out of
     # numpy/version.py: the assignment in that file has changed shape between
     # releases ("version = " vs "version: str = "), and a pattern that stops

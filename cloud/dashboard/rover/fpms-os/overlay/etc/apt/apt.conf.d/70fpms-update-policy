@@ -1,0 +1,93 @@
+// FPMS-OS: nothing on this board updates itself on a timer.
+//
+// Installed by the overlay copy in scripts/50-overlay.sh; verified by
+// scripts/70-update-policy.sh with `apt-config dump`, which is also the
+// syntax check - a malformed file here breaks EVERY apt operation on the
+// image, not just this policy.
+//
+// FILENAME: no extension, like its neighbours 20auto-upgrades and
+// 50unattended-upgrades. apt reads a file in apt.conf.d only if it ends in
+// `.conf` or has no extension at all. The `70` prefix is load-bearing:
+// apt.conf.d is read in alphanumeric order and the LAST assignment to a
+// scalar wins, so 70 overrides whatever 20auto-upgrades says. Do not renumber
+// it below 50.
+//
+// ===========================================================================
+// THE DECISION: automatic apt activity is OFF. Security updates are a
+// deliberate, foreground, operator-initiated act.
+// ===========================================================================
+//
+// This is a competition robot, and the argument is not "updates are bad" - it
+// is that on THIS board every property that makes unattended updating safe on
+// a server is absent:
+//
+//  1. POWER IS A SWITCH. The rover is battery-powered and gets switched off
+//     abruptly, by a human, at the end of a run. dpkg unpacking a package at
+//     that moment leaves a half-configured package and /var/lib/dpkg/updates
+//     behind, and the next apt refuses outright with "dpkg was interrupted".
+//     scripts/00-base-system.sh has a whole repair block for exactly this
+//     state because it has happened repeatedly ON THE BUILD HOST, where
+//     someone was watching. On the rover nobody is watching, and the symptom
+//     surfaces as a service that will not reinstall on race morning.
+//
+//  2. THE LINK IS ALREADY SATURATED. FPMS_CAMERA_FPS=6 and
+//     FPMS_JPEG_QUALITY=40 are shipped deliberately low because higher
+//     settings saturated WiFi and STARVED THE LIDAR FEED (SPEC.md section 5).
+//     A background apt download is tens to hundreds of megabytes over that
+//     same hotspot. The failure it produces is not "the update was slow", it
+//     is a rover whose obstacle guard goes stale mid-mission.
+//
+//  3. RESTARTS ARE NOT CHEAP HERE. A package upgrade restarts services. The
+//     micro-ROS serial link costs 90-225 s to re-establish (SPEC.md section
+//     3) and takes the rover's only pose source with it, and a restart of
+//     fpms-cored is a window with no STOP authority. Neither is acceptable at
+//     a time chosen by a timer.
+//
+//  4. NO CONSOLE. There is no monitor on this board. Anything that goes wrong
+//     unattended is invisible until someone notices the rover is unreachable,
+//     which is the same symptom as a flat battery, a wrong SSID, and a dead
+//     WiFi driver.
+//
+//  5. THE VENUE IS WHEN IT WOULD FIRE. The rover normally lives on an
+//     operator laptop's hotspot at 192.168.137.1 with no route to the
+//     internet. The days it DOES have internet are the days someone brought
+//     it somewhere - i.e. exactly the days you least want a 3 a.m. upgrade.
+//
+// AND THE OTHER SIDE, HONESTLY: never patching is a real cost. mosquitto,
+// rosbridge, fpms_console and sshd all bind 0.0.0.0 (SPEC.md section 7), and
+// on a shared venue network that is genuine exposure. So this policy does NOT
+// remove the ability to take security updates - it removes the TIMER. The
+// unattended-upgrades security-only configuration is still written, still
+// live, and still verifiable (see 71fpms-unattended-upgrades); an operator
+// gets exactly that set, in the foreground, with:
+//
+//     sudo unattended-upgrade --dry-run -v     // what it WOULD do
+//     sudo unattended-upgrade -v               // do it
+//
+// The human, not the clock, chooses the moment. docs/UPDATING.md says when.
+//
+// Three of the keys below are the ones that actually carry this
+// (Update-Package-Lists / Download-Upgradeable-Packages / Unattended-Upgrade:
+// /usr/lib/apt/apt.systemd.daily reads them and does nothing when they are
+// 0). APT::Periodic::Enable is the belt-and-braces master switch; stage 70
+// checks whether this image's apt.systemd.daily actually honours that name
+// and says so in the build log rather than assuming it.
+//
+// NOTE ON WHAT IS *NOT* DONE HERE: apt-daily.timer and
+// apt-daily-upgrade.timer are left alone. They are systemd units and this
+// image's systemd units have one owner. The timers still fire; apt.systemd.daily
+// reads this file and exits without touching the network or dpkg. If you want
+// to confirm that on a rover: `systemctl list-timers apt-daily*` shows them
+// scheduled, and `journalctl -u apt-daily-upgrade` shows them doing nothing.
+
+APT::Periodic::Enable "0";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Download-Upgradeable-Packages "0";
+APT::Periodic::Unattended-Upgrade "0";
+APT::Periodic::AutocleanInterval "0";
+APT::Periodic::CleanInterval "0";
+
+// The rover's uplink is a hotspot that has been measured flapping on a 47 s
+// cycle when WiFi power save comes back. One lost packet should not fail an
+// operator's deliberate update.
+Acquire::Retries "3";

@@ -1,0 +1,35 @@
+# FPMS-OS: do-release-upgrade must never offer, and never take, a new release.
+#
+# WHY THIS FILE EXISTS
+# ====================
+# The apt pins in /etc/apt/preferences.d/fpms-kernel stop `apt upgrade` from
+# replacing the Rockchip BSP kernel. They do NOT stop `do-release-upgrade`,
+# which is a different program with a different mechanism: it rewrites the
+# sources to the next release and pulls a whole new archive, kernel included.
+#
+# On this board that is not "an upgrade with some risk". Ubuntu 24.04 has no
+# rknpu, no Rockchip Mali stack and no bcmdhd. The result is:
+#
+#     no NPU driver      -> no YOLO, and fpms-npud fails at every boot
+#     no WiFi driver     -> no FPMS_Net, and the rover cannot be reached
+#                           at all, on a machine with no monitor attached
+#     possibly no boot   -> the BSP u-boot and the generic kernel disagree
+#
+# It also has no ROS 2 Humble: Humble targets 22.04, and 24.04 carries Jazzy.
+# So a release upgrade does not merely risk the drivers, it invalidates the
+# entire ROS layer this image is built around.
+#
+# Prompt=never means the release-upgrade CHECK never advertises a new release.
+# It is not a hard block - an operator who types `do-release-upgrade -d` still
+# gets it - and that is the correct strength for this control. The failure this
+# guards against is the accidental one: an operator seeing "Ubuntu 24.04.x LTS
+# is available" in the SSH motd and saying yes.
+#
+# THE DELIBERATE PATH, if this rover is ever to move to a newer Ubuntu: it is a
+# REBUILD, not an upgrade. Build a fresh image from an ubuntu-rockchip base for
+# the target release, with a ROS distro that targets it, and flash a new card -
+# so the old card still exists and the rover is one swap away from working.
+# Never in-place, and never the week of a competition.
+
+[DEFAULT]
+Prompt=never

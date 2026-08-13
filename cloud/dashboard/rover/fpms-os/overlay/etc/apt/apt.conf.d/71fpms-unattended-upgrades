@@ -1,0 +1,135 @@
+// FPMS-OS: unattended-upgrades is configured SECURITY-ONLY, and never reboots.
+//
+// Read 70fpms-update-policy first: the timer that would invoke this is off.
+// This file decides what happens when unattended-upgrades DOES run - which on
+// this image means when an operator runs it by hand, or when someone
+// re-enables APT::Periodic::Unattended-Upgrade without reading either file.
+// It is written for that second case as much as the first: a policy that only
+// holds while nobody changes anything is not a policy.
+//
+// If the unattended-upgrades package is not installed at all, every key here
+// is inert and harmless, and stage 70 says which of the two it found.
+//
+// ===========================================================================
+// #clear IS NOT DECORATION
+// ===========================================================================
+// apt.conf LISTS APPEND across files; only SCALARS are overwritten by the
+// last file to set them. Allowed-Origins and Package-Blacklist are lists, so
+// without `#clear` this file would ADD to whatever 50unattended-upgrades
+// already set (Ubuntu ships -security enabled there, and -updates one
+// uncommented line away) instead of replacing it. `#clear` is an apt.conf
+// directive, not a comment - the `#` is part of the syntax. Do not "fix" it
+// to `//`.
+
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+
+// BOTH names are cleared because unattended-upgrades reads both and unions
+// them: Ubuntu's own config uses Allowed-Origins, Debian's uses
+// Origins-Pattern, and an image that has been touched by both leaves both
+// populated. Clearing one and setting the other is the classic way to end up
+// with a policy that is wider than the file appears to say.
+//
+// SECURITY ONLY, and specifically NOT:
+//   ${distro_codename}-updates   - the bug-fix pocket. This is where a new
+//                                  kernel or a mosquitto restart arrives for
+//                                  reasons that are not security.
+//   ${distro_codename}-backports - never automatically, on any robot.
+//   the ROS 2 repository         - packages.ros.org, added by
+//                                  scripts/10-ros-humble.sh. An automatic
+//                                  ros-humble-* upgrade would change Nav2,
+//                                  slam_toolbox or rclpy underneath configs
+//                                  that were diffed against exact versions
+//                                  (SPEC.md section 1). Not listed here, so
+//                                  it can never be selected.
+//   the Rockchip/BSP origin      - the kernel. Excluded here AND pinned to -1
+//                                  in /etc/apt/preferences.d/fpms-kernel, so
+//                                  it takes two independent mistakes.
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+
+// ===========================================================================
+// THE BLACKLIST - DEFENCE IN DEPTH, NOT THE MECHANISM
+// ===========================================================================
+// The real enforcement is /etc/apt/preferences.d/fpms-kernel:
+// unattended-upgrades resolves through apt's own engine, so a version pinned
+// to -1 is not a candidate for it either. This list is the second lock, and
+// it is worth having because it is the one an operator SEES when they read
+// the config.
+//
+// KNOW ITS LIMITS: these entries are Python regular expressions applied with
+// re.match(), i.e. ANCHORED AT THE START of the package name. "rockchip"
+// therefore matches rockchip-multimedia-config but NOT librockchip-mpp1. The
+// glob `*rockchip*` in the pin file does catch that one. Do not read this
+// list as the complete protected set - `apt-mark showhold` and
+// /etc/apt/preferences.d/fpms-kernel-installed are.
+//
+// What is deliberately NOT blacklisted: mosquitto, openssh-server, rosbridge's
+// python dependencies. Those are network-facing daemons on 0.0.0.0 and their
+// security updates are the entire point of leaving this configuration alive.
+// The blacklist protects the things whose upgrade breaks the BOARD, not the
+// things whose upgrade is the reason to update at all.
+
+#clear Unattended-Upgrade::Package-Blacklist;
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image";
+    "linux-headers";
+    "linux-modules";
+    "linux-generic";
+    "linux-virtual";
+    "linux-lowlatency";
+    "linux-rockchip";
+    "linux-firmware";
+    "u-boot";
+    "flash-kernel";
+    "rockchip";
+    "libmali";
+    "mali-";
+    "python3-numpy";
+};
+
+// ===========================================================================
+// NEVER REBOOT. NEVER.
+// ===========================================================================
+// A reboot costs 90-225 s of micro-ROS re-link alone, re-runs first boot
+// logic, and on a board with no console an unattended reboot that does not
+// come back is indistinguishable from a flat battery. There is no hour of the
+// day at which a robot may reboot itself.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+
+// InstallOnShutdown would move the whole dpkg transaction to the moment the
+// power is most likely to be cut - see point 1 in 70fpms-update-policy.
+Unattended-Upgrade::InstallOnShutdown "false";
+
+// MinimalSteps: commit in small chunks so an interruption leaves fewer
+// half-configured packages behind. This is the same reasoning as above,
+// applied to the run that does happen.
+Unattended-Upgrade::MinimalSteps "true";
+
+// Never let an automatic run REMOVE anything. Remove-Unused-Kernel-Packages
+// is the dangerous one on this board: the "unused" kernel it wants to remove
+// is the BSP kernel, because nothing declares a dependency on it.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+
+// SILENCE IS NEVER SUCCESS (SPEC.md section 8, rule 1).
+//
+// Both of these default to values that make a manual run do NOTHING and
+// report success:
+//   OnlyOnACPower defaults true, and a battery-powered rover never has AC.
+//   Skip-Updates-On-Metered-Connections defaults true, and a Windows phone
+//   hotspot is very often flagged metered.
+// With the timer off, every run of unattended-upgrades on this image is a
+// human who typed the command and is waiting for an answer. They must get the
+// real one.
+Unattended-Upgrade::OnlyOnACPower "false";
+Unattended-Upgrade::Skip-Updates-On-Metered-Connections "false";
+
+// No mail on a rover with no MTA; the journal is the record.
+Unattended-Upgrade::Mail "";
+Unattended-Upgrade::SyslogEnable "true";

@@ -1,0 +1,68 @@
+# FPMS-OS numpy 2.x ceiling.
+#
+# THIS FILE DOES NOT REPLACE /etc/apt/preferences.d/fpms-numpy. It closes the
+# one hole that one has.
+#
+# scripts/20-python-deps.sh writes fpms-numpy, which pins the versions
+# matching `1:1.*` to priority 1001. That is the right pin and its 1001 (above
+# 1000, so a DOWNGRADE is permitted) is deliberate - read the comment there
+# before touching either file. What it cannot do is protect against the
+# absence of a 1.x: a pin only assigns a priority to versions that EXIST. If
+# an archive ever offers python3-numpy 2.x and no 1.x at all - a jammy-updates
+# rebuild, a PPA an operator adds, a base image that moves on - then the 1001
+# pin matches nothing, the 2.x sits at the default 500, the installed 1.21.5
+# sits at 100, and `apt upgrade` walks it straight over the top. Silently.
+#
+# WHY THAT MATTERS MORE THAN IT SOUNDS
+# ROS Humble's C extensions are built against the NumPy 1.x ABI. A 2.x breaks
+# tf_transformations with "np.maximum_sctype was removed in the NumPy 2.0
+# release" - reported from a module nowhere near the cause - and
+# selftest/verify_image.sh already fails an image whose numpy is 2.x because
+# it "would break every ROS C extension in the image".
+#
+# A CEILING IS THE RIGHT SHAPE. Naming versions that must never be installed
+# needs no knowledge of what the archive currently offers, so it keeps working
+# on the day the 1.x disappears - which is exactly the day the other pin stops.
+#
+# NO CONFLICT WITH fpms-numpy, BY CONSTRUCTION. Both files use the
+# specific form (`Pin: version`), and apt_preferences(5) says the FIRST
+# matching specific-form record wins. Files in preferences.d are read in
+# alphanumeric order, so "fpms-numpy" is read before "fpms-numpy-ceiling" -
+# but it does not matter, because the two version sets are disjoint: fpms-numpy
+# matches 1.x only and this file matches 2.x and 3.x only. Keep them disjoint.
+# If you ever widen either one, you have created an order-dependent pin, which
+# is a bug that reads like a working file.
+#
+# Four records rather than two because apt's version matcher understands
+# exactly one wildcard - a TRAILING `*` - and Debian's numpy carries epoch 1.
+# "1:2.0.0" does not begin with "2", so `Pin: version 2.*` does not match it.
+# Both spellings, both major versions.
+#
+# WHAT THIS FILE CANNOT DO: apt has no authority over pip. pip installs into
+# /usr/local/lib/python3.10/dist-packages, which PRECEDES apt's
+# /usr/lib/python3/dist-packages on sys.path, so a `pip install -U numpy` puts
+# a 2.x in front of apt's 1.21.5 for every FPMS service while apt continues to
+# report 1.21.5 installed and every apt-side check here still passes. The pip
+# half of this policy is /etc/pip.conf -> /etc/fpms/pip-constraints.txt,
+# written by stage 20. Both halves are needed; neither can cover for the
+# other. See docs/UPDATING.md.
+
+Explanation: FPMS-OS: NumPy 2.x breaks every ROS Humble C extension in this image (1.x ABI).
+Package: python3-numpy
+Pin: version 2.*
+Pin-Priority: -1
+
+Explanation: FPMS-OS: same, spelled with Debian's epoch 1 - apt matches the version string exactly as it prints it.
+Package: python3-numpy
+Pin: version 1:2.*
+Pin-Priority: -1
+
+Explanation: FPMS-OS: a 3.x would break the 1.x ABI at least as hard as 2.x did.
+Package: python3-numpy
+Pin: version 3.*
+Pin-Priority: -1
+
+Explanation: FPMS-OS: same, with the epoch.
+Package: python3-numpy
+Pin: version 1:3.*
+Pin-Priority: -1

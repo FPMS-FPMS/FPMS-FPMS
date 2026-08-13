@@ -1,0 +1,2158 @@
+#!/usr/bin/env python3
+"""fpms-update - replace the FPMS payload on a running rover, reversibly.
+
+Usage:
+    fpms-update status                     what is live, and what can be rolled back to
+    fpms-update check   --from SRC         stage + verify + show the diff. CHANGES NOTHING.
+    fpms-update payload --from SRC         the real thing: stage, verify, snapshot, swap, restart
+    fpms-update rollback [--to GEN]        put the previous payload back
+    fpms-update verify                     recompile what is live NOW and check it against its manifest
+    fpms-update prune --keep N             remove old rollback generations (never automatic)
+    fpms-update os [--check|--apply]       the apt side. Separate on purpose. See below.
+
+    SRC is a directory, a .tar.gz/.tgz/.tar, the word `usb`, or `git:<url-or-path>`.
+
+Exit: 0 success, 1 refused (nothing changed), 2 failed (see the message; the
+      payload was either not touched or automatically rolled back).
+
+
+WHY THIS EXISTS
+===============
+Until this file, the only way to change one line of `fpms_missions.py` on a
+flashed rover was to build a new image and reflash the SD card. That is a
+fourteen-hour answer to a one-character question, and the rover is a
+competition machine running code that is still being fixed.
+
+The whole design follows from one sentence: THE ROVER MAY BE MID-MISSION.
+Silently restarting `fpms-missions.service` while the rover is driving is the
+single worst thing this tool could do -- the executor's SIGTERM handler aborts
+the mission and publishes zero Twists, so it stops, but it stops WHEREVER IT
+IS, mid-leg, with its anchor and its residual bookkeeping thrown away. So
+every mutating path goes through the same gate (see `mission_gate`) and the
+default answer to "is it safe?" is NO.
+
+
+WHAT IT WILL NEVER DO
+=====================
+  - move the rover, or write to /cmd_vel, or open the drive board's tty
+  - restart micro-ros-agent (90-225 s to re-link) -- it is not in any restart
+    set, at all, and neither is fpms-uros-supervisor unless you ask for it by
+    name with --restart-uros
+  - implement its own apt policy. The holds, the pins and
+    /etc/apt/preferences.d belong to the update-policy layer; `fpms-update os`
+    reads them, prints them, refuses to fight them, and never passes
+    --allow-change-held-packages
+  - delete a rollback generation on its own (see `prune`)
+  - delete a file in a destination tree that the new payload simply does not
+    contain. $H/nav2/arena_map.pgm is GENERATED at image build time and is in
+    no repository; a tree sync that mirrored deletions would silently destroy
+    it, and $H/slam/maps/ (a physical mapping run that cannot be rebuilt from
+    the repo) with it. Trees are merged over, never mirrored.
+
+
+THE TWO THINGS BEING UPDATED ARE NOT THE SAME THING
+===================================================
+  `payload`  our Python: fpms_missions.py, fpms_lidar_ros.py, the stack/ libs,
+             nav2/, slam/, the dashboard, the two /usr/local/bin entry points.
+             Changes often. Reversible in seconds. Verified before it goes
+             live. This is what you will run at a competition.
+
+  `os`       apt packages. Changes rarely and dangerously: ROS Humble, numpy
+             <2, paho>=2.0 and the RKNN runtime are all load-bearing and all
+             pinned or held by another layer. An OS upgrade at a venue is a
+             decision, not a maintenance task.
+
+They are separate subcommands because conflating them is how "I updated the
+mission file" becomes "and it also pulled a new numpy and now tf_transformations
+raises np.maximum_sctype was removed".
+
+
+NO NETWORK IS ASSUMED
+=====================
+FPMS_Net is an arena network that may have no route to the internet at all,
+and the measured WiFi behaviour on this board is hostile to short probes: the
+link carrier flaps at association (gained 16:07:12, lost 16:07:12, regained
+16:07:13 -- measured 2026-08-06) and `bcmdhd` re-enables power save every
+30-60 s, which flapped MQTT on a measured 47 s cycle.
+
+So: the USB stick is the FIRST-CLASS path, not the fallback. `git:` exists and
+works, but every network operation has an explicit timeout and a preflight
+that retries across the flap window before declaring the network dead. Nothing
+in this file can hang waiting for a socket.
+"""
+
+import argparse
+import errno
+import re
+import grp
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import socket
+import subprocess
+import stat as statmod
+import sys
+import tarfile
+import tempfile
+import time
+import py_compile
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+CONFIG = "/etc/fpms/config.env"
+STATE_DIR = "/var/lib/fpms"
+GEN_ROOT = os.path.join(STATE_DIR, "updates")
+CURRENT_LINK = os.path.join(GEN_ROOT, "current")
+RESULT_JSON = os.path.join(STATE_DIR, "update.json")
+BROKER_PASSWORD_FILE = os.path.join(STATE_DIR, "broker-password")
+DDS_PROFILE = "/etc/fpms/fastdds_udp_only.xml"
+SELFTEST = "/usr/local/bin/fpms-selftest"
+ROS_SETUP = "/opt/ros/humble/setup.bash"
+
+FPMS_USER = "ubuntu"
+HOME = "/home/ubuntu"
+
+# The environment EVERY ROS process this tool spawns must carry. Without the
+# profile, Fast DDS prefers shared memory, whose segments do not survive across
+# process eras -- and this tool is BY DEFINITION a new era: it starts long
+# after every publisher on the rover. Discovery would succeed and no data would
+# flow, so the mission probe below would see a perfectly still rover on a
+# rover that is driving. That is the exact shape of the failure this gate
+# exists to prevent, so it is not a detail.
+ROS_ENV = {
+    "ROS_DOMAIN_ID": "20",
+    "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+    "FASTRTPS_DEFAULT_PROFILES_FILE": DDS_PROFILE,
+    "ROS_LOCALHOST_ONLY": "1",
+    "PYTHONUNBUFFERED": "1",
+    "HOME": HOME,
+}
+
+# Suffixes that never belong in a payload. __pycache__ in particular: stage 30
+# refuses to run py_compile against the staged overlay for exactly this reason
+# -- bytecode copied into an image is build scaffolding that goes stale the
+# moment anyone edits the source beside it.
+SKIP_DIRS = {"__pycache__", ".git", ".github", ".idea", ".vscode", "node_modules"}
+SKIP_SUFFIX = (".pyc", ".pyo", ".orig", ".rej", ".swp")
+
+_CRLF_RE = re.compile(rb"\r+\n")
+
+# Destinations systemd ExecStart=s DIRECTLY, so the kernel reads their shebang.
+# fpms-uros-supervisor.service does; fpms-rover-agent.service does not (it runs
+# `/usr/bin/python3 /usr/local/bin/fpms-rover-agent`). That difference decides
+# whether a missing "#!" is a refusal or a remark, and getting it backwards in
+# either direction is bad: a hard failure on a file nothing execs is a check
+# that gets deleted, and a remark on the one that IS exec'd is
+# "/usr/bin/env: bad interpreter" on the drive link.
+DIRECT_EXEC = {"/usr/local/bin/fpms-uros-supervisor"}
+
+
+class Refused(Exception):
+    """The tool declined to act. Nothing was changed."""
+
+
+class Failed(Exception):
+    """The tool tried and could not finish. State is described in the message."""
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+_QUIET = False
+
+
+def say(msg=""):
+    if not _QUIET:
+        print(msg)
+
+
+def hdr(msg):
+    say("")
+    say("== %s" % msg)
+
+
+def warn(msg):
+    print("fpms-update: WARNING: %s" % msg, file=sys.stderr)
+
+
+def err(msg):
+    print("fpms-update: %s" % msg, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# Config, the way fpms-selftest does it
+# --------------------------------------------------------------------------
+def load_config():
+    """config.env, with the process environment overlaid on top.
+
+    Copied deliberately from fpms-selftest, including the reason.
+
+    /etc/fpms/config.env is 0640 root:root -- it holds the broker password --
+    so a tool that reads it as `ubuntu` gets a PermissionError, and a bare
+    `except OSError` then hands back an EMPTY config in which every value reads
+    as absent. In fpms-selftest that produced two spurious FAILURES on every
+    single boot. Here it would be worse than spurious: an empty config means an
+    empty FPMS_MQTT_PASS, the mission probe below authenticates with no
+    password, gets nothing, and a tool whose whole job is to refuse to update a
+    driving rover concludes the rover is idle.
+
+    So: read the file if we can, overlay FPMS_* from the environment, and
+    RECORD THE PROVENANCE so a wrong value can be traced to where it came from.
+    The mission gate treats "config came from env only" as evidence it must
+    report, not as a detail.
+    """
+    cfg = {}
+    readable = False
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+        readable = True
+    except OSError:
+        pass
+
+    from_env = 0
+    for k, v in os.environ.items():
+        if k.startswith("FPMS_") and v != "":
+            if cfg.get(k) != v:
+                from_env += 1
+            cfg[k] = v
+
+    # Root's fallback for the password specifically. fpms-firstboot writes it
+    # here 0600 so anyone arriving over SSH later can still reach the broker,
+    # and fpms-hwcheck already reads it. Only consulted when config.env did not
+    # yield one -- never allowed to override it.
+    if not cfg.get("FPMS_MQTT_PASS"):
+        try:
+            with open(BROKER_PASSWORD_FILE) as fh:
+                got = fh.read().strip()
+            if got:
+                cfg["FPMS_MQTT_PASS"] = got
+                cfg["_pass_from"] = BROKER_PASSWORD_FILE
+        except OSError:
+            pass
+
+    cfg["_provenance"] = ("file+env" if readable else
+                          "env only (config.env is 0640 root:root and this "
+                          "runs as %s)" % (os.environ.get("USER") or "?"))
+    cfg["_config_readable"] = "1" if readable else "0"
+    cfg["_from_env"] = str(from_env)
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# Process helpers
+#
+# Every one of these takes a timeout. There is no call in this file that can
+# block forever, because the network it may be talking to is an arena network
+# that may not exist.
+# --------------------------------------------------------------------------
+def sh(cmd, timeout=30, env=None, cwd=None):
+    """Run argv. Returns (rc, stdout, stderr). Never raises for a bad command.
+
+    A timeout is reported as rc 254 with the reason in stderr, distinct from
+    255 (could not spawn) and from any exit code the command itself might use,
+    so a caller can tell "it hung" from "it failed" from "it is not installed".
+    """
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=e, cwd=cwd)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 254, "", "timed out after %ss: %s" % (timeout, " ".join(cmd))
+    except (OSError, ValueError) as exc:
+        return 255, "", "%s: %s" % (type(exc).__name__, exc)
+
+
+def ros_python(snippet, timeout=45):
+    """Run a Python snippet with ROS 2 sourced and the DDS profile forced.
+
+    `bash -lc 'source setup.bash && exec python3 -c ...'` is the shape every
+    ROS unit in this image uses, and it is used here for the same reason: the
+    shell an operator runs this tool from has probably not sourced ROS, and a
+    probe that silently could-not-import-rclpy would report "no motion seen"
+    on a driving rover.
+
+    The DDS variables are passed in the ENVIRONMENT rather than exported inside
+    the shell string, so setup.bash cannot be blamed for them and
+    `systemctl show`-style archaeology is not needed to work out what was set.
+    """
+    if not os.path.exists(ROS_SETUP):
+        return 255, "", "%s does not exist" % ROS_SETUP
+    script = "source %s >/dev/null 2>&1 && exec python3 -c \"$FPMS_PROBE\"" % ROS_SETUP
+    env = dict(ROS_ENV)
+    env["FPMS_PROBE"] = snippet
+    return sh(["/bin/bash", "-lc", script], timeout=timeout, env=env)
+
+
+def unit_active(unit):
+    rc, out, _ = sh(["systemctl", "is-active", unit + ".service"], timeout=10)
+    return out == "active", (out or "unknown")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def require_root(what):
+    if os.geteuid() != 0:
+        raise Refused(
+            "%s must run as root: it writes into %s, /usr/local/bin and %s, and "
+            "reads /etc/fpms/config.env (0640 root:root). Re-run with sudo."
+            % (what, HOME, STATE_DIR))
+
+
+# --------------------------------------------------------------------------
+# THE MISSION GATE
+#
+# This is the most important function in the file.
+# --------------------------------------------------------------------------
+#
+# TWO INDEPENDENT SOURCES OF EVIDENCE, AND NEITHER IS TRUSTED ALONE.
+#
+# (A) MQTT `fpms/<thing>/telemetry/mission`. This is the executor's own view
+#     and it is the one the rest of the stack already uses: fpms_teleop.py
+#     decides whether it owns /cmd_vel purely by whether it has seen one of
+#     these recently (MISSION_OWNS_WIRE_S = 12 s), and fpms-doctor reads
+#     `.armed` out of it. The payload carries `phase`, and the executor's own
+#     definition of busy is `phase not in ("idle",)`
+#     (fpms_missions.py::_telemetry_tick). We use exactly that definition
+#     rather than inventing a second one.
+#
+#     It is published on a timer: TELEM_HZ = 2 Hz while a mission runs, and one
+#     heartbeat every FPMS_MISSION_IDLE_TELEM_S (default 0.5 s) while idle. So
+#     a live executor produces a message within a couple of seconds either way,
+#     and NOT hearing one means the executor is down or the broker is -- it
+#     does NOT mean idle.
+#
+#     `armed` blocks too. An armed rover is one an operator has deliberately
+#     given permission to move and which will move on the next command; the arm
+#     latch expiring is not something this tool may race.
+#
+# (B) A passive ROS probe on /cmd_vel and /odom. This catches everything (A)
+#     cannot: fpms-teleop's jog/nudge, a stale browser tab, anything driving
+#     the rover that is not the mission executor.
+#
+#     /cmd_vel is the direct evidence -- a non-zero Twist on the wire means
+#     something is commanding motion right now. /odom is corroboration only,
+#     and the asymmetry is deliberate and is written down because this project
+#     has been burned by it: this rover has reported clean travel while
+#     spinning in place, so pose that CHANGES proves something moved, while
+#     pose that does not change proves nothing at all. Absence of odom motion
+#     never authorises; presence of it always blocks.
+#
+#     The probe SUBSCRIBES ONLY. It publishes nothing, it does not turn-test
+#     for liveness (that destroys heading), and it does not open any tty.
+#
+# THE POLICY, INCLUDING THE INCONCLUSIVE CASE:
+#
+#     either source says MOVING       -> REFUSE.
+#     both say IDLE                   -> proceed.
+#     one IDLE, one INCONCLUSIVE      -> proceed, printing which evidence was
+#                                        missing and why that matters.
+#     both INCONCLUSIVE               -> REFUSE. Silence is never success. We
+#                                        have no evidence of stillness at all,
+#                                        and the correct response to no
+#                                        evidence is not to act.
+#
+# --i-am-standing-next-to-the-rover overrides a refusal. It is spelled that way
+# on purpose: it is not a flag anybody types by accident or pastes out of a
+# runbook without reading it, and it prints the full evidence it is overriding.
+MISSION_TOPIC_SUFFIX = "telemetry/mission"
+
+MOVING, IDLE, UNKNOWN = "MOVING", "IDLE", "UNKNOWN"
+
+_PROBE = r'''
+import json, time
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+WINDOW = 4.0
+out = {"cmd_n": 0, "cmd_nonzero": 0, "max_lin": 0.0, "max_ang": 0.0,
+       "odom_n": 0, "moved_mm": 0.0, "yaw_delta": 0.0}
+first = {"p": None}
+last = {"p": None}
+
+rclpy.init(args=None)
+node = Node("fpms_update_motion_probe")
+qos = QoSProfile(depth=20, reliability=ReliabilityPolicy.RELIABLE,
+                 durability=DurabilityPolicy.VOLATILE,
+                 history=HistoryPolicy.KEEP_LAST)
+
+def on_cmd(m):
+    out["cmd_n"] += 1
+    lin = abs(float(m.linear.x)); ang = abs(float(m.angular.z))
+    out["max_lin"] = max(out["max_lin"], lin)
+    out["max_ang"] = max(out["max_ang"], ang)
+    if lin > 1e-6 or ang > 1e-6:
+        out["cmd_nonzero"] += 1
+
+def on_odom(m):
+    out["odom_n"] += 1
+    p = m.pose.pose
+    q = p.orientation
+    import math
+    yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                     1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    cur = (float(p.position.x), float(p.position.y), yaw)
+    if first["p"] is None:
+        first["p"] = cur
+    last["p"] = cur
+
+node.create_subscription(Twist, "/cmd_vel", on_cmd, qos)
+node.create_subscription(Odometry, "/odom", on_odom, qos)
+node.create_subscription(Odometry, "/odom_raw", on_odom, qos)
+
+end = time.time() + WINDOW
+while time.time() < end:
+    rclpy.spin_once(node, timeout_sec=0.2)
+node.destroy_node()
+rclpy.shutdown()
+
+if first["p"] is not None and last["p"] is not None:
+    import math
+    dx = last["p"][0] - first["p"][0]
+    dy = last["p"][1] - first["p"][1]
+    out["moved_mm"] = round(math.hypot(dx, dy) * 1000.0, 2)
+    d = last["p"][2] - first["p"][2]
+    while d > math.pi:  d -= 2 * math.pi
+    while d < -math.pi: d += 2 * math.pi
+    out["yaw_delta"] = round(abs(d), 4)
+print("FPMSPROBE " + json.dumps(out))
+'''
+
+
+def probe_mqtt_mission(cfg, wait_s=4):
+    """(verdict, detail). Reads the executor's own telemetry."""
+    thing = cfg.get("FPMS_THING_NAME", "rover1")
+    user = cfg.get("FPMS_MQTT_USER", "fpms")
+    pw = cfg.get("FPMS_MQTT_PASS", "")
+    topic = "fpms/%s/%s" % (thing, MISSION_TOPIC_SUFFIX)
+
+    if shutil.which("mosquitto_sub") is None:
+        return UNKNOWN, "mosquitto_sub is not installed"
+    if not pw:
+        return UNKNOWN, ("no broker password available (config.env unreadable "
+                         "and %s absent). An unauthenticated subscribe would "
+                         "return nothing and read as 'idle'." % BROKER_PASSWORD_FILE)
+
+    rc, out, errout = sh(["mosquitto_sub", "-h", cfg.get("FPMS_MQTT_HOST", "127.0.0.1"),
+                          "-p", str(cfg.get("FPMS_MQTT_PORT", "1883")),
+                          "-u", user, "-P", pw, "-t", topic,
+                          "-C", "1", "-W", str(int(wait_s))],
+                         timeout=wait_s + 8)
+    if rc == 254:
+        return UNKNOWN, "mosquitto_sub timed out"
+    if rc != 0 or not out:
+        return UNKNOWN, ("no message on %s within %ss (rc=%s%s). The executor "
+                         "publishes a heartbeat while idle too, so this means "
+                         "fpms-missions or the broker is down -- NOT that the "
+                         "rover is idle."
+                         % (topic, wait_s, rc, (": " + errout) if errout else ""))
+    try:
+        payload = json.loads(out.splitlines()[-1])
+    except ValueError as exc:
+        return UNKNOWN, "telemetry/mission is not JSON: %s" % exc
+    if not isinstance(payload, dict):
+        return UNKNOWN, "telemetry/mission is not an object"
+
+    phase = payload.get("phase")
+    armed = payload.get("armed")
+    name = payload.get("mission")
+    # The executor's own definition, verbatim: active = phase not in ("idle",).
+    if phase is None:
+        return UNKNOWN, "telemetry/mission carries no 'phase' field"
+    if phase != "idle":
+        return MOVING, ("mission '%s' is in phase '%s' (leg %s/%s, %s mm to run)"
+                        % (name, phase, payload.get("leg_i"),
+                           payload.get("legs_n"),
+                           payload.get("distance_remaining_mm")))
+    if armed is True:
+        return MOVING, ("phase is idle but the executor is ARMED -- an operator "
+                        "has given it permission to move and it will move on "
+                        "the next command")
+    return IDLE, "phase=idle armed=%s" % armed
+
+
+def probe_ros_motion():
+    """(verdict, detail). Passive. Subscribes only, publishes nothing."""
+    rc, out, errout = ros_python(_PROBE, timeout=45)
+    if rc != 0:
+        tail = (errout.splitlines()[-1] if errout else "rc=%s" % rc)
+        return UNKNOWN, "motion probe could not run: %s" % tail
+    line = ""
+    for ln in out.splitlines():
+        if ln.startswith("FPMSPROBE "):
+            line = ln[len("FPMSPROBE "):]
+    if not line:
+        return UNKNOWN, "motion probe produced no result line"
+    try:
+        d = json.loads(line)
+    except ValueError as exc:
+        return UNKNOWN, "motion probe output is not JSON: %s" % exc
+
+    if d.get("cmd_nonzero", 0) > 0:
+        return MOVING, ("%d non-zero Twist(s) on /cmd_vel in the window "
+                        "(max |lin|=%.3f m/s, max |ang|=%.3f rad/s)"
+                        % (d["cmd_nonzero"], d.get("max_lin", 0.0),
+                           d.get("max_ang", 0.0)))
+    if d.get("moved_mm", 0.0) > 5.0 or d.get("yaw_delta", 0.0) > 0.02:
+        return MOVING, ("odom pose changed by %.1f mm / %.3f rad while idle "
+                        "Twists were on the wire -- something is moving the "
+                        "rover. (Pose that CHANGES proves motion; pose that "
+                        "does not change proves nothing, so this test only "
+                        "ever blocks.)"
+                        % (d.get("moved_mm", 0.0), d.get("yaw_delta", 0.0)))
+    if d.get("cmd_n", 0) == 0 and d.get("odom_n", 0) == 0:
+        return UNKNOWN, ("nothing at all on /cmd_vel, /odom or /odom_raw. Either "
+                         "the stack is down, or this is the shared-memory-"
+                         "across-eras bug and the profile is not in effect "
+                         "(see /opt/fpms-os/docs/DDS.md). Not evidence of "
+                         "stillness.")
+    return IDLE, ("%d zero Twist(s), %d odom frame(s), pose moved %.1f mm"
+                  % (d.get("cmd_n", 0), d.get("odom_n", 0),
+                     d.get("moved_mm", 0.0)))
+
+
+def mission_gate(cfg, override=False, label="this operation"):
+    """Refuse unless the evidence says the rover is not moving.
+
+    Returns a dict of the evidence, which the caller records so a later
+    post-mortem can see what was believed at the moment of the change.
+    """
+    hdr("Is the rover mid-mission?")
+    mq_v, mq_d = probe_mqtt_mission(cfg)
+    say("  telemetry/mission : %-8s %s" % (mq_v, mq_d))
+    ros_v, ros_d = probe_ros_motion()
+    say("  /cmd_vel + /odom  : %-8s %s" % (ros_v, ros_d))
+
+    evidence = {"mqtt": {"verdict": mq_v, "detail": mq_d},
+                "ros": {"verdict": ros_v, "detail": ros_d},
+                "config_provenance": cfg.get("_provenance"),
+                "overridden": bool(override)}
+
+    verdicts = (mq_v, ros_v)
+    if MOVING in verdicts:
+        reason = ("THE ROVER IS NOT IDLE.\n"
+                  "  telemetry/mission : %s -- %s\n"
+                  "  /cmd_vel + /odom  : %s -- %s\n"
+                  "%s would restart fpms-missions (and possibly fpms-cored),\n"
+                  "which aborts the mission wherever it happens to be, throws\n"
+                  "away its anchor and residual bookkeeping, and leaves the\n"
+                  "rover stopped in the middle of the arena.\n"
+                  "Stop the mission first, confirm with `fpms-doctor wont-move`\n"
+                  "or the dashboard, then run this again."
+                  % (mq_v, mq_d, ros_v, ros_d, label))
+    elif verdicts == (UNKNOWN, UNKNOWN):
+        reason = ("NO EVIDENCE EITHER WAY. Both checks were inconclusive:\n"
+                  "  telemetry/mission : %s\n"
+                  "  /cmd_vel + /odom  : %s\n"
+                  "Silence is never success in this stack. A tool that treats\n"
+                  "'I heard nothing' as 'nothing is happening' is exactly the\n"
+                  "failure mode that has cost this project whole sessions.\n"
+                  "Fix one of the two channels (fpms-selftest will say which),\n"
+                  "or -- if you are physically watching the rover and it is\n"
+                  "stationary -- re-run with --i-am-standing-next-to-the-rover."
+                  % (mq_d, ros_d))
+    else:
+        reason = None
+
+    if reason is None:
+        if UNKNOWN in verdicts:
+            missing = "telemetry/mission" if mq_v == UNKNOWN else "/cmd_vel + /odom"
+            warn("proceeding on ONE source of evidence; %s was inconclusive. "
+                 "The other says idle." % missing)
+        else:
+            say("  -> idle on both counts.")
+        return evidence
+
+    if override:
+        warn("OVERRIDDEN by --i-am-standing-next-to-the-rover.")
+        for ln in reason.splitlines():
+            warn("  " + ln)
+        return evidence
+    raise Refused(reason)
+
+
+# --------------------------------------------------------------------------
+# The payload manifest
+#
+# THIS TABLE MUST MATCH scripts/30-fpms-payload.sh. It is the same set of
+# destinations, the same modes and the same owners -- because a file this tool
+# installs somewhere the image build does not is a file that survives exactly
+# until the next reflash, and then vanishes with no message.
+#
+# Drift here is expensive in both directions, the same way it is in
+# fpms-selftest's BOOT_UNITS: a destination MISSING from this table is never
+# updated at all (the quiet half -- you fix fpms_missions.py, deploy, and the
+# rover keeps running the old code), and a destination named here that the
+# build does not install is a file with two sources of truth.
+# --------------------------------------------------------------------------
+#   (src-relative, destination, mode, owner, required, units-to-restart)
+PAYLOAD_FILES = [
+    ("fpms_missions.py",       HOME + "/fpms_missions.py",       0o755, FPMS_USER, True,  ["fpms-missions"]),
+    ("fpms_lidar_ros.py",      HOME + "/fpms_lidar_ros.py",      0o755, FPMS_USER, True,  ["fpms-lidar-ros"]),
+    ("fpms_teleop.py",         HOME + "/fpms_teleop.py",         0o755, FPMS_USER, True,  ["fpms-teleop"]),
+    ("fpms_odom_tf.py",        HOME + "/fpms_odom_tf.py",        0o755, FPMS_USER, True,  ["fpms-odom-tf"]),
+    ("fpms_duty_driver.py",    HOME + "/fpms_duty_driver.py",    0o755, FPMS_USER, True,  []),
+    # Imported BY PATH by the agent (sys.path.insert of its own dirname), so a
+    # wrong directory silently disables the cloud uplink -- it is wrapped in
+    # try/except at the call site.
+    ("fpms_cloud_uplink.py",   HOME + "/fpms_cloud_uplink.py",   0o755, FPMS_USER, True,  ["fpms-rover-agent"]),
+    ("fpms_yolo26_npu.py",     HOME + "/yolo/fpms_yolo26_npu.py", 0o755, FPMS_USER, True, ["fpms-rover-agent"]),
+    ("stack/fpms_cored.py",    HOME + "/fpms_cored.py",          0o755, FPMS_USER, True,  ["fpms-cored"]),
+    ("stack/fpms_charact.py",  HOME + "/fpms_charact.py",        0o755, FPMS_USER, True,  []),
+    ("STACK.md",               HOME + "/STACK.md",               0o644, FPMS_USER, False, []),
+    # The two masked second-writers. Shipped so their units can be MASKED
+    # rather than merely absent; absent is fine, a failed install is not.
+    ("fpms_ros_tunnel.py",     HOME + "/fpms_ros_tunnel.py",     0o755, FPMS_USER, False, []),
+    ("fpms_rtos_follower.py",  HOME + "/fpms_rtos_follower.py",  0o755, FPMS_USER, False, []),
+    # root:root on purpose: it is EXECUTED by fpms-uros-supervisor.service (as
+    # root), not imported, and nothing running as ubuntu should be able to
+    # rewrite the process that owns the drive link.
+    ("stack/fpms-uros-supervisor", "/usr/local/bin/fpms-uros-supervisor",
+     0o755, "root", True, ["fpms-uros-supervisor"]),
+]
+
+# Merged over, never mirrored. See the module docstring: $H/nav2/arena_map.pgm
+# is generated at build time and is in no repository, and $H/slam/maps holds a
+# physical mapping run that cannot be rebuilt from source.
+PAYLOAD_TREES = [
+    ("fpms-dashboard", HOME + "/fpms-dashboard", FPMS_USER, True),
+    ("nav2",           HOME + "/nav2",           FPMS_USER, True),
+    ("slam",           HOME + "/slam",           FPMS_USER, False),
+]
+
+# Which unit cares about which destination inside a tree. Only the launch file
+# fpms-tf.service ExecStarts by absolute path matters at boot; the params files
+# are read by units that are shipped disabled.
+TREE_UNIT_HINTS = {
+    os.path.normpath(HOME + "/nav2/fpms_tf.launch.py"): ["fpms-tf"],
+}
+DASHBOARD_UNITS = ["fpms-dashboard"]
+
+# NEVER restarted by this tool, at all. The micro-ROS serial link costs 90-225
+# seconds to re-establish and takes the rover's only pose source down with it.
+NEVER_RESTART = {"micro-ros-agent"}
+# Restarted only when asked for by name with --restart-uros, and even then last.
+GUARDED_RESTART = {"fpms-uros-supervisor"}
+# The stop authority goes back first: there must be no window in which
+# something that can move is accepting commands while nothing is listening for
+# a stop. Then the movers. The dashboard is cosmetic and goes last.
+RESTART_ORDER = ["fpms-cored", "fpms-rover-agent", "fpms-lidar-ros",
+                 "fpms-odom-tf", "fpms-tf", "fpms-teleop", "fpms-missions",
+                 "fpms-telemetry-ros", "fpms-dashboard"]
+
+
+# --------------------------------------------------------------------------
+# Source resolution
+# --------------------------------------------------------------------------
+def looks_like_staged_root(path):
+    """The layout scripts/30-fpms-payload.sh consumes: flat *.py plus stack/."""
+    return (os.path.isfile(os.path.join(path, "fpms_missions.py"))
+            and os.path.isdir(os.path.join(path, "stack")))
+
+
+def resolve_source_root(path):
+    """(rover_root, dashboard_dir) for either layout we might be handed.
+
+    Two layouts exist and both are legitimate:
+      - the STAGED layout, which is what /opt/fpms-os/src looked like inside
+        the image: flat *.py, stack/, nav2/, slam/, and fpms-dashboard/ beside
+        them (build.sh copies the dashboard in from one level up);
+      - the REPO layout, where the rover tree is cloud/dashboard/rover/ and the
+        dashboard is its SIBLING at cloud/dashboard/fpms-dashboard/.
+
+    Guessing wrong is not silent here -- it fails the required-files check
+    below with the path it looked at -- but getting it right means a plain
+    `git clone` on a USB stick works with no --subdir incantation.
+    """
+    path = os.path.abspath(path)
+    if looks_like_staged_root(path):
+        dash = os.path.join(path, "fpms-dashboard")
+        if not os.path.isdir(dash):
+            # The sibling form, for a checkout handed to us as .../rover
+            alt = os.path.join(os.path.dirname(path), "fpms-dashboard")
+            if os.path.isdir(alt):
+                dash = alt
+        return path, dash
+    # A whole repository. Look for the rover tree under it.
+    for rel in ("cloud/dashboard/rover", "dashboard/rover", "rover"):
+        cand = os.path.join(path, rel)
+        if looks_like_staged_root(cand):
+            dash = os.path.join(os.path.dirname(cand), "fpms-dashboard")
+            return cand, dash
+    raise Refused(
+        "%s does not look like an FPMS payload.\n"
+        "Expected either a staged tree (fpms_missions.py and stack/ at the top)\n"
+        "or a checkout containing cloud/dashboard/rover/fpms_missions.py.\n"
+        "What is actually there: %s"
+        % (path, ", ".join(sorted(os.listdir(path))[:12]) if os.path.isdir(path)
+           else "not a directory"))
+
+
+def find_usb_payload():
+    """Scan the places a mounted USB stick shows up. First match wins, loudly."""
+    roots = []
+    for base in ("/media", "/run/media", "/mnt"):
+        if not os.path.isdir(base):
+            continue
+        try:
+            for a in sorted(os.listdir(base)):
+                p = os.path.join(base, a)
+                roots.append(p)
+                if os.path.isdir(p):
+                    try:
+                        for b in sorted(os.listdir(p)):
+                            roots.append(os.path.join(p, b))
+                    except OSError:
+                        pass
+        except OSError:
+            continue
+
+    hits = []
+    for r in roots:
+        if not os.path.isdir(r):
+            continue
+        for name in ("fpms-payload", "fpms-os-payload", "rover"):
+            cand = os.path.join(r, name)
+            if os.path.isdir(cand) and looks_like_staged_root(cand):
+                hits.append(cand)
+        try:
+            for f in sorted(os.listdir(r)):
+                if f.startswith("fpms-payload") and f.endswith((".tar.gz", ".tgz", ".tar")):
+                    hits.append(os.path.join(r, f))
+        except OSError:
+            pass
+
+    if not hits:
+        raise Refused(
+            "no payload found on removable media.\n"
+            "Looked under /media, /run/media and /mnt (two levels) for a\n"
+            "directory named fpms-payload/ (or rover/) containing\n"
+            "fpms_missions.py and stack/, or a file named fpms-payload*.tar.gz.\n"
+            "Is the stick mounted? `lsblk -o NAME,LABEL,MOUNTPOINT`\n"
+            "Or pass the path directly: fpms-update payload --from /path/to/tree")
+    if len(hits) > 1:
+        warn("more than one payload on removable media; using the first:")
+        for h in hits:
+            warn("    " + h)
+    say("  found on removable media: %s" % hits[0])
+    return hits[0]
+
+
+def net_preflight(host, port, attempts=4, gap=2.0, timeout=5.0):
+    """Can we open a TCP connection to host:port? Bounded, and flap-aware.
+
+    A single connect() is not a fair test on this board. The measured
+    behaviour on 2026-08-06 was carrier gained at 16:07:12, lost at 16:07:12,
+    regained at 16:07:13 -- i.e. a whole association flap inside one second --
+    and bcmdhd re-enables power save every 30-60 s, which flapped MQTT on a
+    measured 47 s cycle. So try a few times across several seconds before
+    declaring the network dead, and never for longer than the caller can
+    afford. It still cannot hang: attempts * (timeout + gap) is the ceiling.
+    """
+    last = ""
+    for i in range(attempts):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True, "reachable on attempt %d" % (i + 1)
+        except OSError as exc:
+            last = "%s" % exc
+        if i + 1 < attempts:
+            time.sleep(gap)
+    return False, ("%s:%s unreachable after %d attempts over ~%.0fs (%s). "
+                   "FPMS_Net is an arena network and may have no route to the "
+                   "internet at all -- use a USB stick: "
+                   "`fpms-update payload --from usb`"
+                   % (host, port, attempts, attempts * (timeout + gap), last))
+
+
+def materialise_source(spec, workdir):
+    """Turn --from SPEC into a directory on the local disk. Returns a path."""
+    if spec == "usb":
+        spec = find_usb_payload()
+
+    if spec.startswith("git:"):
+        url = spec[4:]
+        if not url:
+            raise Refused("`git:` with no URL or path after it")
+        if shutil.which("git") is None:
+            raise Refused("git is not installed on this rover")
+        if "://" in url:
+            host = url.split("://", 1)[1].split("/", 1)[0]
+            port = 443 if url.startswith("https") else 80
+            if "@" in host:
+                host = host.split("@", 1)[1]
+            if ":" in host:
+                host, p = host.rsplit(":", 1)
+                if p.isdigit():
+                    port = int(p)
+            ok, why = net_preflight(host, port)
+            if not ok:
+                raise Refused("cannot reach the git remote: %s" % why)
+        dest = os.path.join(workdir, "clone")
+        cmd = ["git", "clone", "--depth", "1"]
+        if GIT_REF:
+            cmd += ["--branch", GIT_REF]
+        cmd += [url, dest]
+        say("  git clone %s%s" % (url, (" @" + GIT_REF) if GIT_REF else ""))
+        rc, _, errout = sh(cmd, timeout=300,
+                           env={"GIT_TERMINAL_PROMPT": "0",
+                                "GIT_ASKPASS": "/bin/true",
+                                "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+                                "GIT_HTTP_LOW_SPEED_TIME": "30"})
+        if rc != 0:
+            raise Refused("git clone failed (rc=%s): %s" % (rc, errout or "no message"))
+        return dest
+
+    spec = os.path.abspath(spec)
+    if os.path.isdir(spec):
+        return spec
+    if os.path.isfile(spec) and spec.endswith((".tar.gz", ".tgz", ".tar")):
+        dest = os.path.join(workdir, "unpacked")
+        os.makedirs(dest, exist_ok=True)
+        say("  unpacking %s" % spec)
+        try:
+            with tarfile.open(spec, "r:*") as tf:
+                # Refuse absolute paths and ..; a payload tarball comes off a
+                # USB stick somebody else wrote, and the extraction target is
+                # a root-owned directory.
+                for m in tf.getmembers():
+                    if m.name.startswith("/") or ".." in m.name.split("/"):
+                        raise Refused("tarball contains an unsafe path: %s" % m.name)
+                    if m.issym() or m.islnk():
+                        raise Refused("tarball contains a link (%s); refusing" % m.name)
+                tf.extractall(dest)
+        except (tarfile.TarError, OSError) as exc:
+            raise Refused("could not unpack %s: %s" % (spec, exc))
+        entries = [os.path.join(dest, e) for e in os.listdir(dest)]
+        if len(entries) == 1 and os.path.isdir(entries[0]):
+            return entries[0]
+        return dest
+    raise Refused("--from %s is not a directory, a tarball, `usb`, or `git:...`"
+                  % spec)
+
+
+GIT_REF = ""   # set from argv in main(); read by materialise_source
+
+
+# --------------------------------------------------------------------------
+# Staging and verification
+# --------------------------------------------------------------------------
+def walk_tree(root):
+    """Relative paths of every file worth installing under root."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in sorted(filenames):
+            if f.endswith(SKIP_SUFFIX) or f.startswith(".#"):
+                continue
+            full = os.path.join(dirpath, f)
+            if os.path.islink(full):
+                continue
+            out.append(os.path.relpath(full, root))
+    return sorted(out)
+
+
+def pick_agent(root):
+    """The rover agent, chosen the same way stage 30 chooses it, and LOUDLY.
+
+    Two files with near-identical names exist in the repo and they have
+    drifted: fpms-rover-agent.py (hyphen) and fpms_rover_agent.py (underscore).
+    The unit runs /usr/local/bin/fpms-rover-agent. Stage 30 installs the LONGER
+    one and says which; silently picking is how they drifted in the first
+    place, so this says which too.
+    """
+    cands = []
+    for name in ("fpms-rover-agent.py", "fpms_rover_agent.py"):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                n = fh.read().count(b"\n")
+            cands.append((n, name, p))
+            say("    agent candidate: %s (%d lines)" % (name, n))
+    if not cands:
+        return None
+    cands.sort()
+    n, name, p = cands[-1]
+    say("    using %s (%d lines) -- the same rule scripts/30-fpms-payload.sh "
+        "uses. Confirm this is the live one before a competition." % (name, n))
+    return p
+
+
+# Only these are line-ending-normalised. THE LIST IS NOT DECORATION: it is
+# scripts/30-fpms-payload.sh's list, and the reason to copy it rather than
+# normalise everything is that "everything" includes the dashboard's images and
+# whatever else lands in a tree. Stripping a CR that happens to precede an 0x0A
+# byte inside a PNG silently corrupts it -- a text transform applied to binary
+# is a corruption that copies, chmods and installs perfectly.
+TEXTISH_SUFFIX = (".py", ".yaml", ".yml", ".json", ".xml", ".md", ".txt",
+                  ".launch", ".html", ".css", ".js", ".sh", ".service",
+                  ".conf", ".cfg", ".ini", ".pth")
+
+
+def is_textish(rel_or_dst):
+    base = os.path.basename(rel_or_dst)
+    return base.startswith("fpms-") or base.endswith(TEXTISH_SUFFIX)
+
+
+def normalise_crlf(path):
+    """Strip CR at end of line, in place. Text-shaped files only.
+
+    Same reasoning as stage 30, and it matters more here than there: the
+    payload comes off a Windows checkout via a USB stick, fpms-os/.gitattributes
+    does not cover the rover tree, and a CRLF shebang on
+    /usr/local/bin/fpms-uros-supervisor makes its unit fail with
+    "/usr/bin/env: bad interpreter" -- on the drive link, on a rover that
+    otherwise boots perfectly. Both agent candidates and the supervisor in the
+    repo today have exactly that CRLF shebang, so this is not hypothetical.
+
+    `grep $'\\r'` is not a portable detector (MSYS grep matches CR in files
+    with no CR byte in them), so nothing is detected: the substitution is
+    unconditional and the file is declared changed only if the bytes changed.
+
+    `\\r+\\n`, not `\\r\\n`. sed's `s/\\r$//` and a single replace both leave one
+    CR behind on a line that ended `\\r\\r\\n` -- which is what a file written in
+    text mode on Windows from a string that already contained \\r looks like.
+    Measured: it survived normalisation and tripped the shebang check below.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"\r" not in data:
+        return False
+    new = _CRLF_RE.sub(b"\n", data)
+    if new == data:
+        return False
+    with open(path, "wb") as fh:
+        fh.write(new)
+    return True
+
+
+def scratch_rel(dst):
+    """A destination path, made safe to join under a scratch root.
+
+    THIS IS NOT COSMETIC. `os.path.join(root, "/home/ubuntu/x")` RETURNS
+    "/home/ubuntu/x" -- join discards everything to the left of an absolute
+    component. So a staging or snapshot path built by joining a destination
+    that was not relativised does not land in the scratch tree at all: it
+    lands ON THE DESTINATION. Staging would then write directly over the live
+    payload, unverified, with no snapshot -- every guarantee in this file gone
+    at once, and silently, because the copy still succeeds.
+
+    Measured while testing: a destination that did not begin with "/" made
+    exactly that happen, and the diff afterwards reported every file as
+    "unchanged" because the source and the destination had become the same
+    file. It looked like a no-op update.
+    """
+    d = os.path.splitdrive(dst)[1]
+    d = d.replace("\\", "/").lstrip("/")
+    if not d or d.startswith("../") or "/../" in d:
+        raise Failed("refusing to handle destination %r: it does not "
+                     "relativise to a safe scratch path" % dst)
+    return d
+
+
+class Item(object):
+    """One destination. Everything this tool does is a list of these."""
+
+    __slots__ = ("staged", "dst", "mode", "owner", "units", "status",
+                 "old_sha", "new_sha")
+
+    def __init__(self, staged, dst, mode, owner, units):
+        self.staged = staged
+        self.dst = dst
+        self.mode = mode
+        self.owner = owner
+        self.units = list(units)
+        self.status = "?"
+        self.old_sha = None
+        self.new_sha = None
+
+
+def stage(src_root, dash_root, workdir):
+    """Copy the payload into a staging tree and build the item list.
+
+    Nothing under a destination is touched by this function. Its whole job is
+    to produce a verified candidate that could be swapped in -- so that
+    `fpms-update check` and `fpms-update payload` do exactly the same work up
+    to the moment of the swap, and a dry run is a real rehearsal rather than a
+    different code path.
+    """
+    staging = os.path.join(workdir, "staging")
+    os.makedirs(staging, exist_ok=True)
+    items = []
+    missing_required = []
+    crlf_n = 0
+
+    def take(src, dst, mode, owner, units):
+        nonlocal crlf_n
+        rel = scratch_rel(dst)
+        sp = os.path.join(staging, rel)
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        shutil.copyfile(src, sp)
+        if is_textish(dst) and normalise_crlf(sp):
+            crlf_n += 1
+        items.append(Item(sp, dst, mode, owner, units))
+
+    hdr("Staging")
+    for rel, dst, mode, owner, required, units in PAYLOAD_FILES:
+        src = os.path.join(src_root, rel)
+        if not os.path.isfile(src):
+            if required:
+                missing_required.append("%s (expected at %s)" % (rel, src))
+            continue
+        take(src, dst, mode, owner, units)
+
+    agent = pick_agent(src_root)
+    if agent is None:
+        missing_required.append("a rover agent (fpms-rover-agent.py or "
+                                "fpms_rover_agent.py) in %s" % src_root)
+    else:
+        take(agent, "/usr/local/bin/fpms-rover-agent", 0o755, "root",
+             ["fpms-rover-agent"])
+
+    for rel, dst, owner, required in PAYLOAD_TREES:
+        tree_src = dash_root if rel == "fpms-dashboard" else os.path.join(src_root, rel)
+        if not os.path.isdir(tree_src):
+            if required:
+                missing_required.append("%s/ (expected at %s)" % (rel, tree_src))
+            continue
+        for f in walk_tree(tree_src):
+            d = os.path.join(dst, f)
+            mode = 0o755 if (f.endswith(".py") or f.endswith(".sh")) else 0o644
+            # normpath on both sides: the key is a literal in the table above,
+            # `d` is assembled from a relpath walk, and a hint that silently
+            # fails to match is a unit that never gets restarted after its own
+            # file changed -- the quiet half of the drift problem, and the one
+            # that leaves the rover running the code you thought you replaced.
+            units = TREE_UNIT_HINTS.get(
+                os.path.normpath(d),
+                DASHBOARD_UNITS if rel == "fpms-dashboard" else [])
+            take(os.path.join(tree_src, f), d, mode, owner, units)
+
+    if missing_required:
+        raise Refused(
+            "the source is missing files this rover needs:\n"
+            + "\n".join("    " + m for m in missing_required)
+            + "\n\nEvery one of these is installed by scripts/30-fpms-payload.sh\n"
+              "and named by a unit that runs at boot. Updating from a tree that\n"
+              "does not have them would leave the rover half-converted.\n"
+              "Nothing has been changed.")
+
+    if crlf_n:
+        say("    normalised CRLF -> LF in %d file(s) (expected: the rover tree "
+            "sits above fpms-os/.gitattributes' reach)" % crlf_n)
+    say("    %d file(s) staged" % len(items))
+    return items
+
+
+def verify_staged(items):
+    """Byte-compile every Python file, and sanity-check the rest.
+
+    THIS IS THE CHECK THE WHOLE TOOL IS BUILT AROUND. A syntax error in
+    fpms_missions.py does not announce itself when you copy the file; it
+    announces itself when systemd next starts the unit, which may be at the
+    next boot, which may be at a competition. py_compile turns that into a
+    message here, before anything is live.
+
+    py_compile.compile(..., cfile=<tmp>, doraise=True):
+      - cfile into a scratch directory, NOT __pycache__ beside the source.
+        Stage 30 refuses py_compile against the staged overlay for exactly this
+        reason: bytecode written next to a source file gets copied along with
+        it and is stale the moment anyone edits the source.
+      - doraise=True. Without it py_compile PRINTS the error and RETURNS None,
+        and a caller that only checks for an exception reports a syntax error
+        as a successful verification. That is the "never let a bare except turn
+        a failed update into a reported success" failure with an extra step.
+
+    Compiling is not importing. It cannot catch an ImportError, a missing
+    constant, or a wrong sign -- and it is not claimed to. It catches the one
+    class of failure that is both certain and invisible until start-up.
+    """
+    hdr("Verifying the staged payload")
+    problems = []
+    n_py = 0
+    with tempfile.TemporaryDirectory(prefix="fpms-update-pyc-") as pycdir:
+        for it in items:
+            try:
+                sz = os.path.getsize(it.staged)
+            except OSError as exc:
+                problems.append("%s: cannot stat staged copy: %s" % (it.dst, exc))
+                continue
+            if sz == 0:
+                # A zero-byte file copies, chmods and installs perfectly and
+                # only announces itself at runtime.
+                problems.append("%s: staged copy is ZERO BYTES" % it.dst)
+                continue
+
+            if it.dst.endswith(".py"):
+                n_py += 1
+                cfile = os.path.join(pycdir, hashlib.sha256(
+                    it.dst.encode()).hexdigest() + ".pyc")
+                try:
+                    py_compile.compile(it.staged, cfile=cfile, dfile=it.dst,
+                                       doraise=True)
+                except py_compile.PyCompileError as exc:
+                    problems.append("%s: WILL NOT COMPILE: %s"
+                                    % (it.dst, str(exc).strip().splitlines()[-1]))
+                except (OSError, ValueError, UnicodeDecodeError) as exc:
+                    problems.append("%s: could not compile: %s: %s"
+                                    % (it.dst, type(exc).__name__, exc))
+
+            if it.mode & 0o111:
+                # Read the first line with a plain readline() -- no pipeline,
+                # so no producer to take SIGPIPE, and a trailing \r survives so
+                # it can be looked for. (`head -c`/`grep` in a pipeline under
+                # `set -o pipefail` is the shape that has killed the image
+                # build three times.)
+                try:
+                    with open(it.staged, "rb") as fh:
+                        first = fh.readline()
+                except OSError as exc:
+                    problems.append("%s: unreadable: %s" % (it.dst, exc))
+                    continue
+                if first.rstrip(b"\n").endswith(b"\r"):
+                    problems.append("%s: CRLF shebang survived normalisation"
+                                    % it.dst)
+                elif not first.startswith(b"#!"):
+                    if it.dst in DIRECT_EXEC:
+                        problems.append(
+                            "%s: installed 0755 and ExecStart=ed DIRECTLY by a "
+                            "unit, but has no '#!' -- it would fail at exec"
+                            % it.dst)
+                    else:
+                        warn("%s is installed executable and has no '#!'. No "
+                             "unit execs it directly, so this is not fatal, "
+                             "but ./%s would not run."
+                             % (it.dst, os.path.basename(it.dst)))
+
+    if problems:
+        raise Refused(
+            "the staged payload did not verify. NOTHING WAS CHANGED:\n"
+            + "\n".join("    " + p for p in problems)
+            + "\n\nFix the source and run this again. This is the check that\n"
+              "exists so a syntax error in fpms_missions.py surfaces here\n"
+              "rather than at the next boot.")
+    say("    %d Python file(s) byte-compiled clean, %d file(s) checked"
+        % (n_py, len(items)))
+
+
+def diff_items(items):
+    """Fill in status/old_sha/new_sha against what is live right now."""
+    for it in items:
+        it.new_sha = sha256_file(it.staged)
+        if os.path.isfile(it.dst):
+            try:
+                it.old_sha = sha256_file(it.dst)
+            except OSError:
+                it.old_sha = None
+            it.status = "same" if it.old_sha == it.new_sha else "changed"
+        else:
+            it.status = "new"
+    return items
+
+
+def report_diff(items, src_root):
+    hdr("What would change")
+    changed = [i for i in items if i.status == "changed"]
+    new = [i for i in items if i.status == "new"]
+    same = [i for i in items if i.status == "same"]
+    for it in sorted(changed + new, key=lambda i: i.dst):
+        try:
+            new_sz = os.path.getsize(it.staged)
+            old_sz = os.path.getsize(it.dst) if it.status == "changed" else 0
+        except OSError:
+            new_sz, old_sz = 0, 0
+        delta = ("%+d bytes" % (new_sz - old_sz)) if it.status == "changed" else "%d bytes" % new_sz
+        say("  [%-7s] %-52s %s" % (it.status.upper(), it.dst, delta))
+    say("")
+    say("  %d changed, %d new, %d unchanged   (source: %s)"
+        % (len(changed), len(new), len(same), src_root))
+
+    preserved = preserved_files(items)
+    if preserved:
+        say("")
+        say("  Present on the rover, absent from this payload, and KEPT:")
+        for p in preserved[:20]:
+            say("      %s" % p)
+        if len(preserved) > 20:
+            say("      ... and %d more" % (len(preserved) - 20))
+        say("  Trees are merged over, never mirrored. $H/nav2/arena_map.pgm is")
+        say("  generated at image build time and is in NO repository, and")
+        say("  $H/slam/maps holds a mapping run that cannot be rebuilt from")
+        say("  source. A tool that mirrored deletions would destroy both.")
+    return changed + new
+
+
+def preserved_files(items):
+    """Destination-tree files this payload does not contain."""
+    wanted = set(i.dst for i in items)
+    out = []
+    for _, dst, _, _ in PAYLOAD_TREES:
+        if not os.path.isdir(dst):
+            continue
+        for f in walk_tree(dst):
+            p = os.path.join(dst, f)
+            if p not in wanted:
+                out.append(p)
+    return sorted(out)
+
+
+def units_for(items):
+    """Units to restart, given the set of items that actually changed."""
+    units = set()
+    for it in items:
+        for u in it.units:
+            units.add(u)
+    held = units & GUARDED_RESTART
+    units -= GUARDED_RESTART
+    units -= NEVER_RESTART
+    ordered = [u for u in RESTART_ORDER if u in units]
+    # Anything named in the table but not in RESTART_ORDER still gets restarted,
+    # after the ordered set. An omission here must not silently skip a unit.
+    ordered += sorted(units - set(ordered))
+    return ordered, sorted(held)
+
+
+# --------------------------------------------------------------------------
+# Generations: the rollback mechanism
+# --------------------------------------------------------------------------
+#
+# A generation is a directory under /var/lib/fpms/updates/ holding, for EVERY
+# destination this update is about to write:
+#
+#     before/<dst>        the exact bytes that were there (absent if the file
+#                         did not exist -- see manifest["existed"])
+#     manifest.json       dst, mode, uid, gid, existed, sha-before, sha-after
+#     meta.json           when, from where, by whom, the mission evidence
+#     COMPLETE            written LAST, and fsynced. A generation without this
+#                         marker is a snapshot that was interrupted and is
+#                         never offered as a rollback target.
+#
+# Rollback is therefore not "reinstall the old version from somewhere" -- there
+# may BE no old version anywhere, the image having been the only copy. It is
+# "put back exactly the bytes and modes that were on this rover", including
+# removing files the update ADDED. That is the only definition that survives a
+# rover at a competition with no network.
+def new_generation():
+    os.makedirs(GEN_ROOT, exist_ok=True)
+    gen = "gen-%s" % time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    path = os.path.join(GEN_ROOT, gen)
+    n = 0
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(GEN_ROOT, "%s-%d" % (gen, n))
+    os.makedirs(os.path.join(path, "before"))
+    return path
+
+
+def list_generations():
+    if not os.path.isdir(GEN_ROOT):
+        return []
+    out = []
+    for name in sorted(os.listdir(GEN_ROOT)):
+        p = os.path.join(GEN_ROOT, name)
+        if not os.path.isdir(p) or name == "current":
+            continue
+        complete = os.path.exists(os.path.join(p, "COMPLETE"))
+        meta = {}
+        try:
+            with open(os.path.join(p, "meta.json")) as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        out.append({"name": name, "path": p, "complete": complete, "meta": meta})
+    return out
+
+
+def fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def snapshot(gen, items, meta):
+    """Record the CURRENT state of every destination. Raises on any failure."""
+    hdr("Snapshotting the current payload (this is what rollback restores)")
+    manifest = []
+    before = os.path.join(gen, "before")
+    for it in items:
+        rel = scratch_rel(it.dst)
+        entry = {"dst": it.dst, "existed": False, "sha_before": None,
+                 "sha_after": it.new_sha, "mode": it.mode,
+                 "uid": None, "gid": None, "units": it.units}
+        if os.path.isfile(it.dst):
+            sp = os.path.join(before, rel)
+            os.makedirs(os.path.dirname(sp), exist_ok=True)
+            shutil.copyfile(it.dst, sp)
+            st = os.stat(it.dst)
+            entry.update(existed=True,
+                         sha_before=sha256_file(it.dst),
+                         mode=statmod.S_IMODE(st.st_mode),
+                         uid=st.st_uid, gid=st.st_gid)
+        manifest.append(entry)
+
+    with open(os.path.join(gen, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    with open(os.path.join(gen, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    fsync_dir(gen)
+    # COMPLETE last, and only after everything above is on the disk. A
+    # generation half-written by a power cut must not be offered as a rollback
+    # target -- restoring from it would be worse than not restoring at all.
+    with open(os.path.join(gen, "COMPLETE"), "w") as fh:
+        fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    fsync_dir(gen)
+    n_existing = sum(1 for e in manifest if e["existed"])
+    say("    %s  (%d existing file(s) preserved, %d would be newly created)"
+        % (os.path.basename(gen), n_existing, len(manifest) - n_existing))
+    return manifest
+
+
+def owner_ids(owner):
+    if owner == "root":
+        return 0, 0
+    try:
+        pw = pwd.getpwnam(owner)
+    except KeyError:
+        raise Failed("user '%s' does not exist on this rover. Every payload "
+                     "file installs with that owner and every unit runs as it."
+                     % owner)
+    # The PRIMARY GROUP IS ASKED FOR, NOT ASSUMED -- exactly as stage 00 and
+    # stage 30 do it. Assuming a group named after the user is true of Ubuntu's
+    # cloud image and is precisely the assumption the build refuses to make.
+    return pw.pw_uid, pw.pw_gid
+
+
+def place(src, dst, mode, owner):
+    """Write <dst>.fpms-new, fully durable, ready for an atomic rename."""
+    tmp = dst + ".fpms-new"
+    d = os.path.dirname(dst)
+    uid, gid = owner_ids(owner)
+    if not os.path.isdir(d):
+        os.makedirs(d, 0o755)
+        try:
+            os.chown(d, uid, gid)
+        except OSError:
+            pass
+    with open(src, "rb") as rfh, open(tmp, "wb") as wfh:
+        shutil.copyfileobj(rfh, wfh)
+        wfh.flush()
+        os.fsync(wfh.fileno())
+    os.chmod(tmp, mode)
+    os.chown(tmp, uid, gid)
+    return tmp
+
+
+def commit(pairs):
+    """os.replace() every staged temp onto its destination.
+
+    HONEST ABOUT WHAT IS AND IS NOT ATOMIC.
+
+    Each individual replace is atomic: a reader of any one file sees either the
+    whole old file or the whole new one, never a truncated mixture. That is the
+    property that matters for a running fpms-missions.py -- a half-written file
+    on disk is what turns an update into an unbootable rover.
+
+    A MULTI-FILE payload cannot be made atomic as a set on a POSIX filesystem
+    without an indirection this tool is not allowed to introduce: the units
+    ExecStart absolute paths like /home/ubuntu/fpms_missions.py, so a
+    generation-symlink root would mean editing unit files, which belong to
+    another owner. Claiming set-atomicity here would be a lie.
+
+    What is done instead, and what it actually buys:
+      - every byte is copied, chmod'd, chown'd and FSYNCED before any
+        destination is touched, so the slow, failure-prone part happens outside
+        the window entirely;
+      - the window is then just this loop of rename(2) calls, milliseconds
+        long, and every file in it has already been byte-compiled;
+      - if a rename fails part-way, the ones already done are undone
+        immediately from the snapshot and the tool exits 2 saying so.
+    """
+    done = []
+    for tmp, dst in pairs:
+        os.replace(tmp, dst)
+        done.append(dst)
+    for d in sorted(set(os.path.dirname(p) for p in done)):
+        fsync_dir(d)
+    return done
+
+
+def restore(gen, only=None):
+    """Put a generation's `before` state back. Returns the list of destinations."""
+    with open(os.path.join(gen, "manifest.json")) as fh:
+        manifest = json.load(fh)
+    before = os.path.join(gen, "before")
+    pairs = []
+    removals = []
+    for e in manifest:
+        dst = e["dst"]
+        if only is not None and dst not in only:
+            continue
+        if e["existed"]:
+            src = os.path.join(before, scratch_rel(dst))
+            if not os.path.isfile(src):
+                raise Failed("rollback source %s is missing from %s. This "
+                             "generation is not usable." % (src, gen))
+            tmp = dst + ".fpms-new"
+            d = os.path.dirname(dst)
+            if not os.path.isdir(d):
+                os.makedirs(d, 0o755)
+            with open(src, "rb") as rfh, open(tmp, "wb") as wfh:
+                shutil.copyfileobj(rfh, wfh)
+                wfh.flush()
+                os.fsync(wfh.fileno())
+            os.chmod(tmp, e.get("mode", 0o644))
+            if e.get("uid") is not None:
+                os.chown(tmp, e["uid"], e["gid"])
+            pairs.append((tmp, dst))
+        else:
+            # The update CREATED this file. Rolling back means removing it --
+            # otherwise a rollback leaves new code sitting beside old code,
+            # which is a state neither version was ever tested in.
+            removals.append(dst)
+    touched = commit(pairs)
+    for dst in removals:
+        try:
+            os.unlink(dst)
+            touched.append(dst)
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                warn("could not remove %s during rollback: %s" % (dst, exc))
+    return touched, [e for e in manifest]
+
+
+def cleanup_temps(items):
+    for it in items:
+        t = it.dst + ".fpms-new"
+        try:
+            os.unlink(t)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Restarting, and proving it worked
+# --------------------------------------------------------------------------
+def capture_unit_states(units):
+    return dict((u, unit_active(u)[0]) for u in units)
+
+
+def restart_units(units, before_states, settle=2.0):
+    """Restart, then VERIFY. Returns the list of units that went bad.
+
+    "Never trust an exit code where you can verify the outcome": `systemctl
+    restart` returning 0 means systemd accepted the job, not that the unit is
+    running. Every one of these has Restart=always, so a unit that crashes on
+    import restart-loops -- and the first `is-active` after a successful
+    restart can perfectly well say "activating" or even "active" before the
+    Python inside it has reached its first import.
+
+    So: restart, wait, and require `active` a couple of seconds later. And
+    compare against the state BEFORE the update -- a unit that was already
+    failing is not evidence that this update broke anything, and rolling back
+    on it would be a false alarm that teaches an operator to stop believing
+    this tool.
+    """
+    hdr("Restarting the units whose files changed")
+    if not units:
+        say("    nothing to restart")
+        return []
+    bad = []
+    for u in units:
+        rc, _, errout = sh(["systemctl", "restart", u + ".service"], timeout=60)
+        if rc != 0:
+            say("    %-24s restart returned %s: %s" % (u, rc, errout))
+        time.sleep(settle)
+        ok, state = unit_active(u)
+        was = before_states.get(u, None)
+        if ok:
+            say("    %-24s active" % u)
+        elif was is False:
+            say("    %-24s %s  (it was already not active before this update)"
+                % (u, state))
+        else:
+            say("    %-24s %s  <-- WAS ACTIVE BEFORE THIS UPDATE" % (u, state))
+            bad.append(u)
+    return bad
+
+
+def run_selftest(settle_s):
+    """Run fpms-selftest and report. Never used to decide a rollback.
+
+    fpms-selftest legitimately reports FAIL for things this tool did not touch
+    and cannot fix: a missing yolo26n-rk3588.rknn (which is in no repository),
+    an unmeasured LiDAR mount transform, a broker password that first boot
+    never provisioned. Rolling back on its exit code would roll back a perfectly
+    good update because of a pre-existing fault, and an operator who has seen
+    that once will stop trusting the rollback too.
+
+    A unit that was active before the update and is not active after IS a
+    causal link, and that is what triggers the automatic rollback above. This
+    is a report.
+    """
+    hdr("Self-test")
+    if not os.path.exists(SELFTEST):
+        warn("%s is not installed; skipping" % SELFTEST)
+        return None
+    if settle_s > 0:
+        say("    waiting %ds for the stack to settle before asking. The DDS "
+            "cross-era probe inside fpms-selftest needs the restarted "
+            "publishers to be up, and asking too early reports a failure that "
+            "is really impatience." % settle_s)
+        time.sleep(settle_s)
+    rc, out, _ = sh([SELFTEST, "--json"], timeout=180, env=ROS_ENV)
+    if rc == 254:
+        warn("fpms-selftest timed out; run it by hand")
+        return None
+    try:
+        summary = json.loads(out)
+    except ValueError:
+        warn("fpms-selftest did not return JSON (rc=%s); run it by hand" % rc)
+        return None
+    fails = [c for c in summary.get("checks", []) if c.get("status") == "FAIL"]
+    warns = [c for c in summary.get("checks", []) if c.get("status") == "WARN"]
+    say("    %d FAIL, %d WARN, %d checks"
+        % (len(fails), len(warns), summary.get("total", 0)))
+    for c in fails:
+        say("      FAIL  %-32s %s" % (c.get("check"), c.get("detail")))
+    for c in warns:
+        say("      WARN  %-32s %s" % (c.get("check"), c.get("detail")))
+    if fails:
+        say("")
+        say("    These are NOT automatically attributed to this update. Compare")
+        say("    against what fpms-selftest said before it; if this update is")
+        say("    the cause: sudo fpms-update rollback")
+    return {"fail": len(fails), "warn": len(warns),
+            "failed_checks": [c.get("check") for c in fails]}
+
+
+def publish_event(cfg, payload):
+    """Best-effort announcement on events/update.
+
+    Rule 1 of this image: every change must be loud, named, and visible on a
+    topic. This is the topic. It is BEST EFFORT and its failure is swallowed --
+    deliberately, and this is the ONE swallow in the file: an update that
+    worked must not be reported as failed because the broker was down. Nothing
+    downstream of here reads its return value, so it cannot turn a failure into
+    a success.
+    """
+    try:
+        if shutil.which("mosquitto_pub") is None:
+            return
+        topic = "fpms/%s/events/update" % cfg.get("FPMS_THING_NAME", "rover1")
+        sh(["mosquitto_pub", "-h", cfg.get("FPMS_MQTT_HOST", "127.0.0.1"),
+            "-p", str(cfg.get("FPMS_MQTT_PORT", "1883")),
+            "-u", cfg.get("FPMS_MQTT_USER", "fpms"),
+            "-P", cfg.get("FPMS_MQTT_PASS", ""),
+            "-t", topic, "-q", "1", "-m", json.dumps(payload)], timeout=10)
+    except Exception as exc:  # noqa: BLE001  - see the docstring
+        warn("could not announce on events/update: %s" % exc)
+
+
+def write_result(payload):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(RESULT_JSON, "w") as fh:
+            json.dump(payload, fh, indent=2)
+    except OSError as exc:
+        warn("could not write %s: %s" % (RESULT_JSON, exc))
+
+
+# --------------------------------------------------------------------------
+# Subcommands
+# --------------------------------------------------------------------------
+def cmd_status(args):
+    cfg = load_config()
+    print("=" * 72)
+    print(" FPMS payload status    %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    print("=" * 72)
+    print("  config.env           %s" % cfg.get("_provenance"))
+    print("  thing                %s" % cfg.get("FPMS_THING_NAME", "?"))
+
+    print("")
+    print("  Live payload:")
+    n_missing = 0
+    for rel, dst, mode, owner, required, _u in PAYLOAD_FILES:
+        if os.path.isfile(dst):
+            st = os.stat(dst)
+            try:
+                own = pwd.getpwuid(st.st_uid).pw_name
+                grp_name = grp.getgrgid(st.st_gid).gr_name
+            except KeyError:
+                own, grp_name = str(st.st_uid), str(st.st_gid)
+            print("    %-42s %s  %o %s:%s  %s"
+                  % (dst, sha256_file(dst)[:12], statmod.S_IMODE(st.st_mode),
+                     own, grp_name,
+                     time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))))
+        elif required:
+            n_missing += 1
+            print("    %-42s MISSING (required)" % dst)
+    if os.path.isfile("/usr/local/bin/fpms-rover-agent"):
+        print("    %-42s %s"
+              % ("/usr/local/bin/fpms-rover-agent",
+                 sha256_file("/usr/local/bin/fpms-rover-agent")[:12]))
+    if n_missing:
+        print("")
+        print("    %d REQUIRED file(s) are missing. This rover is not fully" % n_missing)
+        print("    provisioned; fpms-selftest and fpms-doctor will say more.")
+
+    print("")
+    print("  Rollback generations (newest last):")
+    gens = list_generations()
+    if not gens:
+        print("    none. Nothing has been updated on this rover since it was flashed,")
+        print("    so there is nothing to roll back TO -- the image is the baseline.")
+    for g in gens:
+        m = g["meta"]
+        print("    %-26s %s  from %s"
+              % (g["name"], "complete" if g["complete"] else "INCOMPLETE (unusable)",
+                 m.get("source", "?")))
+    if len(gens) > 10:
+        print("")
+        print("    %d generations. Nothing is ever removed automatically;" % len(gens))
+        print("    run `sudo fpms-update prune --keep 5` when you want the space.")
+
+    if os.path.isfile(RESULT_JSON):
+        try:
+            with open(RESULT_JSON) as fh:
+                last = json.load(fh)
+            print("")
+            print("  Last run: %s  %s  (%s)"
+                  % (last.get("when", "?"), last.get("action", "?"),
+                     last.get("result", "?")))
+        except (OSError, ValueError):
+            pass
+    print("=" * 72)
+    return 0
+
+
+def cmd_verify(args):
+    """Recompile what is LIVE, and check it against the newest manifest."""
+    hdr("Byte-compiling the live payload")
+    problems = []
+    n = 0
+    with tempfile.TemporaryDirectory(prefix="fpms-verify-pyc-") as pycdir:
+        targets = [d for _, d, _, _, _, _ in PAYLOAD_FILES if d.endswith(".py")]
+        for _, dst, _, _ in PAYLOAD_TREES:
+            if os.path.isdir(dst):
+                targets += [os.path.join(dst, f) for f in walk_tree(dst)
+                            if f.endswith(".py")]
+        for dst in targets:
+            if not os.path.isfile(dst):
+                continue
+            n += 1
+            cfile = os.path.join(pycdir, hashlib.sha256(dst.encode()).hexdigest() + ".pyc")
+            try:
+                py_compile.compile(dst, cfile=cfile, dfile=dst, doraise=True)
+            except py_compile.PyCompileError as exc:
+                problems.append("%s: %s" % (dst, str(exc).strip().splitlines()[-1]))
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                problems.append("%s: %s: %s" % (dst, type(exc).__name__, exc))
+    say("    %d live Python file(s) compiled" % n)
+
+    gens = [g for g in list_generations() if g["complete"]]
+    if gens:
+        gen = gens[-1]
+        try:
+            with open(os.path.join(gen["path"], "manifest.json")) as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError) as exc:
+            manifest = []
+            warn("could not read %s's manifest: %s" % (gen["name"], exc))
+        drift = []
+        for e in manifest:
+            if not e.get("sha_after"):
+                continue
+            if not os.path.isfile(e["dst"]):
+                drift.append("%s: GONE" % e["dst"])
+            elif sha256_file(e["dst"]) != e["sha_after"]:
+                drift.append("%s: differs from what %s installed"
+                             % (e["dst"], gen["name"]))
+        hdr("Against the last update (%s)" % gen["name"])
+        if drift:
+            for d in drift:
+                say("    %s" % d)
+            say("    Something changed these after the update -- a hand edit, a")
+            say("    scp, or a partial deploy. That is not necessarily wrong,")
+            say("    but it means rollback will not put back what you think.")
+        else:
+            say("    every file matches the manifest")
+
+    if problems:
+        err("the LIVE payload does not compile:")
+        for p in problems:
+            err("    " + p)
+        err("This rover will fail at the next restart of the affected unit.")
+        err("Fix it, or: sudo fpms-update rollback")
+        return 2
+    say("")
+    say("  Live payload compiles clean.")
+    return 0
+
+
+def cmd_check(args):
+    cfg = load_config()
+    with tempfile.TemporaryDirectory(prefix="fpms-update-") as work:
+        raw = materialise_source(args.source, work)
+        src_root, dash_root = resolve_source_root(raw)
+        say("  rover source : %s" % src_root)
+        say("  dashboard    : %s%s"
+            % (dash_root, "" if os.path.isdir(dash_root) else "   (ABSENT)"))
+        items = stage(src_root, dash_root, work)
+        verify_staged(items)
+        diff_items(items)
+        changed = report_diff(items, src_root)
+        units, held = units_for(changed)
+        hdr("What a real run would restart")
+        say("    %s" % (", ".join(units) if units else "nothing"))
+        if held:
+            say("    HELD BACK: %s" % ", ".join(held))
+            say("    Restarting the micro-ROS supervisor costs a 90-225 s")
+            say("    re-link of the drive board and takes the rover's only")
+            say("    pose source down with it. Pass --restart-uros to include")
+            say("    it, and expect to wait.")
+        say("")
+        say("  Nothing was changed. This was a rehearsal of the exact same code")
+        say("  path a real run takes, up to the swap.")
+    return 0
+
+
+def cmd_payload(args):
+    require_root("fpms-update payload")
+    cfg = load_config()
+    started = time.time()
+
+    with tempfile.TemporaryDirectory(prefix="fpms-update-") as work:
+        hdr("Source")
+        raw = materialise_source(args.source, work)
+        src_root, dash_root = resolve_source_root(raw)
+        say("  rover source : %s" % src_root)
+        say("  dashboard    : %s%s"
+            % (dash_root, "" if os.path.isdir(dash_root) else "   (ABSENT)"))
+
+        # Verify BEFORE the gate as well as before the swap: if the payload is
+        # broken there is no reason to have probed the rover at all, and an
+        # operator who mistyped a path should hear about it immediately.
+        items = stage(src_root, dash_root, work)
+        verify_staged(items)
+        diff_items(items)
+        changed = report_diff(items, src_root)
+
+        if not changed:
+            say("")
+            say("  Nothing to do -- every file on this rover already matches the")
+            say("  source. No snapshot taken, no unit restarted.")
+            return 0
+
+        evidence = mission_gate(cfg, override=args.override,
+                                label="Updating the payload")
+
+        units, held = units_for(changed)
+        if args.restart_uros:
+            units = units + [u for u in held if u not in units]
+            held = []
+        if held:
+            warn("NOT restarting %s even though its file changed. Restarting it "
+                 "costs a 90-225 s re-link of the drive board. The new file is "
+                 "on disk and takes effect at the next restart or reboot; pass "
+                 "--restart-uros if you want it now."
+                 % ", ".join(held))
+
+        before_states = capture_unit_states(units)
+        meta = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "source": args.source,
+                "resolved_source": src_root,
+                "by": os.environ.get("SUDO_USER") or os.environ.get("USER") or "?",
+                "mission_evidence": evidence,
+                "units": units,
+                "held_units": held,
+                "unit_states_before": before_states}
+
+        gen = new_generation()
+        try:
+            snapshot(gen, items, meta)
+        except OSError as exc:
+            raise Failed("could not snapshot the current payload (%s). NOTHING "
+                         "WAS CHANGED -- an update with no rollback is not an "
+                         "update this tool will perform." % exc)
+
+        hdr("Installing")
+        pairs = []
+        try:
+            for it in changed:
+                pairs.append((place(it.staged, it.dst, it.mode, it.owner), it.dst))
+            say("    %d file(s) written, fsynced and ready; swapping now"
+                % len(pairs))
+            commit(pairs)
+        except OSError as exc:
+            # Undo whatever landed, from the snapshot, immediately.
+            err("install failed part-way: %s" % exc)
+            err("rolling back from %s" % os.path.basename(gen))
+            try:
+                restore(gen)
+            except (OSError, Failed) as exc2:
+                raise Failed(
+                    "install failed (%s) AND the automatic rollback also failed "
+                    "(%s). The payload is in a mixed state. Run: sudo "
+                    "fpms-update rollback --to %s"
+                    % (exc, exc2, os.path.basename(gen)))
+            finally:
+                cleanup_temps(items)
+            raise Failed("install failed and was rolled back. Nothing is live "
+                         "from this update. Original error: %s" % exc)
+        finally:
+            cleanup_temps(items)
+
+        with open(os.path.join(GEN_ROOT, "current"), "w") as fh:
+            fh.write(os.path.basename(gen) + "\n")
+
+        bad = restart_units(units, before_states)
+        if bad:
+            err("")
+            err("These units were ACTIVE before the update and are not now: %s"
+                % ", ".join(bad))
+            err("That is a direct causal link, so this update is being rolled")
+            err("back automatically. Restarting from %s." % os.path.basename(gen))
+            restore(gen)
+            restart_units(units, before_states)
+            result = {"when": meta["when"], "action": "payload",
+                      "result": "rolled-back", "generation": os.path.basename(gen),
+                      "bad_units": bad, "source": args.source}
+            write_result(result)
+            publish_event(cfg, result)
+            err("")
+            err("Rolled back. Read: journalctl -u %s -b --no-pager | tail -60"
+                % bad[0])
+            return 2
+
+        st = run_selftest(args.settle)
+
+        result = {"when": meta["when"], "action": "payload", "result": "ok",
+                  "generation": os.path.basename(gen), "source": args.source,
+                  "files_changed": len(changed), "units": units,
+                  "held_units": held, "selftest": st,
+                  "elapsed_s": round(time.time() - started, 1)}
+        write_result(result)
+        publish_event(cfg, result)
+
+        hdr("Done")
+        say("  %d file(s) updated, %d unit(s) restarted, in %.0fs."
+            % (len(changed), len(units), time.time() - started))
+        say("  Roll back with:  sudo fpms-update rollback")
+        say("  (that restores %s, which is this rover's state as of %s)"
+            % (os.path.basename(gen), meta["when"]))
+        if held:
+            say("")
+            say("  Still running old code until you restart it: %s" % ", ".join(held))
+        return 0
+
+
+def cmd_rollback(args):
+    require_root("fpms-update rollback")
+    cfg = load_config()
+    gens = [g for g in list_generations() if g["complete"]]
+    if not gens:
+        raise Refused(
+            "there is nothing to roll back to.\n"
+            "No complete generation exists under %s, which means this rover's\n"
+            "payload is still the one the image was flashed with. That IS the\n"
+            "baseline -- reflash to return to it." % GEN_ROOT)
+    if args.to:
+        match = [g for g in gens if g["name"] == args.to]
+        if not match:
+            raise Refused("no complete generation named %r. Available: %s"
+                          % (args.to, ", ".join(g["name"] for g in gens)))
+        gen = match[0]
+    else:
+        gen = gens[-1]
+
+    say("  rolling back to the state recorded in %s" % gen["name"])
+    m = gen["meta"]
+    if m:
+        say("    taken %s, updating from %s" % (m.get("when", "?"), m.get("source", "?")))
+
+    mission_gate(cfg, override=args.override, label="Rolling back")
+
+    units = list(m.get("units") or [])
+    units = [u for u in units if u not in NEVER_RESTART]
+    if not args.restart_uros:
+        units = [u for u in units if u not in GUARDED_RESTART]
+    before_states = capture_unit_states(units)
+
+    hdr("Restoring")
+    try:
+        touched, manifest = restore(gen["path"])
+    except (OSError, Failed) as exc:
+        raise Failed("rollback failed: %s. The payload may be mixed. The "
+                     "snapshot is still at %s." % (exc, gen["path"]))
+    say("    %d destination(s) restored" % len(touched))
+
+    restart_units(units, before_states)
+    st = run_selftest(args.settle)
+
+    result = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "action": "rollback", "result": "ok", "generation": gen["name"],
+              "files_restored": len(touched), "units": units, "selftest": st}
+    write_result(result)
+    publish_event(cfg, result)
+    hdr("Done")
+    say("  Rolled back to %s." % gen["name"])
+    say("  The generation is NOT removed -- you can roll forward by updating")
+    say("  from the same source again, and `fpms-update status` still lists it.")
+    return 0
+
+
+def cmd_prune(args):
+    require_root("fpms-update prune")
+    gens = list_generations()
+    keep = max(1, args.keep)
+    doomed = gens[:-keep] if len(gens) > keep else []
+    if not doomed:
+        say("  %d generation(s), keeping %d -- nothing to remove." % (len(gens), keep))
+        return 0
+    for g in doomed:
+        say("  removing %s" % g["name"])
+        shutil.rmtree(g["path"], ignore_errors=False)
+    say("  %d removed, %d kept." % (len(doomed), len(gens) - len(doomed)))
+    say("  Pruning is never automatic. A rollback target you did not know you")
+    say("  had deleted is exactly what you want at a competition.")
+    return 0
+
+
+def cmd_os(args):
+    """The apt side. It does not own any policy and does not create any.
+
+    THE HOLDS AND THE PINS BELONG TO ANOTHER LAYER. /etc/apt/preferences.d,
+    /etc/apt/apt.conf.d and the `apt-mark hold` set are installed by the image
+    build's update-policy stage, and they are load-bearing: ROS Humble, numpy
+    <2, paho-mqtt >= 2.0 from pip (NOT apt's 1.6.1, which has no
+    CallbackAPIVersion and would leave the rover with no emergency stop), the
+    RKNN runtime matched to the kernel driver. This subcommand reads that
+    policy, prints it, and obeys it. It never passes
+    --allow-change-held-packages and it never writes an apt config file.
+
+    It also uses `upgrade`, never `dist-upgrade`/`full-upgrade`: upgrade will
+    not remove a package to satisfy a dependency, and on this rover the set of
+    installed packages IS the configuration.
+    """
+    require_root("fpms-update os")
+    cfg = load_config()
+
+    hdr("Holds currently in force")
+    rc, holds, _ = sh(["apt-mark", "showhold"], timeout=60)
+    holds_before = sorted(holds.splitlines()) if rc == 0 else None
+    if holds_before is None:
+        raise Failed("could not read `apt-mark showhold` (rc=%s). Refusing to "
+                     "touch apt without knowing what is held -- that is the "
+                     "whole safety mechanism." % rc)
+    if holds_before:
+        for h in holds_before:
+            say("    %s" % h)
+    else:
+        warn("NOTHING IS HELD. That is surprising on this image: ROS Humble, "
+             "numpy<2 and the RKNN runtime are supposed to be pinned by the "
+             "update-policy layer. Check /etc/apt/preferences.d/ and "
+             "scripts/70-update-policy.sh before upgrading anything.")
+
+    hdr("Network")
+    ok, why = net_preflight("archive.ubuntu.com", 80)
+    if not ok:
+        raise Refused(
+            "no route to the package archives: %s\n"
+            "This is expected on FPMS_Net. `fpms-update os` needs the internet\n"
+            "and has no offline mode -- an OS upgrade is not something to\n"
+            "improvise from a USB stick on this image. The PAYLOAD side does\n"
+            "work offline: `fpms-update payload --from usb`." % why)
+    say("    %s" % why)
+
+    apt_env = {"DEBIAN_FRONTEND": "noninteractive"}
+    apt_opts = ["-o", "Acquire::http::Timeout=20",
+                "-o", "Acquire::https::Timeout=20",
+                "-o", "Acquire::Retries=2",
+                "-o", "Dpkg::Options::=--force-confdef",
+                "-o", "Dpkg::Options::=--force-confold"]
+
+    hdr("apt-get update")
+    rc, out, errout = sh(["apt-get"] + apt_opts + ["update"], timeout=420, env=apt_env)
+    if rc != 0:
+        raise Failed("apt-get update failed (rc=%s): %s" % (rc, errout or out))
+    say("    ok")
+
+    hdr("Upgradable")
+    rc, out, _ = sh(["apt", "list", "--upgradable"], timeout=120, env=apt_env)
+    lines = [ln for ln in out.splitlines()
+             if "/" in ln and not ln.startswith("Listing")]
+    if not lines:
+        say("    nothing to upgrade")
+        return 0
+    for ln in lines:
+        say("    %s" % ln)
+
+    if not args.apply:
+        say("")
+        say("  This was a check. To apply:  sudo fpms-update os --apply")
+        say("  Do that on a bench, not at a venue: an apt upgrade can pull a")
+        say("  kernel, and this board has no RTC and a fragile drive link.")
+        return 0
+
+    hdr("apt-get upgrade")
+    say("    `upgrade`, not `full-upgrade`: it will never REMOVE a package to")
+    say("    satisfy a dependency, and held packages stay held.")
+    rc, out, errout = sh(["apt-get"] + apt_opts + ["-y", "upgrade"],
+                         timeout=3600, env=apt_env)
+    say(out[-4000:] if out else "")
+    if rc != 0:
+        raise Failed("apt-get upgrade failed (rc=%s): %s" % (rc, errout[-2000:] if errout else ""))
+
+    rc2, holds2, _ = sh(["apt-mark", "showhold"], timeout=60)
+    holds_after = sorted(holds2.splitlines()) if rc2 == 0 else None
+    if holds_after != holds_before:
+        err("THE HOLD SET CHANGED ACROSS THIS UPGRADE.")
+        err("  before: %s" % (", ".join(holds_before) or "(none)"))
+        err("  after : %s" % (", ".join(holds_after or []) or "(unreadable)"))
+        err("Nothing here asked for that. Something else is managing apt marks.")
+        err("Do not trust the pins until you know what did it.")
+
+    st = run_selftest(args.settle)
+    reboot = os.path.exists("/var/run/reboot-required")
+    result = {"when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "action": "os", "result": "ok", "selftest": st,
+              "reboot_required": reboot, "holds": holds_after}
+    write_result(result)
+    publish_event(cfg, result)
+    if reboot:
+        hdr("A reboot is flagged")
+        say("  /var/run/reboot-required exists. Do NOT reboot at a venue without")
+        say("  re-running fpms-selftest afterwards: this board has no RTC backup")
+        say("  battery, boots to the filesystem epoch, and the micro-ROS link")
+        say("  takes 90-225 s to re-establish after a cold start.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="fpms-update",
+        description="Update the FPMS payload (or the OS) on a running rover.",
+        epilog="The payload and the OS are separate subcommands on purpose. "
+               "See /opt/fpms-os/docs/UPDATING.md")
+    p.add_argument("--quiet", action="store_true")
+    sub = p.add_subparsers(dest="cmd")
+
+    def add_common(sp):
+        sp.add_argument("--i-am-standing-next-to-the-rover", dest="override",
+                        action="store_true",
+                        help="override a refusal from the mission gate. Prints "
+                             "the evidence it is overriding.")
+        sp.add_argument("--restart-uros", action="store_true",
+                        help="also restart fpms-uros-supervisor. Costs a "
+                             "90-225 s re-link of the drive board.")
+        sp.add_argument("--settle", type=int, default=20,
+                        help="seconds to wait before running fpms-selftest "
+                             "(default 20; 0 to skip the wait)")
+
+    sp = sub.add_parser("status", help="what is live and what can be rolled back to")
+    sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("verify", help="byte-compile the LIVE payload")
+    sp.set_defaults(fn=cmd_verify)
+
+    sp = sub.add_parser("check", help="rehearse an update; change nothing")
+    sp.add_argument("--from", dest="source", required=True,
+                    help="directory, tarball, `usb`, or git:<url-or-path>")
+    sp.add_argument("--ref", default="", help="git branch/tag, with git:")
+    sp.set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("payload", help="update the FPMS Python payload")
+    sp.add_argument("--from", dest="source", required=True,
+                    help="directory, tarball, `usb`, or git:<url-or-path>")
+    sp.add_argument("--ref", default="", help="git branch/tag, with git:")
+    add_common(sp)
+    sp.set_defaults(fn=cmd_payload)
+
+    sp = sub.add_parser("rollback", help="restore the previous payload")
+    sp.add_argument("--to", default="", help="a generation name from `status`")
+    add_common(sp)
+    sp.set_defaults(fn=cmd_rollback)
+
+    sp = sub.add_parser("prune", help="remove old rollback generations")
+    sp.add_argument("--keep", type=int, default=5)
+    sp.set_defaults(fn=cmd_prune)
+
+    sp = sub.add_parser("os", help="the apt side; obeys the holds, sets no policy")
+    sp.add_argument("--check", action="store_true", help="default; report only")
+    sp.add_argument("--apply", action="store_true", help="actually upgrade")
+    sp.add_argument("--settle", type=int, default=20)
+    sp.set_defaults(fn=cmd_os)
+    return p
+
+
+def main():
+    global _QUIET, GIT_REF
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return 2
+    _QUIET = bool(getattr(args, "quiet", False))
+    GIT_REF = getattr(args, "ref", "") or ""
+
+    try:
+        return args.fn(args)
+    except Refused as exc:
+        err("REFUSED. Nothing was changed.")
+        for ln in str(exc).splitlines():
+            err("  " + ln)
+        return 1
+    except Failed as exc:
+        err("FAILED.")
+        for ln in str(exc).splitlines():
+            err("  " + ln)
+        return 2
+    except KeyboardInterrupt:
+        err("interrupted. If an install was in progress, check "
+            "`fpms-update status` and `fpms-update verify`.")
+        return 2
+    except OSError as exc:
+        # Named, not bare. An unexpected OSError is a real failure and must
+        # NEVER be reported as a completed update.
+        err("unexpected OS error: %s: %s" % (type(exc).__name__, exc))
+        err("Run `fpms-update verify` to find out what state the payload is in.")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

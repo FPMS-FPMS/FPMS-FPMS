@@ -1,0 +1,147 @@
+# FPMS-OS kernel/bootloader freeze.
+#
+# Installed by the overlay copy in scripts/50-overlay.sh; verified, moded and
+# completed by scripts/70-update-policy.sh. Do not edit on a running rover
+# without reading docs/UPDATING.md first - the escape hatch is documented and
+# it is not "delete this file".
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS PREVENTS, WHICH IS NOT HYPOTHETICAL
+# ---------------------------------------------------------------------------
+# This image is built on Joshua Riek's ubuntu-rockchip Ubuntu 22.04 arm64.
+# Its kernel is a Rockchip BSP kernel and it is the ONLY reason this hardware
+# works:
+#
+#   rknpu     the NPU driver. No rknpu, no /sys/kernel/debug/rknpu, no
+#             librknnrt, no YOLO - and the agent DEGRADES SILENTLY when the
+#             NPU is missing ("NPU unavailable; streaming without detection"),
+#             so systemd still reports active and the rover just stops
+#             detecting fires.
+#   mali      the GPU stack.
+#   bcmdhd    the WiFi chip driver. No bcmdhd, no association, no FPMS_Net,
+#             no MQTT, no rosbridge - the rover is simply unreachable, on a
+#             board with no monitor attached.
+#
+# STOCK UBUNTU KERNELS CONTAIN NONE OF THESE. A routine `apt upgrade` that
+# pulls a generic linux-image-* therefore produces a rover with no NPU, no
+# WiFi and possibly no boot, and there is no console on which to see it
+# happen. The same is true of the bootloader packages: u-boot-* postinsts on
+# this platform rewrite the raw boot sectors of the boot device.
+#
+# ---------------------------------------------------------------------------
+# WHY A PIN AND NOT ONLY `apt-mark hold`
+# ---------------------------------------------------------------------------
+# scripts/70-update-policy.sh sets holds too, but a hold is not the mechanism
+# this file exists to be. A hold is a dpkg-level SELECTION FLAG living in
+# /var/lib/dpkg/status:
+#
+#   - `apt-get --ignore-hold`, `apt-get -o APT::Ignore-Hold=1` and
+#     `apt --allow-change-held-packages` all walk straight past it;
+#   - it is state, not configuration, so it does not survive a rootfs that is
+#     restored, re-flashed from a base image, or debootstrapped;
+#   - nothing in the repo would recreate it.
+#
+# A pin file is part of the IMAGE. It is copied in by the overlay every build,
+# it is in git, and apt honours it for `apt-get install`, `upgrade`,
+# `full-upgrade`, `dist-upgrade` AND for unattended-upgrades, which resolves
+# through the same engine. --ignore-hold does not touch it. That asymmetry is
+# the whole design: the hold is a courtesy to the operator (it makes
+# `apt-mark showhold` list the protected set); the pin is the guarantee.
+#
+# ---------------------------------------------------------------------------
+# WHY `Pin: release *` AND NOT `Pin: version *` - THE LOAD-BEARING DETAIL
+# ---------------------------------------------------------------------------
+# apt_preferences(5) splits records into two kinds and resolves them in a
+# fixed order:
+#
+#   specific form   `Pin: version ...`   - matched FIRST
+#   general form    `Pin: release ...`   - matched only if no specific-form
+#                                          record matched that version
+#
+# scripts/70-update-policy.sh writes /etc/apt/preferences.d/fpms-kernel-installed
+# containing one SPECIFIC-form record per installed kernel/bootloader/BSP
+# package, pinning the EXACT version this image shipped with at priority 1000.
+# Because specific beats general regardless of filename order, the result is:
+#
+#   the version this image was built with   ->  1000   (the candidate)
+#   every other version of those packages   ->    -1   (never installable)
+#
+# If this stanza used `Pin: version *` it would be a specific-form record too,
+# it would race the generated file on filename order ("fpms-kernel" sorts
+# before "fpms-kernel-installed"), the -1 would win, and the INSTALLED kernel
+# would end up with `Candidate: (none)`. That is why the pin type here is
+# `release` and not `version`. Do not "simplify" it.
+#
+# ---------------------------------------------------------------------------
+# THE FILENAME HAS NO EXTENSION, DELIBERATELY
+# ---------------------------------------------------------------------------
+# apt reads a file in preferences.d only if it ends in `.pref` or has NO
+# extension at all. Anything else is skipped, and for the endings in
+# Dir::Ignore-Files-Silently (`.disabled`, `.bak`, `~`, `.dpkg-*`) it is
+# skipped in silence. So:
+#
+#   - never rename this to fpms-kernel.conf. It would stop working and say
+#     nothing.
+#   - `sudo mv fpms-kernel fpms-kernel.disabled` IS the documented, reversible
+#     way to switch the freeze off for one deliberate upgrade. See
+#     docs/UPDATING.md.
+#
+# ---------------------------------------------------------------------------
+# THE PACKAGE NAMES
+# ---------------------------------------------------------------------------
+# These are GLOBS, not exact names, and that is on purpose: the exact names in
+# the base image cannot be read out of this repository (the base .img is not a
+# text file anyone can grep). The glob set does not have to know whether the
+# flavour is called `linux-image-5.10.160-rockchip` or `linux-image-rockchip`
+# - it blocks the whole family either way, including the generic Ubuntu
+# kernels that are the actual danger and that are NOT installed today.
+#
+# The exact names that ARE installed are discovered at build time by
+# scripts/70-update-policy.sh (`dpkg-query`), recorded in
+# /etc/apt/preferences.d/fpms-kernel-installed, printed into the build log,
+# and cross-checked with `apt-get -s dist-upgrade --ignore-hold`, which proves
+# THIS FILE alone holds the line with every dpkg hold ignored.
+
+# --- the kernel ------------------------------------------------------------
+# linux-image-*/headers/modules covers both the BSP flavour and every generic
+# Ubuntu kernel. linux-generic*/linux-virtual*/linux-lowlatency* are the
+# METApackages: they are how a generic kernel arrives as a dependency of
+# something innocuous rather than as a direct install.
+Explanation: FPMS-OS: the BSP kernel is the only reason rknpu, mali and bcmdhd exist on this board.
+Package: linux-image-* linux-headers-* linux-modules-* linux-generic* linux-virtual* linux-lowlatency* linux-rockchip* linux-*-rockchip*
+Pin: release *
+Pin-Priority: -1
+
+# --- the bootloader --------------------------------------------------------
+# u-boot-* on this platform is not a passive package: its postinst writes
+# idbloader/u-boot.itb to raw sectors of the boot device, and u-boot-menu
+# regenerates /boot/extlinux/extlinux.conf. Either one, done unattended and
+# wrongly, is a board that does not come back - with no console to say why.
+# flash-kernel is here for the same reason on the images that use it.
+Explanation: FPMS-OS: bootloader postinsts write raw sectors; a bad one is an unbootable board with no console.
+Package: u-boot* flash-kernel*
+Pin: release *
+Pin-Priority: -1
+
+# --- the Rockchip BSP userspace and firmware -------------------------------
+# libmali*/mali-* are the vendor GPU blobs, matched to the BSP kernel's
+# driver. *rockchip* catches rockchip-multimedia-config, librockchip-mpp and
+# friends. *bcmdhd* is speculative - see UNVERIFIED below - and costs nothing
+# if no such package exists.
+#
+# linux-firmware is here for a specific reason: the WiFi blobs this board
+# needs are not in Ubuntu's linux-firmware, so the base image supplies them,
+# and if it supplies them at paths linux-firmware also owns then an upgrade of
+# linux-firmware replaces them with Ubuntu's versions and the WiFi stops. That
+# provenance is UNVERIFIED from this repository (see docs/UPDATING.md); the
+# cost of freezing it is a firmware update this rover does not need, and the
+# cost of being wrong the other way is a rover that never joins the hotspot.
+Explanation: FPMS-OS: vendor GPU/NPU/WiFi userspace and firmware, version-matched to the BSP kernel.
+Package: *rockchip* libmali* mali-* *bcmdhd*
+Pin: release *
+Pin-Priority: -1
+
+Explanation: FPMS-OS: may own the bcmdhd blobs this board's WiFi needs. UNVERIFIED - see docs/UPDATING.md.
+Package: linux-firmware
+Pin: release *
+Pin-Priority: -1
