@@ -237,7 +237,7 @@
       "nav2/make_arena_map.py:103-162 - independent mirror of the same derivation; compute_zones() and compute_start_pose() reproduce (228,972) (972,972) (228,228) and (972,228)/90 deg",
       "nav2/arena_map.yaml:36-46 - states the frame identity in prose and quotes zone-a as arena (228,972) = nav2 (0.228,0.972); resolution 0.01, origin [-0.10,-0.10,0.0], 140x140 px",
       "fpms_missions.py:520-548 - the executor's own ARENA_MM/ZONE_FRAC/MARGIN_FRAC/ZONES/ROVER_START",
-      "fpms-os/overlay/etc/fpms/config.env:217-219 - FPMS_ARENA_ANCHOR_X=0.972 Y=0.228 YAW=1.5707963",
+      "fpms-os/overlay/etc/fpms/config.env - FPMS_ARENA_ANCHOR_X=0.972, FPMS_ARENA_ANCHOR_Y=0.228, FPMS_ARENA_ANCHOR_YAW=1.5707963 (cited by variable name, not line number: that file is edited often)",
       "rover/rescued/arena_zones.json - a previously generated make_arena_map.py sidecar; byte-for-byte agreement on all three centres and the start pose"
     ],
     "recomputation": "arena_mm=1200, side=0.30*1200=360, margin=0.04*1200=48. zone-a=(48+180, 1200-48-360+180)=(228,972). zone-b=(1200-48-360+180, same)=(972,972). water=(48+180, 48+180)=(228,228). start=(1200-48-180, 48+180)=(972,228), heading 90 deg = 1.5707963267948966 rad.",

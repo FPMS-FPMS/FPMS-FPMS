@@ -1,0 +1,214 @@
+/* =========================================================================
+   app.css — dark tactical, one file, no webfont.
+
+   THE STALENESS STYLING IS THE POINT, NOT DECORATION.
+
+   Every card carries data-feed="<key>" and the ticker stamps
+   data-level="ok|warn|stale|never" on it at 5 Hz. All four states are styled
+   HERE and nowhere else, so a new panel cannot be added that forgets to grey
+   out. `stale` is struck through as well as greyed: colour alone fails for a
+   colour-blind operator and fails again on a sunlit screen at a venue.
+   ========================================================================= */
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: #040911; color: #e8f7ff;
+  font-family: Consolas, "DejaVu Sans Mono", ui-monospace, monospace;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------- header --- */
+.top {
+  height: 62px; background: #071629; border-bottom: 2px solid #ff4b70;
+  padding: 6px 12px; display: flex; align-items: center; gap: 14px;
+}
+.brand { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+h1 { margin: 0; color: #ff4b70; letter-spacing: 4px; font-size: 20px; }
+.sub { font-size: 11px; color: #98d4ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sub b { color: #e8f7ff; }
+.chips { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+
+.chip {
+  font-size: 11px; font-weight: 900; letter-spacing: 1px;
+  padding: 5px 9px; border-radius: 8px; border: 1px solid #2e76aa;
+  color: #98d4ff; background: #051121; white-space: nowrap;
+}
+.chip.up   { border-color: #3af07a; color: #3af07a; }
+.chip.warn { border-color: #ffbf00; color: #ffbf00; }
+.chip.down { border-color: #ff4b70; color: #ff4b70; background: #23070f; }
+
+button {
+  background: #071427; border: 1px solid #2e76aa; color: #e8f5ff;
+  border-radius: 9px; padding: 8px 12px; font-family: inherit;
+  font-weight: 900; font-size: 12px; cursor: pointer;
+}
+button:hover { border-color: #57a9e0; }
+button.green { border-color: #3af07a; color: #3af07a; }
+button.mini { padding: 5px 8px; font-size: 10px; }
+button.linkish {
+  background: none; border: none; color: #57a9e0; text-decoration: underline;
+  padding: 0 4px; font-size: 11px; font-weight: 400;
+}
+
+/* THE STOP BUTTON. Big, red, always in the same place, never disabled — not
+   even when the link is down, because the fallback path and the "PUBLISH
+   FAILED" message are more useful than a greyed-out button that tells the
+   operator nothing. */
+#stopBtn {
+  background: #ff2d55; border: 2px solid #ff8fa6; color: #fff;
+  font-size: 20px; letter-spacing: 5px; padding: 10px 26px; border-radius: 10px;
+  box-shadow: 0 0 18px rgba(255,45,85,.45);
+}
+#stopBtn:hover { background: #ff4468; }
+#stopBtn.fired { background: #fff; color: #ff2d55; border-color: #fff; }
+
+/* ------------------------------------------------------------- banner --- */
+.banner {
+  background: #2a0713; border-bottom: 2px solid #ff4b70; color: #ffd5de;
+  padding: 8px 14px; font-size: 12px; line-height: 1.5;
+}
+.banner b { color: #ff4b70; letter-spacing: 1px; }
+.banner code { background: #12030a; padding: 1px 5px; border-radius: 4px; color: #ffbf00; }
+.banner-detail { color: #c48f9c; }
+.hidden { display: none !important; }
+
+/* -------------------------------------------------------------- layout -- */
+.main {
+  height: calc(100% - 62px);
+  display: grid; grid-template-columns: minmax(0, 1fr) 420px;
+  gap: 8px; padding: 8px;
+}
+body:has(.banner:not(.hidden)) .main { height: calc(100% - 62px - 54px); }
+
+.panel {
+  background: #071629; border: 1px solid #28506f; border-radius: 12px;
+  padding: 10px; min-height: 0; display: flex; flex-direction: column;
+}
+.right { overflow: auto; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.map-panel { min-height: 0; }
+
+.h {
+  color: #00b7ff; letter-spacing: 2px; font-weight: 900; font-size: 11px;
+  border-bottom: 1px solid #28506f; padding-bottom: 5px; margin: 0 0 8px;
+}
+
+#mapbox {
+  flex: 1; position: relative; background: #020711;
+  border: 1px solid #173450; border-radius: 10px; min-height: 220px;
+}
+#mapbox canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+
+.maprow { display: flex; gap: 8px; margin-top: 8px; }
+.maprow .grow { flex: 1; margin-top: 0; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+/* ---------------------------------------------------------------- cards -- */
+.card {
+  background: #020711; border: 1px solid #1d4163; border-radius: 9px;
+  padding: 7px 8px; margin-top: 6px; min-width: 0;
+}
+.card:first-of-type { margin-top: 0; }
+.k { font-size: 10px; color: #6f9fc4; letter-spacing: 1px; font-weight: 900; }
+.src { color: #4d7593; font-weight: 400; letter-spacing: 0; }
+.big { font-size: 17px; color: #00b7ff; font-weight: 900; margin: 2px 0 1px;
+       overflow: hidden; text-overflow: ellipsis; }
+.age { font-size: 10px; color: #6f9fc4; }
+.tiny { font-size: 10px; color: #587f9c; line-height: 1.4; margin-top: 4px; }
+.mono { white-space: pre-wrap; }
+.dim { color: #4d7593; }
+.ok { color: #3af07a; } .warn { color: #ffbf00; } .bad { color: #ff4b70; }
+
+/* ============ THE FOUR FRESHNESS STATES ================================ */
+[data-level="ok"] { }
+[data-level="warn"]  .big { color: #ffbf00; }
+[data-level="warn"]  .age { color: #ffbf00; }
+[data-level="stale"] { border-color: #3a4652; background: #08090b; }
+[data-level="stale"] .big {
+  color: #7b8794; text-decoration: line-through; text-decoration-thickness: 2px;
+}
+[data-level="stale"] .age::after {
+  content: "  STALE"; color: #ff4b70; font-weight: 900;
+}
+[data-level="never"] { border-color: #2b3440; background: #08090b; }
+[data-level="never"] .big { color: #5c6773; }
+
+/* An event-driven feed (residuals, plan, events) is aged like everything
+   else, but a long age there is a rover standing still, not a fault — so it
+   is greyed without the accusatory STALE badge. */
+[data-level="stale"].evented .age::after { content: "  (last seen)"; color: #6f9fc4; }
+[data-level="stale"].evented .big { text-decoration: none; }
+
+/* --------------------------------------------------------------- battery */
+.bar { height: 8px; background: #0d1620; border-radius: 4px; margin-top: 5px; overflow: hidden; }
+.bar > div { height: 100%; width: 0; transition: width .4s linear; background: #3af07a; }
+.bar > div.warn { background: #ffbf00; }
+.bar > div.bad  { background: #ff4b70; }
+
+/* ----------------------------------------------------------- link tiles -- */
+.ltile {
+  background: #020711; border: 1px solid #1d4163; border-left-width: 4px;
+  border-radius: 9px; padding: 6px 8px; margin-bottom: 6px;
+}
+.lrow { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.lname { font-size: 12px; font-weight: 900; letter-spacing: 2px; color: #98d4ff; }
+.lval { font-size: 12px; font-weight: 900; }
+.ltile.ok    { border-left-color: #3af07a; } .ltile.ok .lval    { color: #3af07a; }
+.ltile.warn  { border-left-color: #ffbf00; } .ltile.warn .lval  { color: #ffbf00; }
+.ltile.down  { border-left-color: #ff4b70; background: #16060b; } .ltile.down .lval { color: #ff4b70; }
+/* "No ROS source" is deliberately NOT a colour on the good/bad axis. It is
+   hatched grey, because it is not a verdict about the hardware — it is the
+   dashboard admitting it has no evidence either way. */
+.ltile.nosrc {
+  border-left-color: #5c6773;
+  background: repeating-linear-gradient(45deg, #08090b, #08090b 6px, #0d1016 6px, #0d1016 12px);
+}
+.ltile.nosrc .lval { color: #8a97a5; }
+.ltile.nosrc .lname { color: #8a97a5; }
+
+/* --------------------------------------------------------------- events -- */
+#events {
+  height: 150px; overflow: auto; font-size: 10px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-word; color: #8fb8d4;
+}
+#events .bad  { color: #ff8fa6; }
+#events .warn { color: #ffd98a; }
+
+/* -------------------------------------------------------------- residual */
+.verdict {
+  font-size: 11px; line-height: 1.45; padding: 6px 8px; margin: 6px 0;
+  border-left: 3px solid #2e76aa; background: #020711; border-radius: 0 6px 6px 0;
+}
+.verdict.ok   { border-left-color: #3af07a; color: #9fe8bd; }
+.verdict.warn { border-left-color: #ffbf00; color: #ffdf8a; }
+.verdict.bad  { border-left-color: #ff4b70; color: #ffb3c2; }
+.verdict.dim  { color: #6f9fc4; }
+
+.restable { width: 100%; border-collapse: collapse; font-size: 10px; }
+.restable th {
+  text-align: left; color: #4d7593; font-weight: 900; letter-spacing: 1px;
+  border-bottom: 1px solid #1d4163; padding: 3px 4px;
+}
+.restable td { padding: 3px 4px; border-bottom: 1px solid #0d1c2b; color: #a8cbe4; }
+.restable tr.turn td { color: #ffd98a; }
+.restable td.bad { color: #ff8fa6; font-weight: 900; }
+
+/* ---------------------------------------------------------------- modal -- */
+.modal {
+  position: fixed; inset: 0; background: rgba(2,7,17,.86);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal-box {
+  background: #071629; border: 1px solid #2e76aa; border-radius: 12px;
+  padding: 16px; width: min(460px, 92vw);
+}
+.modal-box label { display: block; font-size: 11px; color: #98d4ff; margin: 8px 0; }
+.modal-box input {
+  display: block; width: 100%; margin-top: 4px; padding: 8px;
+  background: #020711; border: 1px solid #2e76aa; border-radius: 7px;
+  color: #e8f7ff; font-family: inherit; font-size: 13px;
+}
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+
+code { color: #ffbf00; }

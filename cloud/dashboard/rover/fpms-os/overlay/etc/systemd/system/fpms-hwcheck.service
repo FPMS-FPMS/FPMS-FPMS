@@ -1,0 +1,122 @@
+[Unit]
+Description=FPMS-OS boot hardware check (are the sensors actually producing data?)
+Documentation=file:/usr/local/bin/fpms-hwcheck
+Documentation=file:/opt/fpms-os/docs/DDS.md
+
+# Runs once per boot and answers the question fpms-selftest deliberately stops
+# short of: are the three pieces of hardware this rover cannot work without
+# actually PRODUCING DATA, over ROS, right now?
+#
+#   fpms-selftest   is it configured, and are the devices PRESENT
+#   fpms-hwcheck    are they PRODUCING
+#   fpms-npu-selftest  does the NPU actually infer
+#
+# Presence is not production, and this project has paid for the difference:
+#
+#   - fpms-lidar-ros active, "scans=2848 dropped=0 rate=9.55 Hz" in its own
+#     journal, `ros2 topic info` reporting Publisher count: 1, and no
+#     subscriber ever receiving a scan;
+#   - telemetry/lidar publishing ON A TIMER, so arrival proves the agent is
+#     alive and says nothing whatever about the scanner behind it;
+#   - a dead scanner's all-zero ranges converting to inf, which reads as a
+#     confident, COMPLETELY CLEAR 360 DEGREES - the most dangerous possible
+#     rendering of a broken sensor;
+#   - /battery changing message type three times, where a wrong type matches
+#     NOTHING, silently, while the topic still lists a publisher.
+#
+# The verdict goes to telemetry/health so it reaches the dashboard, and to
+# /var/lib/fpms/hwcheck.json so it survives for SSH. NOTE that telemetry/health
+# has three writers - fpms-cored republishes it about every 10 s, and
+# fpms-selftest publishes there at boot - so the MQTT copy is the newest one
+# only briefly. The payload carries svc=hwcheck and source=fpms-hwcheck so a
+# consumer can tell whose health it is reading; the JSON file is the durable
+# record.
+#
+# IT NEVER MOVES THE ROVER. It publishes to no ROS topic at all, and the report
+# FAILS if the ROS graph says otherwise. It does not turn-test for liveness --
+# that destroys heading, and this rover has reported clean travel while
+# spinning in place -- so pose is read passively and a pose that never changes
+# is information, not a fault. It does not open the drive board's tty, because
+# opening that tty raises the handshake lines wired to EN/IO0 and RESETS the
+# ESP32, costing a 90-225 second re-link; port ownership is read from /proc.
+#
+# THE 240 SECOND DELAY IS THE POINT OF THIS FILE
+# ==============================================
+# CLAUDE.md, verified on hardware: "The board self-reconnects unaided in
+# 90-225s after any agent restart. No reset-button press is needed or helpful."
+# fpms-selftest waits 90 s, which is the MINIMUM of that window; it can
+# therefore run while a perfectly healthy board is still linking. That is
+# acceptable there, because fpms-selftest only asks whether any DDS traffic
+# flows at all. It is not acceptable here, where a silent drive board is the
+# headline verdict.
+#
+# So this waits 225 s plus margin. Anything earlier would report a healthy
+# rover as broken on a large fraction of cold boots, and an alarm that cries
+# wolf gets muted -- which would cost more than the check is worth. The tool
+# ALSO computes the link's age from micro-ros-agent's own
+# ActiveEnterTimestampMonotonic and reports "NOT UP YET" rather than "FAILED"
+# whenever the silence is still inside the window, so running it early by hand
+# is safe and honest too. The delay and the grace logic are belt and braces on
+# purpose: the delay is what makes the BOOT report meaningful, the grace is
+# what makes every other invocation meaningful.
+#
+# Nothing is ordered after this unit, so the delay costs no other service any
+# time at all.
+
+After=fpms-ros-publishers.target
+After=mosquitto.service
+Wants=fpms-ros-publishers.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+
+# config.env is 0640 root:root and this runs as ubuntu, so the tool cannot read
+# the file itself -- systemd reads it as root before dropping privileges and
+# the values arrive in the environment instead. That is exactly why the tool
+# overlays the environment on top of the file and reports which one it used: an
+# invocation that cannot see the broker password SKIPS the MQTT checks rather
+# than reporting a healthy rover as dead.
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+ExecStartPre=/bin/sleep 240
+
+# The two critical variables are RE-EXPORTED after `bash -lc` sources the login
+# profile, so a stray `export ROS_DOMAIN_ID` in ~/.bashrc cannot win over the
+# unit -- the same guard fpms-rosbridge and fpms-console use. Getting the
+# domain wrong here would not error: the board declares domain 20 in its
+# CREATE_PARTICIPANT and publishes nowhere else, so every topic list would be
+# empty and this report would blame the hardware.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID="${FPMS_ROS_DOMAIN_ID:-20}"; export FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml; exec /usr/local/bin/fpms-hwcheck --boot'
+
+# A FAILED check must not mark the unit failed in a way that restart-loops: it
+# is a report, not a service. 1 is "one or more WARN", 2 is "one or more FAIL",
+# and both are successful REPORTS. The exit code is preserved in the journal
+# and in /var/lib/fpms/hwcheck.json.
+#
+# There is deliberately no Restart= line. Re-running this on a FAIL would
+# re-run it forever against hardware that is not going to fix itself, and each
+# pass would republish a verdict over telemetry/health. Worse, the one failure
+# mode most likely to be seen here -- a drive board still linking -- is made
+# WORSE by anything that looks like retrying at the board.
+SuccessExitStatus=0 1 2
+
+# Type=oneshot disables the start timeout by default, and the sleep above plus
+# the checks run to roughly five minutes. This is stated explicitly rather than
+# inherited, so that a future change to Type= cannot silently arm a 90 s
+# DefaultTimeoutStartSec and kill this unit in the middle of the sleep.
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

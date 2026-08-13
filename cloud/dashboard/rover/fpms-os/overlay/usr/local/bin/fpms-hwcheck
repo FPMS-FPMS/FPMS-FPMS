@@ -1,0 +1,1627 @@
+#!/usr/bin/env python3
+"""fpms-hwcheck - are the three pieces of hardware actually PRODUCING DATA?
+
+Usage:
+    fpms-hwcheck              human-readable report
+    fpms-hwcheck --json       machine-readable
+    fpms-hwcheck --quiet      exit code only
+    fpms-hwcheck --boot       boot mode: also publish to telemetry/health
+
+Exit: 0 all pass, 1 one or more WARN, 2 one or more FAIL.
+      The same contract as fpms-selftest and fpms-npu-selftest, deliberately -
+      one system, three depths.
+
+
+WHY THIS EXISTS
+===============
+fpms-selftest asks "is the software configured, and are the devices PRESENT".
+This asks the next question, and the only one an operator can act on before a
+run: are the three pieces of hardware this rover cannot work without actually
+PRODUCING DATA, right now, over ROS?
+
+Presence is not production, and every gap between the two has already cost
+this project a session:
+
+  - fpms-lidar-ros active, logging "scans=2848 dropped=0 rate=9.55 Hz",
+    `ros2 topic info` reporting "Publisher count: 1", and no subscriber ever
+    receiving a single scan.
+  - the LiDAR telemetry publishes ON A TIMER, so a message ARRIVING proves the
+    agent is alive and says NOTHING about the scanner behind it.
+  - a dead scanner's ranges are all zero, and zero converts to `inf` - "no
+    return in that direction" - so the most dangerous possible reading of a
+    broken sensor is a confident, COMPLETELY CLEAR 360 DEGREES. Nav2 and every
+    cone guard downstream would take that as positive evidence of open space.
+  - /battery has changed message type three times (std_msgs/UInt16 decivolts
+    <-> sensor_msgs/BatteryState volts). A wrong type on either end matches
+    NOTHING and does so silently: the topic still lists a publisher, the topic
+    still looks alive, and the value simply stays None forever. It presented
+    as "the dashboard shows no battery" both times.
+  - the micro-ROS link takes 90-225 SECONDS to establish from cold, so a check
+    that runs too early reports a perfectly healthy rover as broken. An alarm
+    that cries wolf is worse than no alarm, so "not up yet" and "failed" are
+    DIFFERENT verdicts here and the report says which.
+
+Each check below exists because one of those happened.
+
+
+WHAT IT WILL NEVER DO
+=====================
+  - move the rover, in any way. It publishes to NO ROS topic at all: not
+    /cmd_vel, not /cmd_duty, not /beep, not a servo. Its entire write surface
+    is /var/lib/fpms/hwcheck.json and one MQTT topic. That is not a promise -
+    the probe asks the ROS graph which topics IT publishes and the report
+    FAILS if the answer is anything but rclpy's own two.
+  - turn-test for liveness. That destroys heading, and this rover has reported
+    clean travel while spinning in place. Pose is read PASSIVELY and a pose
+    that never changes is reported as information, never as a fault: a parked
+    rover is supposed to sit still.
+  - open the drive board's tty. Opening it raises the handshake lines wired to
+    EN/IO0 and RESETS the ESP32, costing a 90-225 second re-link. Ownership is
+    read from /proc instead.
+  - restart, mask or reconfigure anything. It reports; it does not repair.
+    Everything that would change system state is printed as a command for a
+    human to run.
+
+
+WHAT IT CANNOT SEE, AND WHY
+===========================
+The LaserScan header stamp is written by fpms_lidar_ros with the PI's clock at
+the moment it republishes, NOT with any timestamp from the scanner. So the
+stamp can prove that nothing is re-serving an old scan, and it can NEVER prove
+the scanner itself is fresh. Scanner freshness has exactly one source - the
+health/stale/seq fields on telemetry/lidar - and that is why this tool reads
+both and cross-references them rather than trusting either alone.
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+
+CONFIG = "/etc/fpms/config.env"
+STATE_DIR = "/var/lib/fpms"
+STATE_FILE = "/var/lib/fpms/hwcheck.json"
+BROKER_PASSWORD_FILE = "/var/lib/fpms/broker-password"
+DDS_PROFILE = "/etc/fpms/fastdds_udp_only.xml"
+PLACEHOLDER = "__FPMS_FIRSTBOOT_WILL_REPLACE_THIS__"
+
+DRIVE_PORT = "/dev/serial/by-path/platform-fc880000.usb-usb-0:1.3:1.0-port0"
+LIDAR_PORT = "/dev/serial/by-path/platform-fc880000.usb-usb-0:1.2:1.0-port0"
+
+SCAN_TOPIC = os.environ.get("FPMS_SCAN_TOPIC", "/scan_lidar")
+DRIVE_TOPICS = ("/odom_raw", "/imu", "/battery")
+
+# How long the ROS probe listens. /battery is the slowest thing we measure at
+# 1 Hz, so a window much shorter than this cannot produce a rate for it at all
+# - and "no rate" would read as "no battery", which is the false alarm this
+# whole tool exists to avoid.
+WINDOW_S = float(os.environ.get("FPMS_HWCHECK_WINDOW_S", "12"))
+DISCOVERY_S = 3.0          # before we ask the graph what /battery's type is
+PROBE_TIMEOUT_S = 90       # hard ceiling; the probe is spawned, never trusted
+
+# THE COLD-LINK WINDOW. CLAUDE.md, verified on real hardware: "The board
+# self-reconnects unaided in 90-225s after any agent restart. No reset-button
+# press is needed or helpful." A drive board that is silent INSIDE that window
+# is not a fault, and reporting it as one trains an operator to ignore this
+# report - which is the only way this file can actually do harm.
+LINK_COLD_MIN_S = 90.0
+LINK_COLD_MAX_S = 225.0
+
+# Nominal rates. Provenance, because this project has been burned by numbers
+# that looked authoritative and were assumptions:
+#   /odom_raw 11.2 Hz, /imu 25 Hz, /battery 1 Hz  - CLAUDE.md, "Topics on
+#       ROS_DOMAIN_ID=20", measured on this board.
+#   /scan_lidar  - FPMS_LIDAR_HZ from config.env (10), and the agent's own
+#       journal has reported 9.55-9.8 Hz in the healthy case and 2.37 Hz when
+#       the feed was routed over WiFi.
+#   camera  - FPMS_CAMERA_FPS from config.env (6). 6 fps is DELIBERATE, not a
+#       placeholder: higher saturated the WiFi link and starved the LiDAR.
+NOMINAL = {"/odom_raw": 11.2, "/imu": 25.0, "/battery": 1.0}
+
+# The sensor's USB descriptor caps at 30.000 fps at every resolution. Anything
+# above that is not a fast camera, it is two publishers or a replay.
+CAMERA_HW_MAX_FPS = 30.0
+
+# A LaserScan republished with a stamp older than this means something is
+# serving an old scan. Local DDS latency is sub-millisecond, so this is loose
+# by three orders of magnitude on purpose - it fires on a fault, not jitter.
+SCAN_STAMP_MAX_AGE_S = 1.0
+
+# Battery plausibility envelope, in VOLTS. ASSUMED, not measured: the pack
+# chemistry is written down nowhere in this repo. It is deliberately wide, and
+# exists only to catch the units confusion documented in fpms_teleop.py - a
+# decivolt count landing in a volts field reads as ~111 V, and volts landing in
+# a decivolt field read as ~1.1 V. Both are unmistakable at this width.
+BATT_PLAUSIBLE_V = (6.0, 17.0)
+
+MARKER = "__FPMS_HWCHECK_JSON__"
+
+results = []
+
+
+def add(name, status, detail, remedy=""):
+    results.append({"check": name, "status": status,
+                    "detail": detail, "remedy": remedy})
+
+
+def sh(cmd, timeout=20):
+    """Run a command and return (rc, stdout, stderr). NEVER trusted alone.
+
+    Every caller in this file parses the OUTPUT for positive evidence and uses
+    rc only as a tie-breaker. That is not fussiness: this build has been taken
+    down three times by an exit code that was true of a pipeline rather than of
+    the thing being tested - `cmd | grep -q` killing the producer with SIGPIPE,
+    pipefail turning that into 141, and a plain assignment adopting it. We are
+    in Python and cannot make that exact mistake, so the discipline is stated
+    instead: never conclude from a status what you can conclude from an answer.
+
+    mosquitto_sub is the live example. `-C 4 -W 12` exits NON-ZERO when the
+    wait expires with fewer than 4 messages - which is precisely the case where
+    the messages it DID print are the most interesting data we have.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as exc:  # noqa: BLE001
+        return 255, "", str(exc)
+
+
+def load_config():
+    """config.env, then the process environment ON TOP, and say which won.
+
+    This is NOT cosmetic, and it is the one place this tool deliberately
+    differs from fpms-selftest. /etc/fpms/config.env is 0640 root:root and this
+    runs as `ubuntu`, so the FILE IS UNREADABLE TO US. Under systemd that is
+    invisible and harmless, because EnvironmentFile= is read by pid 1 as root
+    and the values arrive in our environment anyway. Run by hand over SSH it is
+    neither: the file read fails, every value falls back to a default, the
+    broker password becomes the empty string, and every MQTT check below would
+    report a healthy rover as dead because of a permission bit.
+
+    So: read what we can, overlay the environment, and record the provenance.
+    """
+    cfg, note = {}, None
+    try:
+        with open(CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+        note = "file"
+    except OSError as exc:
+        note = "unreadable: %s" % getattr(exc, "strerror", exc)
+
+    from_env = []
+    for k in ("FPMS_THING_NAME", "FPMS_MQTT_USER", "FPMS_MQTT_PASS",
+              "FPMS_MQTT_HOST", "FPMS_MQTT_PORT", "FPMS_LIDAR_HZ",
+              "FPMS_CAMERA_FPS", "FPMS_ROS_DOMAIN_ID"):
+        if os.environ.get(k):
+            if os.environ[k] != cfg.get(k):
+                from_env.append(k)
+            cfg[k] = os.environ[k]
+    return cfg, {"file": note, "from_env": sorted(from_env)}
+
+
+def broker_password(cfg):
+    """The password, and where it came from - or None, honestly.
+
+    The last resort is the root-only file fpms-doctor already tells operators
+    to cat. If we cannot get a password at all, the MQTT checks below SKIP with
+    that reason rather than FAIL: an authentication failure that we caused is
+    not a hardware fault, and reporting it as one is how a report becomes
+    wallpaper.
+    """
+    pw = cfg.get("FPMS_MQTT_PASS", "")
+    if pw and pw != PLACEHOLDER:
+        return pw, "config"
+    if pw == PLACEHOLDER:
+        return None, "placeholder"
+    try:
+        with open(BROKER_PASSWORD_FILE) as fh:
+            got = fh.read().strip()
+        if got:
+            return got, "broker-password file"
+    except OSError:
+        pass
+    return None, "unavailable"
+
+
+def hz_from(times, window):
+    """Rate from arrival times, plus how confident we are allowed to be.
+
+    (n-1)/(last-first) rather than n/window: the window's leading and trailing
+    partial periods are not evidence, and with a 1 Hz topic in a 12 s window
+    that difference is the whole answer.
+    """
+    if len(times) >= 3:
+        span = times[-1] - times[0]
+        if span > 0:
+            return (len(times) - 1) / span, "measured"
+    if window > 0 and times:
+        return len(times) / window, "coarse (%d sample(s))" % len(times)
+    return None, "no samples"
+
+
+def band(hz, nominal):
+    """PASS inside half-to-double nominal. Deliberately wide.
+
+    These are arrival rates over a short window on a busy single-board
+    computer. A tight band here would fire on jitter, and a check that fires on
+    jitter gets muted, and a muted check is the failure this file exists to
+    prevent. Half nominal is the LiDAR's own historical failure signature
+    (9.8 Hz -> 2.37 Hz when the feed took a WiFi round trip).
+    """
+    if hz is None or nominal <= 0:
+        return None
+    return 0.5 * nominal <= hz <= 2.0 * nominal
+
+
+# ==========================================================================
+# THE ROS PROBE
+#
+# Runs OUT OF PROCESS, on purpose:
+#   - rclpy and the Fast DDS shared-memory transport can wedge or die hard,
+#     and a health check that dies with the thing it is checking reports
+#     nothing at all;
+#   - a subprocess can be given a hard deadline. A wedged spin inside this
+#     process could not be.
+#
+# It communicates through ONE marker line, because ROS prints a wall of its own
+# logging on both streams that would swallow anything less distinctive.
+#
+# IT CREATES NO PUBLISHER. Read the code: there is no create_publisher call
+# anywhere below, and the probe reports the graph's own answer for which topics
+# this node publishes so that the claim is CHECKED rather than believed.
+# ==========================================================================
+PROBE = r'''
+import json, math, sys, time
+
+MARKER = "__FPMS_HWCHECK_JSON__"
+out = {"ok": False, "stage": "import", "err": None}
+
+
+def emit():
+    sys.stdout.write("\n" + MARKER + " " + json.dumps(out) + "\n")
+    sys.stdout.flush()
+
+
+try:
+    window = float(sys.argv[1])
+    discovery = float(sys.argv[2])
+    scan_topic = sys.argv[3]
+
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                           HistoryPolicy)
+    from sensor_msgs.msg import Imu, LaserScan
+    from nav_msgs.msg import Odometry
+
+    out["stage"] = "init"
+    rclpy.init(args=None)
+    node = Node("fpms_hwcheck_probe")
+
+    # BEST_EFFORT ON PURPOSE, and this matters.
+    #
+    # A BEST_EFFORT subscriber matches a publisher of EITHER reliability; a
+    # RELIABLE one silently fails to match a BEST_EFFORT publisher and reports
+    # perfect silence. So subscribing best-effort makes our liveness answer
+    # incapable of a false negative caused by our own QoS choice. The QoS
+    # AGREEMENT question - does the real consumer match the real publisher - is
+    # a different question, and it is answered separately and explicitly from
+    # the endpoint info below rather than by accident here.
+    qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.BEST_EFFORT,
+                     durability=DurabilityPolicy.VOLATILE,
+                     history=HistoryPolicy.KEEP_LAST)
+
+    S = {
+        "scan": {"t": [], "age": [], "n": [], "finite": [], "min": [],
+                 "frame": None, "range_max": None},
+        "odom": {"t": [], "first": None, "last": None},
+        "imu": {"t": [], "gz": [], "acc": [], "allzero": 0},
+        "battery": {"t": [], "v": [], "raw": [], "type": None},
+    }
+
+    def ros_now():
+        return node.get_clock().now().nanoseconds / 1e9
+
+    def stamp_of(msg):
+        try:
+            return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        except Exception:
+            return None
+
+    def on_scan(msg):
+        d = S["scan"]
+        d["t"].append(time.monotonic())
+        st = stamp_of(msg)
+        d["age"].append(None if st is None else ros_now() - st)
+        finite, mn = 0, None
+        for r in msg.ranges:
+            if math.isfinite(r) and r > 0.0:
+                finite += 1
+                if mn is None or r < mn:
+                    mn = r
+        d["n"].append(len(msg.ranges))
+        d["finite"].append(finite)
+        d["min"].append(mn)
+        d["frame"] = msg.header.frame_id
+        d["range_max"] = float(msg.range_max)
+
+    def on_odom(msg):
+        d = S["odom"]
+        d["t"].append(time.monotonic())
+        # POSE, never twist. CLAUDE.md, measured wheels-off: /odom_raw reports
+        # twist.linear.x with an INVERTED SIGN relative to its own pose. Any
+        # guard comparing a commanded sign against reported twist aborts every
+        # correct move - that is exactly what killed the first deadband sweep.
+        p = msg.pose.pose.position
+        xy = [float(p.x), float(p.y)]
+        if d["first"] is None:
+            d["first"] = xy
+        d["last"] = xy
+
+    def on_imu(msg):
+        d = S["imu"]
+        d["t"].append(time.monotonic())
+        gz = float(msg.angular_velocity.z)
+        a = msg.linear_acceleration
+        ax, ay, az = float(a.x), float(a.y), float(a.z)
+        g = float(msg.angular_velocity.x), float(msg.angular_velocity.y)
+        d["gz"].append(gz)
+        d["acc"].append(math.sqrt(ax * ax + ay * ay + az * az))
+        if gz == 0.0 and g == (0.0, 0.0) and ax == 0.0 and ay == 0.0 and az == 0.0:
+            d["allzero"] += 1
+
+    def on_batt_uint(msg):
+        d = S["battery"]
+        d["t"].append(time.monotonic())
+        d["raw"].append(float(msg.data))
+        d["v"].append(float(msg.data) / 10.0)   # DECIVOLTS. Divide by 10.
+        d["type"] = "std_msgs/msg/UInt16"
+
+    def on_batt_state(msg):
+        d = S["battery"]
+        d["t"].append(time.monotonic())
+        d["raw"].append(float(msg.voltage))
+        d["v"].append(float(msg.voltage))       # VOLTS.
+        d["type"] = "sensor_msgs/msg/BatteryState"
+
+    node.create_subscription(LaserScan, scan_topic, on_scan, qos)
+    node.create_subscription(Odometry, "/odom_raw", on_odom, qos)
+    node.create_subscription(Imu, "/imu", on_imu, qos)
+
+    # Let discovery happen before asking the graph anything about it.
+    out["stage"] = "discovery"
+    end = time.monotonic() + discovery
+    while time.monotonic() < end:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+    advertised = {}
+    try:
+        for name, types in node.get_topic_names_and_types():
+            advertised[name] = list(types)
+    except Exception as exc:
+        out["graph_err"] = repr(exc)
+    out["battery_advertised"] = advertised.get("/battery")
+
+    # /battery's TYPE HAS FLIPPED THREE TIMES between std_msgs/UInt16
+    # (decivolts) and sensor_msgs/BatteryState (volts). Hardcoding either one
+    # here would reproduce, inside the checker, the exact silent no-match this
+    # check exists to detect. So: ask the graph, and if the graph has nothing
+    # to say yet (a link still coming up advertises nothing), try both - each
+    # in its own guard, because Fast DDS refuses a second type on a topic name
+    # it has already registered, and that refusal is information, not an error.
+    want = advertised.get("/battery") or []
+    order = []
+    if "std_msgs/msg/UInt16" in want:
+        order = [("std_msgs/msg/UInt16", on_batt_uint)]
+    elif "sensor_msgs/msg/BatteryState" in want:
+        order = [("sensor_msgs/msg/BatteryState", on_batt_state)]
+    else:
+        # Firmware v3 publishes BatteryState (fpms_main.cpp:835), so it goes
+        # first when we are guessing.
+        order = [("sensor_msgs/msg/BatteryState", on_batt_state),
+                 ("std_msgs/msg/UInt16", on_batt_uint)]
+    out["battery_subscribed"] = []
+    for tname, cb in order:
+        try:
+            if tname == "std_msgs/msg/UInt16":
+                from std_msgs.msg import UInt16
+                node.create_subscription(UInt16, "/battery", cb, qos)
+            else:
+                from sensor_msgs.msg import BatteryState
+                node.create_subscription(BatteryState, "/battery", cb, qos)
+            out["battery_subscribed"].append(tname)
+        except Exception as exc:
+            out.setdefault("battery_sub_err", {})[tname] = repr(exc)
+
+    out["stage"] = "listen"
+    t0 = time.monotonic()
+    end = t0 + window
+    while time.monotonic() < end:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    out["window_s"] = time.monotonic() - t0
+
+    # Who is on each topic, with what type and what QoS. This is how the
+    # type-flip and the reliability mismatch become VISIBLE instead of
+    # presenting as "the topic is alive and the value stays None".
+    out["stage"] = "endpoints"
+    me = node.get_name()
+
+    def enc(e):
+        rel = dur = None
+        try:
+            rel = getattr(e.qos_profile.reliability, "name",
+                          str(e.qos_profile.reliability))
+            dur = getattr(e.qos_profile.durability, "name",
+                          str(e.qos_profile.durability))
+        except Exception:
+            pass
+        return {"node": e.node_name, "type": e.topic_type,
+                "reliability": rel, "durability": dur}
+
+    eps = {}
+    for topic in (scan_topic, "/odom_raw", "/imu", "/battery"):
+        try:
+            eps[topic] = {
+                "publishers": [enc(e)
+                               for e in node.get_publishers_info_by_topic(topic)],
+                # Our own subscription is excluded. It is BEST_EFFORT by
+                # design, and leaving it in would make the QoS-agreement check
+                # below fire on this tool every single time.
+                "subscribers": [enc(e)
+                                for e in node.get_subscriptions_info_by_topic(topic)
+                                if e.node_name != me],
+            }
+        except Exception as exc:
+            eps[topic] = {"error": repr(exc)}
+    out["endpoints"] = eps
+
+    # THE ACTUATION GUARD. Not a promise in a comment - the graph's own answer.
+    try:
+        out["own_publishers"] = sorted(
+            n for n, _t in node.get_publisher_names_and_types_by_node(
+                me, node.get_namespace()))
+    except Exception as exc:
+        out["own_publishers"] = None
+        out["own_publishers_err"] = repr(exc)
+
+    scan = S["scan"]
+    out["scan"] = {
+        "count": len(scan["t"]), "t": scan["t"],
+        "age": [a for a in scan["age"] if a is not None],
+        "bins": scan["n"][-1] if scan["n"] else None,
+        "finite_last": scan["finite"][-1] if scan["finite"] else None,
+        "finite_total": sum(scan["finite"]),
+        "min_m": min([m for m in scan["min"] if m is not None] or [0]) or None,
+        "frame_id": scan["frame"], "range_max": scan["range_max"],
+    }
+    out["odom"] = {"count": len(S["odom"]["t"]), "t": S["odom"]["t"],
+                   "first": S["odom"]["first"], "last": S["odom"]["last"]}
+    imu = S["imu"]
+    out["imu"] = {
+        "count": len(imu["t"]), "t": imu["t"],
+        "gz_min": min(imu["gz"]) if imu["gz"] else None,
+        "gz_max": max(imu["gz"]) if imu["gz"] else None,
+        "acc_min": min(imu["acc"]) if imu["acc"] else None,
+        "acc_max": max(imu["acc"]) if imu["acc"] else None,
+        "allzero": imu["allzero"],
+    }
+    b = S["battery"]
+    out["battery"] = {
+        "count": len(b["t"]), "t": b["t"], "type": b["type"],
+        "v_min": min(b["v"]) if b["v"] else None,
+        "v_max": max(b["v"]) if b["v"] else None,
+        "v_last": b["v"][-1] if b["v"] else None,
+        "raw_last": b["raw"][-1] if b["raw"] else None,
+    }
+    out["ok"] = True
+    out["stage"] = "done"
+    try:
+        node.destroy_node()
+        rclpy.shutdown()
+    except Exception:
+        pass
+except Exception as exc:
+    out["err"] = "%s: %s" % (type(exc).__name__, exc)
+emit()
+'''
+
+
+def run_probe(window=WINDOW_S, discovery=DISCOVERY_S, scan_topic=SCAN_TOPIC):
+    """Spawn the probe and read its marker line. Its exit code is not evidence."""
+    argv = [sys.executable, "-c", PROBE, str(window), str(discovery), scan_topic]
+    info = {}
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return {"timeout": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"spawn_error": str(exc)}
+    info["stderr_tail"] = (p.stderr or "").strip().splitlines()[-3:]
+    for line in (p.stdout or "").splitlines():
+        if line.startswith(MARKER):
+            try:
+                info["probe"] = json.loads(line[len(MARKER):].strip())
+            except ValueError as exc:
+                info["probe"] = None
+                info["parse_error"] = str(exc)
+            break
+    return info
+
+
+def mqtt_sample(cfg, pw, subtopic, count, wait):
+    """Collect up to `count` JSON payloads from a telemetry topic.
+
+    Returns (payloads, note). The exit status of mosquitto_sub is DELIBERATELY
+    ignored: `-C n -W t` exits non-zero when the wait expires early, which is
+    exactly the run whose partial output we most want to read.
+    """
+    if not pw:
+        return [], "no broker password available"
+    thing = cfg.get("FPMS_THING_NAME", "rover2")
+    topic = "fpms/%s/%s" % (thing, subtopic)
+    rc, out, err = sh(["mosquitto_sub",
+                       "-h", cfg.get("FPMS_MQTT_HOST", "127.0.0.1"),
+                       "-p", str(cfg.get("FPMS_MQTT_PORT", "1883")),
+                       "-u", cfg.get("FPMS_MQTT_USER", "fpms"), "-P", pw,
+                       "-t", topic, "-C", str(count), "-W", str(int(wait))],
+                      timeout=wait + 10)
+    payloads = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            payloads.append(obj)
+    if not payloads:
+        return [], (err.splitlines()[-1] if err else "nothing arrived (rc=%d)" % rc)
+    return payloads, None
+
+
+def payload_hz(payloads):
+    """Rate from the publisher's OWN ts fields.
+
+    Every agent payload carries ts (MqttBus.publish stamps it with setdefault),
+    so differencing them measures the PUBLISHER's cadence and is immune to
+    however long mosquitto_sub took to start and to any clock step in between -
+    both timestamps come from the same clock, and only their difference is
+    used.
+    """
+    ts = sorted(float(p["ts"]) for p in payloads
+                if isinstance(p.get("ts"), (int, float)))
+    if len(ts) < 2:
+        return None
+    span = ts[-1] - ts[0]
+    return ((len(ts) - 1) / span) if span > 0 else None
+
+
+def payload_age(payload):
+    """Age of a payload against the wall clock, or None if it cannot be trusted.
+
+    This board has NO RTC. It boots to the filesystem epoch and NTP steps it by
+    hours a minute later, so an age computed across a step is nonsense in
+    either direction. A future-dated payload is reported as a clock problem
+    rather than as freshness, because calling a healthy sensor stale on the
+    strength of a clock step is precisely the false alarm this file must not
+    raise.
+    """
+    ts = payload.get("ts")
+    if not isinstance(ts, (int, float)):
+        return None
+    return time.time() - float(ts)
+
+
+# --------------------------------------------------------------------------
+# 1. The gate: are we even looking in the right place?
+# --------------------------------------------------------------------------
+def check_env(cfg, cfgnote):
+    src = cfgnote["file"]
+    if src == "file" and not cfgnote["from_env"]:
+        add("config source", PASS, CONFIG)
+    elif src == "file":
+        add("config source", PASS,
+            "%s, with %s from the environment"
+            % (CONFIG, ", ".join(cfgnote["from_env"])))
+    elif cfgnote["from_env"]:
+        add("config source", PASS,
+            "environment (%s); %s %s"
+            % (", ".join(cfgnote["from_env"]), CONFIG, src),
+            "Normal under systemd: EnvironmentFile= is read as root before the "
+            "unit drops to ubuntu, so the values arrive even though the file "
+            "is 0640 root:root. Nothing to fix.")
+    else:
+        add("config source", WARN,
+            "%s %s, and the environment carries nothing either" % (CONFIG, src),
+            "Every value below is a built-in default, including the broker "
+            "credentials, so the MQTT checks will describe THIS process's "
+            "permissions rather than the rover. Run it the way the unit does: "
+            "sudo systemctl start fpms-hwcheck ; journalctl -u fpms-hwcheck "
+            "-b --no-pager")
+
+    gate = None
+    domain = os.environ.get("ROS_DOMAIN_ID")
+    want = cfg.get("FPMS_ROS_DOMAIN_ID", "20")
+    if domain in (None, ""):
+        add("ROS_DOMAIN_ID", WARN, "unset in this environment (assuming 0)",
+            "The ESP32 declares domain %s in its CREATE_PARTICIPANT and "
+            "publishes nowhere else, so on any other domain every topic list "
+            "is empty and looks EXACTLY like dead hardware. Export "
+            "ROS_DOMAIN_ID=%s, or run the unit, which sets it." % (want, want))
+        gate = "ROS_DOMAIN_ID is unset"
+    elif domain != want:
+        add("ROS_DOMAIN_ID", FAIL, "ROS_DOMAIN_ID=%s, expected %s"
+            % (domain, want),
+            "Everything below this line will report silence, and that silence "
+            "is THIS setting, not the hardware. The board's firmware stores "
+            "its own domain and cannot be talked to on another one.")
+        gate = "ROS_DOMAIN_ID=%s, not %s" % (domain, want)
+    else:
+        add("ROS_DOMAIN_ID", PASS, domain)
+
+    prof = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", DDS_PROFILE)
+    if not os.path.exists(prof):
+        add("DDS profile", FAIL, "%s missing" % prof,
+            "Without it Fast DDS prefers shared memory, whose segments do not "
+            "survive across process eras: discovery succeeds and NO DATA "
+            "FLOWS. This tool is a freshly started subscriber talking to "
+            "publishers from an older era - the exact case that fails. See "
+            "/opt/fpms-os/docs/DDS.md")
+        gate = gate or "the DDS profile is missing"
+    else:
+        try:
+            import xml.etree.ElementTree as ET
+            ET.parse(prof)
+            add("DDS profile", PASS, prof)
+        except Exception as exc:  # noqa: BLE001
+            add("DDS profile", FAIL, "%s does not parse: %s" % (prof, exc),
+                "Fast DDS SILENTLY IGNORES a malformed profile and falls back "
+                "to defaults, reintroducing the bug it exists to fix.")
+            gate = gate or "the DDS profile does not parse"
+
+    rmw = os.environ.get("RMW_IMPLEMENTATION")
+    if rmw and rmw != "rmw_fastrtps_cpp":
+        add("RMW implementation", WARN, rmw,
+            "The rest of the stack runs rmw_fastrtps_cpp. Two RMWs on one "
+            "robot do not interoperate, so this process would see an empty "
+            "graph and report the hardware dead.")
+    return gate
+
+
+# --------------------------------------------------------------------------
+# 2. How long has the micro-ROS link had? (the "not up yet" question)
+# --------------------------------------------------------------------------
+def link_state():
+    """Seconds since micro-ros-agent last entered active, on the MONOTONIC clock.
+
+    Wall clock is unusable here: this board has no RTC backup battery, boots to
+    the filesystem epoch and gets stepped by NTP a minute later, so a wall-clock
+    age would be off by hours at exactly the moment this runs. systemd's
+    ActiveEnterTimestampMonotonic and /proc/uptime are both measured from boot,
+    so their difference is meaningful even while the wall clock is nonsense.
+    """
+    st = {"active": None, "sub": None, "age_s": None}
+    rc, out, _ = sh(["systemctl", "show", "micro-ros-agent.service",
+                     "--no-pager", "-p", "ActiveState", "-p", "SubState",
+                     "-p", "ActiveEnterTimestampMonotonic"], timeout=15)
+    props = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k.strip()] = v.strip()
+    st["active"] = props.get("ActiveState")
+    st["sub"] = props.get("SubState")
+    try:
+        entered = int(props.get("ActiveEnterTimestampMonotonic", "0")) / 1e6
+    except ValueError:
+        entered = 0.0
+    if entered > 0:
+        try:
+            with open("/proc/uptime") as fh:
+                uptime = float(fh.read().split()[0])
+            st["age_s"] = max(0.0, uptime - entered)
+        except (OSError, ValueError, IndexError):
+            st["age_s"] = None
+    return st
+
+
+def check_link(link):
+    if link["active"] is None:
+        add("micro-ROS agent", SKIP, "systemctl did not answer",
+            "Not a hardware verdict. Without it, 'the drive board is silent' "
+            "cannot be separated from 'the agent is not running', so the drive "
+            "checks below fall back to the raw topic evidence.")
+        return
+    if link["active"] != "active":
+        add("micro-ROS agent", FAIL,
+            "micro-ros-agent is %s (%s)" % (link["active"], link["sub"]),
+            "Nothing from the drive board can arrive without it. Note that "
+            "starting it does not give you a link immediately - the board "
+            "takes 90-225 s to re-establish, unaided, and no reset-button "
+            "press is needed or helpful. Start it and WAIT: sudo systemctl "
+            "start micro-ros-agent ; journalctl -u micro-ros-agent -b "
+            "--no-pager | tail -40")
+        return
+    age = link["age_s"]
+    if age is None:
+        add("micro-ROS agent", PASS, "active (age unknown)")
+    elif age < LINK_COLD_MIN_S:
+        add("micro-ROS agent", PASS,
+            "active for %.0f s - below the %.0f s minimum re-link time"
+            % (age, LINK_COLD_MIN_S),
+            "This is context, not a fault. The board self-reconnects unaided "
+            "in 90-225 s after any agent restart, so drive-board silence right "
+            "now means nothing at all yet.")
+    elif age < LINK_COLD_MAX_S:
+        add("micro-ROS agent", PASS,
+            "active for %.0f s - inside the %.0f-%.0f s re-link window"
+            % (age, LINK_COLD_MIN_S, LINK_COLD_MAX_S))
+    else:
+        add("micro-ROS agent", PASS,
+            "active for %.0f s - past the %.0f s re-link ceiling"
+            % (age, LINK_COLD_MAX_S))
+
+
+# --------------------------------------------------------------------------
+# 3. Serial topology - WITHOUT opening anything
+# --------------------------------------------------------------------------
+def holders_of(path):
+    """Which processes hold this tty, read from /proc. We never open it.
+
+    Opening the drive tty raises the handshake lines wired to EN/IO0 and RESETS
+    the ESP32, costing a 90-225 second re-link. A health check that costs four
+    minutes of downtime to run is not a health check. /proc/<pid>/fd answers
+    the same question for free.
+    """
+    real = os.path.realpath(path)
+    found = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            for fd in os.listdir("/proc/%s/fd" % pid):
+                if os.path.realpath("/proc/%s/fd/%s" % (pid, fd)) == real:
+                    with open("/proc/%s/comm" % pid) as fh:
+                        found.append(fh.read().strip())
+                    break
+        except OSError:
+            continue
+    return sorted(set(found))
+
+
+def check_ports():
+    for path, label, expect in (
+            (DRIVE_PORT, "drive board port", "micro-ros-agent"),
+            (LIDAR_PORT, "LiDAR port", "fpms-rover-agent")):
+        if not os.path.exists(path):
+            add("%s owner" % label, FAIL, "%s does not exist" % path,
+                "Both CP2102s report ID_SERIAL 0001, so only the USB topology "
+                "path tells them apart and binding wrong sends motor frames "
+                "into the laser scanner. Check: ls -l /dev/serial/by-path/ - "
+                "and do NOT try the other port to see if that is it.")
+            continue
+        held = holders_of(path)
+        if held is None:
+            add("%s owner" % label, SKIP, "/proc is not readable here")
+        elif held:
+            add("%s owner" % label, PASS, ", ".join(held))
+        else:
+            add("%s owner" % label, WARN, "nobody holds %s" % path,
+                "%s should. An unheld port is not proof of a fault - the "
+                "holder may be mid-restart - but a device nobody has open is "
+                "producing nothing. systemctl status %s" % (expect, expect))
+
+
+# --------------------------------------------------------------------------
+# 4. LiDAR, over MQTT: is the SCANNER fresh? (the only place that can say)
+# --------------------------------------------------------------------------
+def check_lidar_scanner(cfg, payloads, note):
+    """health / stale / seq from telemetry/lidar.
+
+    The payload is published ON A TIMER, whether or not there is data behind
+    it, so that a dead scanner is a DECLARED FAULT rather than silence the
+    dashboard renders as a frozen last frame. The cost of that guarantee is
+    that ARRIVAL DOES NOT IMPLY FRESHNESS, and this is the check that says so.
+
+    seq is what separates the two faults that used to be indistinguishable:
+        seq CLIMBING + stale:true  ->  THE SCANNER is at fault
+        seq FROZEN                 ->  THE PROCESS is at fault
+    They need completely different fixes.
+    """
+    verdict = {"ok": False, "stale": None, "seq_advancing": None, "hz": None}
+    if not payloads:
+        add("LiDAR scanner health", SKIP if note and "password" in note else FAIL,
+            "nothing on telemetry/lidar (%s)" % (note or "timed out"),
+            "If the broker is up and this is not a credentials problem, "
+            "fpms-rover-agent is not publishing at all - which is a different "
+            "fault from a dead scanner, because the agent publishes on a timer "
+            "even when the scanner is dead. journalctl -u fpms-rover-agent -b "
+            "--no-pager | tail -40")
+        return verdict
+
+    latest = payloads[-1]
+    seqs = [p["seq"] for p in payloads if isinstance(p.get("seq"), int)]
+    advancing = (len(seqs) >= 2 and seqs[-1] > seqs[0]) if seqs else None
+    stale = latest.get("stale")
+    health = latest.get("health", "?")
+    points = latest.get("points")
+    hz = latest.get("hz")
+    rate = payload_hz(payloads)
+    verdict.update({"stale": stale, "seq_advancing": advancing, "hz": hz,
+                    "arrival_hz": rate, "health": health, "points": points})
+
+    shown = "health=%s hz=%s stale=%s seq=%s points=%s" % (
+        health, hz, stale, (seqs[-1] if seqs else "absent"), points)
+
+    if stale is True:
+        if advancing is True:
+            add("LiDAR scanner health", FAIL,
+                "%s (seq is CLIMBING)" % shown,
+                "THE SCANNER IS AT FAULT, not the agent process: seq is "
+                "advancing, so the loop is running and getting nothing back. "
+                "Check that nothing else opened the tty (only one process may "
+                "hold it), and check the baud: sudo lsof %s ; ls -l "
+                "/dev/serial/by-path/. Do NOT open the other port to compare - "
+                "it is the drive board and opening it resets the ESP32."
+                % LIDAR_PORT)
+        elif advancing is False:
+            add("LiDAR scanner health", FAIL,
+                "%s (seq is FROZEN)" % shown,
+                "THE PROCESS IS AT FAULT, not the scanner: the publish timer "
+                "is still firing but the scan loop has stopped advancing seq. "
+                "systemd will never restart this, because the unit is "
+                "perfectly active. sudo systemctl restart fpms-rover-agent ; "
+                "journalctl -u fpms-rover-agent -b --no-pager | tail -40")
+        else:
+            add("LiDAR scanner health", FAIL,
+                "%s (no seq field in this payload)" % shown,
+                "The scanner is declared stale, but this agent predates the "
+                "seq field, so scanner-at-fault and process-at-fault cannot be "
+                "told apart from here - which is the state that made this "
+                "failure so expensive the first time. Upgrade the agent, then "
+                "re-run. Meanwhile: fpms-doctor no-lidar")
+        return verdict
+
+    if advancing is False and len(seqs) >= 3:
+        add("LiDAR scanner health", FAIL,
+            "%s (seq FROZEN across %d payloads)" % (shown, len(seqs)),
+            "The timer is publishing and the scan loop is not advancing. "
+            "stale is not set, so nothing downstream will refuse this data - "
+            "the last scan will simply be repeated as though it were current. "
+            "sudo systemctl restart fpms-rover-agent")
+        return verdict
+
+    if points == 0:
+        add("LiDAR scanner health", FAIL,
+            "%s - zero points in the newest scan" % shown,
+            "A scan with no returns at all, not declared stale. Its ranges are "
+            "all zero, and zero converts to inf downstream - a CONFIDENT, "
+            "COMPLETELY CLEAR 360 DEGREES. That is the single most dangerous "
+            "reading of a broken sensor. fpms-doctor no-lidar")
+        return verdict
+
+    if stale is None and not seqs:
+        add("LiDAR scanner health", WARN,
+            "%s - no stale/seq fields" % shown,
+            "This agent predates the stale contract, so nothing here can tell "
+            "a fresh scan from a dead scanner's all-zero one, and fpms_lidar_ros "
+            "treats a missing 'stale' as fresh in order to keep working against "
+            "exactly this agent. The all-zero-to-inf trap is therefore LIVE; "
+            "the /scan_lidar returns check below is the only thing standing in "
+            "front of it. Upgrade fpms-rover-agent.")
+        verdict["ok"] = True
+        return verdict
+
+    if health == "ok" or (isinstance(hz, (int, float)) and float(hz) > 1.0):
+        detail = shown
+        if rate:
+            detail += " (arriving %.1f/s)" % rate
+        add("LiDAR scanner health", PASS, detail)
+        verdict["ok"] = True
+    else:
+        add("LiDAR scanner health", WARN, shown,
+            "Not declared stale and not declared healthy either. Read the "
+            "agent's journal before trusting a scan: journalctl -u "
+            "fpms-rover-agent -b --no-pager | tail -40")
+    return verdict
+
+
+# --------------------------------------------------------------------------
+# 5. LiDAR, over ROS: does a fresh subscriber actually receive scans?
+# --------------------------------------------------------------------------
+def check_lidar_ros(probe, scanner, gate):
+    if probe is None:
+        return {"ok": False}
+    scan = probe.get("scan") or {}
+    n = scan.get("count", 0)
+    window = probe.get("window_s") or WINDOW_S
+    hz, how = hz_from(scan.get("t") or [], window)
+    out = {"ok": False, "hz": hz, "count": n}
+
+    if n == 0:
+        # Silence has THREE causes here and they are not interchangeable.
+        if scanner.get("stale") is True:
+            add("%s arriving" % SCAN_TOPIC, WARN,
+                "no scans in %.0f s - and the scanner is declared stale"
+                % window,
+                "THIS IS CORRECT BEHAVIOUR, not a second fault. fpms_lidar_ros "
+                "DROPS a stale payload instead of republishing it, precisely "
+                "because a stale scan renders as clear space and absence does "
+                "not. Fix the scanner fault named above and the topic comes "
+                "back on its own.")
+        elif gate:
+            add("%s arriving" % SCAN_TOPIC, FAIL,
+                "no scans in %.0f s - but %s" % (window, gate),
+                "Fix the gate first. Silence caused by looking on the wrong "
+                "domain or without the DDS profile is not evidence about the "
+                "LiDAR.")
+        elif scanner.get("ok"):
+            add("%s arriving" % SCAN_TOPIC, FAIL,
+                "no scans in %.0f s, while telemetry/lidar is healthy" % window,
+                "THIS IS THE SILENT ONE. Data is reaching MQTT and not "
+                "crossing DDS to a freshly started subscriber, which is the "
+                "shared-memory-across-eras bug: connected, subscribed, silent, "
+                "no error anywhere. `ros2 topic info` will report Publisher "
+                "count: 1 either way, because discovery was never the broken "
+                "part. Confirm FASTRTPS_DEFAULT_PROFILES_FILE is set in the "
+                "UNIT and not merely in your shell: systemctl show "
+                "fpms-lidar-ros -p Environment. See /opt/fpms-os/docs/DDS.md")
+        else:
+            add("%s arriving" % SCAN_TOPIC, FAIL,
+                "no scans in %.0f s" % window,
+                "Start from the scanner verdict above: nothing can reach this "
+                "topic that did not first reach telemetry/lidar. "
+                "fpms-doctor no-lidar")
+        return out
+
+    nominal = 10.0
+    ok = band(hz, nominal)
+    detail = "%d scans in %.0f s, %s%s" % (
+        n, window, ("%.1f Hz" % hz) if hz else "rate unknown",
+        "" if how == "measured" else " [%s]" % how)
+    if ok is False:
+        add("%s arriving" % SCAN_TOPIC, WARN, detail,
+            "Nominal is about %.0f Hz and the agent's own journal has reported "
+            "9.55-9.8 Hz when healthy. It measured 2.37 Hz once, when the feed "
+            "was made to take a WiFi round trip - if this is low, ask what got "
+            "between the scanner and the bridge." % nominal)
+    else:
+        add("%s arriving" % SCAN_TOPIC, PASS, detail)
+        out["ok"] = True
+
+    ages = scan.get("age") or []
+    if not ages:
+        add("%s fresh" % SCAN_TOPIC, SKIP, "no usable header stamps")
+    else:
+        worst = max(ages)
+        if worst > SCAN_STAMP_MAX_AGE_S:
+            add("%s fresh" % SCAN_TOPIC, FAIL,
+                "worst header stamp age %.2f s" % worst,
+                "Something is re-serving an old scan. Nav2 must see a scan "
+                "STOP, never a frozen world it will happily keep planning in.")
+        elif worst < -1.0:
+            add("%s fresh" % SCAN_TOPIC, WARN,
+                "header stamps are %.1f s in the FUTURE" % (-worst),
+                "That is a clock event, not a sensor fault: this board has no "
+                "RTC and NTP steps it by hours shortly after boot. Re-run once "
+                "the clock has settled; check systemd-timesyncd.")
+        else:
+            add("%s fresh" % SCAN_TOPIC, PASS,
+                "worst header stamp age %.0f ms" % (worst * 1000.0),
+                "")
+
+    bins = scan.get("bins")
+    finite = scan.get("finite_last")
+    if bins:
+        if finite == 0:
+            add("%s has real returns" % SCAN_TOPIC, FAIL,
+                "0 of %d bearings returned anything" % bins,
+                "A COMPLETELY CLEAR 360 DEGREES. A dead scanner's ranges are "
+                "all zero and zero converts to inf - 'no return in that "
+                "direction' - so this is what a broken sensor looks like when "
+                "it is trusted, and Nav2 and every cone guard read it as "
+                "positive evidence of open space. Confirm against the scanner "
+                "verdict above before believing the room is empty; a genuinely "
+                "vast open space reads the same way, which is exactly why this "
+                "cannot be the only check.")
+        elif bins != 360:
+            add("%s has real returns" % SCAN_TOPIC, WARN,
+                "%d of %d bearings returned (expected 360 bins)" % (finite, bins),
+                "The geometry downstream assumes 360 one-degree bins, so "
+                "another length silently rotates or squashes every scan. Check "
+                "BINS in fpms-rover-agent.")
+        else:
+            add("%s has real returns" % SCAN_TOPIC, PASS,
+                "%d of %d bearings returned, nearest %s"
+                % (finite, bins,
+                   ("%.2f m" % scan["min_m"]) if scan.get("min_m") else "n/a"))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 6. Camera
+# --------------------------------------------------------------------------
+def check_camera(cfg, payloads, note):
+    out = {"ok": False}
+    if not payloads:
+        add("camera frames arriving", SKIP if note and "password" in note else FAIL,
+            "nothing on telemetry/camera (%s)" % (note or "timed out"),
+            "The agent's camera loop is the same loop that feeds the fire "
+            "detector, so a silent camera is not only a blind dashboard. "
+            "Check the device is claimed: journalctl -u fpms-rover-agent -b "
+            "--no-pager | grep -i camera")
+        return out
+
+    latest = payloads[-1]
+    fps = payload_hz(payloads)
+    try:
+        want = float(cfg.get("FPMS_CAMERA_FPS", "6") or 6)
+    except ValueError:
+        want = 6.0
+    w = latest.get("width")
+    h = latest.get("height")
+    frame = latest.get("frame") or ""
+    # base64 is 4 characters per 3 bytes; we do not decode it. Decoding a JPEG
+    # at boot would drag cv2 into a check whose whole point is to be cheap.
+    approx_bytes = int(len(frame) * 3 / 4)
+    age = payload_age(latest)
+    out.update({"fps": fps, "width": w, "height": h, "bytes": approx_bytes,
+                "age_s": age})
+
+    detail = "%s%s, %d frame(s) sampled" % (
+        ("%.1f fps" % fps) if fps else "rate unknown",
+        "" if not want else " (configured %.0f)" % want, len(payloads))
+    if fps and fps > CAMERA_HW_MAX_FPS:
+        add("camera frames arriving", FAIL, detail,
+            "The sensor caps at 30.000 fps in hardware at every resolution - "
+            "that is its USB descriptor, not a software limit - so a higher "
+            "rate is two publishers on the topic or a replay, not a fast "
+            "camera.")
+    elif fps and fps < 0.5 * want:
+        add("camera frames arriving", WARN, detail,
+            "Well under the configured rate. 6 fps at quality 40 is "
+            "DELIBERATE: higher settings saturated the WiFi link and starved "
+            "the LiDAR feed. If this is low, the loop is being starved rather "
+            "than throttled - check CPU and the NPU path.")
+    elif fps is None:
+        add("camera frames arriving", WARN, detail,
+            "Only one payload arrived, so no rate could be measured. That is "
+            "not a fault by itself; re-run for a second opinion.")
+    else:
+        add("camera frames arriving", PASS, detail)
+        out["ok"] = True
+
+    if age is None:
+        add("camera frame plausible", WARN,
+            "%sx%s, ~%d KB, payload carries no ts" % (w, h, approx_bytes // 1024),
+            "Arrival is not freshness. Without a timestamp a frozen camera "
+            "loop and a healthy one are indistinguishable - the same trap the "
+            "LiDAR's seq field exists to close.")
+        return out
+    if age < -2.0:
+        add("camera frame plausible", WARN,
+            "%sx%s, ~%d KB, timestamped %.0f s in the FUTURE"
+            % (w, h, approx_bytes // 1024, -age),
+            "A clock event, not a camera fault: no RTC on this board, and NTP "
+            "steps the clock shortly after boot. Re-run once it settles.")
+        return out
+
+    size_bad = not (isinstance(w, int) and isinstance(h, int)
+                    and 0 < w <= 1920 and 0 < h <= 1080)
+    if size_bad:
+        add("camera frame plausible", FAIL,
+            "frame size %sx%s" % (w, h),
+            "The sensor's descriptor offers 1920x1080, 1280x720 and 640x480. "
+            "A missing or impossible size means the payload is not a frame "
+            "this stack produced.")
+    elif age > 10.0:
+        add("camera frame plausible", FAIL,
+            "%dx%d, ~%d KB, but %.0f s old" % (w, h, approx_bytes // 1024, age),
+            "Stale frames from a running agent mean the camera loop is wedged, "
+            "not dead - and systemd will never restart it, because the unit is "
+            "active. sudo systemctl restart fpms-rover-agent")
+    elif approx_bytes < 1000:
+        add("camera frame plausible", WARN,
+            "%dx%d, only ~%d bytes of JPEG, %.1f s old"
+            % (w, h, approx_bytes, age),
+            "A JPEG this small at quality 40 is almost certainly a blank or "
+            "black frame - a lens cap, a dark room, or a sensor returning "
+            "nothing. This is a heuristic on payload size; we deliberately do "
+            "not decode the image here. Look at the stream before a run.")
+    else:
+        add("camera frame plausible", PASS,
+            "%dx%d, ~%d KB, %.1f s old" % (w, h, approx_bytes // 1024, age))
+        out["ok"] = out["ok"] and True
+    return out
+
+
+# --------------------------------------------------------------------------
+# 7. The ESP32 drive board
+# --------------------------------------------------------------------------
+def check_drive(probe, link, gate):
+    """/odom_raw, /imu and /battery on domain 20 - and 'not up yet' vs 'failed'.
+
+    The distinction is the whole point. A drive board that has been silent for
+    40 seconds after an agent restart is BEHAVING NORMALLY; the same silence at
+    six minutes is a fault. Reporting the first as a failure every boot is how
+    an alarm becomes something an operator learns to skip past.
+    """
+    out = {"ok": False, "state": "unknown"}
+    if probe is None:
+        add("drive board link", SKIP, "the ROS probe did not run")
+        return out
+
+    counts = {t: (probe.get(k) or {}).get("count", 0)
+              for t, k in (("/odom_raw", "odom"), ("/imu", "imu"),
+                           ("/battery", "battery"))}
+    window = probe.get("window_s") or WINDOW_S
+    age = link.get("age_s")
+    silent = sum(counts.values()) == 0
+
+    if silent:
+        if link.get("active") not in (None, "active"):
+            out["state"] = "down"
+            add("drive board link", FAIL,
+                "no /odom_raw, /imu or /battery in %.0f s; micro-ros-agent is %s"
+                % (window, link["active"]),
+                "The agent is not running, so there is nothing to wait for. "
+                "See the micro-ROS agent check above.")
+        elif gate:
+            out["state"] = "unknown"
+            add("drive board link", FAIL,
+                "silent for %.0f s - but %s" % (window, gate),
+                "Fix the gate first. The board declares domain 20 in its "
+                "CREATE_PARTICIPANT and publishes nowhere else, so on the "
+                "wrong domain a perfectly healthy board is invisible.")
+        elif age is not None and age < LINK_COLD_MAX_S:
+            out["state"] = "not_up_yet"
+            add("drive board link", WARN,
+                "NOT UP YET: silent, but micro-ros-agent has only been up "
+                "%.0f s of the %.0f-%.0f s cold re-link window"
+                % (age, LINK_COLD_MIN_S, LINK_COLD_MAX_S),
+                "THIS IS NOT A FAILURE. The board self-reconnects unaided in "
+                "90-225 s after any agent restart; no reset-button press is "
+                "needed or helpful, and restarting the agent makes it WORSE by "
+                "starting the clock again. Wait about %.0f s and re-run: "
+                "fpms-hwcheck" % max(0.0, LINK_COLD_MAX_S - age))
+        else:
+            out["state"] = "down"
+            add("drive board link", FAIL,
+                "silent for %.0f s%s" % (
+                    window,
+                    "" if age is None else
+                    "; micro-ros-agent has been up %.0f s, past the %.0f s "
+                    "ceiling" % (age, LINK_COLD_MAX_S)),
+                "The link has had its full cold window and is carrying no "
+                "data. Check the baud FIRST - a mismatch does not error, the "
+                "agent runs happily and never establishes a session, which is "
+                "indistinguishable from a dead board: grep FPMS_UROS_BAUD "
+                "/etc/fpms/config.env (230400 for FPMS firmware v3, 921600 for "
+                "Yahboom factory). Then: journalctl -u micro-ros-agent -b "
+                "--no-pager | tail -40. Do NOT open the tty to test it - that "
+                "resets the ESP32 and costs another 90-225 s.")
+        for topic in DRIVE_TOPICS:
+            add("%s rate" % topic, SKIP, "no messages")
+        return out
+
+    partial = [t for t, c in counts.items() if c == 0]
+    if partial:
+        out["state"] = "partial"
+        add("drive board link", FAIL,
+            "the link is live but %s produced nothing in %.0f s"
+            % (", ".join(partial), window),
+            "This is NOT a link problem - other topics from the same board "
+            "arrived. A single silent topic on a live session is a TYPE or a "
+            "QoS mismatch, and it fails silently by design: the topic still "
+            "lists a publisher and the value simply stays None. See the type "
+            "check below, and ros2 topic info %s -v" % partial[0])
+    else:
+        out["state"] = "up"
+        out["ok"] = True
+        add("drive board link", PASS,
+            "live: all three drive topics produced data in %.0f s" % window)
+
+    for topic, key in (("/odom_raw", "odom"), ("/imu", "imu"),
+                       ("/battery", "battery")):
+        d = probe.get(key) or {}
+        n = d.get("count", 0)
+        if n == 0:
+            add("%s rate" % topic, FAIL, "no messages in %.0f s" % window)
+            continue
+        hz, how = hz_from(d.get("t") or [], window)
+        out["%s_hz" % key] = hz
+        detail = "%s (nominal %.1f Hz, %d msg%s)%s" % (
+            ("%.1f Hz" % hz) if hz else "rate unknown", NOMINAL[topic], n,
+            "" if n == 1 else "s", "" if how == "measured" else " [%s]" % how)
+        ok = band(hz, NOMINAL[topic])
+        if ok is False:
+            add("%s rate" % topic, WARN, detail,
+                "Off nominal by more than a factor of two. The nominal rates "
+                "were measured on this board (CLAUDE.md); a rate this far out "
+                "usually means the serial link is saturated or the session is "
+                "half-established rather than that the sensor changed.")
+        else:
+            add("%s rate" % topic, PASS, detail)
+
+    # Pose, PASSIVELY. A parked rover must read zero here, and that is a PASS.
+    odom = probe.get("odom") or {}
+    if odom.get("first") and odom.get("last"):
+        dx = odom["last"][0] - odom["first"][0]
+        dy = odom["last"][1] - odom["first"][1]
+        out["pose_delta_m"] = math.sqrt(dx * dx + dy * dy)
+
+    imu = probe.get("imu") or {}
+    if imu.get("count"):
+        gz_lo, gz_hi = imu.get("gz_min"), imu.get("gz_max")
+        acc_hi = imu.get("acc_max")
+        if imu.get("allzero") == imu.get("count"):
+            add("IMU is producing values", WARN,
+                "every field of every one of %d messages is exactly 0.0"
+                % imu["count"],
+                "Read this carefully before chasing it: a HEALTHY gyro on this "
+                "board reads exactly 0.0 while parked, because of a "
+                "+/-0.01 rad/s deadband - a zero gyro is NOT evidence of a "
+                "fault and has been re-opened as a bug before on exactly that "
+                "misreading. Linear acceleration is the part that should not "
+                "be zero: gravity alone is about 9.8 m/s2 on some axis. All "
+                "six channels at exactly zero suggests the message is being "
+                "filled with defaults rather than sampled.")
+        elif acc_hi is not None and 5.0 <= acc_hi <= 15.0:
+            add("IMU is producing values", PASS,
+                "|accel| up to %.1f m/s2, gyro z in [%.3f, %.3f] rad/s"
+                % (acc_hi, gz_lo, gz_hi))
+        else:
+            add("IMU is producing values", WARN,
+                "|accel| up to %s m/s2, gyro z in [%s, %s] rad/s"
+                % (acc_hi, gz_lo, gz_hi),
+                "Gravity should put |accel| near 9.8 m/s2 on a stationary "
+                "rover. MEASURE ME: the firmware's accelerometer scaling has "
+                "never been written down in this repo, so this is a "
+                "plausibility remark and not a calibration. Note that "
+                "orientation is NOT fused on this board (identity quaternion) "
+                "- heading comes from integrating angular_velocity.z - so "
+                "there is nothing to check there.")
+
+    bat = probe.get("battery") or {}
+    if bat.get("count"):
+        v = bat.get("v_last")
+        raw = bat.get("raw_last")
+        btype = bat.get("type")
+        out["battery_v"] = v
+        lo, hi = BATT_PLAUSIBLE_V
+        if v == 0.0:
+            add("battery reading", WARN,
+                "0.0 V (%s, raw %s)" % (btype, raw),
+                "0.0 V is what the WRONG PROTOCOL reports, not what a flat "
+                "pack reports - Rosmaster_Lib over direct serial returns "
+                "version=-1, battery 0.0 V and all-zero encoders on this "
+                "board. Check what is actually publishing before replacing a "
+                "battery: ros2 topic info /battery -v")
+        elif lo <= v <= hi:
+            add("battery reading", PASS, "%.1f V (%s)" % (v, btype))
+        elif lo * 10 <= v <= hi * 10:
+            add("battery reading", FAIL,
+                "%.1f V (%s) - that is DECIVOLTS in a volts field" % (v, btype),
+                "The units have flipped between the two conventions three "
+                "times. UInt16 carries DECIVOLTS and must be divided by 10; "
+                "BatteryState carries VOLTS. Everything downstream that "
+                "renders a battery gauge is now off by 10x.")
+        elif lo / 10.0 <= v <= hi / 10.0:
+            add("battery reading", FAIL,
+                "%.1f V (%s) - that is VOLTS in a decivolts field" % (v, btype),
+                "The units have flipped between the two conventions three "
+                "times. The publisher is sending volts where the consumer "
+                "divides by 10, so the dashboard reads about a tenth of the "
+                "real pack voltage and a full pack looks critically flat.")
+        else:
+            add("battery reading", WARN,
+                "%.2f V (%s, raw %s)" % (v, btype, raw),
+                "Outside the %.0f-%.0f V envelope this check assumes. That "
+                "envelope is ASSUMED, not measured - the pack chemistry is "
+                "written down nowhere in this repo - so confirm with a "
+                "multimeter rather than trusting either number."
+                % (lo, hi))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 8. Do the endpoints on each topic actually agree?
+# --------------------------------------------------------------------------
+def check_endpoints(probe):
+    """The silent no-match: right topic, wrong type or incompatible QoS.
+
+    /battery has flipped between std_msgs/UInt16 and sensor_msgs/BatteryState
+    three times. A wrong type matches NOTHING and does so silently - the topic
+    still lists a publisher, `ros2 topic list` still shows it, and the consumer
+    simply never receives. It presented as "the dashboard shows no battery"
+    both times, and nothing in the system said a word.
+    """
+    if probe is None:
+        return
+    eps = probe.get("endpoints")
+    if not eps:
+        add("topic types and QoS agree", SKIP, "no endpoint information",
+            "rclpy's get_publishers_info_by_topic did not answer. Fall back "
+            "to: ros2 topic info /battery -v")
+        return
+
+    problems, seen = [], 0
+    for topic, info in sorted(eps.items()):
+        if not isinstance(info, dict) or "publishers" not in info:
+            continue
+        pubs, subs = info["publishers"], info["subscribers"]
+        if not pubs or not subs:
+            continue
+        seen += 1
+        ptypes = {p["type"] for p in pubs}
+        stypes = {s["type"] for s in subs}
+        if ptypes - stypes:
+            problems.append("%s: published as %s, subscribed as %s"
+                            % (topic, "/".join(sorted(ptypes)),
+                               "/".join(sorted(stypes))))
+        # BEST_EFFORT publisher + RELIABLE subscriber is the one incompatible
+        # pairing. The reverse matches fine.
+        if any(p.get("reliability") == "BEST_EFFORT" for p in pubs) and \
+                any(s.get("reliability") == "RELIABLE" for s in subs):
+            problems.append("%s: BEST_EFFORT publisher, RELIABLE subscriber"
+                            % topic)
+
+    if problems:
+        add("topic types and QoS agree", FAIL, "; ".join(problems),
+            "A mismatch on either axis matches NOTHING and says nothing: the "
+            "topic still lists a publisher and looks alive, and the value just "
+            "stays None forever. /battery has flipped type three times "
+            "(UInt16 decivolts vs BatteryState volts) and presented as 'the "
+            "dashboard shows no battery' each time. Fix the SUBSCRIBER to "
+            "match the board - the firmware is the authority. "
+            "ros2 topic info <topic> -v")
+    elif seen:
+        add("topic types and QoS agree", PASS,
+            "%d topic(s) with both ends present, all compatible" % seen)
+    else:
+        add("topic types and QoS agree", SKIP,
+            "no topic had both a publisher and another subscriber",
+            "Nothing to compare yet. This check needs the real consumers "
+            "(fpms-teleop, fpms-odom-tf, fpms-missions) to be running.")
+
+
+def check_no_actuation(probe):
+    """We publish nothing. Verified from the graph, not asserted in a comment."""
+    if probe is None:
+        add("nothing was actuated", SKIP, "the ROS probe did not run")
+        return
+    own = probe.get("own_publishers")
+    if own is None:
+        add("nothing was actuated", WARN,
+            "the graph would not say which topics the probe published",
+            "The probe contains no create_publisher call, so this is a "
+            "missing confirmation rather than a positive finding. Confirm by "
+            "reading the PROBE constant in this file.")
+        return
+    allowed = {"/rosout", "/parameter_events"}
+    extra = [t for t in own if t not in allowed]
+    if extra:
+        add("nothing was actuated", FAIL,
+            "the probe published on %s" % ", ".join(extra),
+            "STOP AND READ THIS FILE. This tool must publish NOTHING but "
+            "rclpy's own two topics. Anything else means a code change put a "
+            "writer on the robot's graph inside a health check.")
+    elif own:
+        add("nothing was actuated", PASS,
+            "only rclpy's own topics (%s)" % ", ".join(sorted(own)))
+    else:
+        add("nothing was actuated", PASS, "no publishers at all")
+
+
+# --------------------------------------------------------------------------
+def publish_health(cfg, pw, summary):
+    """Best-effort. A health check a broker can block is not a health check.
+
+    NOTE the topic is SHARED. fpms-cored republishes telemetry/health about
+    every 10 s with its own unit list, and fpms-selftest publishes there at
+    boot too, so this verdict is the newest one only briefly. That is why
+    /var/lib/fpms/hwcheck.json is the durable copy and why this payload carries
+    both svc and source: a consumer must be able to tell whose health it is
+    reading.
+    """
+    if not pw:
+        return
+    try:
+        topic = "fpms/%s/telemetry/health" % cfg.get("FPMS_THING_NAME", "rover2")
+        sh(["mosquitto_pub", "-h", cfg.get("FPMS_MQTT_HOST", "127.0.0.1"),
+            "-p", str(cfg.get("FPMS_MQTT_PORT", "1883")),
+            "-u", cfg.get("FPMS_MQTT_USER", "fpms"), "-P", pw,
+            "-t", topic, "-q", "1", "-m", json.dumps(summary)], timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wrap(text, width):
+    words, line, out = text.split(), "", []
+    for w in words:
+        if len(line) + len(w) + 1 > width:
+            out.append(line)
+            line = w
+        else:
+            line = (line + " " + w).strip()
+    if line:
+        out.append(line)
+    return out
+
+
+USAGE = """fpms-hwcheck - are the LiDAR, the camera and the drive board
+                producing data, over ROS, right now?
+
+    fpms-hwcheck              human-readable report
+    fpms-hwcheck --json       machine-readable
+    fpms-hwcheck --quiet      exit code only
+    fpms-hwcheck --boot       also publish to telemetry/health
+
+Exit: 0 all pass, 1 one or more WARN, 2 one or more FAIL.
+
+It never moves the rover, never turn-tests for liveness, and never opens the
+drive board's tty. Start with fpms-selftest; this is the deeper, ROS-level
+check that the devices are actually PRODUCING DATA. Then: fpms-doctor."""
+
+
+def main():
+    args = set(sys.argv[1:])
+    if "--help" in args or "-h" in args:
+        print(USAGE)
+        return 0
+
+    cfg, cfgnote = load_config()
+    pw, pwsrc = broker_password(cfg)
+    if pwsrc == "placeholder":
+        add("broker password", WARN,
+            "FPMS_MQTT_PASS is still the image placeholder",
+            "First boot did not complete, so every MQTT check below is about "
+            "credentials rather than hardware and is skipped. fpms-selftest "
+            "reports this as a FAIL, which is the right place for it. Run: "
+            "sudo fpms-firstboot --force")
+    elif pwsrc == "unavailable":
+        add("broker password", WARN,
+            "no broker password from config.env, the environment or %s"
+            % BROKER_PASSWORD_FILE,
+            "The MQTT-side checks are SKIPPED rather than failed: an "
+            "authentication failure we caused is not a hardware fault, and "
+            "reporting it as one is how a report becomes wallpaper. Run it as "
+            "the unit does, or as root.")
+
+    gate = check_env(cfg, cfgnote)
+    link = link_state()
+    check_link(link)
+    check_ports()
+
+    # Collect everything BEFORE reporting, so the checks can cross-reference
+    # each other. The LiDAR verdict in particular is only correct when the MQTT
+    # and the ROS evidence are read together: /scan_lidar going silent is a
+    # FAULT when the scanner is healthy and CORRECT BEHAVIOUR when it is not.
+    lidar_payloads, lnote = mqtt_sample(cfg, pw, "telemetry/lidar", 4, 12)
+    cam_payloads, cnote = mqtt_sample(cfg, pw, "telemetry/camera", 3, 12)
+    info = run_probe()
+    probe = info.get("probe")
+
+    if probe is None:
+        if info.get("timeout"):
+            add("ROS probe", FAIL,
+                "the probe did not finish within %d s" % PROBE_TIMEOUT_S,
+                "A wedged rclpy spin, which is worse than a failed one. It "
+                "runs out of process precisely so that it cannot take this "
+                "report down with it. Check dmesg and whether the DDS "
+                "discovery traffic is being answered.")
+        else:
+            tail = "; ".join(info.get("stderr_tail") or []) or "no output"
+            add("ROS probe", SKIP, "the probe produced no result: %s" % tail[:160],
+                "Usually means the ROS environment is not sourced in this "
+                "shell. Every ROS check below is skipped rather than failed, "
+                "because this says nothing about the hardware. Run: source "
+                "/opt/ros/humble/setup.bash && fpms-hwcheck")
+    elif not probe.get("ok"):
+        add("ROS probe", SKIP,
+            "failed at %s: %s" % (probe.get("stage", "?"),
+                                  probe.get("err") or "unknown"),
+            "The probe could not complete, so the ROS-side checks below say "
+            "nothing about the hardware. If the stage is 'import', source "
+            "/opt/ros/humble/setup.bash first.")
+        probe = None
+
+    scanner = check_lidar_scanner(cfg, lidar_payloads, lnote)
+    lidar = check_lidar_ros(probe, scanner, gate)
+    camera = check_camera(cfg, cam_payloads, cnote)
+    drive = check_drive(probe, link, gate)
+    check_endpoints(probe)
+    check_no_actuation(probe)
+
+    n_fail = sum(1 for r in results if r["status"] == FAIL)
+    n_warn = sum(1 for r in results if r["status"] == WARN)
+    n_skip = sum(1 for r in results if r["status"] == SKIP)
+
+    summary = {
+        "ts": time.time(),
+        "svc": "hwcheck",
+        "source": "fpms-hwcheck",
+        "ok": n_fail == 0,
+        "fail": n_fail, "warn": n_warn, "skip": n_skip, "total": len(results),
+        "window_s": (probe or {}).get("window_s"),
+        "link_age_s": link.get("age_s"),
+        # The headline. Anything consuming this should be able to alarm on
+        # three booleans without parsing the check list.
+        "lidar": {"ok": bool(lidar.get("ok") and scanner.get("ok")),
+                  "hz": lidar.get("hz"),
+                  "scanner_stale": scanner.get("stale"),
+                  "seq_advancing": scanner.get("seq_advancing")},
+        "camera": {"ok": camera.get("ok"), "fps": camera.get("fps"),
+                   "width": camera.get("width"), "height": camera.get("height"),
+                   "age_s": camera.get("age_s")},
+        "drive": {"ok": drive.get("ok"), "state": drive.get("state"),
+                  "odom_hz": drive.get("odom_hz"), "imu_hz": drive.get("imu_hz"),
+                  "battery_hz": drive.get("battery_hz"),
+                  "battery_v": drive.get("battery_v"),
+                  "pose_delta_m": drive.get("pose_delta_m")},
+        "checks": results,
+    }
+
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_FILE, "w") as fh:
+            json.dump(summary, fh, indent=2)
+    except OSError as exc:
+        add("state file", WARN, "cannot write %s: %s" % (STATE_FILE, exc))
+
+    if "--boot" in args:
+        publish_health(cfg, pw, summary)
+
+    if "--json" in args:
+        print(json.dumps(summary, indent=2))
+    elif "--quiet" not in args:
+        print("=" * 72)
+        print(" FPMS-OS hardware check    %s"
+              % time.strftime("%Y-%m-%d %H:%M:%S"))
+        print("=" * 72)
+        for r in results:
+            print("  [%-4s] %-32s %s" % (r["status"], r["check"], r["detail"]))
+            if r["remedy"] and r["status"] in (FAIL, WARN, SKIP):
+                for i, chunk in enumerate(_wrap(r["remedy"], 62)):
+                    print("         %s%s" % ("-> " if i == 0 else "   ", chunk))
+        print("-" * 72)
+        print("  LiDAR  %s      camera %s      drive board %s" % (
+            "ok" if summary["lidar"]["ok"] else "NOT OK",
+            "ok" if summary["camera"]["ok"] else "NOT OK",
+            {"up": "ok", "not_up_yet": "NOT UP YET",
+             "partial": "PARTIAL", "down": "DOWN"}.get(
+                 drive.get("state"), "unknown")))
+        if drive.get("state") == "not_up_yet":
+            print("  The drive board is INSIDE its 90-225 s cold re-link "
+                  "window. That is")
+            print("  not a failure. Wait, then re-run - and do NOT restart the "
+                  "agent.")
+        if n_fail:
+            print("  %d FAILED, %d warnings. This rover is NOT ready."
+                  % (n_fail, n_warn))
+        elif n_warn:
+            print("  %d warnings, %d skipped, nothing failed. Read them before "
+                  "a run." % (n_warn, n_skip))
+        else:
+            print("  All checks passed.")
+        print("=" * 72)
+
+    return 2 if n_fail else (1 if n_warn else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

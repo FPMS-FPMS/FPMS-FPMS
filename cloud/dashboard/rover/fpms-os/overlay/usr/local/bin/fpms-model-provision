@@ -1,0 +1,960 @@
+#!/usr/bin/env bash
+# fpms-model-provision - get the detection model onto this rover, or declare,
+#                        by name and on a topic, that there isn't one.
+#
+# Runs once per boot from fpms-model-provision.service, BEFORE fpms-npud.
+#
+# Usage:
+#   fpms-model-provision            provision and report; publishes nothing
+#   fpms-model-provision --boot     boot mode: ALSO publish events/npu_fault
+#                                   (edge-triggered, with a cooldown - see
+#                                   "WHY THE COOLDOWN IS LOAD-BEARING")
+#   fpms-model-provision --status   print the last recorded state; change nothing
+#   fpms-model-provision --dry-run  decide and report; copy nothing, write nothing
+#   fpms-model-provision --force    install over a conflicting model, and over
+#                                   the end2end pre-filter's refusal
+#   fpms-model-provision --no-mqtt  never publish, even with --boot (for tests)
+#   fpms-model-provision --help
+#
+# Exit codes - and the 0/1 split is the whole point:
+#   0  a model is installed AND its output shape was OBSERVED this boot
+#   1  a model is installed and IDENTIFIED, but its shape is UNPROVEN (no
+#      rknnlite, device contended, a check that could not run). "We could not
+#      check" must never share an exit code with "we checked and it was fine",
+#      or every boot script quietly accepts an unverified model. Same contract
+#      as fpms-model-verify and fpms-selftest.
+#   3  NO USABLE MODEL. A declared fault. The unit is allowed to FAIL on this,
+#      deliberately - see the unit file.
+#   4  this script could not do its own job (state dir unwritable, etc.)
+#
+#
+# ============================================================================
+# WHY THIS EXISTS
+# ============================================================================
+# yolo26n-rk3588.rknn IS NOT IN THE REPOSITORY. It exists on exactly one SD
+# card, in one Pi. No build can produce it, the converter is x86-only and has
+# never been run, and a set of quantised weights cannot be reconstructed from
+# prose the way FAILURE_MODES.md A1's three missing shell scripts were.
+#
+# So the image ships without it, and a rover that boots without it does the
+# worst thing this project knows how to do:
+#
+#     fpms_rover_agent.py wraps the ENTIRE NPU block - import, load_rknn,
+#     init_runtime, labels - in ONE try/except, logs
+#
+#         NPU unavailable (...); streaming without detection
+#
+#     exactly once, at startup, at the same severity as "camera found", and
+#     then runs blind forever. systemd says active. The camera streams. The
+#     dashboard fills with frames. Nothing is ever detected.
+#
+# That is indistinguishable from success at every level an operator normally
+# checks. This script's entire job is to make it distinguishable, on every
+# boot, without anyone having to think to look.
+#
+# It does two things:
+#
+#   1. INSTALL. An operator cannot put a binary in git, but they CAN drop it on
+#      the FAT boot partition from Windows, next to fpms-wifi.conf, with the
+#      card in a reader. That is the realistic delivery path for this file, and
+#      firstboot already proves the pattern works (fpms-wifi.conf,
+#      fpms-hostname, fpms-broker-host, fpms-mqtt-password).
+#
+#   2. DECLARE. If there is no model, that is a NAMED, PERSISTENT fault:
+#      events/npu_fault at QoS 1, a journal banner on the console, and a
+#      marker file that fpms-selftest / fpms-npu-selftest can read without
+#      loading anything. Never a silent success. Never an exit 0 on a rover
+#      that cannot see.
+#
+#
+# ============================================================================
+# WHY THE COOLDOWN IS LOAD-BEARING
+# ============================================================================
+# A past FPMS bug emailed 330 obstacle events and exhausted the Resend daily
+# quota, so A REAL FIRE ALERT COULD NOT SEND (CLAUDE.md "Hard-won
+# constraints"; cloud/HANDOFF.md item 10). An un-cooled alert path does not
+# merely spam - it destroys the alerting channel for the one event the whole
+# product exists to report.
+#
+# This script runs once per boot, so the naive shape looks safe. It is not: a
+# rover that reboots on a loose barrel jack, or that is being flashed and
+# re-flashed on a bench the afternoon before a competition, boots dozens of
+# times an hour. Every one of those boots has no model and would fire an event.
+#
+# So the fault state PERSISTS in /var/lib/fpms/model-provision.json across
+# boots, and an event is published only when:
+#     - the fault NAME changes (model_missing -> model_conflict is new news), or
+#     - FPMS_MODEL_FAULT_REPEAT_S has elapsed since one was last SENT.
+# The cooldown defaults to 3600 s, twelve times fpms-npud's 300 s, precisely
+# because a per-boot publisher has a much worse worst case than a daemon.
+#
+# `last_sent` advances ONLY on a publish that actually left the machine. This
+# unit runs seconds after mosquitto.service starts and the broker may not be
+# accepting connections yet; marking an edge as spent on a publish that went
+# nowhere would swallow the most important alert this rover can send for a
+# whole cooldown. Same reasoning, verbatim, as fpms-npud's set_fault().
+#
+#
+# ============================================================================
+# THE PIPELINE BUG CLASS THIS FILE REFUSES TO REPRODUCE
+# ============================================================================
+# This build has been taken down three times by the same shape:
+#
+#     x="$(producer | grep -q pattern)"     # or | head -N, or | awk '...exit'
+#
+# The early-exiting consumer closes the pipe, the producer dies of SIGPIPE,
+# `pipefail` makes the pipeline report 141, a plain assignment adopts 141, and
+# `set -e` kills the script with no message. fpms-firstboot carries two written
+# scars from exactly this (the vfat probe and the password generator).
+#
+# So: CAPTURE, THEN MATCH. There is not one `grep -q`, `head` or early-exiting
+# `awk` in a pipeline anywhere below. Where structured data must be read, a
+# python3 heredoc is used - it consumes its input completely and returns a
+# whole value. And `set -e` is deliberately NOT set, for the same reason
+# fpms-firstboot does not set it: this runs at boot, and every step is fenced
+# individually so that one surprise cannot take the rest of the report with it.
+#
+#
+# ============================================================================
+# WHAT THIS WILL NEVER DO
+# ============================================================================
+#   - delete anything. Not the operator's file on the boot partition, not a
+#     model already installed, not a rejected one. The .rknn exists in one
+#     place in the world; this script is not going to be the second way it is
+#     lost. A model it refuses is RENAMED aside, never removed, and the copy on
+#     the boot partition is left exactly where the operator put it so that a
+#     re-flash still finds it.
+#   - guess a model. A .rknn with the wrong name is reported, not adopted:
+#     yolov8n's head is ALSO [1,84,8400], so a shape check cannot tell it from
+#     yolo26n's, and a wrong model does not error - it emits boxes that look
+#     exactly like detections.
+#   - move the rover, touch a drive or LiDAR tty, or open the NPU itself. The
+#     only thing that opens the NPU here is fpms-model-verify, in its own child
+#     process, because an end2end=True export SEGFAULTS on this NPU and a
+#     provisioner that dies with the thing it is provisioning reports nothing.
+#   - block the boot. Nothing Requires= this unit.
+#
+#
+# ============================================================================
+# NEVER RUN ON HARDWARE
+# ============================================================================
+# The Orange Pi 5B has not arrived. Nothing here has run against a real vfat
+# boot partition on an RK3588S, a real rknpu driver or a real .rknn. The
+# decision logic and the failure paths have been exercised against stubs; the
+# device-facing half is fpms-model-verify's, and that has never run either.
+# Everything unconfirmed is marked MEASURE ME with the command that confirms it.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- constants --
+
+CONFIG=/etc/fpms/config.env
+DEFAULT_MODEL_NAME=yolo26n-rk3588.rknn
+LOGICAL_NAME=yolo26n              # the key in models.json
+COMPANION=custom_labels.json      # optional operator label override
+
+PROG=fpms-model-provision
+
+# ------------------------------------------------------------------- flags --
+
+MODE=run
+BOOT=0
+DRYRUN=0
+FORCE=0
+NO_MQTT=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --boot)     BOOT=1 ;;
+        --status)   MODE=status ;;
+        --dry-run)  DRYRUN=1 ;;
+        --force)    FORCE=1 ;;
+        --no-mqtt)  NO_MQTT=1 ;;
+        -h|--help)
+            # Print the header block. `sed -n '2,/^set -uo/p'` reads the whole
+            # file and exits on its own; nothing upstream of it can SIGPIPE.
+            sed -n '2,/^set -uo pipefail/p' "$0" | sed 's/^# \{0,1\}//;$d'
+            exit 0 ;;
+        *)
+            echo "$PROG: unknown argument '$arg' (try --help)" >&2
+            exit 4 ;;
+    esac
+done
+
+# ------------------------------------------------------------------ output --
+#
+# Everything goes to stdout so the unit's StandardOutput=journal+console puts
+# the important lines on a monitor as well as in the journal. An operator with
+# a screen and no laptop is a real case at a competition venue.
+
+log()  { echo "$PROG: $*"; }
+warn() { echo "$PROG: WARNING: $*"; }
+
+rule() { echo "=================================================================="; }
+
+# ------------------------------------------------------------------ config --
+#
+# Read /etc/fpms/config.env without sourcing it (it is root-owned, but this
+# runs as root at boot and sourcing an operator-edited file as root to obtain
+# four strings is a trade with no upside) and WITHOUT a pipeline.
+#
+# The ENVIRONMENT WINS over the file, matching fpms-npud's documented
+# precedence. That is also what makes this script testable: point
+# FPMS_YOLO_DIR, FPMS_MODELS_JSON, FPMS_STATE_DIR and FPMS_BOOT_DIR at a
+# scratch tree and the whole decision table can be exercised off-target.
+
+cfg_get() {
+    local key="$1" def="${2-}" line k v out=""
+    if [ -r "$CONFIG" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in ''|\#*) continue ;; esac
+            case "$line" in *=*) ;; *) continue ;; esac
+            k="${line%%=*}"; v="${line#*=}"
+            k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+            [ "$k" = "$key" ] || continue
+            v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+            out="$v"                     # last assignment wins, as in a shell
+        done < "$CONFIG"
+    fi
+    if [ -n "${!key-}" ]; then out="${!key}"; fi
+    [ -n "$out" ] || out="$def"
+    printf '%s' "$out"
+}
+
+YOLO_DIR="$(cfg_get FPMS_YOLO_DIR /home/ubuntu/yolo)"
+REGISTRY="$(cfg_get FPMS_MODELS_JSON /etc/fpms/models.json)"
+STATE_DIR="$(cfg_get FPMS_STATE_DIR /var/lib/fpms)"
+VERIFY="$(cfg_get FPMS_MODEL_VERIFY /usr/local/bin/fpms-model-verify)"
+THING="$(cfg_get FPMS_THING_NAME rover1)"
+MQTT_HOST="$(cfg_get FPMS_MQTT_HOST 127.0.0.1)"
+MQTT_PORT="$(cfg_get FPMS_MQTT_PORT 1883)"
+MQTT_USER="$(cfg_get FPMS_MQTT_USER fpms)"
+MQTT_PASS="$(cfg_get FPMS_MQTT_PASS '')"
+FAULT_REPEAT_S="$(cfg_get FPMS_MODEL_FAULT_REPEAT_S 3600)"
+OWNER="$(cfg_get FPMS_USER ubuntu)"
+
+# FPMS_NPU_REQUIRED decides whether a fault carries alert:true (it reaches the
+# operator alert path) or alert:false (a bench board knowingly running without
+# detection). It does NOT decide whether we report - we always report. Default
+# 1: on a fire-detection rover, no detector is an alert. Same semantics as
+# fpms-npud, deliberately, so the dashboard sees one vocabulary.
+REQUIRED_RAW="$(cfg_get FPMS_NPU_REQUIRED 1)"
+case "${REQUIRED_RAW,,}" in
+    0|false|no|off|'') REQUIRED=false ;;
+    *)                 REQUIRED=true ;;
+esac
+
+STATE_FILE="$STATE_DIR/model-provision.json"
+VERIFY_LOG="$STATE_DIR/model-provision-verify.txt"
+
+# ------------------------------------------------------------------ helpers --
+
+json_escape() {
+    local s="${1-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/ }"
+    s="${s//$'\r'/ }"
+    s="${s//$'\t'/ }"
+    printf '%s' "$s"
+}
+
+# sha256 with no pipeline at all. `sha256sum -- FILE` prints "<hash>  <name>";
+# ${out%% *} takes the hash. A pipe into cut/awk would buy nothing and would
+# reintroduce the failure mode at the top of this file.
+sha_of() {
+    local out
+    out="$(sha256sum -- "$1" 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    printf '%s' "${out%% *}"
+}
+
+now_s() { date +%s; }
+
+# Split a multi-line command substitution into the LINES array, CR-stripped.
+#
+# Not `${x%%$'\n'*}` chains: those mis-slice when a helper returns FEWER lines
+# than expected (the last field silently inherits the previous one) and they
+# carry a \r straight into a JSON string if anything upstream ever emits CRLF.
+# Reading with `read -r` is exact, and the here-string is fully materialised
+# before the loop starts, so there is no producer to SIGPIPE.
+read_lines() {
+    local l
+    LINES=()
+    while IFS= read -r l; do LINES+=("${l%$'\r'}"); done <<< "${1-}"
+}
+
+# ------------------------------------------------ locate the boot partition --
+#
+# Lifted, reasoning and all, from fpms-firstboot - which is the file that
+# already learned this. Ubuntu Rockchip images mount the FAT partition at
+# /boot/firmware; some at /boot. We want the one an operator can see from
+# Windows, which is the vfat one.
+#
+# CAPTURE, THEN TEST -- not `findmnt ... | grep -qi vfat`. grep -q exits on its
+# first match, findmnt dies of SIGPIPE, pipefail reports 141, and the test
+# reads BACKWARDS: a real FAT boot partition is not recognised, BOOTDIR falls
+# through to the rootfs /boot, and the model the operator dropped there - the
+# only copy in the world - is never found. The rover then comes up blind and it
+# looks exactly like they put the file in the wrong place.
+#
+# stat -f is also more truthful than findmnt: findmnt reads
+# /proc/self/mountinfo, which lists host-side paths inside a chroot or a mount
+# namespace. statfs asks the kernel about the path itself.
+find_boot_dir() {
+    local override cand fstype
+    override="$(cfg_get FPMS_BOOT_DIR '')"
+    if [ -n "$override" ]; then printf '%s' "$override"; return 0; fi
+    for cand in /boot/firmware /boot; do
+        [ -d "$cand" ] || continue
+        fstype="$(stat -f -c %T "$cand" 2>/dev/null || true)"
+        case "$fstype" in
+            msdos|vfat|fat|exfat) printf '%s' "$cand"; return 0 ;;
+        esac
+    done
+    printf '%s' ""
+    return 1
+}
+
+# ------------------------------------------------------- registry questions --
+#
+# models.json is JSON, so it is read with python3 rather than with a regex.
+# python3 is present on every FPMS image (fpms-npud, fpms-model-verify,
+# fpms-selftest and fpms-npu-selftest are all python3) and a heredoc into it
+# has no pipeline and no early exit.
+#
+# Three lines out, always exactly three, so the caller's parameter expansion
+# below cannot mis-slice a short answer:
+#     1  the recorded sha256, or empty  (empty is a DECLARED state here: the
+#        file has never been in git and has never been hashed, and models.json
+#        says so in sha256_status. Never fabricate one.)
+#     2  the registry's declared file path, or empty
+#     3  "true" if the entry claims verified, else empty
+registry_facts() {
+    python3 - "$REGISTRY" "$LOGICAL_NAME" <<'PY' 2>/dev/null
+import json, sys
+sha = path = ver = ""
+try:
+    with open(sys.argv[1]) as fh:
+        doc = json.load(fh)
+    e = (doc.get("models") or {}).get(sys.argv[2]) or {}
+    s = e.get("sha256")
+    if isinstance(s, str) and s.strip():
+        sha = s.strip().lower()
+    f = e.get("file")
+    if isinstance(f, str) and f.strip():
+        path = f.strip()
+    if e.get("verified") is True:
+        ver = "true"
+except Exception:
+    pass
+print(sha); print(path); print(ver)
+PY
+}
+
+# Previous fault name and the time an event for it last actually LEFT the
+# machine. Two lines out, always.
+previous_state() {
+    python3 - "$STATE_FILE" <<'PY' 2>/dev/null
+import json, sys
+fault = ""; last = "0"
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+    f = d.get("fault")
+    if isinstance(f, str):
+        fault = f
+    ls = d.get("last_sent")
+    if isinstance(ls, (int, float)):
+        last = str(int(ls))
+except Exception:
+    pass
+print(fault); print(last)
+PY
+}
+
+# ----------------------------------------------------------------- publish --
+#
+# mosquitto_pub, not paho: this is a shell script that runs once, and adding a
+# python MQTT client here would be a second implementation of the fault
+# vocabulary that fpms-npud already owns. Best effort, always - a provisioner
+# that can be blocked by a broker is not one. Bounded by `timeout` because this
+# is on the boot path.
+mqtt_publish() {
+    local topic="$1" payload="$2" i
+    local -a auth=()
+    [ "$NO_MQTT" -eq 1 ] && return 1
+    [ "$BOOT" -eq 1 ] || return 1            # manual runs never alert anyone
+    command -v mosquitto_pub >/dev/null 2>&1 || {
+        warn "mosquitto_pub is not installed; cannot publish $topic"
+        return 1
+    }
+    [ -n "$MQTT_USER" ] && auth+=(-u "$MQTT_USER")
+    [ -n "$MQTT_PASS" ] && auth+=(-P "$MQTT_PASS")
+    # Three tries. We are ordered After=mosquitto.service, but "started" is not
+    # "accepting connections", and this is the one message that must not be
+    # lost to a five-second race at boot.
+    for i in 1 2 3; do
+        if timeout 8 mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" \
+                ${auth[@]+"${auth[@]}"} \
+                -t "$topic" -q 1 -m "$payload" >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$i" -lt 3 ] && sleep 2
+    done
+    warn "could not publish to $topic on $MQTT_HOST:$MQTT_PORT after 3 tries;" \
+         "the fault edge is NOT marked as sent and will be retried next boot"
+    return 1
+}
+
+# --------------------------------------------------------------- the report --
+
+STATUS=ok            # ok | unproven | fault
+FAULT=""             # a NAME, from the fixed vocabulary below. Never free text.
+DETAIL=""
+REMEDY=""
+INSTALLED_FROM=""
+MODEL_SHA=""
+VERIFY_RC=""
+
+set_fault() { STATUS=fault; FAULT="$1"; DETAIL="$2"; REMEDY="${3-}"; }
+set_unproven() { STATUS=unproven; FAULT="$1"; DETAIL="$2"; REMEDY="${3-}"; }
+
+# ============================================================================
+# --status: print what the last run recorded, touch nothing
+# ============================================================================
+if [ "$MODE" = status ]; then
+    if [ -r "$STATE_FILE" ]; then
+        cat -- "$STATE_FILE"
+        echo
+    else
+        echo "$PROG: no state at $STATE_FILE - this has never run on this rover."
+        echo "That is itself a finding: nothing has checked whether a detection"
+        echo "model is present. Run: sudo $PROG"
+        exit 4
+    fi
+    exit 0
+fi
+
+# ============================================================================
+# 1. Where things are
+# ============================================================================
+rule
+log "NPU model provisioning"
+rule
+
+BOOTDIR="$(find_boot_dir)" || true
+if [ -z "$BOOTDIR" ]; then
+    BOOTDIR=/boot
+    warn "no vfat boot partition found; looking in /boot anyway. An operator" \
+         "can only have written the model from Windows onto the FAT partition," \
+         "so if this is wrong the file will never be found. Check: " \
+         "stat -f -c %T /boot/firmware /boot"
+fi
+log "boot partition: $BOOTDIR"
+
+read_lines "$(registry_facts)"
+REG_SHA="${LINES[0]-}"
+REG_FILE="${LINES[1]-}"
+REG_VERIFIED="${LINES[2]-}"
+
+MODEL_NAME="$DEFAULT_MODEL_NAME"
+if [ -n "$REG_FILE" ]; then
+    MODEL_NAME="${REG_FILE##*/}"
+fi
+TARGET="$YOLO_DIR/$MODEL_NAME"
+
+# The registry may name an ABSOLUTE path, and fpms-model-verify honours an
+# absolute "file" outright (a registry that silently relocated the model would
+# describe a different file than the agent loads). If it disagrees with
+# FPMS_YOLO_DIR, say so here rather than letting two tools check two files.
+if [ -n "$REG_FILE" ] && [ "${REG_FILE#/}" != "$REG_FILE" ] \
+   && [ "$REG_FILE" != "$TARGET" ]; then
+    warn "the registry names $REG_FILE but FPMS_YOLO_DIR resolves to $TARGET." \
+         "fpms-model-verify will check the registry's path, this script" \
+         "installs to FPMS_YOLO_DIR, and fpms_yolo26_npu.py hardcodes MODEL -" \
+         "all three must agree or they describe different files silently."
+fi
+
+log "model:          $TARGET"
+log "registry:       $REGISTRY (sha256 ${REG_SHA:-UNKNOWN - declared, not missing})"
+
+if [ "$DRYRUN" -eq 0 ]; then
+    install -d -m 0755 -o "$OWNER" -g "$OWNER" -- "$YOLO_DIR" 2>/dev/null \
+        || mkdir -p -- "$YOLO_DIR" 2>/dev/null \
+        || warn "cannot create $YOLO_DIR"
+    install -d -m 0755 -- "$STATE_DIR" 2>/dev/null || mkdir -p -- "$STATE_DIR" \
+        || { echo "$PROG: FATAL: cannot create $STATE_DIR" >&2; exit 4; }
+fi
+
+# ============================================================================
+# 2. What is on the boot partition
+# ============================================================================
+#
+# The name must MATCH. We do not adopt an arbitrarily-named .rknn, and the
+# reason is specific rather than fussy: yolov8n's exported head is also
+# [1,84,8400], so no shape check anywhere in this stack can tell a stray
+# yolov8n.rknn from yolo26n's. Installing it under the canonical name would
+# produce a rover that verifies clean, detects confidently, and is wrong -
+# which is the exact class of failure the whole NPU layer exists to abolish.
+#
+# Case IS folded, because vfat lookups are case-insensitive and Windows
+# preserves whatever case the operator's file already had.
+
+STAGED=""
+OTHER_RKNN=""
+_scan_dirs=("$BOOTDIR" "$BOOTDIR/yolo" "$BOOTDIR/fpms")
+
+shopt -s nullglob nocaseglob
+for d in "${_scan_dirs[@]}"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.rknn; do
+        [ -f "$f" ] || continue
+        b="${f##*/}"
+        if [ "${b,,}" = "${MODEL_NAME,,}" ]; then
+            [ -n "$STAGED" ] || STAGED="$f"
+        else
+            OTHER_RKNN="$OTHER_RKNN $f"
+        fi
+    done
+done
+shopt -u nullglob nocaseglob
+
+if [ -n "$STAGED" ]; then
+    log "found on the boot partition: $STAGED"
+elif [ -n "$OTHER_RKNN" ]; then
+    warn "the boot partition carries .rknn file(s) that are NOT named" \
+         "'$MODEL_NAME':$OTHER_RKNN"
+    warn "NOT ADOPTING THEM. yolov8n's head is also [1,84,8400], so nothing in" \
+         "this stack can tell a stray model from the right one by inspection." \
+         "Rename the file to exactly '$MODEL_NAME' and reboot."
+fi
+
+# ============================================================================
+# 3. Decide
+# ============================================================================
+
+INSTALLED_SHA=""
+if [ -f "$TARGET" ]; then
+    INSTALLED_SHA="$(sha_of "$TARGET")" || INSTALLED_SHA=""
+    if [ -z "$INSTALLED_SHA" ]; then
+        warn "$TARGET exists but cannot be hashed - unreadable or a directory"
+    fi
+fi
+
+STAGED_SHA=""
+if [ -n "$STAGED" ]; then
+    STAGED_SHA="$(sha_of "$STAGED")" || STAGED_SHA=""
+    [ -n "$STAGED_SHA" ] || warn "cannot hash $STAGED - the card may be failing"
+fi
+
+# --- the end2end pre-filter, before anything enters the load path -----------
+#
+# An `end2end=True` export emits [1,300,6] and Ultralytics report that its
+# top-k op SEGFAULTS ON THE RK3588 NPU. A SIGSEGV is not an exception: the
+# agent's one big try/except cannot catch it, fpms-npud dies, systemd restarts
+# it, and it dies again - a crash loop that publishes NOTHING, which is the
+# same silence by another route.
+#
+# The .rknn container embeds op-name strings, so scanning for TopK /
+# NonMaxSuppression is a device-free advisory that costs one read.
+#
+# IT IS A HEURISTIC AND HAS NEVER BEEN CHECKED AGAINST A REAL BAD EXPORT
+# (fpms-model-verify's check_end2end_prefilter says the same). fpms-model-verify
+# therefore only WARNs on it, correctly: a false positive that blocked the one
+# good model the project owns would be worse than the thing it guards against.
+#
+# Here the stakes are different, so the response is different but NOT harsher:
+# a suspect file is still copied off the card - the card is the thing that
+# might die tonight - but it lands beside the load path rather than in it, so
+# fpms-npud cannot crash-loop on it. Nothing is lost, and one documented
+# command overrides it. If this ever misfires on the project's one good model,
+# override, then DELETE THE CHECK rather than leaving a comforting one in
+# place, exactly as npu/models/README.md instructs.
+e2e_suspect() {
+    local hits
+    hits="$(LC_ALL=C grep -a -c -E 'TopK|NonMaxSuppression' -- "$1" 2>/dev/null || true)"
+    [ -n "$hits" ] || hits=0
+    [ "$hits" -gt 0 ] 2>/dev/null
+}
+
+# --- copy: verified, then atomic -------------------------------------------
+#
+# A truncated read off a tired SD card produces a file that looks fine and
+# fails at load_rknn with a message nobody connects to the card. So: copy to a
+# temp file in the TARGET directory (same filesystem, so the rename is atomic),
+# sync it, re-hash it, compare to the source, and only then rename into place.
+# A half-written model at the canonical path is worse than none, because
+# fpms-npud would load it, fail, and name the wrong cause.
+install_model() {
+    local src="$1" want="$2" tmp got
+    tmp="$TARGET.incoming.$$"
+    if ! cp -- "$src" "$tmp" 2>/dev/null; then
+        warn "copy failed: $src -> $tmp"
+        rm -f -- "$tmp" 2>/dev/null
+        return 1
+    fi
+    sync -- "$tmp" 2>/dev/null || sync 2>/dev/null || true
+    got="$(sha_of "$tmp")" || got=""
+    if [ -z "$got" ] || [ "$got" != "$want" ]; then
+        warn "THE COPY DOES NOT MATCH THE SOURCE (source $want, copy ${got:-unreadable})."
+        warn "That is a truncated or corrupted read, not a model problem." \
+             "Re-seat the card and try again; if it repeats, the card is failing" \
+             "and the ONLY copy of this file is on it."
+        mv -f -- "$tmp" "$TARGET.badcopy.$got" 2>/dev/null || rm -f -- "$tmp" 2>/dev/null
+        return 1
+    fi
+    chown "$OWNER:$OWNER" -- "$tmp" 2>/dev/null || true
+    chmod 0644 -- "$tmp" 2>/dev/null || true
+    if ! mv -f -- "$tmp" "$TARGET" 2>/dev/null; then
+        warn "cannot rename $tmp into place at $TARGET"
+        return 1
+    fi
+    return 0
+}
+
+DO_INSTALL=0
+INSTALL_REASON=""
+
+if [ -z "$INSTALLED_SHA" ] && [ -n "$STAGED_SHA" ]; then
+    DO_INSTALL=1; INSTALL_REASON="no model installed; one is on the boot partition"
+elif [ -n "$INSTALLED_SHA" ] && [ -n "$STAGED_SHA" ]; then
+    if [ "$INSTALLED_SHA" = "$STAGED_SHA" ]; then
+        log "the installed model and the one on the boot partition are the same file"
+    elif [ -n "$REG_SHA" ] && [ "$STAGED_SHA" = "$REG_SHA" ] \
+         && [ "$INSTALLED_SHA" != "$REG_SHA" ]; then
+        # The repair case, and the only one where an overwrite happens without
+        # --force: the registry says which file is right, the installed one is
+        # not it, and the one on the card is. That is a corrupt or swapped
+        # rootfs copy being restored from the operator's original.
+        DO_INSTALL=1
+        INSTALL_REASON="the installed model does not match the registry and the boot-partition copy does - REPAIRING"
+    elif [ "$FORCE" -eq 1 ]; then
+        DO_INSTALL=1; INSTALL_REASON="--force: replacing the installed model"
+    else
+        set_fault "model_conflict" \
+            "two different models: installed ${INSTALLED_SHA:0:16}..., boot partition ${STAGED_SHA:0:16}..., registry says ${REG_SHA:-UNKNOWN}" \
+            "Refusing to choose. Nothing is deleted and nothing is overwritten. Decide deliberately: keep the installed one (remove or rename the file on the boot partition), or take the new one with: sudo $PROG --force"
+    fi
+fi
+
+if [ "$DO_INSTALL" -eq 1 ] && [ -n "$STAGED" ]; then
+    if e2e_suspect "$STAGED" && [ "$FORCE" -eq 0 ]; then
+        # Copy it off the card anyway - beside the load path, not in it.
+        QUARANTINE="$YOLO_DIR/$MODEL_NAME.end2end-suspect"
+        if [ "$DRYRUN" -eq 0 ]; then
+            cp -- "$STAGED" "$QUARANTINE" 2>/dev/null \
+                && chown "$OWNER:$OWNER" -- "$QUARANTINE" 2>/dev/null
+        fi
+        DO_INSTALL=0
+        set_fault "model_end2end_suspect" \
+            "$STAGED contains TopK/NonMaxSuppression strings, the signature of an end2end=True export" \
+            "An end2end export emits [1,300,6] and its top-k op SEGFAULTS on the RK3588 NPU - not an exception, a dead process and a systemd restart loop. The file has been copied to $QUARANTINE so the card is no longer the only copy, but it is NOT in the load path. THIS SCAN IS AN UNCONFIRMED HEURISTIC: if you have reason to believe the match is coincidental, install it anyway with: sudo $PROG --force  (then confirm with: fpms-model-verify $LOGICAL_NAME --force)"
+    fi
+fi
+
+if [ "$DO_INSTALL" -eq 1 ]; then
+    log "installing: $INSTALL_REASON"
+    if [ "$DRYRUN" -eq 1 ]; then
+        log "--dry-run: would install $STAGED -> $TARGET"
+        INSTALLED_SHA="$STAGED_SHA"
+        INSTALLED_FROM="$STAGED"
+    elif install_model "$STAGED" "$STAGED_SHA"; then
+        INSTALLED_SHA="$STAGED_SHA"
+        INSTALLED_FROM="$STAGED"
+        log "installed $TARGET (sha256 ${INSTALLED_SHA:0:16}..., $(stat -c %s -- "$TARGET" 2>/dev/null || echo '?') bytes)"
+        # The operator's file is LEFT WHERE IT IS. fpms-wifi-provision renames
+        # fpms-wifi.conf to .applied because a WiFi password on a card that any
+        # computer will mount is a hazard. A model is the opposite: it is the
+        # only copy in the world, and leaving it on the boot partition means a
+        # re-flash of this card still has it. Do not "tidy" this.
+        log "left $STAGED in place on purpose - it is the only copy of this file"
+    else
+        set_fault "model_install_failed" \
+            "could not install $STAGED to $TARGET" \
+            "See the copy errors above. Nothing was deleted and the source file is untouched."
+    fi
+fi
+
+# The optional label override. Never a fault: the agent loads it inside a bare
+# try/except and falls back to the compiled COCO_NAMES, so a missing one costs
+# display names, not detection.
+if [ "$DRYRUN" -eq 0 ] && [ ! -e "$YOLO_DIR/$COMPANION" ]; then
+    shopt -s nullglob
+    for d in "${_scan_dirs[@]}"; do
+        if [ -f "$d/$COMPANION" ]; then
+            if cp -- "$d/$COMPANION" "$YOLO_DIR/$COMPANION" 2>/dev/null; then
+                chown "$OWNER:$OWNER" -- "$YOLO_DIR/$COMPANION" 2>/dev/null || true
+                log "installed the operator label override $YOLO_DIR/$COMPANION"
+            fi
+            break
+        fi
+    done
+    shopt -u nullglob
+fi
+
+# ============================================================================
+# 4. The absence case - the one this whole file exists for
+# ============================================================================
+if [ ! -f "$TARGET" ] && [ "$DRYRUN" -eq 0 ] && [ -z "$FAULT" ]; then
+    set_fault "model_missing" \
+        "$TARGET does not exist, and no '$MODEL_NAME' was found on $BOOTDIR" \
+        "THE MODEL IS NOT IN GIT AND NO BUILD CAN PRODUCE IT. It exists only on the old Pi at ~/yolo/. Copy it off that card, then put it on this rover's FAT boot partition from Windows - the same partition as fpms-wifi.conf - named exactly '$MODEL_NAME', and reboot. See npu/models/README.md."
+fi
+if [ ! -f "$TARGET" ] && [ -z "$FAULT" ] && [ "$DRYRUN" -eq 1 ]; then
+    set_fault "model_missing" "$TARGET does not exist (dry run)" ""
+fi
+
+# ============================================================================
+# 5. Verify what is installed
+# ============================================================================
+#
+# TWO different depths, because they answer different questions and cost
+# different amounts:
+#
+#   --offline   hash + registry only. Never opens the NPU. Answers "WHICH file
+#               is this", which is the question a fresh install raises.
+#   full        loads the model, calls init_runtime(), runs one inference in a
+#               CHILD PROCESS and asserts the OUTPUT SHAPE. Answers "does this
+#               model work on this silicon TODAY", which is the only question
+#               that means detection works.
+#
+# The full check runs on EVERY boot when a model is present, not just after an
+# install. That is deliberate: the thing it catches is the three-way version
+# coupling (kernel rknpu driver <-> librknnrt.so <-> the wheel), which fails at
+# init_runtime() and which the agent SWALLOWS. That coupling can break between
+# boots - an apt upgrade, a different card, a vendor kernel - and this unit
+# runs Before=fpms-npud, when the device is free and nothing is contending.
+#
+# HONESTY: this runs as ROOT, and fpms-model-verify does not drop privileges.
+# So a pass here proves the model and the version chain; it does NOT prove that
+# the unprivileged `ubuntu` user - which is what actually runs fpms-npud and
+# the agent - can open the device. That gap is real and it is why
+# fpms-npu-selftest exists and drops to ubuntu. Do not read a green line here
+# as proof of the permission that 99-fpms-npu.rules grants.
+
+have_rknnlite() {
+    # In a subprocess on purpose: NPU_SPEC records that a version mismatch
+    # inside librknnrt can abort() outright, and a provisioner that dies with
+    # the thing it is probing reports nothing.
+    timeout 60 python3 -c 'import rknnlite.api' >/dev/null 2>&1
+}
+
+run_verify() {
+    # $1..: arguments to fpms-model-verify. Output is echoed to the journal
+    # AND kept at $VERIFY_LOG, because the remedy text in that output is the
+    # most useful thing anyone reads at 2am and the journal rotates.
+    local rc=0 out
+    out="$(FPMS_MODELS_JSON="$REGISTRY" FPMS_YOLO_DIR="$YOLO_DIR" \
+           timeout 300 "$VERIFY" "$@" 2>&1)" || rc=$?
+    printf '%s\n' "$out"
+    if [ "$DRYRUN" -eq 0 ]; then
+        { echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ)  fpms-model-verify $*"
+          printf '%s\n' "$out"; } >> "$VERIFY_LOG" 2>/dev/null || true
+    fi
+    return "$rc"
+}
+
+if [ -f "$TARGET" ] && [ -z "$FAULT" ]; then
+    MODEL_SHA="$INSTALLED_SHA"
+
+    if [ ! -x "$VERIFY" ]; then
+        set_unproven "model_unverified" \
+            "$VERIFY is missing or not executable; the model is installed but nothing has checked it" \
+            "fpms-model-verify is the only thing in this image that can assert the [1,84,8400] output shape. Without it a wrong-shaped model loads, infers, and emits boxes that look exactly like detections. Reinstall the overlay."
+
+    elif [ "$DRYRUN" -eq 1 ]; then
+        set_unproven "model_unverified" "--dry-run: verification skipped" ""
+
+    elif ! have_rknnlite; then
+        # Record IDENTITY even though we cannot prove function. Knowing WHICH
+        # file this is has value on its own, and it is the state models.json
+        # calls RECORDED_UNVERIFIED. It never sets verified:true.
+        if [ -z "$REG_SHA" ]; then
+            run_verify "$LOGICAL_NAME" --offline --register || true
+        else
+            run_verify "$LOGICAL_NAME" --offline || true
+        fi
+        set_unproven "model_unverified" \
+            "the model is installed (sha256 ${MODEL_SHA:0:16}...) but rknnlite does not import, so its output shape has NOT been observed" \
+            "This is not a fault of the model. The aarch64 rknn-toolkit-lite2 wheel is not on PyPI and must version-match /usr/lib/librknnrt.so and the kernel rknpu driver. fpms-npud will report this as fault 'runtime_import' - that is the authority on it. Confirm with: fpms-npu-selftest -v"
+
+    else
+        VERIFY_RC=0
+        run_verify "$LOGICAL_NAME" || VERIFY_RC=$?
+        case "$VERIFY_RC" in
+            0)
+                # Shape OBSERVED. Bless the file if it is not already blessed -
+                # but only then, so a healthy rover does not rewrite an /etc
+                # file with a fresh timestamp on every single boot.
+                if [ "$REG_VERIFIED" != "true" ] || [ "$REG_SHA" != "$MODEL_SHA" ]; then
+                    if [ -n "$REG_SHA" ] && [ "$REG_SHA" != "$MODEL_SHA" ]; then
+                        # A differing recorded hash is NOT ours to overwrite.
+                        # fpms-model-verify refuses this without --force, and
+                        # so do we: a registry that quietly adopts whatever it
+                        # finds verifies nothing.
+                        warn "the registry records a DIFFERENT sha256 for $LOGICAL_NAME;" \
+                             "not re-registering. If this file is genuinely the intended one:" \
+                             "sudo fpms-model-verify $LOGICAL_NAME --register --force"
+                    else
+                        run_verify "$LOGICAL_NAME" --register || true
+                    fi
+                fi
+                STATUS=ok; FAULT=""
+                DETAIL="output shape OBSERVED as [1,84,8400] on this boot; sha256 ${MODEL_SHA:0:16}..."
+                ;;
+            1)
+                set_unproven "model_unverified" \
+                    "fpms-model-verify could not prove this model (exit 1: one or more checks unproven)" \
+                    "IDENTIFIED but not VERIFIED. Read $VERIFY_LOG - a SKIP usually means the NPU was held by fpms-npud, or the end2end pre-filter withheld the inference probe. Neither is a pass. Re-run in a maintenance window: sudo systemctl stop fpms-npud && fpms-model-verify $LOGICAL_NAME && sudo systemctl start fpms-npud"
+                ;;
+            124)
+                set_fault "model_verify_timeout" \
+                    "fpms-model-verify did not return within 300 s" \
+                    "A wedged NPU call. It was bounded here so it could not stall the boot, but the same call inside fpms-npud stalls detection with no error anywhere. Check dmesg for rknpu timeouts and /sys/kernel/debug/rknpu/load."
+                ;;
+            *)
+                set_fault "model_verify_failed" \
+                    "fpms-model-verify exited $VERIFY_RC - one or more checks FAILED" \
+                    "DO NOT TRUST DETECTION FROM THIS MODEL. Read $VERIFY_LOG: the line that matters is 'output shape [1,84,8400]'. A wrong-shaped model does not error - it produces garbage boxes that look exactly like detections. If the child died with SIGSEGV, that is the end2end=True signature and the model must be re-exported with end2end=false (npu/convert/)."
+                ;;
+        esac
+    fi
+fi
+
+# ============================================================================
+# 6. Record, publish, and say it loudly
+# ============================================================================
+
+read_lines "$(previous_state)"
+PREV_FAULT="${LINES[0]-}"
+PREV_SENT="${LINES[1]-}"
+case "$PREV_SENT" in ''|*[!0-9]*) PREV_SENT=0 ;; esac
+case "$FAULT_REPEAT_S" in ''|*[!0-9]*) FAULT_REPEAT_S=3600 ;; esac
+
+NOW="$(now_s)"
+LAST_SENT="$PREV_SENT"
+PUBLISHED=false
+
+if [ "$STATUS" = ok ]; then
+    rule
+    log "DETECTION MODEL VERIFIED"
+    log "  $TARGET"
+    log "  sha256 ${MODEL_SHA:0:32}..."
+    log "  $DETAIL"
+    rule
+    # Falling edge. Published once, never repeated - same vocabulary as
+    # fpms-npud's clear_fault(), so a dashboard has one thing to listen for.
+    if [ -n "$PREV_FAULT" ]; then
+        payload="$(printf '{"ts":%s,"thing":"%s","component":"npu","source":"%s","alert":false,"cleared":"%s","model":"%s","model_sha256":"%s","detection_available":true}' \
+            "$NOW" "$(json_escape "$THING")" "$PROG" "$(json_escape "$PREV_FAULT")" \
+            "$(json_escape "$TARGET")" "$(json_escape "$MODEL_SHA")")"
+        if mqtt_publish "fpms/$THING/events/npu_recovered" "$payload"; then
+            log "published events/npu_recovered (cleared '$PREV_FAULT')"
+        fi
+    fi
+    LAST_SENT=0
+else
+    # ---- the banner. This is what an operator with a monitor sees. ----------
+    echo
+    rule
+    if [ "$STATUS" = fault ]; then
+        log "  *** NO USABLE DETECTION MODEL ON THIS ROVER ***"
+    else
+        log "  *** DETECTION MODEL IS UNPROVEN ***"
+    fi
+    rule
+    log "  fault:  $FAULT"
+    log "  detail: $DETAIL"
+    [ -n "$REMEDY" ] && log "  fix:    $REMEDY"
+    log ""
+    log "  WHAT THIS MEANS IF NOBODY ACTS ON IT:"
+    log "  fpms_rover_agent.py will log 'NPU unavailable; streaming without"
+    log "  detection' ONCE, at startup, and carry on forever. Every unit will"
+    log "  report active. The camera will stream. The dashboard will look"
+    log "  alive. events/fire will still fire, because the HSV colour screen is"
+    log "  CPU-side - so the rover gets LESS discriminating while looking"
+    log "  exactly as busy. Nothing else will ever mention it."
+    log ""
+    log "  Check any time with:  $PROG --status"
+    rule
+    echo
+
+    # ---- edge-triggered publish -------------------------------------------
+    due=0
+    if [ "$FAULT" != "$PREV_FAULT" ]; then
+        due=1                                   # a NEW named fault is new news
+        LAST_SENT=0
+    elif [ $((NOW - PREV_SENT)) -ge "$FAULT_REPEAT_S" ]; then
+        due=1                                   # the cooldown has elapsed
+    fi
+
+    if [ "$due" -eq 1 ]; then
+        alert=$REQUIRED
+        [ "$STATUS" = unproven ] && alert=false   # unproven is not an alarm
+        payload="$(printf '{"ts":%s,"thing":"%s","component":"npu","source":"%s","alert":%s,"required":%s,"fault":"%s","error":"%s","remedy":"%s","model":"%s","model_sha256":"%s","boot_partition":"%s","detection_available":false,"repeat":%s}' \
+            "$NOW" "$(json_escape "$THING")" "$PROG" "$alert" "$REQUIRED" \
+            "$(json_escape "$FAULT")" "$(json_escape "$DETAIL")" \
+            "$(json_escape "$REMEDY")" "$(json_escape "$TARGET")" \
+            "$(json_escape "$MODEL_SHA")" "$(json_escape "$BOOTDIR")" \
+            "$([ "$FAULT" = "$PREV_FAULT" ] && echo true || echo false)")"
+        if mqtt_publish "fpms/$THING/events/npu_fault" "$payload"; then
+            LAST_SENT="$NOW"
+            PUBLISHED=true
+            log "published events/npu_fault '$FAULT' at QoS 1"
+        fi
+        # If the publish did NOT leave, LAST_SENT keeps its old value on
+        # purpose. The edge is not spent on a message nobody received.
+    else
+        log "events/npu_fault '$FAULT' NOT republished:" \
+            "$((NOW - PREV_SENT))s since the last one, cooldown ${FAULT_REPEAT_S}s." \
+            "The fault is unchanged and is still recorded in $STATE_FILE."
+    fi
+fi
+
+# ---- the marker ------------------------------------------------------------
+#
+# /var/lib/fpms/model-provision.json, next to selftest.json and
+# npu-selftest.json, in the shape those tools already use ("ok", "ts", plus
+# named fields). It is the cheap, load-nothing answer to "does this rover have
+# a detection model", readable by fpms-selftest and fpms-npu-selftest without
+# hashing a file or opening the NPU - and it is what carries the fault edge
+# across a reboot.
+if [ "$DRYRUN" -eq 0 ]; then
+    tmp="$STATE_FILE.tmp.$$"
+    {
+        printf '{\n'
+        printf '  "ts": %s,\n' "$NOW"
+        printf '  "source": "%s",\n' "$PROG"
+        printf '  "ok": %s,\n' "$([ "$STATUS" = ok ] && echo true || echo false)"
+        printf '  "status": "%s",\n' "$STATUS"
+        printf '  "fault": %s,\n' "$([ -n "$FAULT" ] && printf '"%s"' "$(json_escape "$FAULT")" || echo null)"
+        printf '  "detail": "%s",\n' "$(json_escape "$DETAIL")"
+        printf '  "remedy": "%s",\n' "$(json_escape "$REMEDY")"
+        printf '  "model": "%s",\n' "$(json_escape "$TARGET")"
+        printf '  "model_present": %s,\n' "$([ -f "$TARGET" ] && echo true || echo false)"
+        printf '  "model_sha256": %s,\n' "$([ -n "$MODEL_SHA" ] && printf '"%s"' "$MODEL_SHA" || echo null)"
+        printf '  "installed_from": %s,\n' "$([ -n "$INSTALLED_FROM" ] && printf '"%s"' "$(json_escape "$INSTALLED_FROM")" || echo null)"
+        printf '  "boot_partition": "%s",\n' "$(json_escape "$BOOTDIR")"
+        printf '  "registry": "%s",\n' "$(json_escape "$REGISTRY")"
+        printf '  "registry_sha256": %s,\n' "$([ -n "$REG_SHA" ] && printf '"%s"' "$(json_escape "$REG_SHA")" || echo null)"
+        printf '  "verify_exit": %s,\n' "${VERIFY_RC:-null}"
+        printf '  "verify_log": "%s",\n' "$(json_escape "$VERIFY_LOG")"
+        printf '  "required": %s,\n' "$REQUIRED"
+        printf '  "published": %s,\n' "$PUBLISHED"
+        printf '  "last_sent": %s\n' "$LAST_SENT"
+        printf '}\n'
+    } > "$tmp" 2>/dev/null && mv -f -- "$tmp" "$STATE_FILE" 2>/dev/null || {
+        rm -f -- "$tmp" 2>/dev/null
+        warn "could not write $STATE_FILE - the fault edge will not survive this" \
+             "boot and fpms-selftest has nothing to read"
+    }
+fi
+
+# ---- exit ------------------------------------------------------------------
+case "$STATUS" in
+    ok)       exit 0 ;;
+    unproven) exit 1 ;;
+    *)        exit 3 ;;
+esac
