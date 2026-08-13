@@ -132,11 +132,29 @@ BOOT_UNITS=(
     fpms-npu-tune.service
     fpms-ros-publishers.target
     fpms-rosbridge.service
-    fpms-console.service
     fpms-selftest.service
     fpms-dashboard.service
     fpms-hwcheck.service
     fpms-telemetry-ros.service
+)
+
+# SHIPPED BUT DELIBERATELY NOT ENABLED.
+#
+# fpms-console.service ExecStarts /home/ubuntu/fpms_console/fpms_console.py,
+# which exists only on the old Pi and is in NO repository, so no build can
+# produce it. This list used to sit in BOOT_UNITS above, which made the check
+# demand a .wants symlink for a unit stage 60 deliberately refuses to enable
+# (60-enable-units.sh:61) and offers to the operator instead (:345). That is
+# the verifier being stale, not the image being wrong.
+#
+# It is checked in the OPPOSITE direction rather than dropped, because
+# "not enabled" is a real requirement with a real failure mode: enabling a unit
+# whose ExecStart is absent produces a service that fails on EVERY boot, and a
+# boot with a permanently-failing unit is one an operator learns to ignore.
+# The console is superseded by the ROS dashboard (fpms-dashboard.service) in
+# any case.
+MUST_BE_SHIPPED_NOT_ENABLED=(
+    fpms-console.service
 )
 
 # Both can write /cmd_vel. They are SHIPPED so they can be masked - masking a
@@ -861,6 +879,40 @@ image root, not this host's - a check that forgets to do that reports whatever
 happens to be installed on the build machine."
     else
         add "no dangling .wants links" "$PASS" "every link resolves inside the image"
+    fi
+
+    # -- shipped, and deliberately NOT enabled -----------------------------
+    # Checked in both directions: absent from the image is a FAIL (the
+    # operator cannot enable what is not there), and enabled is also a FAIL
+    # (a unit whose ExecStart does not exist fails on every boot, and an
+    # operator who learns to ignore one failing unit ignores the next one too).
+    local n unshipped_ne="" wrongly_enabled=""
+    for n in "${MUST_BE_SHIPPED_NOT_ENABLED[@]}"; do
+        if [ ! -f "$etc/$n" ] && [ ! -f "$vendor/$n" ]; then
+            unshipped_ne="$unshipped_ne $n"
+            continue
+        fi
+        # Same .wants sweep the enabled check uses, opposite expectation.
+        if find "$etc" -name "$n" -path '*.wants/*' 2>/dev/null | grep -q .; then
+            wrongly_enabled="$wrongly_enabled $n"
+        fi
+    done
+
+    if [ -n "$unshipped_ne" ]; then
+        add "operator-enablable units shipped" "$FAIL" "absent:$unshipped_ne" \
+            "Stage 60 offers these for the operator to enable by hand once the
+missing payload is copied across. A unit that is not on the image cannot be
+enabled, so the offer in 60-enable-units.sh:345 is a dead letter."
+    elif [ -n "$wrongly_enabled" ]; then
+        add "operator-enablable units not enabled" "$FAIL" \
+            "enabled but payload is absent:$wrongly_enabled" \
+            "fpms-console.service ExecStarts a file that exists in no
+repository. Enabling it produces a unit that fails on EVERY boot. Stage 60
+deliberately does not enable it (60-enable-units.sh:61); something re-enabled
+it."
+    else
+        add "operator-enablable units not enabled" "$PASS" \
+            "${#MUST_BE_SHIPPED_NOT_ENABLED[@]} shipped, none enabled"
     fi
     return 0
 }
