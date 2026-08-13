@@ -112,11 +112,35 @@ except Exception:                        # already uses it for the LiDAR).
 # +/-1-4 deg turns on this chassis. Re-deriving them is how a session gets lost.
 
 TKMM = math.pi * 70.0 / 1320.0   # mm per encoder tick: 70 mm wheel, 1320 ticks/rev.
-                                 # NOTE the factory firmware header says
-                                 # MOTOR_ENCODER_CIRCLE 1040, not 1320. B8B measured
-                                 # 0.6 % error with 1320, so 1320 stands until a tape
-                                 # measure says otherwise -- but expect to re-measure
-                                 # this first if distances come out ~27 % long.
+                                 #
+                                 # *** DISPUTED -- THIS IMPLIES 6.00 counts/mm ***
+                                 # 1/TKMM = 6.002. SPEC.md:242 records 5.5 counts/mm
+                                 # as MEASURED. If 5.5 is right, anything trusting this
+                                 # constant overshoots by ~9 %.
+                                 #
+                                 # The two are not reconcilable by choosing a favourite:
+                                 #   - B8B measured 0.6 % distance error using 1320, but
+                                 #     it measured AT REST after every leg and corrected
+                                 #     the residual, so a scale error partly hides in the
+                                 #     correction rather than showing up in the total.
+                                 #   - the 5.5 measurement was taken on a chassis whose
+                                 #     front-left hub was working loose. The 2.7x
+                                 #     correction it produced is robust; its third digit
+                                 #     is not.
+                                 # The factory firmware header says MOTOR_ENCODER_CIRCLE
+                                 # 1040, a third value, agreeing with neither.
+                                 #
+                                 # DO NOT tune this to make one distance come out right:
+                                 # a wrong scale here is indistinguishable on a plot from
+                                 # a constant coast factor. Re-measure it directly -- push
+                                 # a known distance by tape and read the raw counts -- and
+                                 # record the result in SPEC.md before trusting either.
+DRIVE_COUNTS_PER_MM_DISPUTED = True
+"""Set False only when TKMM has been re-derived from a tape-measured push.
+
+Consumers that care about absolute distance should check this and say so in their
+output rather than reporting a confident number built on a disputed scale.
+"""
 DRV = 26                         # drive duty, of 100. A square wave: 0 -> 26 -> 0.
 TRN = 50                         # turn duty, of 100.
 COAST = 0.93                     # cut a turn at 93 % of target and let momentum
@@ -169,20 +193,23 @@ byte loss in the system; a duplicated stop costs nothing."""
 
 # ================================================================= THE PORT
 #
-# *** CONFLICT, UNRESOLVED, READ THIS ***
+# *** RESOLVED: drive = 1.3, LiDAR = 1.2. Golden is stale. ***
 #
-# golden_backup/phase6_latest.py:117-119 says:
+# golden_backup/phase6_latest.py:117-119 says the opposite:
 #       YAHBOOM_PORT (drive) = ...usb-0:1.2:1.0-port0
 #       D500_PORT    (LiDAR) = ...usb-0:1.3:1.0-port0
-# CLAUDE.md, NAV2_BRIEF sec.2 and micro-ros-agent.service all say the OPPOSITE:
-#       drive board = 1.3          LiDAR = 1.2
 #
-# The later three agree with each other, are dated after the golden code, and one
-# of them is the unit file that is demonstrably driving the board today. So 1.3
-# wins. The cables were almost certainly swapped between then and now. DO NOT
-# resolve this by trying both: the wrong one puts motor frames into the LiDAR.
-# Confirm with `udevadm info -q path -n <dev>` and the agent's own journal before
-# the first open.
+# Nine independent files disagree with it, including three that settle it:
+#   micro-ros-agent.service:16        the unit driving the board today
+#   fpms-os/.../config.env:92,96      what the shipped image binds
+#   firmware/README.md:285            flashes the BOARD on 1.3 -- and you
+#                                     cannot flash a LiDAR
+# The cables were swapped between the golden session and now. 1.3 is drive.
+#
+# DO NOT re-resolve this by trying both: the wrong one puts motor frames into
+# the LiDAR. The pre-open `udevadm info -q path -n <dev>` check below stays --
+# it costs nothing and it is the only thing that would catch the cables being
+# swapped back.
 #
 # Both CP2102 adapters report an IDENTICAL ID_SERIAL. Only USB topology tells
 # them apart, which is why binding by /dev/ttyUSBn is refused below rather than
