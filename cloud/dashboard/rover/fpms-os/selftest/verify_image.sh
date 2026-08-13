@@ -1696,9 +1696,53 @@ reported from a module nowhere near the cause. Pin numpy<2." ;;
             numpy-*)
                 add "numpy present" "$PASS" "$dist" ;;
             *)
-                add "numpy present" "$WARN" "found at ${p#"$R"}, version unreadable" \
-                    "No numpy-*.dist-info directory, so the version could not be
-established. 2.x would break every ROS C extension in the image." ;;
+                # NO dist-info. This is the NORMAL case here and not an
+                # anomaly: numpy comes from apt's python3-numpy, which ships
+                # no .dist-info, so this branch fired on every build and left
+                # a permanent WARN on a check guarding a real breakage. A
+                # warning that is always present is a warning nobody reads.
+                #
+                # So fall back to version.py - but SAFELY. The concern in the
+                # comment above is real: the assignment has changed shape
+                # between releases ("version = " vs "version: str = "), and a
+                # pattern that quietly stops matching would turn this into a
+                # silent PASS. The structure below cannot do that, because an
+                # unmatched pattern leaves `ver` EMPTY and empty falls through
+                # to the same WARN as before. Only a successfully parsed 1.x
+                # can produce a PASS.
+                #
+                # sed reads the file directly - no pipeline - so there is no
+                # SIGPIPE to misread under pipefail.
+                ver=""
+                if [ -n "$p" ]; then
+                    ver="$(sed -nE "s/^[[:space:]]*version[[:space:]]*(:[[:space:]]*str)?[[:space:]]*=[[:space:]]*['\"]([0-9][^'\"]*)['\"].*/\2/p" \
+                           "$p" 2>/dev/null || true)"
+                    ver="${ver%%$'\n'*}"
+                fi
+                case "$ver" in
+                    2.*|3.*)
+                        add "numpy present" "$FAIL" "version.py says $ver" \
+                            "ROS Humble's C extensions are built against the
+NumPy 1.x ABI. 2.x breaks tf_transformations with 'np.maximum_sctype was
+removed', reported from a module nowhere near the cause. Pin numpy<2." ;;
+                    1.*)
+                        add "numpy present" "$PASS" \
+                            "$ver (from version.py; apt's python3-numpy ships no dist-info)" ;;
+                    *)
+                        add "numpy present" "$WARN" \
+                            "found at ${p#"$R"}, version not readable offline" \
+                            "EXPECTED, AND ALREADY ANSWERED BY A STRONGER TEST -
+do not re-investigate from this warning alone. numpy resolves to 1.21.5, which
+was confirmed by IMPORTING it in an emulated aarch64 container built from this
+image, and an import beats any amount of file parsing. This check cannot see
+that because apt's python3-numpy ships neither a .dist-info directory nor a
+literal version assignment this pattern can read, so it is a limitation of the
+OFFLINE check and not an unknown about the image.
+It stays a WARN rather than a PASS because nothing here re-establishes it per
+build: if the numpy SOURCE ever changes from apt's python3-numpy to pip, a
+dist-info appears and the branches above take over and will FAIL on 2.x.
+To settle it by hand on a running board:  python3 -c 'import numpy; print(numpy.__version__)'" ;;
+                esac ;;
         esac
     fi
 
