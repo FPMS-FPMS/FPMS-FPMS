@@ -859,6 +859,23 @@ stage_all() {
               "$HERE/../STACK.md" "$MNT/opt/fpms-os/src/" \
             || die "could not stage the rover source tree into the image.
 Check free space and that $HERE/../{stack,nav2,slam} exist."
+
+        # The operator dashboard lives at cloud/dashboard/, one level ABOVE the
+        # rover tree, so the copy above does not reach it. Staged explicitly
+        # rather than moved into rover/: it is not rover firmware, it is the
+        # operator's view of the rover, and the same tree is served from a
+        # laptop as well as from the board.
+        #
+        # NOT fatal here, and stage 30 is where the verdict is given. A build
+        # host with no dashboard checked out should still produce a driving
+        # rover; stage 30 reports it as MISSING and names
+        # fpms-dashboard.service as the unit that would fail on every boot.
+        if [ -d "$HERE/../../fpms-dashboard" ]; then
+            cp -a "$HERE/../../fpms-dashboard" "$MNT/opt/fpms-os/src/" \
+                || die "the dashboard exists but could not be staged - check free space"
+        else
+            note "no fpms-dashboard/ beside the rover tree; stage 30 will report it"
+        fi
     fi
     run "chmod +x '$MNT/opt/fpms-os/scripts/'*.sh"
 

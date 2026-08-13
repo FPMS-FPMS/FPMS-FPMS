@@ -56,7 +56,22 @@ BOOT_UNITS=(
     fpms-npu-tune.service
     fpms-ros-publishers.target
     fpms-rosbridge.service
-    fpms-console.service
+    # THE DASHBOARD THE ROVER SERVES ITSELF, on :8090.
+    #
+    # fpms-console.service is deliberately NOT here any more. It
+    # ExecStarted /home/ubuntu/fpms_console/fpms_console.py, which is in
+    # no repository and exists only on the old Pi -- so it was enabled and
+    # FAILED ON EVERY BOOT of every image ever built (verify_image.sh
+    # reports it). An enabled unit that cannot start is worse than an
+    # absent one: it fills the journal and makes `systemctl --failed`
+    # useless as a signal, which teaches an operator to ignore red.
+    fpms-dashboard.service
+    # ROS-level hardware verification: is the LiDAR producing data, is the
+    # camera, is the ESP32 link actually carrying /odom_raw, /imu and /battery.
+    # Deeper than fpms-selftest, which checks presence; this checks PRODUCTION.
+    # Shipped-but-not-enabled is the exact failure this project already has on
+    # record for fpms-missions, so it goes in the boot set, not beside it.
+    fpms-hwcheck.service
     fpms-selftest.service
 )
 
@@ -310,8 +325,12 @@ done
 # `disable` is called on all four; it is a no-op on a unit with no [Install]
 # and is only ever advisory here anyway. The find/delete is what actually does
 # the work, for the same reason as everything else in this file.
+# fpms-console is listed rather than deleted: an operator who has copied
+# fpms_console across from the old Pi can `systemctl enable --now fpms-console`
+# and have it back. It is superseded by fpms-dashboard.service, not forbidden.
 for u in fpms-ros-settle.service fpms-nav2.service \
-         fpms-slam-mapping.service fpms-slam-localization.service; do
+         fpms-slam-mapping.service fpms-slam-localization.service \
+         fpms-console.service; do
     systemctl disable "$u" >/dev/null 2>&1 || true
     find "$ETC" /lib/systemd/system "$VENDOR" -mindepth 2 -name "$u" -type l -delete 2>/dev/null || true
     # Capture, not `find | grep -q`: pipefail turns grep -q's early exit into

@@ -612,6 +612,39 @@ if [ -n "$CAL_SITE" ]; then
     fi
 fi
 
+# --- the operator dashboard -------------------------------------------------
+#
+# Served BY the rover on :8090 by fpms-dashboard.service, so the operator needs
+# no checkout, no toolchain and no build step -- just a browser. Static page
+# plus a stdlib server, deliberately: a dashboard with an npm build is a
+# dashboard that cannot be fixed at a competition.
+#
+# NOTE ON WHERE IT COMES FROM: fpms-dashboard lives at cloud/dashboard/, which
+# is the PARENT of the rover tree, so build.sh stages it explicitly. If this
+# block reports it missing, that staging is the thing to look at, not this
+# stage.
+DASH_SRC="$SRC/fpms-dashboard"
+if [ -d "$DASH_SRC" ]; then
+    install -d -m 0755 -o "${FPMS_USER}" -g "${FPMS_GROUP}" "$H/fpms-dashboard"
+    cp -a "$DASH_SRC/." "$H/fpms-dashboard/"
+    chown -R "${FPMS_USER}:${FPMS_GROUP}" "$H/fpms-dashboard"
+    # Verify the OUTCOME, not cp's exit code. cp -a from a Windows-hosted
+    # source routinely fails to preserve ownership and exits non-zero having
+    # copied everything correctly, so its status is uninformative both ways.
+    for f in serve.py index.html; do
+        if [ -f "$H/fpms-dashboard/$f" ]; then
+            echo "    $H/fpms-dashboard/$f"
+        else
+            echo "    MISSING: fpms-dashboard/$f" >&2
+            MISSING=1
+        fi
+    done
+else
+    echo "    MISSING: $DASH_SRC (the dashboard payload)" >&2
+    echo "    fpms-dashboard.service is enabled and would fail on every boot" >&2
+    MISSING=1
+fi
+
 # --- nav2 / slam trees ------------------------------------------------------
 #
 # fpms-tf.service has always referenced /home/ubuntu/nav2/fpms_tf.launch.py and

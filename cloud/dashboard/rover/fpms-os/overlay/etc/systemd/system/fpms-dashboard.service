@@ -1,0 +1,89 @@
+[Unit]
+Description=FPMS operator dashboard (http :8090, ROS-native over rosbridge)
+Documentation=file:/home/ubuntu/fpms-dashboard/README.md
+
+# THE ROVER SERVES ITS OWN DASHBOARD. Open:
+#
+#     http://fpms-rover1.local:8090/
+#
+# Nothing to install on the laptop, nothing to start, no build step. That is
+# the whole point: the operator has a browser and a rover, and needs neither
+# a toolchain nor a checkout to see what the robot is doing.
+#
+# ALWAYS TYPE THE NAME, NEVER AN IP. The rover's address has changed more than
+# seven times in this project and every note that wrote one down was wrong the
+# next day. mDNS resolution is also per-RESOLVER, not per-machine - it has
+# worked from one language's resolver and failed from another's on the same
+# box at the same time - so the page also carries an IP override field.
+#
+# WHAT REPLACED WHAT
+# ==================
+# This supersedes fpms-console.service, which is now disabled. That unit
+# ExecStarted /home/ubuntu/fpms_console/fpms_console.py - a file that is in NO
+# REPOSITORY and exists only on the old Pi, so it was enabled and failed on
+# every single boot of every image ever built. verify_image.sh reports it.
+# An enabled unit that cannot start is worse than an absent one: it fills the
+# journal, it makes `systemctl --failed` useless as a signal, and it teaches
+# the operator to ignore red.
+#
+# THE DIRECTION THE CONNECTION GOES
+# =================================
+# The page is served FROM the rover, and the browser then dials rosbridge on
+# :9090 - also on the rover. Both are outbound from the laptop's point of
+# view, which is the only direction that works: the operator's Windows
+# Firewall has no inbound rule for either port and there is no admin account
+# to add one.
+#
+# ORDERING
+# ========
+# After fpms-ros-publishers.target and after rosbridge, for the reason
+# documented at length in that target: rosbridge only ever delivers topics
+# whose PUBLISHER ALREADY EXISTED when it started. A dashboard that attaches
+# before a publisher exists is accepted, subscribed, and silent forever - the
+# worst shape of failure this project has. The dashboard re-subscribes from
+# scratch on every reconnect for the same reason.
+
+After=network-online.target mosquitto.service
+After=fpms-ros-publishers.target fpms-rosbridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fpms-dashboard
+
+# EnvironmentFile FIRST so the unit's values below win, matching every other
+# ROS unit in this image. The domain and the RMW are safety properties, not
+# tuning knobs, and a stale value in config.env must not be able to move the
+# rover onto a domain where every topic list reads empty.
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=FPMS_ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+Environment=FPMS_DASHBOARD_PORT=8090
+Environment=FPMS_ROSBRIDGE_PORT=9090
+
+# FPMS_ROVER_HOST is what the SERVED PAGE tells the browser to dial, so it must
+# be an address the BROWSER can resolve - not localhost, which would make every
+# remote viewer connect to their own machine and see a dead link. Derived from
+# the running hostname rather than written out, so it stays correct on a rover
+# renamed via the boot partition.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash 2>/dev/null || true; \
+  export FPMS_ROVER_HOST="${FPMS_ROVER_HOST:-$(hostname).local}"; \
+  echo "fpms-dashboard: serving :8090, telling browsers to dial ${FPMS_ROVER_HOST}:${FPMS_ROSBRIDGE_PORT}"; \
+  exec python3 /home/ubuntu/fpms-dashboard/serve.py --port "${FPMS_DASHBOARD_PORT:-8090}"'
+
+Restart=always
+RestartSec=3
+SyslogIdentifier=fpms-dashboard
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,155 @@
+[Unit]
+Description=FPMS NPU model provisioning (installs the .rknn from the boot partition, or declares its absence)
+Documentation=file:/usr/local/bin/fpms-model-provision
+Documentation=file:/opt/fpms-os/docs/NPU.md
+Documentation=file:/opt/fpms-os/npu/models/README.md
+
+# WHY THIS UNIT EXISTS
+# ====================
+# yolo26n-rk3588.rknn IS NOT IN THE REPOSITORY and no build can produce it. It
+# exists on one SD card, in one Pi, and a set of quantised weights cannot be
+# reconstructed from prose the way FAILURE_MODES.md A1's three lost shell
+# scripts were. So every image ships blind by default, and a blind rover does
+# the worst thing this project knows how to do:
+#
+#     fpms_rover_agent.py logs "NPU unavailable; streaming without detection"
+#     ONCE, at startup, and runs forever. Every unit reports active. The camera
+#     streams. The dashboard looks alive. Nothing is ever detected.
+#
+# This unit closes both halves of that. It gives an operator a way to deliver
+# the file (drop it on the FAT boot partition from Windows, next to
+# fpms-wifi.conf), and it makes the absence a NAMED, PERSISTENT fault:
+# events/npu_fault at QoS 1, a banner on the console, a marker at
+# /var/lib/fpms/model-provision.json, and a FAILED unit.
+
+# ORDERING
+# ========
+# Before=fpms-npud.service, for two independent reasons:
+#
+#   1. The model must be in place before the daemon's first load attempt, or
+#      the rover spends its first 30 seconds in fault "model_missing" for no
+#      reason. (Only the first 30: the daemon retries the load every
+#      FPMS_NPU_RELOAD_BACKOFF_S forever, precisely so a model copied across at
+#      runtime is picked up without an operator noticing the unit needs a kick.
+#      So this edge is an optimisation, not a correctness requirement - and it
+#      is written down as such so nobody later "hardens" it into a Requires=.)
+#
+#   2. fpms-model-provision runs the FULL fpms-model-verify check, which opens
+#      the NPU and runs one real inference. Doing that before the daemon exists
+#      means the device is uncontended, so an init_runtime() failure means a
+#      version mismatch rather than "something else held it" - which
+#      fpms-model-verify can only report as a SKIP.
+#
+# Before= is ORDERING ONLY. A failed oneshot does not stop units ordered after
+# it; only Requires=/BindsTo= propagate failure, and nothing declares either on
+# this unit. That is deliberate: a rover with no detection model must still
+# come up, drive, stream video and answer the console. NEVER BLOCK THE BOOT.
+#
+# After=fpms-firstboot.service because firstboot creates /home/ubuntu/yolo,
+# provisions the broker password into config.env, and is the thing that already
+# knows how to find the vfat boot partition. Publishing an alert with the
+# placeholder password would be a silent auth failure - services retry forever
+# and nothing crashes - so ordering after it is load-bearing for the fault path,
+# not just tidy.
+After=fpms-firstboot.service local-fs.target mosquitto.service
+Wants=mosquitto.service
+Before=fpms-npud.service fpms-rover-agent.service
+
+# NO ConditionPathExists OF ANY KIND, and this is the most important negative
+# in the file. A condition on the model's presence would make the unit skip
+# itself on exactly the rover that needs it most - the blind one - and
+# `systemctl status` would report "condition failed" in grey, which reads as
+# fine. The whole point of this unit is to run WHEN THERE IS NOTHING THERE.
+
+[Service]
+Type=oneshot
+
+# RemainAfterExit so the result is legible in `systemctl status` and in
+# fpms-selftest's unit list for the whole life of the boot, rather than
+# collapsing to "inactive (dead)" the moment it finishes. A oneshot that leaves
+# no trace is a check nobody can see afterwards.
+RemainAfterExit=yes
+
+# ROOT, deliberately. It installs into ${FPMS_YOLO_DIR} (owned by ubuntu),
+# chowns what it installs, and writes /var/lib/fpms.
+#
+# The honesty cost is written into the script and repeated here: because this
+# runs as root, fpms-model-verify's inference probe also runs as root, so a
+# PASS proves the model and the driver/runtime/wheel version chain - it does
+# NOT prove that the unprivileged `ubuntu` user (which is what actually runs
+# fpms-npud and the agent) can open the NPU device. That is the gap
+# 99-fpms-npu.rules exists to close and fpms-npu-selftest exists to detect, by
+# dropping to ubuntu on purpose. Do not read a green line here as proof of it.
+
+# NOT A ROS NODE - MQTT only, exactly like fpms-npud and fpms-rover-agent.
+# There is deliberately NO ROS_DOMAIN_ID, NO RMW_IMPLEMENTATION, NO
+# FASTRTPS_DEFAULT_PROFILES_FILE and NO ROS_LOCALHOST_ONLY. SPEC.md section 2's
+# block is mandatory for ROS units; this is not one, and adding it would create
+# a DDS participant, a multicast socket and a failure mode for nothing.
+Environment=PYTHONUNBUFFERED=1
+
+# Default fault-event cooldown, in seconds. One hour, twelve times fpms-npud's
+# 300 s, and the difference is on purpose.
+#
+# A past FPMS bug emailed 330 obstacle events and exhausted the Resend daily
+# quota so A REAL FIRE ALERT COULD NOT SEND (CLAUDE.md "Hard-won constraints";
+# cloud/HANDOFF.md item 10). This unit publishes once per BOOT, which looks
+# harmless until you picture the afternoon before a competition: a bench, a
+# loose barrel jack, a card being reflashed - dozens of boots an hour, every
+# one of them with no model, every one of them an event.
+#
+# So the fault state persists in /var/lib/fpms/model-provision.json ACROSS
+# boots and an event is published only on a change of fault NAME or after this
+# many seconds. Overridable in /etc/fpms/config.env, which is read after this.
+Environment=FPMS_MODEL_FAULT_REPEAT_S=3600
+
+# LAST, on purpose - same rule and same reasoning as fpms-npud.service.
+# systemd applies Environment= and EnvironmentFile= in the order they appear
+# and a later setting wins, so putting this after the block above means
+# /etc/fpms/config.env - the documented single configuration point - overrides
+# these defaults. Moving it to the top of [Service] silently makes every knob
+# above read-only. Verify with: systemctl show fpms-model-provision -p Environment
+EnvironmentFile=-/etc/fpms/config.env
+
+ExecStart=/usr/local/bin/fpms-model-provision --boot
+
+# EXIT CODES ARE THE INTERFACE. This is why there is no `-` on ExecStart and no
+# blanket SuccessExitStatus:
+#
+#   0  a model is installed and its output shape was OBSERVED this boot
+#   1  a model is installed and IDENTIFIED, but UNPROVEN (no rknnlite yet, a
+#      contended device, a check that could not run). Not a failure: it is the
+#      honest day-one state of a rover whose NPU stack has never been proven,
+#      and the detail is on telemetry, in the journal and in the marker file.
+#   3  NO USABLE MODEL. The unit FAILS, and that is the entire design.
+#   4  the script could not do its own job (state dir unwritable).
+#
+# A failed unit puts the system into `degraded`, shows up in `systemctl
+# --failed`, and appears in fpms-selftest's unit list - three places an
+# operator already looks, none of which currently say anything about a rover
+# that cannot see. That is the point: this project's recurring defect is not
+# that things break, it is that they break while continuing to look correct.
+#
+# NOTE THE DIFFERENCE from a unit that merely restart-loops on missing code. A
+# failure here is a single, named, one-shot report whose journal entry says
+# exactly what is wrong and exactly how to fix it. It is not a Restart=always
+# unit spraying the same traceback every three seconds - that is noise, and
+# noise is how a real signal gets ignored.
+SuccessExitStatus=0 1
+
+# 300 s: a cold model load plus one inference on a busy board is not fast, the
+# script's own fpms-model-verify call is bounded at 300 s internally, and the
+# MQTT publish retries for up to ~20 s if the broker is not yet accepting
+# connections. This is a ceiling that must never be reached, not a budget.
+TimeoutStartSec=360
+
+# journal+console, like fpms-firstboot. An operator at a venue with a monitor
+# and no laptop must be able to see "NO USABLE DETECTION MODEL ON THIS ROVER"
+# without knowing that journalctl exists.
+StandardOutput=journal+console
+StandardError=journal+console
+
+SyslogIdentifier=fpms-model-provision
+
+[Install]
+WantedBy=multi-user.target

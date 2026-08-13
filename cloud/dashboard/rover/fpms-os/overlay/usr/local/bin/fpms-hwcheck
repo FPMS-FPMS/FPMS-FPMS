@@ -126,6 +126,14 @@ NOMINAL = {"/odom_raw": 11.2, "/imu": 25.0, "/battery": 1.0}
 # above that is not a fast camera, it is two publishers or a replay.
 CAMERA_HW_MAX_FPS = 30.0
 
+# "seq did not advance" is only evidence over a span long enough for it to
+# have advanced. telemetry/lidar publishes at about 10 Hz, so a few payloads
+# cover a fraction of a second - which is why this tool samples MANY of them
+# and refuses the process-vs-scanner attribution below this span rather than
+# guessing. Those two faults need completely different fixes; a coin flip
+# between them is worse than saying so.
+SEQ_MIN_SPAN_S = 1.0
+
 # A LaserScan republished with a stamp older than this means something is
 # serving an old scan. Local DDS latency is sub-millisecond, so this is loose
 # by three orders of magnitude on purpose - it fires on a fault, not jitter.
@@ -591,6 +599,13 @@ def mqtt_sample(cfg, pw, subtopic, count, wait):
     return payloads, None
 
 
+def payload_span(payloads):
+    """Seconds of publisher time these payloads cover, from their own ts."""
+    ts = sorted(float(p["ts"]) for p in payloads
+                if isinstance(p.get("ts"), (int, float)))
+    return (ts[-1] - ts[0]) if len(ts) >= 2 else None
+
+
 def payload_hz(payloads):
     """Rate from the publisher's OWN ts fields.
 
@@ -703,6 +718,12 @@ def check_env(cfg, cfgnote):
 # --------------------------------------------------------------------------
 # 2. How long has the micro-ROS link had? (the "not up yet" question)
 # --------------------------------------------------------------------------
+def _uptime():
+    """Seconds since boot. Its own function so it can be stubbed in a test."""
+    with open("/proc/uptime") as fh:
+        return float(fh.read().split()[0])
+
+
 def link_state():
     """Seconds since micro-ros-agent last entered active, on the MONOTONIC clock.
 
@@ -729,9 +750,7 @@ def link_state():
         entered = 0.0
     if entered > 0:
         try:
-            with open("/proc/uptime") as fh:
-                uptime = float(fh.read().split()[0])
-            st["age_s"] = max(0.0, uptime - entered)
+            st["age_s"] = max(0.0, _uptime() - entered)
         except (OSError, ValueError, IndexError):
             st["age_s"] = None
     return st
@@ -844,18 +863,36 @@ def check_lidar_scanner(cfg, payloads, note):
     """
     verdict = {"ok": False, "stale": None, "seq_advancing": None, "hz": None}
     if not payloads:
-        add("LiDAR scanner health", SKIP if note and "password" in note else FAIL,
-            "nothing on telemetry/lidar (%s)" % (note or "timed out"),
-            "If the broker is up and this is not a credentials problem, "
-            "fpms-rover-agent is not publishing at all - which is a different "
-            "fault from a dead scanner, because the agent publishes on a timer "
-            "even when the scanner is dead. journalctl -u fpms-rover-agent -b "
-            "--no-pager | tail -40")
+        if note and "password" in note:
+            add("LiDAR scanner health", SKIP,
+                "not sampled: %s" % note,
+                "SKIPPED, not failed: this says something about how this "
+                "process was started, not about the scanner. Scanner "
+                "freshness has exactly one source - the health/stale/seq "
+                "fields on telemetry/lidar - so without the broker it cannot "
+                "be answered at all, and guessing would be worse than "
+                "silence.")
+        else:
+            add("LiDAR scanner health", FAIL,
+                "nothing on telemetry/lidar (%s)" % (note or "timed out"),
+                "fpms-rover-agent is not publishing at all - which is a "
+                "DIFFERENT fault from a dead scanner, because the agent "
+                "publishes on a timer even when the scanner is dead. So this "
+                "is the agent or the broker, not the laser. Note that an auth "
+                "failure crashes nothing: services retry forever. journalctl "
+                "-u fpms-rover-agent -b --no-pager | tail -40")
         return verdict
 
     latest = payloads[-1]
     seqs = [p["seq"] for p in payloads if isinstance(p.get("seq"), int)]
     advancing = (len(seqs) >= 2 and seqs[-1] > seqs[0]) if seqs else None
+    # How much TIME the samples cover. "seq did not advance" only means
+    # anything over a span long enough for it to have advanced: at a 10 Hz
+    # publish cadence a handful of payloads span a third of a second, and
+    # calling the process wedged on that evidence would be a coin flip
+    # dressed up as a diagnosis.
+    span = payload_span(payloads)
+    long_enough = span is not None and span >= SEQ_MIN_SPAN_S
     stale = latest.get("stale")
     health = latest.get("health", "?")
     points = latest.get("points")
@@ -878,14 +915,24 @@ def check_lidar_scanner(cfg, payloads, note):
                 "/dev/serial/by-path/. Do NOT open the other port to compare - "
                 "it is the drive board and opening it resets the ESP32."
                 % LIDAR_PORT)
-        elif advancing is False:
+        elif advancing is False and long_enough:
             add("LiDAR scanner health", FAIL,
-                "%s (seq is FROZEN)" % shown,
+                "%s (seq FROZEN across %.1f s)" % (shown, span),
                 "THE PROCESS IS AT FAULT, not the scanner: the publish timer "
                 "is still firing but the scan loop has stopped advancing seq. "
                 "systemd will never restart this, because the unit is "
                 "perfectly active. sudo systemctl restart fpms-rover-agent ; "
                 "journalctl -u fpms-rover-agent -b --no-pager | tail -40")
+        elif advancing is False:
+            add("LiDAR scanner health", FAIL,
+                "%s (seq did not advance, but only %s of samples)"
+                % (shown, "%.1f s" % span if span is not None else "no span"),
+                "The scanner is declared stale and that much is certain. What "
+                "is NOT certain is which side of it: seq did not advance, but "
+                "not over enough time to distinguish a wedged scan loop from "
+                "the ordinary gap between two scans. Re-run - the attribution "
+                "matters, because a scanner fault and a process fault need "
+                "completely different fixes.")
         else:
             add("LiDAR scanner health", FAIL,
                 "%s (no seq field in this payload)" % shown,
@@ -896,9 +943,10 @@ def check_lidar_scanner(cfg, payloads, note):
                 "re-run. Meanwhile: fpms-doctor no-lidar")
         return verdict
 
-    if advancing is False and len(seqs) >= 3:
+    if advancing is False and len(seqs) >= 3 and long_enough:
         add("LiDAR scanner health", FAIL,
-            "%s (seq FROZEN across %d payloads)" % (shown, len(seqs)),
+            "%s (seq FROZEN across %d payloads / %.1f s)"
+            % (shown, len(seqs), span),
             "The timer is publishing and the scan loop is not advancing. "
             "stale is not set, so nothing downstream will refuse this data - "
             "the last scan will simply be repeated as though it were current. "
@@ -1058,12 +1106,18 @@ def check_lidar_ros(probe, scanner, gate):
 def check_camera(cfg, payloads, note):
     out = {"ok": False}
     if not payloads:
-        add("camera frames arriving", SKIP if note and "password" in note else FAIL,
-            "nothing on telemetry/camera (%s)" % (note or "timed out"),
-            "The agent's camera loop is the same loop that feeds the fire "
-            "detector, so a silent camera is not only a blind dashboard. "
-            "Check the device is claimed: journalctl -u fpms-rover-agent -b "
-            "--no-pager | grep -i camera")
+        if note and "password" in note:
+            add("camera frames arriving", SKIP, "not sampled: %s" % note,
+                "SKIPPED, not failed: the camera reaches the rest of the "
+                "system only over MQTT, so with no broker credentials there "
+                "is nothing to measure and nothing to conclude.")
+        else:
+            add("camera frames arriving", FAIL,
+                "nothing on telemetry/camera (%s)" % (note or "timed out"),
+                "The agent's camera loop is the same loop that feeds the fire "
+                "detector, so a silent camera is not merely a blind "
+                "dashboard. Check the device is claimed: journalctl -u "
+                "fpms-rover-agent -b --no-pager | grep -i camera")
         return out
 
     latest = payloads[-1]
@@ -1187,7 +1241,22 @@ def check_drive(probe, link, gate):
                 "Fix the gate first. The board declares domain 20 in its "
                 "CREATE_PARTICIPANT and publishes nowhere else, so on the "
                 "wrong domain a perfectly healthy board is invisible.")
-        elif age is not None and age < LINK_COLD_MAX_S:
+        elif age is None:
+            # We could not establish how long the agent has been up, so we
+            # cannot rule out the cold window - and calling a healthy board
+            # broken is the one mistake that would get this whole report
+            # ignored. Say what we do not know instead of picking a side.
+            out["state"] = "unknown"
+            add("drive board link", WARN,
+                "silent for %.0f s, and the agent's uptime could not be read"
+                % window,
+                "This is UNDECIDED, not a fault: without micro-ros-agent's "
+                "ActiveEnterTimestampMonotonic there is no way to tell 'still "
+                "inside the 90-225 s cold re-link window' from 'failed'. "
+                "Re-run in four minutes - if it is still silent then, it is "
+                "the second one. systemctl show micro-ros-agent -p "
+                "ActiveEnterTimestampMonotonic")
+        elif age < LINK_COLD_MAX_S:
             out["state"] = "not_up_yet"
             add("drive board link", WARN,
                 "NOT UP YET: silent, but micro-ros-agent has only been up "
@@ -1486,6 +1555,9 @@ def main():
 
     cfg, cfgnote = load_config()
     pw, pwsrc = broker_password(cfg)
+
+    gate = check_env(cfg, cfgnote)
+
     if pwsrc == "placeholder":
         add("broker password", WARN,
             "FPMS_MQTT_PASS is still the image placeholder",
@@ -1502,7 +1574,6 @@ def main():
             "reporting it as one is how a report becomes wallpaper. Run it as "
             "the unit does, or as root.")
 
-    gate = check_env(cfg, cfgnote)
     link = link_state()
     check_link(link)
     check_ports()
@@ -1511,7 +1582,11 @@ def main():
     # each other. The LiDAR verdict in particular is only correct when the MQTT
     # and the ROS evidence are read together: /scan_lidar going silent is a
     # FAULT when the scanner is healthy and CORRECT BEHAVIOUR when it is not.
-    lidar_payloads, lnote = mqtt_sample(cfg, pw, "telemetry/lidar", 4, 12)
+    # 20 payloads, not 4: at a ~10 Hz publish cadence that is a couple of
+    # seconds of publisher time, which is the minimum on which "seq is not
+    # advancing" means anything at all. -W caps the cost when the feed is
+    # slow or dead.
+    lidar_payloads, lnote = mqtt_sample(cfg, pw, "telemetry/lidar", 20, 12)
     cam_payloads, cnote = mqtt_sample(cfg, pw, "telemetry/camera", 3, 12)
     info = run_probe()
     probe = info.get("probe")

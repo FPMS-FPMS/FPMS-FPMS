@@ -26,24 +26,97 @@
    draws a hollow ghost at the start box labelled ASSUMED and says so. An
    assumed pose that admits it beats a confident pose in the wrong frame.
 
-   Geometry constants are derived exactly the way fpms_missions.py derives
-   them (ARENA_MM, ZONE_FRAC, MARGIN_FRAC), so a rescale is one number in
-   both places rather than a table of coordinates that can drift apart.
+   GEOMETRY IS DERIVED, NEVER COPIED. /etc/fpms/zones.json in the image ships
+   the three zone centres, and states in its own words why a consumer must not
+   simply read them:
+
+     > A consumer that reads cx_mm/cy_mm and uses them directly has created
+     > the fifth independent copy of these numbers, which is the exact failure
+     > the derivation-not-output rule exists to prevent.
+     >
+     > A consumer must recompute the centres from arena_mm, zone_side_frac and
+     > zone_margin_frac and REFUSE this whole file if any published
+     > cx_mm/cy_mm disagrees by more than 0.05 mm.
+
+   So this file derives everything from three numbers — arena_mm and the two
+   fractions — exactly as fpms_missions.py, arena.ts and make_arena_map.py all
+   do, and `validateZones()` below implements the refusal. A missing zones.json
+   does nothing at all: built-in constants, no note, no fault, which is what
+   the file itself asks for.
+
+   ZONE NAMES ARE BY CORNER, DELIBERATELY. zones.json records the trap: the
+   zone STRAIGHT AHEAD of the start box (top-right) is mission `m2`, and the
+   FAR one (top-left) is `m1`, so an operator saying "Zone 1" means the code's
+   `m2`. Nothing is renumbered — renaming ids would silently change what every
+   stored command and log line means — so every operator-facing string here
+   names the CORNER, which is the one description that cannot be read two ways.
    ========================================================================= */
 (function (global) {
 "use strict";
 
+/* The three numbers everything else comes from. */
 var ARENA_MM = 1200.0, ZONE_FRAC = 0.30, MARGIN_FRAC = 0.04;
 var ZONE = ZONE_FRAC * ARENA_MM;        // 360
 var MARGIN = MARGIN_FRAC * ARENA_MM;    // 48
 
+/* Rects anchored bottom-left, in arena mm. Ids match zones.json exactly so
+   the two can be diffed field for field. */
 var ZONES = [
-  { id: "zone-a", label: "M1 / ZONE A",  x: MARGIN,               y: ARENA_MM - MARGIN - ZONE, c: "#ff4b70" },
-  { id: "zone-b", label: "M2 / ZONE B",  x: ARENA_MM - MARGIN - ZONE, y: ARENA_MM - MARGIN - ZONE, c: "#ffbf00" },
-  { id: "water",  label: "WATER",        x: MARGIN,               y: MARGIN,                   c: "#00b7ff" }
+  { id: "zone-a", label: "ZONE A", corner: "TOP-LEFT", mission: "m1", role: "FIRE",
+    x: MARGIN,                   y: ARENA_MM - MARGIN - ZONE, c: "#ff4b70" },
+  { id: "zone-b", label: "ZONE B", corner: "TOP-RIGHT", mission: "m2", role: "FIRE",
+    x: ARENA_MM - MARGIN - ZONE, y: ARENA_MM - MARGIN - ZONE, c: "#ffbf00" },
+  { id: "water-station", label: "WATER", corner: "BOTTOM-LEFT", mission: "water", role: "REFILL",
+    x: MARGIN,                   y: MARGIN,                   c: "#00b7ff" }
 ];
+ZONES.forEach(function (z) { z.cx = z.x + ZONE / 2; z.cy = z.y + ZONE / 2; });
 
+/* The start box. Bottom-right member of the same four-corner family, but NOT
+   a zone: zones are destinations, this is where the operator is asked to
+   PLACE the rover. 90 deg because +y is up the arena and psi is CCW from +x. */
 var HOME = { x: ARENA_MM - MARGIN - ZONE / 2, y: MARGIN + ZONE / 2, hdg: 90 };  // 972, 228
+
+/* The refusal zones.json asks for. Returns {ok, checked, problems[]}.
+   Called by app.js when a copy of zones.json is reachable; a failure is shown
+   to the operator and the BUILT-IN derivation is kept, because a zone 100 mm
+   from where it should be is a perfectly plausible number that drives the
+   rover to the wrong place, silently and forever. */
+function validateZones(j) {
+  var problems = [], checked = 0;
+  var TOL = 0.05;   // the same tolerance test_stack.py uses on the 744 mm gate
+  try {
+    var a = j.arena || {};
+    if (Math.abs((a.arena_mm || 0) - ARENA_MM) > TOL) {
+      problems.push("arena_mm " + a.arena_mm + " != " + ARENA_MM);
+    }
+    if (Math.abs((a.zone_side_frac || 0) - ZONE_FRAC) > 1e-9) {
+      problems.push("zone_side_frac " + a.zone_side_frac + " != " + ZONE_FRAC);
+    }
+    if (Math.abs((a.zone_margin_frac || 0) - MARGIN_FRAC) > 1e-9) {
+      problems.push("zone_margin_frac " + a.zone_margin_frac + " != " + MARGIN_FRAC);
+    }
+    ZONES.forEach(function (z) {
+      var p = (j.zones || {})[z.id];
+      if (!p) { problems.push("zones." + z.id + " missing"); return; }
+      checked++;
+      if (Math.abs(p.cx_mm - z.cx) > TOL || Math.abs(p.cy_mm - z.cy) > TOL) {
+        problems.push(z.id + " centre published (" + p.cx_mm + "," + p.cy_mm +
+                      ") but derives to (" + z.cx + "," + z.cy + ")");
+      }
+    });
+    var sp = j.start_pose || {};
+    checked++;
+    if (Math.abs(sp.x_mm - HOME.x) > TOL || Math.abs(sp.y_mm - HOME.y) > TOL ||
+        Math.abs(sp.heading_deg - HOME.hdg) > TOL) {
+      problems.push("start_pose published (" + sp.x_mm + "," + sp.y_mm + "," +
+                    sp.heading_deg + ") but derives to (" + HOME.x + "," +
+                    HOME.y + "," + HOME.hdg + ")");
+    }
+  } catch (e) {
+    problems.push("unreadable: " + e);
+  }
+  return { ok: problems.length === 0, checked: checked, problems: problems };
+}
 
 var VIEW_MIN = -180, VIEW_MAX = ARENA_MM + 180;    // a little apron round the arena
 var ROBOT_W = 230, ROBOT_NOSE = 160, ROBOT_TAIL = -80;
@@ -127,9 +200,12 @@ Arena.prototype.drawStatic = function () {
     g.strokeRect(p0[0], p0[1], p1[0] - p0[0], p1[1] - p0[1]);
     g.setLineDash([]);
     g.fillStyle = z.c;
-    g.fillText(z.label, (p0[0] + p1[0]) / 2, p0[1] - 6);
+    /* CORNER first, mission id second and in brackets — see the header. An
+       operator reads the corner and cannot misread it; the mission id is
+       there only to connect what they see to what the logs say. */
+    g.fillText(z.label + " · " + z.corner, (p0[0] + p1[0]) / 2, p0[1] - 6);
     g.font = "9px Consolas, monospace";
-    g.fillText(Math.round(z.x) + "," + Math.round(z.y) + " +" + ZONE,
+    g.fillText("(" + z.mission + ")  centre " + Math.round(z.cx) + "," + Math.round(z.cy),
                (p0[0] + p1[0]) / 2, p1[1] - 6);
     g.font = "bold 10px Consolas, monospace";
   });
@@ -139,7 +215,8 @@ Arena.prototype.drawStatic = function () {
   g.strokeStyle = "#3af07a"; g.lineWidth = 2;
   g.beginPath(); g.arc(hp[0], hp[1], 13, 0, Math.PI * 2); g.stroke();
   g.fillStyle = "#3af07a";
-  g.fillText("HOME 972,228", hp[0], hp[1] - 18);
+  g.fillText("START · BOTTOM-RIGHT " + Math.round(HOME.x) + "," + Math.round(HOME.y) +
+             " @" + HOME.hdg + "°", hp[0], hp[1] - 18);
   g.textAlign = "left";
 };
 
@@ -284,8 +361,10 @@ Arena.prototype.clearTrail = function () { this.trail = []; };
 
 global.Arena = Arena;
 global.ARENA = {
-  ARENA_MM: ARENA_MM, ZONE: ZONE, MARGIN: MARGIN, ZONES: ZONES,
-  HOME: HOME, FRONT_STOP_MM: FRONT_STOP_MM
+  ARENA_MM: ARENA_MM, ZONE_FRAC: ZONE_FRAC, MARGIN_FRAC: MARGIN_FRAC,
+  ZONE: ZONE, MARGIN: MARGIN, ZONES: ZONES,
+  HOME: HOME, FRONT_STOP_MM: FRONT_STOP_MM,
+  validateZones: validateZones
 };
 
 })(window);

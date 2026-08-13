@@ -7,31 +7,65 @@
 var F = global.Feeds;
 
 /* ======================================================================
-   0. WHERE IS THE ROVER
+   0. IDENTITY — WHICH ROVER, AND WHICH TOPIC ROOT
    ----------------------------------------------------------------------
-   This page is served from the OPERATOR's machine, not from the Pi, so
-   `location.hostname` is the laptop and is never the answer. Resolution
-   order, most explicit first:
+   THIS IMAGE IS ROVER 1. Changed from rover2 on 2026-08-13. The defaults
+   below are that identity:
 
-     1. ?rover=host[:port]     one visit, overrides everything
-     2. localStorage           what the operator last chose
-     3. /config.json           what serve.py was started with (FPMS_ROVER_HOST)
-     4. the modal              ask, and do not guess
+     host   fpms-rover1.local   (hostname fpms-rover1, from fpms-os.conf)
+     port   9090                (fpms-rosbridge.service)
+     thing  rover1              (FPMS_THING_NAME in /etc/fpms/config.env)
 
-   There is deliberately no default host. A dashboard that silently dials
-   "localhost" and shows a dead link is indistinguishable from a dashboard
-   pointed at a rover that is off.
+   WHY THE HOST HAS AN IP OVERRIDE, AND WHY IT IS NOT OPTIONAL
+   mDNS resolution is PER-RESOLVER, NOT PER-MACHINE. The image's own
+   FLASHING.md records a session where `fpms-rover1.local` resolved from
+   .NET and failed from Python's getaddrinfo on the same box at the same
+   time. "ping works" therefore does not prove the browser will resolve it.
+   The picker takes a raw IP for exactly that case.
+
+   WHY THE THING NAME IS HERE AT ALL, GIVEN THIS IS A ROS DASHBOARD
+   Be precise about this, because getting it wrong wastes a session. The ROS
+   topic names this page subscribes to contain NO thing name — /scan_lidar
+   and /fpms/mission/x_mm are the same strings on every rover. The thing name
+   is the MQTT topic root, and it matters here for two real reasons:
+
+     1. A two-rover fleet is coming, and the operator must be able to see at
+        a glance WHICH rover the numbers on screen belong to. It is in the
+        header, always, never behind a settings panel.
+     2. It is CHECKABLE. Every DiagnosticStatus the Pi-side bridge publishes
+        carries hardware_id = FPMS_THING_NAME, so /diagnostics is live
+        evidence of the rover's own idea of its identity. If it disagrees
+        with the dashboard's, that is shown loudly — see checkIdentity().
+
+   And the failure that makes all of this worth doing, in config.env's own
+   words: a consumer on the wrong root "connects, authenticates, stays
+   connected and receives nothing forever. The rover looks dead; the broker,
+   the bridge and every unit look healthy."
+
+   Resolution order for the target, most explicit first:
+     1. ?rover=host[:port]&thing=name    one visit, overrides everything
+     2. localStorage                     what the operator last chose
+     3. config.json                      what serve.py was started with
+     4. the built-in rover1 defaults     dialed, and shown, and checkable
    ====================================================================== */
-var LS_KEY = "fpms.dashboard.rover";
-var target = { host: null, port: 9090 };
+var DEFAULT_HOST  = "fpms-rover1.local";
+var DEFAULT_PORT  = 9090;
+var DEFAULT_THING = "rover1";
 
-function parseTarget(s) {
+var LS_KEY = "fpms.dashboard.rover";
+var target = { host: DEFAULT_HOST, port: DEFAULT_PORT, thing: DEFAULT_THING };
+
+function parseTarget(s, thing) {
   if (!s) { return null; }
   s = String(s).trim().replace(/^wss?:\/\//, "").replace(/\/+$/, "");
   if (!s) { return null; }
   var m = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(s);
   if (!m) { return null; }
-  return { host: m[1], port: m[2] ? parseInt(m[2], 10) : 9090 };
+  return {
+    host: m[1],
+    port: m[2] ? parseInt(m[2], 10) : DEFAULT_PORT,
+    thing: (thing || DEFAULT_THING).trim() || DEFAULT_THING
+  };
 }
 
 function wsUrl() { return "ws://" + target.host + ":" + target.port; }
@@ -73,7 +107,14 @@ function ts() {
 }
 
 function connect() {
-  if (stopLink) { stopLink.reconnectNow = function () {}; }   // orphan the old pair
+  /* Retire the previous pair BEFORE clearing state. A link that is merely
+     dropped keeps its supervisor timer and goes on dialing the old rover
+     forever, invisibly. */
+  if (stopLink) { stopLink.dispose(); }
+  if (mainLink) { mainLink.dispose(); }
+  /* Every feed is cleared on a target change. Carrying rover2's last pose
+     into rover1's map is precisely the confident-value-in-the-wrong-frame
+     failure this dashboard exists to prevent. */
   F.reset();
   arena.clearTrail();
   resHistory = [];
@@ -96,6 +137,8 @@ function connect() {
   subscribeAll(mainLink);
 
   document.getElementById("roverHost").textContent = target.host + ":" + target.port;
+  document.getElementById("thingChip").textContent = target.thing;
+  log("target " + target.host + ":" + target.port + "  thing " + target.thing);
 }
 
 /* ======================================================================
@@ -121,12 +164,40 @@ function connect() {
    ~330 Hz during a plan; unthrottled it does not merely fill a log, it
    starves /scan_lidar on the same socket, and a frozen map beside a
    scrolling log is the exact failure this dashboard exists to prevent.
+
+   `expectS` IS THE SILENCE ALARM, AND IT IS DELIBERATELY NARROW.
+   Only FOUR topics declare one, because only four have publishers that run
+   unconditionally whatever the rover is doing:
+
+     /scan_lidar          the LiDAR node runs whether or not a mission does
+     /diagnostics         fpms_foxglove_cmd's own 0.5 s timer. The strongest
+                          canary on the graph: it is published by the SAME
+                          node that mirrors every /fpms/* topic, so if it is
+                          arriving and the mirrors are not, the bridge is
+                          alive and its MQTT side is empty — which is the
+                          wrong-topic-root signature exactly.
+     /fpms/mission/state  `_mirror_mission` publishes it on EVERY inbound
+                          telemetry/mission with no condition attached.
+     /fpms/mission/phase  likewise, and it defaults to "idle" rather than
+                          being omitted, so it is present when parked too.
+
+   Everything else is left unflagged ON PURPOSE:
+     * x_mm / y_mm / heading_deg are omitted by `_f32` when the executor has
+       no pose to report, which is the normal parked state;
+     * /fpms_health and /wheel_ticks are FIRMWARE V3 ONLY and legitimately
+       absent on the factory firmware this rover runs today;
+     * /battery, residuals, the plan and events are event-driven.
+   A silence alarm that fires while the rover is parked and healthy is an
+   alarm the operator learns to ignore, and then it is worth nothing on the
+   day it is right.
    ====================================================================== */
 var scan = null;         // LaserScan or null. NEVER a stale frame.
 var route = [];
 var resHistory = [];     // newest first, from /fpms/residual/raw
 var diagStatus = {};     // name -> {level, message, age_s, hz} from /diagnostics
 var healthWords = null;  // /fpms_health Int32MultiArray data
+var reportedThing = null; // hardware_id off /diagnostics: the ROVER's own identity
+var zonesCheck = null;   // result of ARENA.validateZones(), or null if no file
 
 function f32(key, fx) {
   return function (m) {
@@ -140,7 +211,7 @@ function subscribeAll(L) {
   /* ---- sensors ------------------------------------------------------ */
   L.subscribe("/scan_lidar", "sensor_msgs/LaserScan", function (m) {
     scan = m; F.mark("scan", (m.ranges || []).length + " rays", m);
-  }, { throttle: 100 });
+  }, { throttle: 100, expectS: 8 });
 
   /* No type asserted: BatteryState on firmware v3, UInt16 decivolts on the
      Yahboom stock image. Guessing wrong shows a plausible number in the
@@ -174,8 +245,13 @@ function subscribeAll(L) {
       out[s.name] = { level: s.level, message: s.message, kv: kv };
     });
     diagStatus = out;
+    /* hardware_id is FPMS_THING_NAME on every status the bridge publishes —
+       the rover's own statement of which rover it is. */
+    (m.status || []).forEach(function (s) {
+      if (s.hardware_id) { reportedThing = s.hardware_id; }
+    });
     F.mark("diag", Object.keys(out).length + " statuses", out);
-  }, { throttle: 1000 });
+  }, { throttle: 1000, expectS: 8 });
 
   /* ---- mission mirror — THE POSE. Not /odom. See arena.js. ----------- */
   L.subscribe("/fpms/mission/x_mm", "std_msgs/Float32", f32("x"));
@@ -190,10 +266,10 @@ function subscribeAll(L) {
     var v = m.data, j = null;
     try { j = JSON.parse(m.data); } catch (e) {}
     F.mark("state", j && j.state ? String(j.state) : String(v).slice(0, 40), j || v);
-  });
+  }, { expectS: 25 });
   L.subscribe("/fpms/mission/phase", "std_msgs/String", function (m) {
     F.mark("phase", m.data, m.data);
-  });
+  }, { expectS: 25 });
   L.subscribe("/fpms/mission/armed", "std_msgs/Bool", function (m) {
     F.mark("armed", m.data ? "ARMED" : "disarmed", !!m.data);
   });

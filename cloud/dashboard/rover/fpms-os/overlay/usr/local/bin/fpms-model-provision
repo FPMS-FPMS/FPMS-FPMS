@@ -279,10 +279,26 @@ now_s() { date +%s; }
 # carry a \r straight into a JSON string if anything upstream ever emits CRLF.
 # Reading with `read -r` is exact, and the here-string is fully materialised
 # before the loop starts, so there is no producer to SIGPIPE.
+#
+# EVERY CR is removed, not just a trailing one. The fields these helpers carry
+# are hashes, absolute paths and the literal "true" - none of which may contain
+# a CR - and a single stray \r that survives into a comparison turns "the hash
+# on record matches" into "the hash on record differs" with no visible
+# difference in any log. Cheap insurance against a CRLF-translating layer
+# anywhere between python3 and here.
+#
+# The strip is a SEPARATE ASSIGNMENT, not `LINES+=("${l//$'\r'/}")` inline:
+# some bash builds do not apply ANSI-C quoting to a pattern used inside an
+# array-append word, and the CR then survives silently into the value.
+# Reproduced on bash 5.3 while testing this file; do not "simplify" it back
+# into one line without checking the result with `printf %q`.
 read_lines() {
     local l
     LINES=()
-    while IFS= read -r l; do LINES+=("${l%$'\r'}"); done <<< "${1-}"
+    while IFS= read -r l; do
+        l="${l//$'\r'/}"
+        LINES+=("$l")
+    done <<< "${1-}"
 }
 
 # ------------------------------------------------ locate the boot partition --

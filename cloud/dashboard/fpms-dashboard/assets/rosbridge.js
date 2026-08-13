@@ -58,20 +58,43 @@
         never delivers again and nothing errors. Every advertise and every
         subscribe is recorded and replayed on every open, reconnect included.
 
-     6. THE WEDGE DETECTOR — see `wedgeS` below. This one is FPMS-specific
-        and is documented at length in cloud/dashboard/ROS_PORT.md:
+     6. PER-TOPIC SILENCE DETECTION. The most FPMS-specific mechanism here,
+        and the one that catches the failure this project keeps meeting.
 
-          > rosbridge only delivers topics whose PUBLISHER already existed
-          > when rosbridge started. A publisher created afterwards is never
-          > discovered, and the client subscription asking for it is accepted
-          > and then silent forever.
+        TWO INDEPENDENT CAUSES PRODUCE THE SAME SYMPTOM — "connected,
+        subscribed, silent, no error anywhere":
 
-        Symptom: connected, subscribed, silent, no error anywhere. It is the
-        worst failure mode in this stack because every layer reports healthy.
-        A client cannot fix it — reconnecting the BROWSER does not help,
-        because the fault is in the SERVER's discovery state. So we detect it,
-        say so in plain words, and name the actual remedy (restart
-        fpms-rosbridge on the Pi) instead of silently retrying forever.
+        (a) The rosbridge discovery bug, documented in ROS_PORT.md and in the
+            image's own fpms-ros-publishers.target:
+
+              > rosbridge only delivers topics whose PUBLISHER already
+              > existed when rosbridge started. A publisher created
+              > afterwards is never discovered, and the client subscription
+              > asking for it is accepted and then silent forever.
+
+            The image now orders rosbridge After=fpms-ros-publishers.target,
+            so this should be rare — but "should be" is not a reason to stop
+            detecting it, and a dashboard that connects DURING boot can still
+            attach before a publisher exists.
+
+        (b) A WRONG TOPIC ROOT. /etc/fpms/config.env says it plainly: a
+            consumer pointed at the wrong thing name "connects,
+            authenticates, stays connected and receives nothing forever. The
+            rover looks dead; the broker, the bridge and every unit look
+            healthy."
+
+        Neither raises an error. Neither is visible in the socket state. So
+        every subscription may declare `expectS` — the number of seconds of
+        silence that is definitely abnormal FOR THAT TOPIC — and the
+        supervisor reports exactly which topics have gone quiet. A topic with
+        no `expectS` is never flagged, because a false alarm on a topic that
+        is legitimately event-driven trains an operator to ignore the alarm.
+
+        Remediation is bounded and honest: cycle the silent subscriptions,
+        then force one fresh socket, then STOP and hold the banner. Retrying
+        forever would be worse than useless — for cause (a) the fault is in
+        the SERVER's discovery state and no client action can fix it, and for
+        cause (b) the fix is a config change on one side or the other.
 
    Everything above is implemented against the rosbridge v2 protocol directly.
    There is no roslibjs here for the same reason there is none in
@@ -131,10 +154,14 @@ function RosLink(opts) {
   this.gen       = 0;        // invalidates callbacks from superseded sockets
   this.phase     = PHASE.INIT;
   this.phaseAt   = now();
+  this.disposed  = false;
 
   this.subs      = [];       // [{topic, type, queue_length, throttle_rate}]
   this.advs      = [];       // [{topic, type}]
   this.handlers  = {};       // topic -> cb
+  this.expect    = {};       // topic -> seconds of silence that is abnormal
+  this.lastMsgAt = {};       // topic -> perf-ms of the last message on it
+  this.silent    = [];       // topics currently past their expectS
 
   this.attempts     = 0;
   this.backoffMs    = cfg.backoffBaseMs;
@@ -160,6 +187,7 @@ function RosLink(opts) {
      waiting and try immediately. */
   function wake(why) {
     return function () {
+      if (self.disposed) { return; }
       if (self.phase === PHASE.BACKOFF || self.phase === PHASE.OFFLINE) {
         self._log("wake (" + why + ") — retrying now");
         self.reconnectNow();
@@ -206,6 +234,7 @@ RosLink.prototype._send = function (obj) {
 
 RosLink.prototype._connect = function () {
   var self = this;
+  if (this.disposed) { return; }
   var gen = ++this.gen;
 
   if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
@@ -234,6 +263,11 @@ RosLink.prototype._connect = function () {
     self.openedAt = now();
     self.lastFrameAt = now();
     self.lastDataAt = 0;
+    /* Per-socket, deliberately. Silence is measured from when THIS socket
+       opened, so a topic that delivered on the previous socket and not on
+       this one is caught rather than inheriting a fresh-looking timestamp. */
+    self.lastMsgAt = {};
+    self.silent = [];
     self.probeId = null;
     self.wedgeRemedy = 0;
     self.connectDueAt = 0;
@@ -271,6 +305,7 @@ RosLink.prototype._connect = function () {
     if (m.op === "publish") {
       self.counters.data++;
       self.lastDataAt = now();
+      self.lastMsgAt[m.topic] = now();
       if (self.phase === PHASE.OPEN || self.phase === PHASE.WEDGED) {
         self._setPhase(PHASE.LIVE, "topic data flowing");
       }
@@ -309,6 +344,7 @@ RosLink.prototype._connect = function () {
 
 RosLink.prototype._scheduleRetry = function (why) {
   var self = this;
+  if (this.disposed) { return; }
   if (this.retryTimer) { return; }   // exactly one retry in flight, ever
 
   /* HALF-JITTER, not full jitter. Full jitter (`random() * delay`) can draw
@@ -334,6 +370,7 @@ RosLink.prototype._scheduleRetry = function (why) {
    A dashboard that must never lose its link cannot depend on one timer. */
 RosLink.prototype._supervise = function () {
   var t = now(), cfg = this.cfg;
+  if (this.disposed) { return; }
 
   /* (a) Stuck in CONNECTING with no event from the socket. */
   if (this.phase === PHASE.CONNECTING && this.connectDueAt && t > this.connectDueAt) {
@@ -389,45 +426,95 @@ RosLink.prototype._supervise = function () {
     }
   }
 
-  /* (e) WEDGE DETECTOR. Socket demonstrably alive (frames within quietS, or a
-         probe answered) yet no topic data at all. This is the ROS_PORT.md
-         failure: rosbridge accepted the subscription and will never deliver
-         it, because the publisher appeared after rosbridge started. */
-  if (this.expectsData && this.subs.length && this.openedAt) {
-    var since = this.lastDataAt ? (t - this.lastDataAt) : (t - this.openedAt);
-    if (since / 1000 > cfg.wedgeS) {
-      if (this.phase !== PHASE.WEDGED) {
-        this.counters.wedges++;
-        this._setPhase(PHASE.WEDGED,
-          "socket alive but ZERO topic data for " + (since / 1000).toFixed(0) + "s");
+  /* (e) PER-TOPIC SILENCE. Socket demonstrably alive (frames within quietS,
+         or a probe answered) yet one or more topics that should be arriving
+         are not. Either cause (a) the rosbridge discovery bug or cause (b) a
+         wrong topic root — see the header. Both are silent by nature, so
+         this is the only place either becomes visible. */
+  if (this.expectsData && this.openedAt) {
+    var expected = [], silent = [];
+    for (var topic in this.expect) {
+      if (!Object.prototype.hasOwnProperty.call(this.expect, topic)) { continue; }
+      expected.push(topic);
+      var since = this.lastMsgAt[topic]
+        ? (t - this.lastMsgAt[topic]) / 1000
+        : (t - this.openedAt) / 1000;
+      if (since > this.expect[topic]) { silent.push(topic); }
+    }
+    var wasSilent = this.silent.join(",");
+    this.silent = silent;
+    if (silent.join(",") !== wasSilent) {
+      /* onstate so the UI redraws its banner the moment this changes, rather
+         than on the next 5 Hz tick. */
+      try { this.onstate(this.snapshot()); } catch (e) {}
+      if (silent.length) {
+        this._log("SILENT while the link is up: " + silent.join(", "));
+      } else if (wasSilent) {
+        this._log("all expected topics delivering again");
       }
-      /* Remedy 1: cycle the subscriptions. Cheap, safe, and fixes the lesser
-         version of this (a subscription rosbridge dropped on its side). */
+    }
+
+    if (silent.length) {
+      /* ALL of them silent is a link-level verdict; SOME of them is a
+         per-publisher or per-topic-root verdict. The two need different
+         words in front of the operator, so they are different phases. */
+      if (silent.length === expected.length && this.phase !== PHASE.WEDGED) {
+        this.counters.wedges++;
+        this._setPhase(PHASE.WEDGED, "every expected topic is silent");
+      } else if (silent.length < expected.length && this.phase === PHASE.WEDGED) {
+        this._setPhase(PHASE.LIVE, "some topics recovered");
+      }
+
+      /* The remedy ladder, bounded. Step 2 is the reconnect the boot-ordering
+         case asks for; step 3 stops, because neither cause is fixable by
+         retrying and a loop would keep dropping the topics that DO work. */
+      var self = this;
+      var worstS = Math.max.apply(null, silent.map(function (tp) {
+        return self._silenceS(tp, t);
+      }));
       if (this.wedgeRemedy === 0) {
         this.wedgeRemedy = 1;
-        this._log("wedge remedy 1/2 — cycling every subscription");
-        this._cycleSubs();
-      } else if (this.wedgeRemedy === 1 && since / 1000 > cfg.wedgeS * 2) {
-        /* Remedy 2: a fresh socket. Unlikely to help — the fault is in the
-           SERVER's discovery state, not ours — but it is free and it rules
-           the client out. */
+        this._log("silence remedy 1/2 — resubscribing " + silent.join(", "));
+        this._cycleSubs(silent);
+      } else if (this.wedgeRemedy === 1 && worstS > cfg.wedgeS * 2) {
         this.wedgeRemedy = 2;
-        this._log("wedge remedy 2/2 — forcing a fresh socket");
+        this._log("silence remedy 2/2 — forcing a fresh socket and " +
+                  "resubscribing everything from scratch");
         this.reconnectNow();
-      } else if (this.wedgeRemedy === 2 && since / 1000 > cfg.wedgeS * 3) {
+      } else if (this.wedgeRemedy === 2 && worstS > cfg.wedgeS * 3) {
         this.wedgeRemedy = 3;
-        this._log("WEDGE PERSISTS. This is not fixable from the browser. " +
-                  "On the Pi: sudo systemctl restart fpms-rosbridge");
+        this._log("STILL SILENT on " + silent.join(", ") + ". Not fixable from " +
+                  "the browser. Check (1) the thing name / topic root, " +
+                  "(2) that the publisher is running, (3) sudo systemctl " +
+                  "restart fpms-rosbridge on the Pi.");
       }
+    } else if (this.wedgeRemedy) {
+      this.wedgeRemedy = 0;     // recovered; the ladder is available again
     }
   }
 };
 
-RosLink.prototype._cycleSubs = function () {
+/* Seconds this socket has gone without a message on `topic`. Measured from
+   the socket's OPEN when the topic has never delivered at all, because on a
+   fresh socket "never arrived" and "arrived once, long ago" are the same
+   fault and want the same response. */
+RosLink.prototype._silenceS = function (topic, t) {
+  t = t || now();
+  return this.lastMsgAt[topic] ? (t - this.lastMsgAt[topic]) / 1000
+                               : (t - this.openedAt) / 1000;
+};
+
+/* Resubscribe. With no argument, everything — which is what a fresh socket
+   does anyway; with a list, only the topics that have gone quiet, so a
+   working /scan_lidar is not interrupted to chase a silent /fpms/mission. */
+RosLink.prototype._cycleSubs = function (only) {
   var self = this;
-  this.subs.forEach(function (s) { self._send({ op: "unsubscribe", topic: s.topic }); });
+  var list = only
+    ? this.subs.filter(function (s) { return only.indexOf(s.topic) >= 0; })
+    : this.subs;
+  list.forEach(function (s) { self._send({ op: "unsubscribe", topic: s.topic }); });
   setTimeout(function () {
-    self.subs.forEach(function (s) { self._send(assign({ op: "subscribe" }, s)); });
+    list.forEach(function (s) { self._send(assign({ op: "subscribe" }, s)); });
   }, 300);
 };
 
@@ -442,6 +529,11 @@ RosLink.prototype.subscribe = function (topic, type, cb, opt) {
   if (opt.throttle) { s.throttle_rate = opt.throttle; }
   this.subs.push(s);
   this.handlers[topic] = cb;
+  /* Only topics whose publisher runs UNCONDITIONALLY may declare expectS.
+     Declaring it for an event-driven topic makes the silence alarm fire
+     whenever the rover is parked, which trains the operator to ignore it —
+     and the alarm is worth having only if it is believed. */
+  if (opt.expectS) { this.expect[topic] = opt.expectS; }
   this._send(assign({ op: "subscribe" }, s));
   return this;
 };
@@ -459,7 +551,25 @@ RosLink.prototype.publish = function (topic, msg) {
   return this._send({ op: "publish", topic: topic, msg: msg });
 };
 
+/* Retire this link permanently. Used when the operator re-points the
+   dashboard at a different rover: without it the old pair of sockets keeps
+   its supervisor interval and goes on dialing the OLD host forever, which is
+   both invisible and exactly the kind of zombie that makes a "why is it
+   reconnecting" question unanswerable. A disposed link never reconnects
+   again — every path that could reschedule one checks this flag. */
+RosLink.prototype.dispose = function () {
+  this.disposed = true;
+  if (this.superviseTimer) { clearInterval(this.superviseTimer); this.superviseTimer = null; }
+  if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+  this.gen++;
+  try { if (this.ws) { this.ws.close(); } } catch (e) {}
+  this.ws = null;
+  this.handlers = {};
+  this._setPhase(PHASE.INIT, "disposed");
+};
+
 RosLink.prototype.reconnectNow = function () {
+  if (this.disposed) { return; }
   if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
   this.gen++;
   try { if (this.ws) { this.ws.close(); } } catch (e) {}
@@ -474,8 +584,15 @@ RosLink.prototype.isOpen = function () {
 };
 
 RosLink.prototype.snapshot = function () {
-  var t = now();
+  var t = now(), self = this;
   return {
+    /* Topics that declared an expectS and are past it, newest silence last.
+       The UI turns this into the banner that names them. */
+    silent:       this.silent.map(function (tp) {
+                    return { topic: tp, silentS: self._silenceS(tp, t),
+                             expectS: self.expect[tp] };
+                  }),
+    expecting:    Object.keys(this.expect),
     label:        this.label,
     url:          this.url,
     phase:        this.phase,

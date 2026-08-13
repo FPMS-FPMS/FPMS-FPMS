@@ -389,6 +389,7 @@ one of them is a promise between agents, not an implementation detail:
 /etc/fpms/models.json               the model registry
 /home/ubuntu/yolo/yolo26n-rk3588.rknn
 /var/lib/fpms/npu-selftest.json     selftest output
+/var/lib/fpms/model-provision.json  boot-time model state + the fault edge
 /run/fpms/npud.sock                 daemon IPC
 MQTT  fpms/<thing>/telemetry/npu
 MQTT  fpms/<thing>/events/npu_fault
@@ -405,6 +406,208 @@ fault that gets dropped like everything else.
 
 ---
 
+## The boot sequence
+
+The model is not in the image and cannot be, so **the moment a rover is most
+likely to be blind is the moment it comes up**. That is where this layer has to
+be loudest, and it is what `fpms-model-provision.service` is for.
+
+```
+fpms-firstboot.service          grows the rootfs, WiFi, hostname, the broker
+        │                       password, and creates ${FPMS_YOLO_DIR}
+        ▼
+fpms-model-provision.service    ONESHOT, ROOT, RemainAfterExit
+        │                         1. find the vfat boot partition (statfs, not
+        │                            findmnt | grep -q)
+        │                         2. is ${FPMS_YOLO_DIR}/yolo26n-rk3588.rknn there?
+        │                         3. is a copy on the boot partition?
+        │                         4. install / verify / register / DECLARE
+        │                       -> /var/lib/fpms/model-provision.json
+        │                       -> MQTT events/npu_fault   QoS 1, edge-triggered
+        ▼
+fpms-npu-tune.service           core mask and thermal policy
+        ▼
+fpms-npud.service               loads the model, probes the shape, serves
+        │                       /run/fpms/npud.sock
+        ▼
+fpms-rover-agent.service        camera, MQTT, overlay
+```
+
+The `Before=fpms-npud.service` edge is **ordering only**, and it is an
+optimisation rather than a correctness requirement: the daemon retries its load
+every `FPMS_NPU_RELOAD_BACKOFF_S` (30 s) forever, so a model copied across at
+runtime is picked up without anyone restarting anything. What the edge does buy
+is an **uncontended device** for the verification inference, so an
+`init_runtime()` failure at boot means a version mismatch rather than "the
+daemon already had it" — which `fpms-model-verify` can only report as a `SKIP`.
+
+Nothing declares `Requires=` on this unit. A rover with no detection model must
+still boot, drive, stream and answer the console.
+
+### At boot, with a model
+
+```
+fpms-model-provision: NPU model provisioning
+fpms-model-provision: boot partition: /boot/firmware
+fpms-model-provision: model:          /home/ubuntu/yolo/yolo26n-rk3588.rknn
+fpms-model-provision: DETECTION MODEL VERIFIED
+fpms-model-provision:   sha256 58b38aee2dec4b1f...
+fpms-model-provision:   output shape OBSERVED as [1,84,8400] on this boot
+```
+
+It runs the **full** `fpms-model-verify` — not `--offline` — on every boot where
+a model is present, and that is deliberate. The thing it is watching for is the
+three-way version coupling (kernel `rknpu` ↔ `librknnrt.so` ↔ the wheel), which
+fails at `init_runtime()`, which the agent swallows, and which can break
+*between* boots: an apt upgrade, a different card, a vendor kernel. A hash check
+sees none of that.
+
+If the shape is observed and the registry does not already record it, the file
+is **blessed** — `fpms-model-verify --register` writes the sha256,
+`verified: true`, and who/when/where. It will not overwrite a *different*
+recorded hash without `--force` (a registry that quietly adopts whatever it
+finds verifies nothing), and it does not re-register on a rover that is already
+blessed, so a healthy boot does not churn an `/etc` file with a new timestamp
+every time.
+
+> **A pass here does not prove the permission.** The unit runs as root and
+> `fpms-model-verify` does not drop privileges, so a pass proves the model and
+> the version chain. It does **not** prove that the unprivileged `ubuntu` user —
+> which is what actually runs `fpms-npud` and the agent — can open the device.
+> That gap is what `99-fpms-npu.rules` closes and what `fpms-npu-selftest`
+> detects, by dropping to `ubuntu` on purpose. Run it before believing a run.
+
+### At boot, without one
+
+This is the case the unit exists for, and it produces **four** signals, because
+every single-signal design this project has tried has been missed:
+
+| Signal | Where it lands |
+|---|---|
+| a console banner: `*** NO USABLE DETECTION MODEL ON THIS ROVER ***` | `StandardOutput=journal+console` — readable on a monitor with no laptop |
+| `events/npu_fault`, QoS 1, edge-triggered, cooled down | MQTT → dashboard → the operator alert path |
+| `/var/lib/fpms/model-provision.json` | a marker `fpms-selftest` / `fpms-npu-selftest` can read without loading anything or opening the NPU |
+| the unit **FAILS** (exit 3) | `systemctl --failed`, `systemctl is-system-running` → `degraded`, and the health topic's unit list |
+
+The exit code is the interface, and the `0`/`1` split matters as much as the
+`3`:
+
+| Exit | Meaning |
+|---|---|
+| `0` | installed **and** the output shape was OBSERVED this boot |
+| `1` | installed and IDENTIFIED, shape **UNPROVEN** — no `rknnlite`, a contended device, a check that could not run. `SuccessExitStatus=0 1`, so this is not a unit failure; it is the honest day-one state of a rover whose NPU stack has never been proven. |
+| `3` | **no usable model.** The unit fails, on purpose. |
+| `4` | the script could not do its own job (unwritable state dir). |
+
+"We could not check" never shares an exit code with "we checked and it was
+fine" — the same contract as `fpms-model-verify` and `fpms-selftest`, for the
+same reason: otherwise every boot script quietly accepts an unverified model.
+
+The faults are a fixed vocabulary, never free text:
+
+| Fault | What it means |
+|---|---|
+| `model_missing` | nothing installed, and nothing on the boot partition |
+| `model_conflict` | an installed model and a *different* one on the boot partition, with no registry hash to arbitrate. **Refuses to choose**; nothing is overwritten. |
+| `model_end2end_suspect` | the container carries `TopK` / `NonMaxSuppression` strings. Copied off the card as `…​.rknn.end2end-suspect`, kept **out of the load path** |
+| `model_install_failed` | the copy did not match the source — a truncated read off a tired card, not a model problem |
+| `model_unverified` | present and identified; the shape has never been observed here |
+| `model_verify_failed` | `fpms-model-verify` FAILED. Read `/var/lib/fpms/model-provision-verify.txt`. |
+| `model_verify_timeout` | a wedged NPU call, bounded so it could not stall the boot |
+
+### Why the fault event has a cooldown
+
+`events/npu_fault` is published on the **rising edge of a named fault**, then at
+most once per `FPMS_MODEL_FAULT_REPEAT_S` (default **3600 s**) while it
+persists, and `events/npu_recovered` once on the falling edge. A change of fault
+*name* counts as a new edge; the same name repeating does not.
+
+This is not theoretical tidiness. A past FPMS bug emailed 330 obstacle events
+and exhausted the Resend daily quota, so **a real fire alert could not send**
+(`CLAUDE.md`, "Hard-won constraints"; `cloud/HANDOFF.md` item 10). An alert path
+that fires per occurrence does not merely spam — it destroys the channel for the
+one event the product exists to report.
+
+A once-per-boot publisher looks safe until you picture the afternoon before a
+competition: a bench, a loose barrel jack, a card being reflashed — dozens of
+boots an hour, every one with no model, every one an event. So the fault state
+**persists across reboots** in `model-provision.json`, and the cooldown is
+twelve times `fpms-npud`'s 300 s precisely because a per-boot publisher has a
+much worse worst case than a daemon.
+
+`last_sent` advances **only on a publish that actually left the machine**. This
+unit runs seconds after `mosquitto.service` starts, and "started" is not
+"accepting connections"; marking an edge as spent on a publish that went nowhere
+would swallow the most important alert this rover can send for a whole cooldown.
+Same reasoning, verbatim, as `fpms-npud`'s `set_fault()`.
+
+### Getting a model onto a rover from Windows
+
+This is the realistic delivery path for a binary that cannot live in git, and it
+is the same one `fpms-wifi.conf` already uses.
+
+1. **Rescue it from the old Pi first.** Nothing below matters if that card dies —
+   `npu/models/README.md` has the `scp` + `sha256sum` recipe.
+2. Put the rover's SD card in a Windows machine. It mounts the **FAT boot
+   partition** — the one with `README-FPMS.txt` and `fpms-wifi.conf.example` on
+   it. (Windows cannot see the Linux rootfs at all, which is exactly why this
+   partition is the delivery mechanism.)
+3. Copy the model there, named **exactly** `yolo26n-rk3588.rknn`. Case does not
+   matter, vfat folds it. The `yolo\` and `fpms\` subdirectories of that
+   partition are searched too, so dropping the whole rescued `yolo` folder in
+   works.
+4. Eject, boot the rover, and watch for the banner.
+
+```sh
+ssh ubuntu@fpms-rover1.local
+fpms-model-provision --status              # what the last boot decided
+journalctl -u fpms-model-provision -b --no-pager
+```
+
+Three things it deliberately will **not** do:
+
+- **It does not delete the file from the boot partition.** `fpms-wifi.conf` is
+  renamed to `.applied` because a WiFi password on a card that any computer will
+  mount is a hazard. A model is the opposite: it is the only copy in the world,
+  and leaving it there means a re-flash of this card still has it. Do not "tidy"
+  this.
+- **It does not adopt a differently-named `.rknn`.** yolov8n's exported head is
+  *also* `[1,84,8400]`, so no shape check anywhere in this stack can tell a stray
+  `yolov8n.rknn` from the right file. Installing one under the canonical name
+  would produce a rover that verifies clean, detects confidently, and is wrong.
+  It reports what it found and refuses.
+- **It does not put a suspected `end2end=True` export into the load path.** That
+  model's top-k op segfaults on the NPU, and a SIGSEGV is not an exception:
+  `fpms-npud` dies, systemd restarts it, and it dies again — a crash loop that
+  publishes *nothing*, which is the same silence by another route. The file is
+  still copied off the card (as `…​.rknn.end2end-suspect`, because the card
+  is the thing that might die tonight), just not into the path anything loads.
+  The byte scan is **an unconfirmed heuristic**, so there is one documented
+  override:
+
+  ```sh
+  sudo fpms-model-provision --force
+  ```
+
+  If it ever misfires on the project's one good model, override it and then
+  **delete the check** rather than leaving a comforting one in place — the same
+  instruction `npu/models/README.md` gives.
+
+### Two smaller things, written down so they are not re-derived
+
+It also installs `custom_labels.json` from the boot partition if one is there
+and none is installed. That is deliberately not a fault path: the agent loads
+that file inside a bare `try/except` and falls back to the compiled
+`COCO_NAMES`, so a missing one costs display names, not detection.
+
+It does not touch `fpms_yolo26_npu.py`. That module — the v26 decode path — **is**
+in the repository, and `scripts/30-fpms-payload.sh` installs it to
+`${FPMS_YOLO_DIR}`. The `.rknn` really is the only piece of the v26 detection
+path that is missing, which is why one file on a FAT partition is enough to fix
+it.
+
+---
+
 ## How to verify it is really working
 
 **"The unit is active" proves nothing here.** Neither does live video, nor a
@@ -413,6 +616,13 @@ that has never run a single inference. The check has to exercise the thing that
 actually fails.
 
 ```sh
+# 0. Is there a model at all, and did anything check it? This is the cheapest
+#    question and the one most often skipped. It loads nothing and opens
+#    nothing - it reads what the boot already decided.
+fpms-model-provision --status
+systemctl status fpms-model-provision      # FAILED here means: no usable model
+journalctl -u fpms-model-provision -b --no-pager
+
 # 1. Did the agent say the words? This is the one line that matters, and it
 #    appears ONCE at startup, so grep the whole journal, not the tail.
 journalctl -u fpms-rover-agent --no-pager | grep -E 'NPU ready|NPU unavailable'
@@ -500,7 +710,9 @@ before a competition.
 | | Status |
 |---|---|
 | **Nothing in this layer has run on an RK3588S** | **The board has not arrived.** Every latency figure, core-mask recommendation, device path and sysfs node in this document is derived from documentation and from the old Pi, not measured on the target. |
-| **The model is still not in git** | `yolo26n-rk3588.rknn` exists only on the old Pi's SD card. `yolov8n.rknn` and `custom_labels.json` with it. Nothing in this repository can rebuild them, and the conversion pipeline that theoretically could has never been run. **This is the single highest-value thing anyone can fix this week, and it needs `scp`, not code.** |
+| **The model is still not in git** | `yolo26n-rk3588.rknn` exists only on the old Pi's SD card. `yolov8n.rknn` and `custom_labels.json` with it. Nothing in this repository can rebuild them, and the conversion pipeline that theoretically could has never been run. `fpms-model-provision` gives it a delivery path and makes its absence loud; **it does not make a copy exist.** This is still the single highest-value thing anyone can fix this week, and it needs `scp`, not code. |
+| **`fpms-model-provision` has never seen a real vfat boot partition** | its decision table, fault vocabulary, cooldown and exit codes were exercised against stubs on a workstation, including the found / absent / conflicting / truncated / suspected-end2end paths. The `statfs` probe for `/boot/firmware`, the install into `${FPMS_YOLO_DIR}` on a real rootfs, and the `mosquitto_pub` at boot have not run on hardware. Confirm the first with `stat -f -c %T /boot/firmware`. |
+| **The end2end byte scan has still never met a bad export** | `fpms-model-provision` withholds a flagged file from the load path where `fpms-model-verify` only WARNs, because a SIGSEGV here is a crash loop rather than a wrong number. Both are the same unconfirmed heuristic. The day a real `end2end=True` export exists, run `strings model.rknn \| grep -Ei 'topk\|nonmaxsuppression'` against a known-good and a known-bad file, and **delete the check** rather than leave a comforting one if it does not discriminate. |
 | **`/dev/rknpu` is unverified** | the node name is inferred. Confirm with `ls -l /dev/rknpu*` on the real board before trusting `99-fpms-npu.rules`. |
 | **No multi-core configuration has ever run** | every NPU number this project owns was measured with `init_runtime()` on the default core 0, or explicitly pinned to `NPU_CORE_0`. The 3× is an assumption. |
 | **Thermal behaviour is completely unmeasured** | no sustained-load run exists, on this board or the old Pi. `bench_npu.py` averages 30 frames after a 3-frame warm-up. |
@@ -522,6 +734,7 @@ These four are **new**. They do not exist in `/etc/fpms/config.env` today.
 | `FPMS_NPU_REQUIRED` | `1` | `1` — a rover that cannot infer is a **declared fault**: `fpms-npud` publishes `events/npu_fault` at QoS 1 and the selftest FAILs. `0` — permit streaming-only operation, for bench work on a board with no model. Default `1` because on this rover detection is the product, not a feature. |
 | `FPMS_NPU_MAX_LATENCY_MS` | `250` | Per-inference deadline. Exceeding it is a fault event, not a warning, because the failure it is watching for is thermal throttling, which is gradual and silent. Derived from the ~333 ms budget implied by 3 inferences/second — **MEASURE ME**, this number is arithmetic, not observation. |
 | `FPMS_NPU_SOCKET` | `/run/fpms/npud.sock` | The `fpms-npud` unix socket. Under `/run` deliberately: tmpfs, cleared on every boot, so a stale socket from a previous process era cannot be connected to. (`docs/DDS.md` is a long story about exactly that mistake in another transport.) |
+| `FPMS_MODEL_FAULT_REPEAT_S` | `3600` | How long `fpms-model-provision` waits before re-publishing an **unchanged** `events/npu_fault`. Twelve times `fpms-npud`'s `FPMS_NPU_FAULT_REPEAT_S`, because a once-per-boot publisher on a bench being reflashed has a far worse worst case than a daemon. A change of fault *name* ignores it. Set to `0` only when testing the publish path. |
 
 Two that already exist and are covered by `config.env` today:
 
@@ -567,6 +780,46 @@ Until that lands, every consumer must apply the defaults in the table above when
 the variable is absent — and say in its log which value it used and where it
 came from. A default that is applied silently is how this project got
 `FPMS_YOLO_VARIANT=v8` on a rover with no v8 module.
+
+### Follow-up: `fpms-model-provision.service` is not enabled yet
+
+**This is a flagged action item, not a completed change.** Units are enabled at
+build time by `scripts/60-enable-units.sh`, from the `BOOT_UNITS` array near the
+top of that file — it runs `systemctl enable` in the chroot, then verifies (and
+if necessary creates) the `multi-user.target.wants` symlink by hand. That script
+belongs to agent A, so this document names the change rather than making it:
+
+```sh
+# scripts/60-enable-units.sh, in BOOT_UNITS
+    fpms-model-provision.service
+```
+
+Until that one line lands, `fpms-model-provision.service` ships **installed but
+disabled**, which is the worst of both worlds: the file is present, `systemctl
+cat` shows it, and it never runs. `fpms-missions` was once found in exactly that
+state. There is no runtime symptom to notice, because the whole point of the
+unit is to speak up when nothing else does.
+
+Confirm on a flashed card with:
+
+```sh
+systemctl is-enabled fpms-model-provision     # want: enabled
+```
+
+Two smaller follow-ups in the same category, both outside this layer's files:
+
+- `fpms-selftest`'s `check_npu()` and `fpms-npu-selftest`'s `check_model()` both
+  answer "is the model there" by `os.path.exists`. Neither reads
+  `/var/lib/fpms/model-provision.json`, so neither can currently distinguish
+  *absent* from *present but rejected as an end2end suspect*, nor report which
+  boot last proved the shape. Folding that marker in is a few lines in each and
+  removes a whole class of "the file is there so it must be fine".
+- `overlay/boot/README-FPMS.txt` — the operator-facing card README — documents
+  `fpms-wifi.conf`, `fpms-hostname`, `fpms-broker-host` and
+  `fpms-mqtt-password`, and says nothing about the model. The one place an
+  operator with a card in a Windows reader will actually look should carry the
+  four lines from "Getting a model onto a rover from Windows" above. It is owned
+  by agent B.
 
 ---
 

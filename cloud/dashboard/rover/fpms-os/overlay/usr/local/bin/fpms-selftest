@@ -76,7 +76,32 @@ def sh(cmd, timeout=10):
 
 
 def load_config():
+    """config.env, with the process environment overlaid on top.
+
+    THE OVERLAY IS NOT OPTIONAL, and leaving it out produced two SPURIOUS
+    FAILURES on every single boot.
+
+    /etc/fpms/config.env is 0640 root:root -- deliberately, it holds the broker
+    password -- and fpms-selftest.service runs as User=ubuntu. So under systemd
+    this open() raises PermissionError, the `except OSError` swallows it, and
+    cfg comes back EMPTY. Every value then reads as absent:
+
+        FPMS_MQTT_PASS  == ""  -> "broker password provisioned" FAILS, because
+                                  an empty string is not the placeholder either
+        the MQTT probe    auths with an empty password -> "LiDAR telemetry
+                                  arriving" FAILS on a rover whose LiDAR is fine
+
+    A boot report that cries wolf twice is worse than no boot report: it is the
+    thing that teaches an operator to stop reading it, and this file's entire
+    purpose is to be believed when it says something is wrong.
+
+    The unit passes the values it needs as Environment=, so the environment is
+    the reliable source under systemd and the file is the reliable source when
+    a human runs this by hand as root. Read both, environment wins.
+    fpms-npu-selftest and fpms-hwcheck already do exactly this.
+    """
     cfg = {}
+    readable = False
     try:
         with open(CONFIG) as fh:
             for line in fh:
@@ -85,8 +110,26 @@ def load_config():
                     continue
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
+        readable = True
     except OSError:
+        # Expected as `ubuntu`. Not an error, and not silence either - the
+        # provenance is reported below so a wrong value can be traced to the
+        # source it actually came from.
         pass
+
+    # The environment wins. Only FPMS_* keys, so this cannot import unrelated
+    # state from whatever shell a human happens to be in.
+    from_env = 0
+    for k, v in os.environ.items():
+        if k.startswith("FPMS_") and v != "":
+            if cfg.get(k) != v:
+                from_env += 1
+            cfg[k] = v
+
+    cfg["_provenance"] = ("file+env" if readable else "env only (config.env is "
+                          "0640 root:root and this runs as %s)"
+                          % (os.environ.get("USER") or "ubuntu"))
+    cfg["_from_env"] = str(from_env)
     return cfg
 
 
