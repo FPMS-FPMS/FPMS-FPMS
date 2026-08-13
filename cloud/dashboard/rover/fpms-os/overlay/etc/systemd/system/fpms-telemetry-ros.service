@@ -1,0 +1,135 @@
+[Unit]
+Description=FPMS camera + NPU health -> ROS 2 (MQTT telemetry -> std_msgs under /fpms/)
+Documentation=file:/opt/fpms-os/SPEC.md
+Documentation=file:/opt/fpms-os/npu/NPU_SPEC.md
+
+# THE GAP THIS CLOSES
+# ===================
+# Two of the four subsystems on the operator dashboard had NO ROS PUBLISHER
+# ANYWHERE. fpms-rover-agent sends camera frames straight to MQTT; fpms-npud
+# raises its faults on MQTT. Neither had a mirror inside rosbridge's
+# topics_glob, so the dashboard rendered both tiles as NO ROS SOURCE - hatched
+# grey, deliberately neither good nor bad, because guessing green would have
+# meant a blind fire-detection rover reported healthy.
+#
+# This unit is the mirror. It publishes HEALTH only:
+#
+#   /fpms/camera/state|health|stale|frame_age_s|fps|resolution
+#   /fpms/npu/state|health|detection_available|model_loaded|model_sha_state
+#   /fpms/npu/p50_ms|p90_ms|infer_per_s|drops|consecutive_failures|core_mask
+#   /fpms/npu/fault      (events/npu_fault + events/npu_recovered)
+#   /fpms/agent/fault    (events/fault + events/camera_recovered)
+#
+# NOT the frames. telemetry/camera carries a ~40 kB base64 JPEG every ~170 ms;
+# pushing that through rosbridge is a different engineering problem and the
+# dashboard does not ask for it.
+#
+# THE WHITELIST DOES NOT MOVE FOR THIS UNIT
+# =========================================
+# Every topic above is under /fpms/, and topics_glob in
+# /etc/fpms/rosbridge_params.yaml already contains /fpms/* with fnmatch
+# semantics where '*' matches '/' too. The node ASSERTS that prefix over rclpy's
+# own publisher list at startup and refuses to start otherwise, because a topic
+# outside it would publish happily and be dropped by rosbridge in silence.
+#
+# IT CANNOT MOVE THE ROVER
+# ========================
+# Read-out only. No /cmd_vel, no /cmd_duty, no /estop, and no MQTT publish path
+# at all - the paho client is subscribe-only. The same startup assertion aborts
+# the process if a publisher on any actuation topic is ever added.
+#
+# THE STALE CONTRACT - the sharp edge
+# ===================================
+# ARRIVAL DOES NOT IMPLY FRESHNESS. telemetry/pose is published on a 5 s TIMER
+# whether or not the camera has produced a frame, and fpms-npud publishes
+# telemetry/npu on a timer INCLUDING WHILE FAULTED (deliberately, so that
+# silence means the daemon is gone rather than merely unhappy). So the node ages
+# every value from the moment IT received it, on a monotonic clock, and never
+# from a timestamp inside a payload.
+#
+# And when a source has never spoken it publishes the literal string "unknown" -
+# not 0, not "ok", not false. A blind rover reported healthy is the worst
+# failure this system can produce; an honest "unknown" is not a failure at all.
+#
+# NO ORDERING EDGE ONTO fpms-rover-agent OR fpms-npud, DELIBERATELY
+# ================================================================
+# The stack's design rule (SPEC.md section 3) is that each node detects its own
+# missing input and says so rather than being ordered behind it - and this node
+# exists precisely to say so. An edge here would also be worthless: both are
+# Type=simple, so systemd calls them "started" the instant execve returns,
+# seconds before either has produced anything.
+
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+# rosbridge only delivers topics whose PUBLISHER ALREADY EXISTED when rosbridge
+# started. Measured and reproduced three times: rosbridge up at 22:26:33,
+# fpms-odom-tf at 22:45:45, /odom delivering ZERO messages while publishing
+# healthily at 6.6 Hz - connected, subscribed, silent, no error anywhere. Every
+# publisher declares Before= this target and every consumer declares After= it.
+# Without this line the camera and NPU tiles would go from "NO ROS SOURCE" to
+# "subscribed and permanently silent", which is strictly worse: it looks like a
+# dead camera instead of an honest absence.
+Before=fpms-ros-publishers.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# ENVIRONMENT ORDERING - EnvironmentFile FIRST. SPEC.md section 2.
+#
+# systemd applies these in file order and a later setting wins, so putting
+# EnvironmentFile= first means the UNIT wins for the four ROS variables below.
+# That is correct for a ROS unit and is the opposite of fpms-npud.service:
+# ROS_DOMAIN_ID and RMW_IMPLEMENTATION are safety properties, and a stale value
+# left in config.env must not be able to put this node on a domain where every
+# topic list reads empty - which looks exactly like a dead rover.
+#
+# The FPMS_* tuning knobs this node reads (FPMS_CAMERA_STALE_S,
+# FPMS_NPU_STALE_S, FPMS_TELEMETRY_ROS_HZ, ...) are NOT set below, so
+# config.env still owns them and load_config() lets the environment win for
+# them. Verify the resolved set with:
+#     systemctl show fpms-telemetry-ros -p Environment
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# THE MOST IMPORTANT LINE IN THIS FILE. Fast DDS defaults to a shared-memory
+# transport whose segments do not survive across process eras: a publisher
+# started in one era and a subscriber in another complete discovery and then
+# never exchange a single byte. That is the root cause of the "rosbridge only
+# sees pre-existing publishers" symptom above. Forcing UDPv4 removes it.
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# No "-" prefix, matching fpms-lidar-ros and fpms-tf: if the network is not
+# stable we would rather wait than create a DDS participant that is
+# discoverable and silent. The script itself exits 0 on timeout, so this cannot
+# strand the health mirror indefinitely.
+ExecStartPre=/usr/local/bin/fpms-wait-net
+
+# `bash -lc` + source, like every other ROS unit here: rclpy is not importable
+# from a bare /usr/bin/python3. The re-exported ROS variables above survive the
+# login shell because systemd's environment is inherited, and `exec` means the
+# python process keeps this unit's PID rather than hiding behind a shell.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /usr/local/bin/fpms-telemetry-ros'
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+# Restart=always, and it matters more here than for most units: while this node
+# is down the camera and NPU tiles have no source at all, and "no source" is the
+# state it was written to abolish.
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=fpms-ros-publishers.target

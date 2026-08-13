@@ -40,6 +40,7 @@ User=root
 # inherit an FPMS_UROS_* override from a parent environment. The
 # EnvironmentFile line below is therefore intentionally ABSENT.
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
 Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml

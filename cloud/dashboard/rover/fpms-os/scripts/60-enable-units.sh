@@ -79,6 +79,11 @@ BOOT_UNITS=(
     # the point: without it the agent logs "NPU unavailable; streaming without
     # detection" once and runs blind forever with every unit reporting active.
     fpms-model-provision.service
+    # MQTT -> ROS mirror for camera and NPU health. Without it those
+    # two tiles on the dashboard have NO ROS SOURCE at all, and the
+    # dashboard correctly refuses to colour them -- guessing green
+    # would mean a blind fire-detection rover reported healthy.
+    fpms-telemetry-ros.service
     fpms-selftest.service
 )
 

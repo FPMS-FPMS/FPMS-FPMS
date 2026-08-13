@@ -64,7 +64,29 @@ Documentation=file:/home/ubuntu/STACK.md
 After=network-online.target
 After=dev-serial-by\x2dpath-platform\x2dfc880000.usb\x2dusb\x2d0:1.3:1.0\x2dport0.device
 Wants=network-online.target
-Before=fpms-ros-publishers.target
+# DELIBERATELY NOT Before=fpms-ros-publishers.target, and not WantedBy= it
+# either. This unit is the ONE thing in the image that must stay outside that
+# barrier.
+#
+# Every consumer -- rosbridge, the console, the dashboard, both selftests,
+# Nav2, both SLAM units -- is After= that target. Putting this unit before it
+# ordered all NINE of them behind a serial link that takes 90-225 SECONDS to
+# establish, and put the barrier and all its consumers into the same start job
+# as the agent.
+#
+# Today the cost is milliseconds, because Type=simple means "started" is just
+# execve returning, not a live XRCE session. That is exactly what makes it
+# dangerous: it is latent. The moment this unit gains a Type=notify, an
+# ExecStartPre that waits for the session, or an sd_notify wrapper, a routine
+# bridge restart becomes a multi-minute outage of the operator's entire view
+# of the robot.
+#
+# And it is NOT replaced with an After= anywhere. The design rule is that each
+# consumer detects its own missing input and says so -- fpms-hwcheck reports
+# "link not up yet" as distinct from "down" for precisely this reason.
+#
+# selftest/test_boot_graph.py's uros_isolation check enforces this by walking
+# the transitive closure, so it cannot quietly come back.
 
 [Service]
 Type=simple
@@ -76,6 +98,8 @@ Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
 Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
 
 # The wrapper starts fpms-uros-release-reset alongside the agent, in this same
 # cgroup. That holder is not optional: RTS drives the ESP32-S3's EN pin and
@@ -91,4 +115,3 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-WantedBy=fpms-ros-publishers.target

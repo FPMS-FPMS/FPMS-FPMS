@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+"""fpms-telemetry-ros - camera and NPU HEALTH from MQTT onto the ROS graph.
+
+Usage:
+    fpms-telemetry-ros          run in the foreground (systemd Type=simple)
+
+WHY THIS NODE EXISTS
+====================
+The operator dashboard reads the rover through rosbridge, and rosbridge only
+delivers what is inside `topics_glob` in /etc/fpms/rosbridge_params.yaml. Two of
+the four subsystems it shows had NO ROS PUBLISHER ANYWHERE:
+
+  * the camera - fpms_rover_agent.py encodes frames and sends them straight to
+    MQTT `telemetry/camera`; nothing mirrors any of it onto the graph;
+  * the NPU    - fpms-npud publishes `telemetry/npu` and raises its faults on
+    `events/npu_fault`, also MQTT only.
+
+So the dashboard renders both tiles as NO ROS SOURCE - hatched grey, deliberately
+neither good nor bad (assets/app.js, linkTiles()). That choice was right: the
+alternative is guessing green, and a green tile over a blind fire-detection rover
+is the single worst thing this system can produce. But grey is not an answer, it
+is an admission, and this node is the answer.
+
+It is the same shape as fpms_lidar_ros.py - subscribe to the agent's MQTT,
+republish onto ROS - and the same shape as fpms_foxglove_cmd.py's mission
+mirror, whose /fpms/mission/* topics this dashboard already consumes.
+
+WHAT IT DOES NOT DO: FRAMES
+===========================
+It does not carry the picture. `telemetry/camera` embeds a base64 JPEG of about
+40 kB every ~170 ms; pushing that through rosbridge is a different engineering
+problem (a 10 MB max_message_size, a websocket shared with the LiDAR, and a
+browser decoding base64 at 6 Hz) and the dashboard does not ask for it - it asks
+whether the camera is ALIVE. So the encoder output is read for its shape and
+then dropped on the floor: see _camera_fields(), which whitelists the keys it
+keeps and never retains `frame`. That is structural, not a convention - the
+40 kB string cannot reach a publisher because it is never stored.
+
+THE STALE CONTRACT - the sharp edge, and it is sharper here than on the LiDAR
+============================================================================
+ARRIVAL DOES NOT IMPLY FRESHNESS. Two of the three sources publish on a TIMER:
+
+  telemetry/pose   every ~5 s from fpms_rover_agent.heartbeat(), ALWAYS, whether
+                   or not the camera has produced a single frame. `camera_ok`
+                   inside it is a flag the agent last wrote, not an observation
+                   made now.
+  telemetry/npu    every FPMS_NPU_TELEMETRY_S from fpms-npud's watchdog thread,
+                   unconditionally AND INCLUDING WHILE FAULTED - deliberately,
+                   so "the NPU is broken" is distinguishable from "fpms-npud is
+                   not running".
+
+Only telemetry/camera is data-driven: the agent publishes it inside the `if ok:`
+after cv2.imencode() of a frame it just read, so one message means one frame
+actually existed. That distinction is load-bearing and is the reason a fresh
+frame is allowed to clear a latched camera fault below, while a fresh heartbeat
+is never allowed to clear anything.
+
+Every value published here is therefore aged from THE MOMENT THIS PROCESS
+RECEIVED IT, on time.monotonic(), never from a timestamp inside the payload -
+the same rule assets/feeds.js states as non-negotiable, for the same two
+reasons: a stuck publisher re-stamps a dead sensor, and the Pi's clock and the
+laptop's clock do not agree and are not synchronised at a venue with no NTP.
+
+THE UNKNOWN CONTRACT - do not invent a value when the source is silent
+======================================================================
+If telemetry/npu has never arrived, this node publishes "unknown". Not 0, not
+"ok", not false. NPU_SPEC.md design rule 3 in the daemon's own words: never
+claim a detection you cannot substantiate - and "nothing is wrong" is a claim.
+
+Mechanically there are three classes of topic and the class decides the rule:
+
+  ALWAYS      /fpms/camera/state, /fpms/camera/health, /fpms/npu/state,
+              /fpms/npu/health. Published at FPMS_TELEMETRY_ROS_HZ from process
+              start, with zero MQTT arrivals, carrying the literal string
+              "unknown". These four are what a tile keys off, and they are the
+              only topics that can say "I am running and my source is silent" -
+              a statement no absent topic can make.
+
+  WHILE FRESH every scalar. /fpms/npu/p50_ms is published while telemetry/npu is
+              fresh and STOPS when it is not. It is never zero-filled and never
+              frozen. Absence is a failure mode ROS already handles correctly;
+              a confident stale number is not - fpms_lidar_ros.py stops
+              publishing LaserScans for exactly this reason.
+
+  ONCE SEEN   /fpms/camera/stale and /fpms/camera/frame_age_s. Omitted until a
+              first frame has arrived (before that there is no age to report,
+              and `stale=false` would be a lie about a camera nobody has heard
+              from), then published forever, including while stale - they are
+              the topics ABOUT staleness and going quiet would defeat them.
+
+THIS NODE CANNOT MOVE THE ROVER
+===============================
+Every topic it publishes begins "/fpms/" and is a READ-OUT. There is no
+/cmd_vel, no /cmd_duty, no /estop, and no MQTT publish path AT ALL - the paho
+client here is subscribe-only and this file contains no call to client.publish().
+_assert_publishers() enforces the topic rule at startup and refuses to start if
+it is ever broken, because a comment saying "this node cannot move the rover"
+decays and a check that aborts the process does not. Same guard, same reasoning
+as fpms_foxglove_cmd._assert_no_actuators().
+
+TOPICS PUBLISHED - all inside `topics_glob`, which is NOT widened
+================================================================
+/etc/fpms/rosbridge_params.yaml whitelists "[/estop,/fpms/*,...]" with fnmatch
+semantics where '*' matches '/' too, so /fpms/* already covers every name below
+and NOTHING IN THE WHITELIST NEEDS TO CHANGE. That is why the "/fpms/" prefix is
+asserted rather than assumed: a topic outside it would be accepted by ROS,
+published happily, and silently never reach the browser.
+
+    /fpms/camera/state                std_msgs/String   unknown|ok|warn|stale|off|fault
+    /fpms/camera/health               std_msgs/String   JSON snapshot
+    /fpms/camera/stale                std_msgs/Bool
+    /fpms/camera/frame_age_s          std_msgs/Float32
+    /fpms/camera/fps                  std_msgs/Float32  ARRIVALS here, measured
+    /fpms/camera/resolution           std_msgs/String   e.g. "640x480"
+
+    /fpms/npu/state                   std_msgs/String   unknown|ok|degraded|stale|fault
+    /fpms/npu/health                  std_msgs/String   JSON snapshot
+    /fpms/npu/detection_available     std_msgs/Bool
+    /fpms/npu/model_loaded            std_msgs/Bool
+    /fpms/npu/model_sha_state         std_msgs/String   verified|unverified|mismatch
+    /fpms/npu/p50_ms                  std_msgs/Float32
+    /fpms/npu/p90_ms                  std_msgs/Float32
+    /fpms/npu/infer_per_s             std_msgs/Float32
+    /fpms/npu/drops                   std_msgs/Int32
+    /fpms/npu/consecutive_failures    std_msgs/Int32
+    /fpms/npu/core_mask               std_msgs/String   in force, not requested
+
+    /fpms/npu/fault                   std_msgs/String   events/npu_fault + npu_recovered
+    /fpms/agent/fault                 std_msgs/String   events/fault + camera_recovered
+
+MQTT SOURCES (subscribe only, QoS 0 for telemetry, QoS 1 for events)
+    fpms/<thing>/telemetry/camera     per frame  (data-driven)
+    fpms/<thing>/telemetry/pose       ~0.2 Hz    (TIMER)
+    fpms/<thing>/telemetry/npu        ~0.2 Hz    (TIMER, including while faulted)
+    fpms/<thing>/events/npu_fault     edge       (and fpms-npud's LWT)
+    fpms/<thing>/events/npu_recovered edge
+    fpms/<thing>/events/fault         edge       (agent: camera|lidar|heartbeat)
+    fpms/<thing>/events/camera_recovered edge
+
+VERIFY THE OUTCOME, NOT THE EXIT CODE
+=====================================
+paho's subscribe() returns (rc, mid) the instant the packet is queued; it says
+nothing about whether the broker GRANTED the subscription. /etc/mosquitto/
+fpms.acl names fpms/rover1/# explicitly, so a thing-name drift or an ACL edit
+produces a REFUSED subscribe that looks exactly like a silent sensor. So the
+SUBACK is checked in on_subscribe(), refusals are named in the log and carried
+in `mqtt.refused` inside both health snapshots. Likewise the publisher table is
+verified against rclpy's own list at startup rather than trusted, and the
+publish plan is checked against that table on every tick so a topic with no
+publisher is a logged fault instead of a value that quietly goes nowhere.
+
+This module is importable WITHOUT ROS and WITHOUT paho (both imports are
+guarded), so Store, the state machines and the publish plan can be unit-tested
+off-robot - the same trick fpms_lidar_ros.py, fpms_odom_tf.py and
+deadband_sweep.py use.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import sys
+import threading
+import time
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                           HistoryPolicy)
+    from std_msgs.msg import Bool, Float32, Int32, String
+    _ROS_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only off-robot
+    _ROS_AVAILABLE = False
+    Node = object
+
+
+# ============================================================================
+# TOPICS
+# ============================================================================
+# The prefix is asserted, not assumed. See _assert_publishers().
+#
+# fnmatch semantics in rosbridge_params.yaml: '*' matches '/' too, so the single
+# entry /fpms/* in topics_glob covers every name in this table. The whitelist
+# does not move for this node, which is the whole point of putting everything
+# under /fpms/ - "widen the whitelist" is not on the table and never should be.
+TOPIC_PREFIX = "/fpms/"
+
+# Named so that a future edit adding an actuator has to delete a line that says
+# REFUSING TO START rather than merely ignore a comment.
+FORBIDDEN_TOPICS = ("/cmd_vel", "/cmd_duty", "/cmd_enable", "/estop",
+                    "/reset_encoders", "/beep", "/servo_s1", "/servo_s2",
+                    "/fpms/cmd/stop")
+
+T_CAM_STATE = "/fpms/camera/state"
+T_CAM_HEALTH = "/fpms/camera/health"
+T_CAM_STALE = "/fpms/camera/stale"
+T_CAM_AGE = "/fpms/camera/frame_age_s"
+T_CAM_FPS = "/fpms/camera/fps"
+T_CAM_RES = "/fpms/camera/resolution"
+
+T_NPU_STATE = "/fpms/npu/state"
+T_NPU_HEALTH = "/fpms/npu/health"
+T_NPU_DET = "/fpms/npu/detection_available"
+T_NPU_LOADED = "/fpms/npu/model_loaded"
+T_NPU_SHA = "/fpms/npu/model_sha_state"
+T_NPU_P50 = "/fpms/npu/p50_ms"
+T_NPU_P90 = "/fpms/npu/p90_ms"
+T_NPU_RATE = "/fpms/npu/infer_per_s"
+T_NPU_DROPS = "/fpms/npu/drops"
+T_NPU_CONSEC = "/fpms/npu/consecutive_failures"
+T_NPU_CORES = "/fpms/npu/core_mask"
+
+T_NPU_FAULT = "/fpms/npu/fault"
+T_AGENT_FAULT = "/fpms/agent/fault"
+
+# kind -> the std_msgs type published on that topic. Kept as strings so the
+# whole table, and every publish plan built from it, is testable with no ROS.
+TOPIC_KINDS = {
+    T_CAM_STATE: "str", T_CAM_HEALTH: "str", T_CAM_STALE: "bool",
+    T_CAM_AGE: "f32", T_CAM_FPS: "f32", T_CAM_RES: "str",
+    T_NPU_STATE: "str", T_NPU_HEALTH: "str", T_NPU_DET: "bool",
+    T_NPU_LOADED: "bool", T_NPU_SHA: "str", T_NPU_P50: "f32",
+    T_NPU_P90: "f32", T_NPU_RATE: "f32", T_NPU_DROPS: "i32",
+    T_NPU_CONSEC: "i32", T_NPU_CORES: "str",
+    T_NPU_FAULT: "str", T_AGENT_FAULT: "str",
+}
+
+ROS_TYPE_NAMES = {"str": "std_msgs/String", "bool": "std_msgs/Bool",
+                  "f32": "std_msgs/Float32", "i32": "std_msgs/Int32"}
+
+
+# ============================================================================
+# STATES
+# ============================================================================
+# "unknown" is a first-class value, not a placeholder. It is what this node says
+# when it has no evidence, and it is deliberately distinct from every other
+# state so that no consumer can accidentally treat it as good OR as bad.
+S_UNKNOWN = "unknown"    # no evidence has ever arrived
+S_OK = "ok"
+S_WARN = "warn"          # arriving, but slower than it should be
+S_STALE = "stale"        # arrived once, has now gone quiet
+S_OFF = "off"            # camera only: streaming was turned OFF on purpose
+S_FAULT = "fault"        # a declared, named fault
+S_DEGRADED = "degraded"  # npu only: serving, but not as configured
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+def load_config(path="/etc/fpms/config.env"):
+    """Read the same file every other FPMS service reads.
+
+    Credentials live there and only there - never in this file, which is pushed
+    to a public repo. Environment wins for the keys this node needs, matching
+    fpms_lidar_ros.py, so the unit's Environment= block is not silently inert.
+    """
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError as e:
+        # Not fatal, but it IS the reason a service can retry against the wrong
+        # broker forever with nothing in the log. Say it once.
+        log(f"config read failed ({e}); falling back to the environment")
+    cfg.update({k: v for k, v in os.environ.items() if k.startswith("FPMS_")})
+    return cfg
+
+
+def _f(cfg, key, default):
+    try:
+        return float(str(cfg.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return float(default)
+
+
+class Thresholds:
+    """Freshness bounds, DERIVED from the cadences that produce the data.
+
+    Hard-coding these would let /etc/fpms/config.env change a publish rate while
+    the judgement of "too slow" stayed behind - the dashboard and the rover
+    disagreeing about the same feed, which assets/feeds.js calls out as the
+    thing its per-feed SPEC table exists to prevent. So every bound below is
+    computed from the knob that actually sets the rate.
+    """
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        # The agent's camera pump: FPMS_CAMERA_FPS=6 today, and deliberately so
+        # (higher settings saturated the WiFi link and starved the LiDAR).
+        fps = max(0.1, _f(cfg, "FPMS_CAMERA_FPS", 6.0))
+        self.camera_fps_nominal = fps
+        # 18 frame periods, floored at 3 s. At 6 fps that is 3.0 s: long enough
+        # that ordinary jitter and one dropped MQTT round trip never trip it,
+        # short enough that a dead camera is caught inside one dashboard glance.
+        self.camera_stale_s = _f(cfg, "FPMS_CAMERA_STALE_S", max(3.0, 18.0 / fps))
+        self.camera_warn_s = _f(cfg, "FPMS_CAMERA_WARN_S", self.camera_stale_s / 2.0)
+        # The agent heartbeat is every 5 s (heartbeat() sleeps 50 x 0.1 s).
+        # 15 s = three beats; one lost beat must not read as a dead agent.
+        self.pose_stale_s = _f(cfg, "FPMS_POSE_STALE_S", 15.0)
+        # fpms-npud's own cadence knob, times three, for the same reason.
+        npu_period = max(0.5, _f(cfg, "FPMS_NPU_TELEMETRY_S", 5.0))
+        self.npu_stale_s = _f(cfg, "FPMS_NPU_STALE_S", npu_period * 3.0)
+        # How long we wait, while the agent claims to be streaming, before
+        # calling a total absence of frames a fault rather than a cold start.
+        # A camera open + MJPG negotiation is seconds, not tens of seconds.
+        self.no_frame_grace_s = _f(cfg, "FPMS_CAMERA_GRACE_S",
+                                   max(10.0, self.camera_stale_s * 3.0))
+        self.publish_hz = max(0.2, _f(cfg, "FPMS_TELEMETRY_ROS_HZ", 1.0))
+        self.report_s = _f(cfg, "FPMS_TELEMETRY_ROS_REPORT_S", 30.0)
+
+
+# A mirrored event is a log line, not a payload channel. 4 kB is far above any
+# event this stack emits (the agent truncates its own error to 300 chars) and
+# far below anything that would matter on the websocket.
+MAX_EVENT_CHARS = 4000
+
+
+# ============================================================================
+# PURE HELPERS - no ROS, no MQTT, no clock. Unit-testable off-robot.
+# ============================================================================
+
+def _scrub(obj):
+    """Replace non-finite floats with None, recursively.
+
+    Python's json.dumps emits bare NaN and Infinity by default, and its
+    json.loads ACCEPTS them - so a NaN produced anywhere upstream survives the
+    MQTT hop invisibly and would be re-emitted here into a String the browser
+    feeds to JSON.parse(), which throws on "NaN". One malformed float would
+    therefore take out the whole health tile with a parse error pointing at this
+    node rather than at whatever produced the NaN. Scrub instead: an absent
+    number reads as unknown, which is exactly what a NaN means anyway.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _scrub(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub(v) for v in obj]
+    return obj
+
+
+def to_json(obj, limit=None):
+    """Serialise for a std_msgs/String. Must never raise into a publish path."""
+    try:
+        s = json.dumps(_scrub(obj), allow_nan=False, default=str)
+    except (TypeError, ValueError) as e:
+        s = json.dumps({"error": f"unserialisable payload: {e}"})
+    if limit and len(s) > limit:
+        s = json.dumps({"truncated": True, "chars": len(s),
+                        "head": s[:limit]})
+    return s
+
+
+def _num(v):
+    """A finite float, or None. None means UNKNOWN and is never published."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _int(v):
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bool(v):
+    """Tri-state. A missing key is UNKNOWN, never False.
+
+    This is the single most important coercion in the file. `bool(None)` is
+    False, and a False on detection_available means "the NPU is not detecting",
+    which is a hard claim. A key that simply was not in the payload must not be
+    able to manufacture it - in either direction.
+    """
+    if v is None:
+        return None
+    return bool(v)
+
+
+def _camera_fields(payload):
+    """Whitelist what is kept from telemetry/camera. `frame` is NOT on the list.
+
+    The payload carries a ~40 kB base64 JPEG. Nothing here retains it, so it
+    cannot reach a publisher, a health snapshot or a log line by accident. This
+    function is the only place the camera payload is read.
+    """
+    if not isinstance(payload, dict):
+        return None
+    w, h = _int(payload.get("width")), _int(payload.get("height"))
+    dets = payload.get("detections")
+    return {
+        "width": w,
+        "height": h,
+        "resolution": (f"{w}x{h}" if w and h else None),
+        # The agent's own view of whether ITS in-process NPU path came up. Not
+        # the same statement as fpms-npud's detection_available and deliberately
+        # published under a different name: the agent has its own legacy NPU
+        # block, and conflating the two would hide a half-migrated rover.
+        "agent_npu": _bool(payload.get("npu")),
+        "detections": len(dets) if isinstance(dets, list) else None,
+        "fire_like": _bool(payload.get("fire_like")),
+        "fire_ratio": _num(payload.get("fire_ratio")),
+        "format": payload.get("format") if isinstance(payload.get("format"), str) else None,
+    }
+
+
+def _npu_fields(payload):
+    """Whitelist what is kept from telemetry/npu.
+
+    Whitelisted rather than passed through so that a future field added to
+    fpms-npud cannot silently change the size or the shape of what crosses the
+    websocket, and so this file's contract with the dashboard is readable in one
+    place.
+    """
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "detection_available": _bool(payload.get("detection_available")),
+        "required": _bool(payload.get("required")),
+        "model_loaded": _bool(payload.get("model_loaded")),
+        "model_sha_state": payload.get("model_sha_state"),
+        "model_sha_note": payload.get("model_sha_note"),
+        "model_path": payload.get("model_path"),
+        "variant": payload.get("variant"),
+        "core_mask": payload.get("core_mask"),
+        "core_mask_requested": payload.get("core_mask_requested"),
+        "core_mask_fallback": _bool(payload.get("core_mask_fallback")),
+        "p50_ms": _num(payload.get("p50_ms")),
+        "p90_ms": _num(payload.get("p90_ms")),
+        "max_ms": _num(payload.get("max_ms")),
+        "probe_ms": _num(payload.get("probe_ms")),
+        "budget_ms": _num(payload.get("budget_ms")),
+        "infer_per_s": _num(payload.get("infer_per_s")),
+        "inferences": _int(payload.get("inferences")),
+        "latency_samples": _int(payload.get("latency_samples")),
+        "drops": _int(payload.get("drops")),
+        "timeouts": _int(payload.get("timeouts")),
+        "errors": _int(payload.get("errors")),
+        "slow": _int(payload.get("slow")),
+        "consecutive_failures": _int(payload.get("consecutive_failures")),
+        "consecutive_slow": _int(payload.get("consecutive_slow")),
+        "reinits": _int(payload.get("reinits")),
+        "queued": _int(payload.get("queued")),
+        "clients": _int(payload.get("clients")),
+        "uptime_s": _num(payload.get("uptime_s")),
+        "fault": payload.get("fault"),
+        "fault_detail": payload.get("fault_detail"),
+        "fault_since": _num(payload.get("fault_since")),
+    }
+
+
+class Rate:
+    """Arrival rate, weighted so ONE long gap moves the number a lot.
+
+    Same 0.6/0.4 weighting as assets/feeds.js and the rover agent, and the same
+    reason: a smooth average keeps reporting a plausible rate long after the
+    source dies, and a plausible-but-frozen number has fooled this project
+    twice. A gap longer than the stale bound is not averaged in at all - the
+    feed died and came back, so the pre-outage history is not evidence about
+    now, and the EWMA restarts from the first interval after the gap.
+    """
+
+    def __init__(self, gap_reset_s):
+        self.hz = 0.0
+        self.last = None
+        self.gap_reset_s = gap_reset_s
+
+    def note(self, now):
+        if self.last is not None:
+            dt = now - self.last
+            if dt > 1e-4:
+                inst = 1.0 / dt
+                if dt > self.gap_reset_s or self.hz <= 0.0:
+                    self.hz = inst
+                else:
+                    self.hz = 0.6 * self.hz + 0.4 * inst
+        self.last = now
+
+
+class Store:
+    """Everything this node knows, and when it learned it.
+
+    No ROS, no MQTT, no wall clock: every time argument is a caller-supplied
+    time.monotonic() value. That makes the whole state machine testable off
+    robot at any simulated age, which is the only way to exercise the stale and
+    silent paths without waiting for them in real time.
+
+    Monotonic, not time.time(), because an NTP step or a manual clock change on
+    a Pi that has just found a route to the internet must not be able to make a
+    stale value look fresh - the same reason feeds.js uses performance.now().
+    """
+
+    def __init__(self, thresholds=None, started=0.0):
+        self.th = thresholds or Thresholds()
+        self.started = started
+
+        self.cam = None            # last _camera_fields(), or None
+        self.cam_at = None         # monotonic of arrival
+        self.cam_n = 0
+        self.cam_rate = Rate(self.th.camera_stale_s)
+
+        self.pose = None
+        self.pose_at = None
+        self.pose_n = 0
+        # (monotonic, frames) of the previous heartbeat, for the agent's own
+        # encode rate - an independent cross-check on our arrival rate. If the
+        # two disagree the frames are being lost between the agent and here,
+        # which is a broker/WiFi problem and not a camera problem.
+        self._frames_mark = None
+        self.agent_fps = None
+
+        self.npu = None
+        self.npu_at = None
+        self.npu_n = 0
+
+        # Last NPU event, and whether it currently stands. fpms-npud's LWT
+        # publishes fault=daemon_offline on an unclean disconnect, so this can
+        # be the ONLY evidence that exists when telemetry/npu never arrived.
+        self.npu_event = None
+        self.npu_event_at = None
+        self.npu_fault_active = None      # str name, or None if recovered
+
+        # Latched camera fault from the agent's events/fault. Cleared by
+        # events/camera_recovered OR by a frame arriving - see note_camera().
+        self.cam_fault = None
+        self.cam_fault_at = None
+        self.cam_fault_last = None        # never cleared; history for the JSON
+
+        self.bad_payloads = 0
+        self.unknown_topics = 0
+
+        # MQTT link state, so a silent source can be told apart from a broker
+        # that never connected. Written by the paho callbacks.
+        self.mqtt = {"state": "never", "since": None, "refused": [],
+                     "subscribed": 0, "expected": 0}
+
+    # -- ingestion ----------------------------------------------------------
+
+    def note_camera(self, payload, now):
+        fields = _camera_fields(payload)
+        if fields is None:
+            self.bad_payloads += 1
+            return False
+        self.cam = fields
+        self.cam_at = now
+        self.cam_n += 1
+        self.cam_rate.note(now)
+        # A frame is POSITIVE EVIDENCE and is allowed to clear a latched camera
+        # fault. That is legitimate here and would not be for the heartbeat:
+        # telemetry/camera is published inside `if ok:` after imencode() of a
+        # frame the agent just read, so it cannot be produced by a dead camera.
+        # telemetry/pose can, and therefore clears nothing.
+        if self.cam_fault is not None:
+            self.cam_fault = None
+        return True
+
+    def note_pose(self, payload, now):
+        if not isinstance(payload, dict):
+            self.bad_payloads += 1
+            return False
+        self.pose = {
+            "camera_ok": _bool(payload.get("camera_ok")),
+            "lidar_ok": _bool(payload.get("lidar_ok")),
+            "streaming": _bool(payload.get("streaming")),
+            "frames": _int(payload.get("frames")),
+            "scans": _int(payload.get("scans")),
+            "uptime_s": _num(payload.get("uptime_s")),
+        }
+        self.pose_at = now
+        self.pose_n += 1
+
+        frames = self.pose["frames"]
+        if frames is None:
+            self._frames_mark = None
+            self.agent_fps = None
+        else:
+            prev = self._frames_mark
+            self._frames_mark = (now, frames)
+            if prev is not None:
+                dt, dn = now - prev[0], frames - prev[1]
+                if dn < 0:
+                    # The counter went backwards: the agent restarted. The rate
+                    # across a restart is meaningless, so report nothing rather
+                    # than a negative or a wild number.
+                    self.agent_fps = None
+                elif dt >= 1.0:
+                    self.agent_fps = round(dn / dt, 2)
+        return True
+
+    def note_npu(self, payload, now):
+        fields = _npu_fields(payload)
+        if fields is None:
+            self.bad_payloads += 1
+            return False
+        self.npu = fields
+        self.npu_at = now
+        self.npu_n += 1
+        return True
+
+    def note_event(self, suffix, payload, now):
+        """An edge from events/*. Returns the dict to mirror, or None."""
+        if not isinstance(payload, dict):
+            self.bad_payloads += 1
+            return None
+        out = dict(payload)
+        out["_topic"] = suffix
+        out["_rx_monotonic"] = round(now, 3)
+
+        if suffix == "events/npu_fault":
+            self.npu_event, self.npu_event_at = out, now
+            self.npu_fault_active = payload.get("fault") or "unnamed"
+        elif suffix == "events/npu_recovered":
+            self.npu_event, self.npu_event_at = out, now
+            self.npu_fault_active = None
+        elif suffix == "events/camera_recovered":
+            self.cam_fault = None
+        elif suffix == "events/fault":
+            if payload.get("component") == "camera":
+                self.cam_fault = payload.get("error") or "unnamed camera fault"
+                self.cam_fault_at = now
+                self.cam_fault_last = {"error": self.cam_fault,
+                                       "at_monotonic": round(now, 3)}
+        else:
+            self.unknown_topics += 1
+            return None
+        return out
+
+    # -- ages ---------------------------------------------------------------
+
+    @staticmethod
+    def _age(at, now):
+        return None if at is None else max(0.0, now - at)
+
+    def camera_age(self, now):
+        return self._age(self.cam_at, now)
+
+    def pose_age(self, now):
+        return self._age(self.pose_at, now)
+
+    def npu_age(self, now):
+        return self._age(self.npu_at, now)
+
+
+# ============================================================================
+# STATE MACHINES
+# ============================================================================
+
+def camera_state(store, now):
+    """One of unknown|ok|warn|stale|off|fault, and WHY.
+
+    Order matters and is defended line by line below. Read it as: the most
+    recent, most direct evidence wins.
+    """
+    th = store.th
+    age = store.camera_age(now)
+    p_age = store.pose_age(now)
+    pose_fresh = p_age is not None and p_age <= th.pose_stale_s
+    pose = store.pose if pose_fresh else None
+    streaming = pose.get("streaming") if pose else None
+    camera_ok = pose.get("camera_ok") if pose else None
+
+    # 1. A FRESH FRAME OUTRANKS EVERYTHING. It is the only direct observation of
+    #    the sensor that exists, and it is at most camera_stale_s old, whereas
+    #    the heartbeat's camera_ok can be five seconds behind reality.
+    if age is not None and age <= th.camera_stale_s:
+        if age > th.camera_warn_s:
+            return S_WARN, f"frames arriving but {age:.1f}s since the last one"
+        return S_OK, "frames arriving"
+
+    # 2. A declared fault. The agent says the device stopped delivering, or
+    #    vanished, or was never found. Named, not inferred.
+    if store.cam_fault is not None:
+        return S_FAULT, f"agent declared a camera fault: {store.cam_fault}"
+    if camera_ok is False:
+        return S_FAULT, "agent heartbeat reports camera_ok=false"
+
+    # 3. Streaming turned OFF by an operator command is NOT a fault and must
+    #    never be coloured like one. The agent stops publishing telemetry/camera
+    #    when STREAM_ENABLED is clear, which is indistinguishable from a dead
+    #    camera unless this case is handled explicitly.
+    if streaming is False:
+        return S_OFF, "streaming is switched off; the agent is not sending frames"
+
+    # 4. Frames were arriving and have stopped.
+    if age is not None:
+        return S_STALE, f"no frame for {age:.1f}s (bound {th.camera_stale_s:.1f}s)"
+
+    # 5. Never a single frame. Only a fault once the grace window has passed AND
+    #    the agent is alive and claims to be streaming - before that this node
+    #    may simply have started first, which is the normal case at boot.
+    if pose_fresh and streaming is not False:
+        if (now - store.started) > th.no_frame_grace_s:
+            return S_STALE, ("the agent is alive and streaming but NO camera "
+                             "frame has ever arrived here")
+        return S_UNKNOWN, "waiting for a first frame"
+
+    # 6. No frames, no live heartbeat: we know nothing about the camera, and
+    #    saying so is the whole job.
+    return S_UNKNOWN, ("no camera frame and no agent heartbeat have arrived; "
+                       "this says nothing about the camera")
+
+
+def npu_state(store, now):
+    """One of unknown|ok|degraded|stale|fault, and WHY."""
+    th = store.th
+    age = store.npu_age(now)
+
+    if age is None:
+        # fpms-npud's last will publishes fault=daemon_offline on an unclean
+        # disconnect and may be the only thing we ever hear from it.
+        if store.npu_fault_active:
+            return S_FAULT, (f"no telemetry/npu has ever arrived; the only "
+                             f"evidence is an npu_fault: {store.npu_fault_active}")
+        return S_UNKNOWN, ("no telemetry/npu has ever arrived - fpms-npud may "
+                           "not be running. This is NOT evidence that detection "
+                           "works, and it is not evidence that it is broken.")
+
+    if age > th.npu_stale_s:
+        # fpms-npud publishes telemetry UNCONDITIONALLY, including while
+        # faulted, precisely so silence means the daemon is gone rather than
+        # merely unhappy. Silence is therefore its own diagnosis.
+        extra = f"; last event {store.npu_fault_active}" if store.npu_fault_active else ""
+        return S_STALE, (f"telemetry/npu silent for {age:.1f}s (bound "
+                         f"{th.npu_stale_s:.1f}s); fpms-npud publishes even "
+                         f"while faulted, so silence means the daemon is "
+                         f"gone{extra}")
+
+    p = store.npu or {}
+    det = p.get("detection_available")
+    if det is None:
+        return S_UNKNOWN, ("telemetry/npu is arriving but carries no "
+                           "detection_available field; refusing to guess")
+    if det is False:
+        fault = p.get("fault") or "unnamed"
+        return S_FAULT, (f"fpms-npud reports detection_available=false "
+                         f"(fault: {fault}) - THE ROVER IS NOT DETECTING")
+    if p.get("model_sha_state") == "mismatch":
+        return S_DEGRADED, "the loaded model contradicts /etc/fpms/models.json"
+    if p.get("core_mask_fallback"):
+        return S_DEGRADED, (f"detecting, but on core mask {p.get('core_mask')} "
+                            f"after a fallback from "
+                            f"{p.get('core_mask_requested')}")
+    return S_OK, "detecting"
+
+
+# ============================================================================
+# SNAPSHOTS
+# ============================================================================
+
+def camera_snapshot(store, now, seq=0):
+    th = store.th
+    state, why = camera_state(store, now)
+    age = store.camera_age(now)
+    p_age = store.pose_age(now)
+    cam = store.cam or {}
+
+    fresh = age is not None and age <= th.camera_stale_s
+    # Gated on the POSE feed, not the camera feed. agent_fps is derived from the
+    # heartbeat's monotonic `frames` counter, so its freshness is the
+    # heartbeat's; gating it on camera freshness would delete it at exactly the
+    # moment it is most valuable - frames stopping HERE while the agent's own
+    # counter keeps climbing is the signature of a broker/WiFi loss rather than
+    # a dead camera, and those two must not look alike.
+    pose_fresh = p_age is not None and p_age <= th.pose_stale_s
+    if age is None:
+        fps = None                       # never seen: NOT zero
+    elif fresh:
+        fps = round(store.cam_rate.hz, 2)
+    else:
+        fps = 0.0                        # seen, now stale: zero is the truth
+
+    return {
+        "component": "camera",
+        "state": state,
+        "why": why,
+        "stale": (None if age is None else not fresh),
+        "frame_age_s": (None if age is None else round(age, 2)),
+        "fps": fps,
+        "fps_nominal": th.camera_fps_nominal,
+        "agent_fps": store.agent_fps if pose_fresh else None,
+        "resolution": cam.get("resolution") if fresh else None,
+        "width": cam.get("width") if fresh else None,
+        "height": cam.get("height") if fresh else None,
+        "detections": cam.get("detections") if fresh else None,
+        "fire_like": cam.get("fire_like") if fresh else None,
+        "agent_npu": cam.get("agent_npu") if fresh else None,
+        "frames_received": store.cam_n,
+        # Nulled the moment the heartbeat goes stale. `camera_ok` from a
+        # heartbeat that stopped a minute ago is the agent's last OPINION, not
+        # an observation, and republishing it every second would render a dead
+        # agent's parting words as the current state of the camera.
+        "agent_frames": (store.pose or {}).get("frames") if pose_fresh else None,
+        "agent_camera_ok": (store.pose or {}).get("camera_ok") if pose_fresh else None,
+        "agent_streaming": (store.pose or {}).get("streaming") if pose_fresh else None,
+        "agent_heartbeat": ("never" if p_age is None else
+                            ("ok" if p_age <= th.pose_stale_s else "stale")),
+        "agent_heartbeat_age_s": (None if p_age is None else round(p_age, 2)),
+        "last_camera_fault": store.cam_fault_last,
+        "camera_fault_active": store.cam_fault,
+        "warn_s": th.camera_warn_s,
+        "stale_s": th.camera_stale_s,
+        "mqtt": store.mqtt,
+        "bridge_uptime_s": round(now - store.started, 1),
+        "seq": seq,
+        # Wall clock, for a human reading a log. NEVER for freshness - see the
+        # stale contract in the module docstring.
+        "ts": round(time.time(), 3),
+    }
+
+
+def npu_snapshot(store, now, seq=0):
+    th = store.th
+    state, why = npu_state(store, now)
+    age = store.npu_age(now)
+    fresh = age is not None and age <= th.npu_stale_s
+    p = store.npu if fresh else {}
+    p = p or {}
+
+    out = {
+        "component": "npu",
+        "state": state,
+        "why": why,
+        "stale": (None if age is None else not fresh),
+        "telemetry_age_s": (None if age is None else round(age, 2)),
+        "telemetry_received": store.npu_n,
+        "fault_active": store.npu_fault_active,
+        "last_event": store.npu_event,
+        "stale_s": th.npu_stale_s,
+        "mqtt": store.mqtt,
+        "bridge_uptime_s": round(now - store.started, 1),
+        "seq": seq,
+        "ts": round(time.time(), 3),
+    }
+    # Every mirrored field is present ONLY while the source is fresh. A stale
+    # p90 is not a slow NPU, it is no NPU, and the two must not look alike.
+    for k in ("detection_available", "required", "model_loaded",
+              "model_sha_state", "model_sha_note", "model_path", "variant",
+              "core_mask", "core_mask_requested", "core_mask_fallback",
+              "p50_ms", "p90_ms", "max_ms", "probe_ms", "budget_ms",
+              "infer_per_s", "inferences", "latency_samples", "drops",
+              "timeouts", "errors", "slow", "consecutive_failures",
+              "consecutive_slow", "reinits", "queued", "clients", "uptime_s",
+              "fault", "fault_detail", "fault_since"):
+        out[k] = p.get(k) if fresh else None
+    return out
+
+
+# ============================================================================
+# PUBLISH PLAN
+# ============================================================================
+# A list of (topic, kind, value). Built as data so the ENTIRE publish decision -
+# including every "omit this because the source is silent" - is testable with no
+# ROS, no MQTT and no clock. The node then executes the plan and does no
+# thinking of its own.
+
+def plan_camera(snap):
+    plan = [(T_CAM_STATE, "str", snap["state"]),
+            (T_CAM_HEALTH, "str", to_json(snap))]
+    # ONCE SEEN, then forever: these two are the topics ABOUT staleness, so they
+    # must keep talking while stale. Before the first frame there is no age to
+    # report and `stale=false` would be a lie, so they are absent instead.
+    if snap["frame_age_s"] is not None:
+        plan.append((T_CAM_AGE, "f32", snap["frame_age_s"]))
+    if snap["stale"] is not None:
+        plan.append((T_CAM_STALE, "bool", snap["stale"]))
+    # WHILE FRESH only.
+    if snap["fps"] is not None and snap["stale"] is False:
+        plan.append((T_CAM_FPS, "f32", snap["fps"]))
+    if snap["resolution"]:
+        plan.append((T_CAM_RES, "str", snap["resolution"]))
+    return plan
+
+
+def plan_npu(snap):
+    plan = [(T_NPU_STATE, "str", snap["state"]),
+            (T_NPU_HEALTH, "str", to_json(snap))]
+    for topic, kind, key in (
+            (T_NPU_DET, "bool", "detection_available"),
+            (T_NPU_LOADED, "bool", "model_loaded"),
+            (T_NPU_SHA, "str", "model_sha_state"),
+            (T_NPU_P50, "f32", "p50_ms"),
+            (T_NPU_P90, "f32", "p90_ms"),
+            (T_NPU_RATE, "f32", "infer_per_s"),
+            (T_NPU_DROPS, "i32", "drops"),
+            (T_NPU_CONSEC, "i32", "consecutive_failures"),
+            (T_NPU_CORES, "str", "core_mask")):
+        v = snap.get(key)
+        if v is None:
+            # UNKNOWN. Not 0, not false, not "ok". The topic simply does not
+            # tick, and every consumer of this stack already treats a silent
+            # topic correctly.
+            continue
+        plan.append((topic, kind, v))
+    return plan
+
+
+def plan_all(cam_snap, npu_snap):
+    return plan_camera(cam_snap) + plan_npu(npu_snap)
+
+
+# ============================================================================
+# MQTT INGESTION - the exact entry point paho's on_message calls
+# ============================================================================
+
+def mqtt_suffix(topic, thing):
+    """"fpms/rover1/telemetry/npu" -> "telemetry/npu", or None if foreign."""
+    prefix = f"fpms/{thing}/"
+    if not topic.startswith(prefix):
+        return None
+    return topic[len(prefix):]
+
+
+TELEMETRY_SUFFIXES = ("telemetry/camera", "telemetry/pose", "telemetry/npu")
+EVENT_SUFFIXES = ("events/npu_fault", "events/npu_recovered",
+                  "events/fault", "events/camera_recovered")
+ALL_SUFFIXES = TELEMETRY_SUFFIXES + EVENT_SUFFIXES
+
+
+def handle_mqtt_message(store, topic, raw, now, thing):
+    """Ingest one MQTT message. Returns (suffix, mirror_dict_or_None).
+
+    Called from paho's network thread. MUST NOT RAISE - an exception here kills
+    the network loop and the whole node goes silent, which is the failure mode
+    this file exists to eliminate rather than reproduce.
+    """
+    try:
+        suffix = mqtt_suffix(topic, thing)
+        if suffix is None or suffix not in ALL_SUFFIXES:
+            store.unknown_topics += 1
+            return None, None
+        try:
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray))
+                                 else raw)
+        except (ValueError, UnicodeDecodeError, AttributeError):
+            store.bad_payloads += 1
+            return suffix, None
+        if not isinstance(payload, dict):
+            store.bad_payloads += 1
+            return suffix, None
+
+        if suffix == "telemetry/camera":
+            store.note_camera(payload, now)
+            return suffix, None
+        if suffix == "telemetry/pose":
+            store.note_pose(payload, now)
+            return suffix, None
+        if suffix == "telemetry/npu":
+            store.note_npu(payload, now)
+            return suffix, None
+        return suffix, store.note_event(suffix, payload, now)
+    except Exception as e:  # noqa: BLE001 - see the docstring; never raise
+        store.bad_payloads += 1
+        log(f"mqtt handler error on {topic}: {e}")
+        return None, None
+
+
+# ============================================================================
+# NODE
+# ============================================================================
+
+class TelemetryBridge(Node):
+    """MQTT camera/NPU health -> ROS 2 std_msgs under /fpms/."""
+
+    def __init__(self, cfg):
+        super().__init__("fpms_telemetry_ros")
+        self.thing = cfg.get("FPMS_THING_NAME", "rover1")
+        self.th = Thresholds(cfg)
+        self.store = Store(self.th, started=time.monotonic())
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._published = 0
+        self._plan_errors = 0
+        self._seen_first = set()
+
+        # RELIABLE + VOLATILE, depth 10 - byte for byte the QoS that
+        # fpms_foxglove_cmd.py's /fpms/mission/* mirror uses and that this
+        # dashboard's rosbridge subscriptions already consume successfully.
+        # Not TRANSIENT_LOCAL: a latched last value would let a late subscriber
+        # read a value from before the outage as if it were current, which is
+        # exactly the lie this node is built to prevent. At 1 Hz a new
+        # subscriber waits at most one second for the truth instead.
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.VOLATILE,
+                         history=HistoryPolicy.KEEP_LAST, depth=10)
+        types = {"str": String, "bool": Bool, "f32": Float32, "i32": Int32}
+        self.pubs = {}
+        for topic, kind in TOPIC_KINDS.items():
+            self.pubs[topic] = (self.create_publisher(types[kind], topic, qos),
+                                types[kind], kind)
+
+        self._assert_publishers()
+
+        self.topics_in = [f"fpms/{self.thing}/{s}" for s in ALL_SUFFIXES]
+        self.store.mqtt["expected"] = len(self.topics_in)
+
+        period = 1.0 / self.th.publish_hz
+        self.create_timer(period, self._tick)
+        self.create_timer(max(5.0, self.th.report_s), self._report)
+
+        log(f"thing={self.thing} publishing {len(self.pubs)} topics under "
+            f"{TOPIC_PREFIX} at {self.th.publish_hz:.2f} Hz")
+        log(f"bounds: camera warn={self.th.camera_warn_s:.1f}s "
+            f"stale={self.th.camera_stale_s:.1f}s | pose stale="
+            f"{self.th.pose_stale_s:.1f}s | npu stale={self.th.npu_stale_s:.1f}s")
+        log("publishers on actuation topics: 0 (this node cannot move the rover)")
+
+    # -- guardrail ----------------------------------------------------------
+
+    def _assert_publishers(self):
+        """Verify the OUTCOME - rclpy's own publisher list - not our intent.
+
+        Two properties, both enforced by aborting the process rather than by a
+        comment, because a comment decays:
+
+          1. Nothing outside /fpms/. A topic outside the prefix would be
+             published perfectly happily by ROS and then dropped by rosbridge's
+             topics_glob without a word - connected, subscribed, silent, which
+             is this project's signature failure.
+          2. Nothing that can move the rover. /cmd_vel and /cmd_duty are absent
+             from that whitelist BY CONSTRUCTION and must be absent from here by
+             construction too.
+        """
+        actual = sorted(p.topic_name for p in self.publishers)
+        bad_prefix = [t for t in actual if not t.startswith(TOPIC_PREFIX)]
+        forbidden = [t for t in actual if t in FORBIDDEN_TOPICS]
+        missing = sorted(set(TOPIC_KINDS) - set(actual))
+        if forbidden:
+            raise SystemExit(
+                f"REFUSING TO START: fpms-telemetry-ros created publishers on "
+                f"{forbidden}. This node is a READ-OUT. Whatever added that "
+                f"publisher belongs in fpms_teleop or fpms_missions.")
+        if bad_prefix:
+            raise SystemExit(
+                f"REFUSING TO START: {bad_prefix} is outside {TOPIC_PREFIX} and "
+                f"is therefore outside topics_glob in "
+                f"/etc/fpms/rosbridge_params.yaml. It would publish and never "
+                f"reach the dashboard, with no error anywhere. Rename it under "
+                f"{TOPIC_PREFIX}; do NOT widen the whitelist.")
+        if missing:
+            raise SystemExit(
+                f"REFUSING TO START: create_publisher did not produce {missing}. "
+                f"The publisher table and the ROS graph disagree.")
+
+    # -- MQTT side ----------------------------------------------------------
+
+    def on_mqtt_message(self, topic, payload):
+        """paho network thread. Fast, and never raises."""
+        now = time.monotonic()
+        with self._lock:
+            suffix, mirror = handle_mqtt_message(self.store, topic, payload,
+                                                 now, self.thing)
+        if suffix and suffix not in self._seen_first:
+            self._seen_first.add(suffix)
+            log(f"first {suffix} received")
+        if mirror is None:
+            return
+        # Mirrored immediately rather than on the next tick: an event is an
+        # interruption and a second of latency on a fault is a second the
+        # operator is not looking at it.
+        topic_out = T_NPU_FAULT if suffix.startswith("events/npu") else T_AGENT_FAULT
+        try:
+            self._publish_one(topic_out, "str", to_json(mirror, MAX_EVENT_CHARS))
+            log(f"mirrored {suffix} -> {topic_out}: "
+                f"{mirror.get('fault') or mirror.get('error') or mirror.get('cleared') or ''}")
+        except Exception as e:  # noqa: BLE001
+            log(f"event mirror failed for {suffix}: {e}")
+
+    def on_mqtt_state(self, state, detail=""):
+        with self._lock:
+            self.store.mqtt["state"] = state
+            self.store.mqtt["since"] = round(time.time(), 1)
+            if detail:
+                self.store.mqtt["detail"] = detail
+
+    def on_mqtt_suback(self, topic, granted_ok, code):
+        """SUBACK, not the return of subscribe(). See the module docstring."""
+        with self._lock:
+            if granted_ok:
+                self.store.mqtt["subscribed"] += 1
+            else:
+                self.store.mqtt["refused"].append({"topic": topic,
+                                                   "code": str(code)})
+        if not granted_ok:
+            log(f"*** SUBSCRIBE REFUSED for {topic} (code {code}). The broker "
+                f"ACL does not grant it. This looks EXACTLY like a dead sensor "
+                f"from the dashboard - check /etc/mosquitto/fpms.acl against "
+                f"FPMS_THING_NAME={self.thing}. ***")
+
+    # -- publish ------------------------------------------------------------
+
+    def _publish_one(self, topic, kind, value):
+        entry = self.pubs.get(topic)
+        if entry is None:
+            # A plan naming a topic with no publisher. Impossible today because
+            # _assert_publishers() checked the table, but a value that quietly
+            # goes nowhere is the exact class of bug this stack keeps paying
+            # for, so it is counted and named rather than dropped.
+            self._plan_errors += 1
+            log(f"plan names {topic} but there is no publisher for it")
+            return False
+        pub, msgcls, want = entry
+        if want != kind:
+            self._plan_errors += 1
+            log(f"plan gave a {kind} for {topic}, which is {want}")
+            return False
+        msg = msgcls()
+        if kind == "str":
+            msg.data = value if isinstance(value, str) else to_json(value)
+        elif kind == "bool":
+            msg.data = bool(value)
+        elif kind == "f32":
+            f = _num(value)
+            if f is None:
+                return False
+            msg.data = float(f)
+        else:
+            i = _int(value)
+            if i is None:
+                return False
+            msg.data = int(i)
+        pub.publish(msg)
+        self._published += 1
+        return True
+
+    def _tick(self):
+        now = time.monotonic()
+        with self._lock:
+            self._seq += 1
+            seq = self._seq
+            cam = camera_snapshot(self.store, now, seq)
+            npu = npu_snapshot(self.store, now, seq)
+        for topic, kind, value in plan_all(cam, npu):
+            try:
+                self._publish_one(topic, kind, value)
+            except Exception as e:  # noqa: BLE001
+                self._plan_errors += 1
+                log(f"publish failed on {topic}: {e}")
+
+    def _report(self):
+        now = time.monotonic()
+        with self._lock:
+            s = self.store
+            cam = camera_state(s, now)[0]
+            npu = npu_state(s, now)[0]
+            counts = (s.cam_n, s.pose_n, s.npu_n, s.bad_payloads)
+        log(f"camera={cam} npu={npu} | rx camera={counts[0]} pose={counts[1]} "
+            f"npu={counts[2]} bad={counts[3]} | published={self._published} "
+            f"plan_errors={self._plan_errors} mqtt={self.store.mqtt['state']}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    if not _ROS_AVAILABLE:
+        log("rclpy/std_msgs not importable - source /opt/ros/humble/setup.bash")
+        return 1
+    try:
+        import paho.mqtt.client as mqtt
+        # VERSION2 unguarded, on purpose: the image pins paho >= 2.0 precisely
+        # because five files import this symbol. A guarded fallback here would
+        # let a downgraded paho run this node with v1 callback signatures, whose
+        # arguments differ, and the failure would be a handler that never fires.
+        from paho.mqtt.client import CallbackAPIVersion
+    except ImportError as e:
+        log(f"paho.mqtt is not importable ({e}); this node cannot run")
+        return 1
+
+    cfg = load_config()
+    rclpy.init()
+    node = TelemetryBridge(cfg)
+
+    # mid -> topic, so a SUBACK can be attributed to the subscription that
+    # caused it. paho gives the mid at subscribe time and only the mid back.
+    pending = {}
+    pending_lock = threading.Lock()
+
+    def on_connect(client, userdata, flags, rc, properties=None):
+        node.on_mqtt_state("connected", str(rc))
+        log(f"MQTT connected to {cfg.get('FPMS_MQTT_HOST')}:"
+            f"{cfg.get('FPMS_MQTT_PORT')} ({rc})")
+        for topic in node.topics_in:
+            # QoS 0 for telemetry, 1 for events. Telemetry is a description of
+            # NOW and a replayed queue of it after a reconnect is a queue of
+            # lies; an event is an interruption that must not be lost. Same
+            # split fpms-npud publishes with.
+            qos = 1 if "/events/" in topic else 0
+            try:
+                rc_sub, mid = client.subscribe(topic, qos=qos)
+            except Exception as e:  # noqa: BLE001
+                log(f"subscribe({topic}) raised: {e}")
+                node.on_mqtt_suback(topic, False, f"raised: {e}")
+                continue
+            if rc_sub != mqtt.MQTT_ERR_SUCCESS:
+                node.on_mqtt_suback(topic, False, f"queue rc={rc_sub}")
+                continue
+            with pending_lock:
+                pending[mid] = topic
+        # Subscriptions are NOT counted here. The count that matters is the one
+        # the broker granted, and that arrives in on_subscribe below.
+
+    def on_subscribe(client, userdata, mid, reason_codes, properties=None):
+        with pending_lock:
+            topic = pending.pop(mid, f"<mid {mid}>")
+        codes = reason_codes if isinstance(reason_codes, (list, tuple)) else [reason_codes]
+        for code in codes:
+            failed = getattr(code, "is_failure", None)
+            if failed is None:
+                # v3.1.1 granted-QoS ints: 0x80 is the refusal.
+                try:
+                    failed = int(code) >= 128
+                except (TypeError, ValueError):
+                    failed = False
+            node.on_mqtt_suback(topic, not failed, code)
+
+    def on_message(client, userdata, msg):
+        node.on_mqtt_message(msg.topic, msg.payload)
+
+    def on_disconnect(client, userdata, flags, rc, properties=None):
+        node.on_mqtt_state("disconnected", str(rc))
+        log(f"MQTT disconnected ({rc}); paho will retry")
+
+    thing = cfg.get("FPMS_THING_NAME", "rover1")
+    client = mqtt.Client(client_id=f"{thing}-telemetry-ros",
+                         callback_api_version=CallbackAPIVersion.VERSION2)
+    user = cfg.get("FPMS_MQTT_USER")
+    if user:
+        client.username_pw_set(user, cfg.get("FPMS_MQTT_PASS", ""))
+    client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+
+    host = cfg.get("FPMS_MQTT_HOST", "127.0.0.1")
+    port = int(cfg.get("FPMS_MQTT_PORT", "1883") or 1883)
+    try:
+        client.connect(host, port, keepalive=30)
+    except Exception as e:  # noqa: BLE001
+        # Do not die. systemd would restart us into the same broker outage, and
+        # a restarting node is one that stops publishing "unknown" - which is
+        # the only honest thing to say during an outage.
+        log(f"initial MQTT connect to {host}:{port} failed ({e}); will retry")
+        node.on_mqtt_state("connecting", str(e))
+    client.loop_start()
+
+    stopping = threading.Event()
+
+    def stop(*_):
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    try:
+        while not stopping.is_set():
+            rclpy.spin_once(node, timeout_sec=0.2)
+    finally:
+        client.loop_stop()
+        try:
+            client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
+        log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

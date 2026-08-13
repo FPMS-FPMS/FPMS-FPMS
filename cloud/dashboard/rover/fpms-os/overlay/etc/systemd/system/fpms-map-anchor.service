@@ -65,6 +65,7 @@ Environment=ROS_DOMAIN_ID=20
 Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
 Environment=ROS_LOCALHOST_ONLY=1
+Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/ubuntu
 
 ExecStartPre=/usr/local/bin/fpms-wait-net
