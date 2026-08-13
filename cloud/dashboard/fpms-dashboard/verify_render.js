@@ -231,6 +231,17 @@ const lvl = (feed) => {
   return el ? el.attrs["data-level"] : "<<no card for " + feed + ">>";
 };
 const links = () => (dom.byId.links ? dom.byId.links.innerHTML : "");
+/* One link tile, by name: its css class and its rendered body. renderLinks()
+   emits `<div class="ltile CLS"><div class="lrow"><span class="lname">NAME…`,
+   and the class is the whole point of these assertions — a tile that says the
+   right words in the wrong colour is still a lie. */
+const tile = (name) => {
+  const re = new RegExp('<div class="ltile ([a-z]+)"><div class="lrow">' +
+                        '<span class="lname">' + name + '</span>' +
+                        '([\\s\\S]*?)(?=<div class="ltile |$)');
+  const m = re.exec(links());
+  return m ? { cls: m[1], html: m[2] } : { cls: "<<no " + name + " tile>>", html: "" };
+};
 /* Resolve the CURRENT socket of each link every time. Both links dial the
    same URL, so they are told apart by what they asked for: only the main
    link ever subscribes. The silence remedy replaces sockets underneath us,
@@ -298,6 +309,32 @@ ok(![...mainSock().sent, ...stopSock().sent].some((m) => m.op === "call_service"
 ok(stopSock().sent.filter((m) => m.op === "subscribe").length === 0,
    "the STOP socket subscribes to NOTHING — its send buffer is empty by construction");
 
+/* The camera/NPU health mirror published by fpms-telemetry-ros. Every name is
+   asserted individually rather than by prefix: "/fpms/* covers it" is the
+   claim, and a typo'd topic would satisfy the prefix and never arrive. */
+const MIRROR = [
+  "/fpms/camera/state", "/fpms/camera/health", "/fpms/camera/stale",
+  "/fpms/camera/frame_age_s", "/fpms/camera/fps", "/fpms/camera/resolution",
+  "/fpms/npu/state", "/fpms/npu/health", "/fpms/npu/detection_available",
+  "/fpms/npu/model_loaded", "/fpms/npu/model_sha_state", "/fpms/npu/p50_ms",
+  "/fpms/npu/p90_ms", "/fpms/npu/infer_per_s", "/fpms/npu/drops",
+  "/fpms/npu/consecutive_failures", "/fpms/npu/core_mask",
+  "/fpms/npu/fault", "/fpms/agent/fault",
+];
+const subscribed = new Set(mainSock().sent.filter((m) => m.op === "subscribe").map((m) => m.topic));
+const missing = MIRROR.filter((t) => !subscribed.has(t));
+ok(missing.length === 0,
+   "all " + MIRROR.length + " camera/NPU health topics are subscribed" +
+   (missing.length ? " — MISSING: " + missing.join(", ") : ""));
+ok(MIRROR.every(globOk),
+   "and every one of them is inside topics_glob via /fpms/* — the whitelist did not move");
+/* expectS is what feeds the silence banner. These topics are quiet on any
+   rover whose image predates fpms-telemetry-ros, and accusing them there
+   would be a false alarm on a working rover. */
+ok(!MIRROR.some((t) => new RegExp("expect .*" + t.replace(/\//g, "\\/")).test(txt("linkDiag"))),
+   "none of them declares expectS, so a rover without fpms-telemetry-ros never " +
+   "trips the silence banner (a false alarm is how an alarm becomes worthless)");
+
 console.log("\n4. a value renders with an age, then goes STALE with NO new message");
 mainSock().pub("/scan_lidar", { ranges: [1, 2, 3], angle_min: 0, angle_increment: 0.01, range_max: 12 });
 advance(300);
@@ -339,18 +376,173 @@ advance(300);
 ok(/11\.20 V/.test(txt("battVal")) && /fallback/.test(txt("battAge")),
    "falls back and LABELS the fallback: " + txt("battVal") + " | " + txt("battAge"));
 
-console.log("\n7. link health: real evidence for LIDAR/ESP32, honest silence for CAMERA/NPU");
+console.log("\n7. link health: real evidence for LIDAR/ESP32");
 mainSock().pub("/fpms_health", { data: [30001, (1 << 4) | (1 << 3), 1, 0, 0, 0, 1000, 15, 11800, 0, 120, 640] });
 advance(300);
 ok(/ESP32[\s\S]*?fw 30001/.test(links()), "ESP32 tile reads the build off /fpms_health");
 ok(/uptime 640s/.test(links()), "and the board uptime");
-ok(/CAMERA[\s\S]*?NO ROS SOURCE/.test(links()), "CAMERA: NO ROS SOURCE");
-ok(/NPU[\s\S]*?NO ROS SOURCE/.test(links()), "NPU: NO ROS SOURCE");
-ok(/ltile nosrc/.test(links()), "both styled as 'no evidence', not as good or bad");
 mainSock().pub("/fpms_health", { data: [30001, 1 << 3, 0, 60000, 60000, 0, 0, 0, 11800, 0, 120, 700] });
 advance(300);
 ok(/ESP32[\s\S]*?AGENT NOT CONNECTED/.test(links()),
    "bit4 clear reads as AGENT NOT CONNECTED, not as a healthy board");
+
+/* =====================================================================
+   7b–7h. THE CAMERA AND NPU TILES.
+
+   These are the tiles that can do the most damage. A green NPU tile over a
+   rover that is not detecting is the single worst output this dashboard has,
+   so every state word the mirror can emit is driven through the real render
+   path here and its COLOUR asserted — not merely its text.
+   ===================================================================== */
+console.log("\n7b. NO MIRROR AT ALL: nothing has published /fpms/camera/state — NO ROS SOURCE");
+ok(tile("CAMERA").cls === "nosrc" && /NO ROS SOURCE/.test(tile("CAMERA").html),
+   "CAMERA is hatched grey and says NO ROS SOURCE before the mirror ever speaks");
+ok(tile("NPU").cls === "nosrc" && /NO ROS SOURCE/.test(tile("NPU").html),
+   "NPU likewise — an absent bridge is not evidence about the sensor");
+ok(/fpms-telemetry-ros/.test(tile("NPU").html),
+   "and it names the unit to check rather than saying 'no data'");
+
+console.log("\n7c. \"unknown\" IS NOT HEALTHY, AND IS NOT A FAULT — the load-bearing case");
+/* The mirror is running and telling us it cannot see its source. This is the
+   assertion the whole file exists for: never green. */
+const CAM_WHY_UNKNOWN = "no camera frame and no agent heartbeat have arrived; " +
+                        "this says nothing about the camera";
+const NPU_WHY_UNKNOWN = "no telemetry/npu has ever arrived - fpms-npud may not be running. " +
+                        "This is NOT evidence that detection works, and it is not evidence " +
+                        "that it is broken.";
+mainSock().pub("/fpms/camera/state", { data: "unknown" });
+mainSock().pub("/fpms/camera/health", { data: JSON.stringify({
+  component: "camera", state: "unknown", why: CAM_WHY_UNKNOWN,
+  mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/npu/state", { data: "unknown" });
+mainSock().pub("/fpms/npu/health", { data: JSON.stringify({
+  component: "npu", state: "unknown", why: NPU_WHY_UNKNOWN,
+  mqtt: { state: "connected", refused: [] } }) });
+advance(300);
+ok(tile("CAMERA").cls === "nosrc",
+   "CAMERA state=unknown renders nosrc, NOT ok (class was '" + tile("CAMERA").cls + "')");
+ok(tile("NPU").cls === "nosrc",
+   "NPU state=unknown renders nosrc, NOT ok (class was '" + tile("NPU").cls + "')");
+ok(tile("NPU").cls !== "ok" && tile("CAMERA").cls !== "ok",
+   "NEITHER is green — an 'unknown' painted green is a blind rover reported healthy");
+ok(tile("NPU").cls !== "down" && tile("CAMERA").cls !== "down",
+   "and neither is red — 'I cannot see my source' is not a declared fault");
+ok(tile("NPU").html.includes(NPU_WHY_UNKNOWN.replace(/&/g, "&amp;")),
+   "the mirror's own `why` is shown VERBATIM, not paraphrased");
+
+console.log("\n7d. a working camera and a working NPU do go green");
+mainSock().pub("/fpms/camera/state", { data: "ok" });
+mainSock().pub("/fpms/camera/health", { data: JSON.stringify({
+  state: "ok", why: "frames arriving", stale: false, fps: 5.9,
+  resolution: "640x480", agent_fps: 5.9, agent_heartbeat: "ok",
+  mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/camera/stale", { data: false });
+mainSock().pub("/fpms/camera/fps", { data: 5.9 });
+mainSock().pub("/fpms/camera/frame_age_s", { data: 0.2 });
+mainSock().pub("/fpms/camera/resolution", { data: "640x480" });
+mainSock().pub("/fpms/npu/state", { data: "ok" });
+mainSock().pub("/fpms/npu/health", { data: JSON.stringify({
+  state: "ok", why: "detecting", detection_available: true, model_loaded: true,
+  model_sha_state: "verified", p50_ms: 12.4, mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/npu/detection_available", { data: true });
+mainSock().pub("/fpms/npu/model_loaded", { data: true });
+mainSock().pub("/fpms/npu/model_sha_state", { data: "verified" });
+mainSock().pub("/fpms/npu/p50_ms", { data: 12.4 });
+mainSock().pub("/fpms/npu/p90_ms", { data: 19.1 });
+mainSock().pub("/fpms/npu/infer_per_s", { data: 5.8 });
+mainSock().pub("/fpms/npu/core_mask", { data: "0x7" });
+advance(300);
+ok(tile("CAMERA").cls === "ok" && /5\.9 fps/.test(tile("CAMERA").html),
+   "CAMERA state=ok is green and carries the measured rate");
+ok(/640x480/.test(tile("CAMERA").html), "and the resolution off the mirror");
+ok(tile("NPU").cls === "ok" && /p50 12 ms/.test(tile("NPU").html),
+   "NPU state=ok is green and carries the latency");
+
+console.log("\n7e. detection_available=false CANNOT BE GREEN, whatever word arrives with it");
+/* The mirror already turns det=false into state=fault. This asserts the
+   dashboard does not DEPEND on it having done so: a contradictory pair — a
+   healthy-looking state beside detection_available=false — must resolve
+   pessimistically, because the pessimistic reading is the one that cannot
+   get somebody hurt. */
+mainSock().pub("/fpms/npu/state", { data: "ok" });
+mainSock().pub("/fpms/npu/health", { data: JSON.stringify({
+  state: "ok", why: "detecting", detection_available: false,
+  mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/npu/detection_available", { data: false });
+advance(300);
+ok(tile("NPU").cls !== "ok",
+   "a 'healthy' NPU reporting detection_available=false is NOT green (class '" +
+   tile("NPU").cls + "')");
+ok(tile("NPU").cls === "down", "it is red — the rover is not detecting");
+ok(/NOT DETECTING/.test(tile("NPU").html), "and it says so in words: " +
+   (/(THE ROVER IS NOT DETECTING)/.exec(tile("NPU").html) || ["<<not said>>"])[0]);
+
+console.log("\n7f. `off` is an OPERATOR ACTION — amber, never red");
+mainSock().pub("/fpms/camera/state", { data: "off" });
+mainSock().pub("/fpms/camera/health", { data: JSON.stringify({
+  state: "off", why: "streaming is switched off; the agent is not sending frames",
+  mqtt: { state: "connected", refused: [] } }) });
+advance(300);
+ok(tile("CAMERA").cls === "warn",
+   "CAMERA state=off renders warn (class '" + tile("CAMERA").cls + "')");
+ok(tile("CAMERA").cls !== "down",
+   "and NOT down — red for a thing somebody chose is how an operator learns to ignore red");
+ok(/switched off/.test(tile("CAMERA").html), "the reason is the mirror's own sentence");
+
+console.log("\n7g. degraded -> warn; stale and fault -> down; an unknown WORD -> nosrc");
+mainSock().pub("/fpms/npu/state", { data: "degraded" });
+mainSock().pub("/fpms/npu/health", { data: JSON.stringify({
+  state: "degraded", why: "the loaded model contradicts /etc/fpms/models.json",
+  detection_available: true, model_sha_state: "mismatch",
+  mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/npu/detection_available", { data: true });
+mainSock().pub("/fpms/npu/model_sha_state", { data: "mismatch" });
+advance(300);
+ok(tile("NPU").cls === "warn", "degraded -> warn (serving, but not as configured)");
+mainSock().pub("/fpms/npu/state", { data: "fault" });
+advance(300);
+ok(tile("NPU").cls === "down", "fault -> down");
+mainSock().pub("/fpms/camera/state", { data: "stale" });
+advance(300);
+ok(tile("CAMERA").cls === "down", "stale -> down (it was alive and it stopped)");
+mainSock().pub("/fpms/camera/state", { data: "sploorf" });
+advance(300);
+ok(tile("CAMERA").cls === "nosrc",
+   "a state word this dashboard does not know is NOT coloured good or bad");
+ok(/does not recognise/.test(tile("CAMERA").html), "and it says that it does not know it");
+
+console.log("\n7h. a REFUSED MQTT subscription is named, not left looking like a dead sensor");
+mainSock().pub("/fpms/camera/state", { data: "unknown" });
+mainSock().pub("/fpms/camera/health", { data: JSON.stringify({
+  state: "unknown", why: CAM_WHY_UNKNOWN,
+  mqtt: { state: "connected", subscribed: 0, expected: 7,
+          refused: [{ topic: "fpms/rover1/telemetry/camera", code: "128" }] } }) });
+advance(300);
+ok(/BROKER REFUSED/.test(tile("CAMERA").html),
+   "the ACL refusal is called out by name");
+ok(/fpms\.acl/.test(tile("CAMERA").html), "and the file to check is named");
+ok(tile("CAMERA").cls === "nosrc",
+   "still grey, not red: an ACL refusal is not evidence the camera failed");
+
+console.log("\n7i. THE MIRROR ITSELF GOING QUIET reverts to NO ROS SOURCE");
+/* /fpms/camera/state is published at 1 Hz unconditionally, carrying even the
+   word "unknown". So silence on it means fpms-telemetry-ros is gone — which
+   is a statement about the bridge and about nothing else. */
+mainSock().pub("/fpms/npu/state", { data: "ok" });
+mainSock().pub("/fpms/npu/health", { data: JSON.stringify({
+  state: "ok", why: "detecting", detection_available: true, model_loaded: true,
+  model_sha_state: "verified", mqtt: { state: "connected", refused: [] } }) });
+mainSock().pub("/fpms/npu/detection_available", { data: true });
+mainSock().pub("/fpms/npu/model_sha_state", { data: "verified" });
+advance(300);
+ok(tile("NPU").cls === "ok", "NPU green while the mirror is talking");
+advance(12000);                       // no message of any kind: 12 s > stale 10 s
+ok(tile("NPU").cls === "nosrc" && /NO ROS SOURCE/.test(tile("NPU").html),
+   "a stale mirror reverts to NO ROS SOURCE — never holds the last green tile");
+ok(tile("CAMERA").cls === "nosrc" && /NO ROS SOURCE/.test(tile("CAMERA").html),
+   "same for CAMERA, from the clock alone, with no message having arrived");
+ok(/down or unreachable/.test(tile("NPU").html),
+   "and it blames the bridge rather than the sensor");
 
 console.log("\n8. residual verdicts follow STACK.md's table, and refuse to guess early");
 mainSock().pub("/fpms/residual/raw", { data: JSON.stringify({ kind: "drive", leg_i: 0, segment_i: 0, target: 100, measured: 41, residual: -59, ratio: 0.41 }) });

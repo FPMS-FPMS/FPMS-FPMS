@@ -19,8 +19,8 @@ fpms-dashboard/
   assets/arena.js     the arena map, zone geometry, pose rendering
   assets/app.js       subscriptions, STOP, panels, the 5 Hz ticker
   serve.py            a static server. Not in the data path.
-  verify_link.js      optional: proves the reconnect logic (28 assertions)
-  verify_render.js    optional: proves the staleness + silence contract (48)
+  verify_link.js      optional: proves the reconnect logic (32 assertions)
+  verify_render.js    optional: proves the staleness + silence contract (77)
 ```
 
 ---
@@ -424,7 +424,7 @@ and `/fpms/mission/x_mm` alike. **It was not widened.** `verify_render.js`
 asserts every requested topic against this list, so the check runs rather than
 being claimed.
 
-### Subscribed (28)
+### Subscribed (46)
 
 | topic | type | on whitelist | used for |
 |---|---|---|---|
@@ -455,6 +455,33 @@ being claimed.
 | `/fpms/residual/raw` | `std_msgs/String` | **yes** (`/fpms/*`) | the per-segment table and the diagnostic verdict |
 | `/fpms/plan/route` | `std_msgs/String` | **yes** (`/fpms/*`) | planned route on the map |
 | `/fpms/events` | `std_msgs/String` | **yes** (`/fpms/*`) | event log (throttled to 10 Hz) |
+| `/fpms/camera/state` | `std_msgs/String` | **yes** (`/fpms/*`) | **CAMERA tile colour.** `unknown\|ok\|warn\|stale\|off\|fault` |
+| `/fpms/camera/health` | `std_msgs/String` | **yes** (`/fpms/*`) | the JSON snapshot; its `why` is the tile's note, verbatim, and its `mqtt.refused` names a broker ACL refusal |
+| `/fpms/camera/stale` | `std_msgs/Bool` | **yes** (`/fpms/*`) | cross-check against `state` |
+| `/fpms/camera/frame_age_s` | `std_msgs/Float32` | **yes** (`/fpms/*`) | frame age **at the rover-side mirror** — data, never this page's freshness |
+| `/fpms/camera/fps` | `std_msgs/Float32` | **yes** (`/fpms/*`) | measured arrival rate into the mirror |
+| `/fpms/camera/resolution` | `std_msgs/String` | **yes** (`/fpms/*`) | e.g. `640x480` |
+| `/fpms/npu/state` | `std_msgs/String` | **yes** (`/fpms/*`) | **NPU tile colour.** `unknown\|ok\|degraded\|stale\|fault` |
+| `/fpms/npu/health` | `std_msgs/String` | **yes** (`/fpms/*`) | the JSON snapshot; `why` verbatim, `mqtt.refused` named |
+| `/fpms/npu/detection_available` | `std_msgs/Bool` | **yes** (`/fpms/*`) | **false ⇒ the tile cannot be green, whatever `state` says** |
+| `/fpms/npu/model_loaded` | `std_msgs/Bool` | **yes** (`/fpms/*`) | NPU tile |
+| `/fpms/npu/model_sha_state` | `std_msgs/String` | **yes** (`/fpms/*`) | `verified\|unverified\|mismatch`; a mismatch downgrades a green tile |
+| `/fpms/npu/p50_ms` | `std_msgs/Float32` | **yes** (`/fpms/*`) | NPU tile headline latency |
+| `/fpms/npu/p90_ms` | `std_msgs/Float32` | **yes** (`/fpms/*`) | NPU tile |
+| `/fpms/npu/infer_per_s` | `std_msgs/Float32` | **yes** (`/fpms/*`) | NPU tile |
+| `/fpms/npu/drops` | `std_msgs/Int32` | **yes** (`/fpms/*`) | NPU tile |
+| `/fpms/npu/consecutive_failures` | `std_msgs/Int32` | **yes** (`/fpms/*`) | NPU tile; >0 downgrades a green tile |
+| `/fpms/npu/core_mask` | `std_msgs/String` | **yes** (`/fpms/*`) | the mask **in force**, not the one requested |
+| `/fpms/npu/fault` | `std_msgs/String` | **yes** (`/fpms/*`) | edge: `events/npu_fault` + `npu_recovered`, mirrored. Event-driven — aged and labelled, never a fault by its age |
+| `/fpms/agent/fault` | `std_msgs/String` | **yes** (`/fpms/*`) | edge: the agent's `events/fault` + `camera_recovered` |
+
+None of the 19 health topics declares `expectS`. That is deliberate: `expectS`
+feeds the silence banner, and a rover whose image predates `fpms-telemetry-ros`
+is silent on all of them **while being perfectly healthy**. Accusing it would be
+a false alarm on a working rover, and a false alarm is how an alarm becomes
+worth nothing on the day it is right. Their absence is reported precisely and
+quietly, by the tiles themselves. `verify_link.js` asserts both halves: no
+alarm, and no lost subscription across a reconnect.
 
 ### Advertised and published (2)
 
@@ -479,16 +506,69 @@ being careful.
 
 ### Nothing was needed that is not on the list
 
-One consequence to flag rather than fix: **camera and NPU health have no ROS
-publisher at all.** The rover agent sends camera frames straight to MQTT and
-`FPMS_NPU_REQUIRED=1` raises its fault on MQTT too — neither has a mirror inside
-`topics_glob`. Those two tiles therefore read **NO ROS SOURCE**, hatched grey,
-with the reason attached. They are not coloured good or bad, because the
-dashboard has no evidence either way and guessing green would be the worst
-failure it could have: *a blind fire-detection rover reported healthy.*
+Camera and NPU health used to be the one gap: nothing published either onto the
+ROS graph, so both tiles read **NO ROS SOURCE**, hatched grey. The fix was
+always a **rover-side publisher, not a dashboard change and not a wider
+whitelist** — and that publisher now exists.
+`rover/fpms-os/overlay/usr/local/bin/fpms-telemetry-ros` subscribes to the
+agent's and `fpms-npud`'s MQTT and mirrors the *health* of both onto `/fpms/*`.
+Every one of its 19 topics is covered by the existing `/fpms/*` entry;
+**`topics_glob` did not move**, and `verify_render.js` checks each of the 19
+names against the list rather than trusting the prefix.
 
-Reaching them needs a **rover-side publisher**, not a dashboard change and not a
-wider whitelist. Flagging it here as requested; nothing has been widened.
+It does not carry the picture, and this page does not ask for one: a ~40 kB
+base64 JPEG at 6 Hz on the socket that also carries the 10 Hz `LaserScan` is a
+different engineering problem. The question these tiles answer is whether the
+camera is **alive**.
+
+---
+
+## The camera and NPU tiles — how a state word becomes a colour
+
+| `state` | tile | why |
+|---|---|---|
+| `unknown` | **`nosrc`** — hatched grey | The mirror is *running* and saying it cannot see its own source. Not green, not red. From the operator's chair that is still "no source". |
+| *state topic stale, or never seen* | **`nosrc`** | `/fpms/camera/state` is published at 1 Hz unconditionally, carrying even the word `unknown` — so silence on it means the **bridge** is gone. "NO ROS SOURCE" is still the honest answer, and it says so about `fpms-telemetry-ros`, not about the sensor. |
+| `ok` | `ok` | |
+| `warn` | `warn` | arriving, slower than it should be |
+| `off` | `warn` | **A deliberate operator action.** Streaming was switched off on purpose. Red for a thing somebody chose is how an operator learns to ignore red. |
+| `degraded` | `warn` | serving, but not as configured |
+| `stale` | `down` | it was alive and it has stopped |
+| `fault` | `down` | named and declared by the daemon that owns it |
+| *any other word* | `nosrc` | a dashboard that colours a word it does not understand is guessing |
+
+**Never let `unknown` render as healthy.** That is the single worst thing this
+dashboard could do — *a blind fire-detection rover reported healthy* — so it is
+asserted explicitly in `verify_render.js` (§7c) in both directions: not `ok`,
+and not `down` either.
+
+Three further rules the tiles enforce **without trusting the mirror to have
+enforced them first**, because a cross-check that depends on the thing it is
+checking is not a cross-check:
+
+* `/fpms/npu/detection_available` **false ⇒ never green**, whatever `state`
+  arrived alongside it. The tile turns red and reads `NOT DETECTING`. (An
+  `unknown` is still left grey: the rule that `unknown` is never coloured runs
+  in both directions.)
+* a `model_sha_state` of `mismatch`, a `model_loaded` of false, or any
+  `consecutive_failures` above zero downgrades a green tile to amber.
+* `/fpms/camera/stale` true beside a `state` of `ok` is a contradiction — the
+  mirror computes both in the same tick — and resolves to the **worse** of the
+  two.
+
+The note line under each tile is the mirror's own **`why` string, verbatim**.
+It is written for direct display and names the specific evidence behind the
+state; composing a sentence here instead would be a second opinion assembled
+from less information than the mirror had. Alongside it, `mqtt.refused` out of
+the health snapshot is called out loudly, because **a broker ACL refusal looks
+exactly like a dead sensor** from this end — the mirror checks the SUBACK rather
+than the return of `subscribe()` precisely so that this can be said out loud.
+
+Freshness is unchanged and non-negotiable: every age and every level on these
+tiles is measured **in this browser from the moment the message arrived**. The
+snapshot's own `frame_age_s`, `telemetry_age_s` and `ts` are *data about the
+rover's sources*, displayed and labelled as such, and never used to decide
+whether what is on this screen is fresh.
 
 ---
 
@@ -503,8 +583,9 @@ wider whitelist. Flagging it here as requested; nothing has been widened.
 * **Mission** — state, phase, armed, leg/segment, travelled, remaining, route.
 * **Battery** — volts, source, age, and a bar (never a percentage: that would
   imply a state-of-charge model nobody has calibrated).
-* **Link health** — LIDAR, ESP32, CAMERA, NPU. See above for why two of them
-  are permanently "no ROS source".
+* **Link health** — LIDAR, ESP32, CAMERA, NPU. All four now have a ROS source;
+  see the colour table above for how a state word becomes a colour, and why
+  `unknown` stays hatched grey.
 * **Residual** — `drive_mm`, `turn_deg`, both cumulatives, a table of the last
   12 settled segments with target/measured/ratio from `/fpms/residual/raw`, and
   a **verdict** applying `STACK.md`'s table:
@@ -535,8 +616,12 @@ wider whitelist. Flagging it here as requested; nothing has been widened.
   Those buttons live in `fpms_console`; this is a monitoring dashboard with a
   panic button.
 * **It cannot change a ROS parameter.** `params_glob` is `"[]"`.
-* **It cannot show camera or NPU health**, because nothing publishes them onto
-  the ROS graph. It says so rather than implying otherwise.
+* **It cannot show the camera picture.** It shows camera *health* — alive,
+  stale, off, faulted — because that is what `fpms-telemetry-ros` mirrors onto
+  the graph. The frames themselves stay on MQTT by design.
+* **It cannot claim a subsystem is healthy on no evidence.** When the mirror
+  says `unknown`, or the mirror itself goes quiet, the tile reads NO ROS
+  SOURCE and stays grey rather than guessing in either direction.
 * **It cannot show a pose while the rover is parked**, because the mission
   mirror does not publish one. It draws ASSUMED rather than guessing.
 * **It cannot fix a wedged rosbridge.** It detects it, names it, and tells you
@@ -550,15 +635,18 @@ Optional, and **not** a build step — nothing here is loaded by the page. Node 
 not required to run the dashboard.
 
 ```bash
-node verify_link.js     # 28 assertions: reconnect, heartbeat, silence, backoff
-node verify_render.js   # 48 assertions: identity, staleness, zones, STOP, panels
+node verify_link.js     # 32 assertions: reconnect, heartbeat, silence, backoff
+node verify_render.js   # 77 assertions: identity, staleness, zones, STOP, panels,
+                        #                and the camera/NPU colour rules
 ```
 
 `verify_link.js` loads `rosbridge.js` unmodified against a fake WebSocket and
 drives the failure modes that actually happen: a socket that closes; one that
 opens and immediately flaps; one that hangs in CONNECTING; one that is open and
-silently dead; total silence; partial silence (the wrong-topic-root shape); and
-re-pointing at another rover without leaving a zombie.
+silently dead; total silence; partial silence (the wrong-topic-root shape);
+re-pointing at another rover without leaving a zombie; and a live link on which
+every camera/NPU health topic is silent — which raises no alarm, by design, and
+loses no subscription across a reconnect.
 
 `verify_render.js` loads `index.html` plus all four scripts into a minimal DOM
 shim, moves a **fake monotonic clock** forward, and asserts what is actually
@@ -567,4 +655,11 @@ rendered — including that a value goes stale with no new message arriving, tha
 mismatch raises the identity banner, and that a silent mirror with a live
 `/diagnostics` produces **CHECK THE THING NAME**.
 
-Both were run against the current tree: **28/28 and 48/48**.
+Its §7b–7i drive every state word `fpms-telemetry-ros` can emit through the real
+render path and assert the resulting **colour**, not merely the text — a tile
+that says the right words in the wrong colour is still a lie. In particular:
+`unknown` is neither green nor red; a stale mirror reverts to NO ROS SOURCE from
+the clock alone with no message arriving; `off` is amber and not red; and an NPU
+reporting `state: ok` beside `detection_available: false` is **not** green.
+
+Both were run against the current tree: **32/32 and 77/77**.

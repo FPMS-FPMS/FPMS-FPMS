@@ -72,6 +72,52 @@ var SPEC = {
   front:     { warn: 3,  stale: 8,   label: "/fpms/mission/front_mm" },
   battm:     { warn: 5,  stale: 20,  label: "/fpms/mission/batt_v" },
 
+  /* --- camera + NPU health, mirrored onto the graph by the rover's
+         fpms-telemetry-ros. 1 Hz (FPMS_TELEMETRY_ROS_HZ), so the same
+         2/5-style bounds as `health` and `diag` would be too tight: at a 1 s
+         cadence a single missed tick would read as a fault. 3/10 is three
+         missed ticks before WARN and ten before STALE.
+
+         THE ONE THING TO UNDERSTAND ABOUT THESE FEEDS: going stale here means
+         THE MIRROR stopped, not that the camera or the NPU stopped. The
+         mirror publishes state and health UNCONDITIONALLY from process start
+         — carrying the literal word "unknown" when it has heard nothing — so
+         silence on /fpms/camera/state is a statement about fpms-telemetry-ros
+         and about nothing else. app.js renders that as NO ROS SOURCE, not as
+         a dead sensor. The scalars below are the opposite: the mirror stops
+         publishing them the moment their source goes quiet, deliberately, so
+         a stale one is simply absent rather than frozen.
+
+         The first seven are the set the mirror's author specified. The rest
+         are the remaining scalars it publishes, registered at the identical
+         bound so that no feed on this page falls through to DEFAULT_SPEC —
+         feeds.js's third rule is that every feed declares its own. --------- */
+  cam_state:  { warn: 3, stale: 10, label: "/fpms/camera/state" },
+  cam_health: { warn: 3, stale: 10, label: "/fpms/camera/health" },
+  cam_fps:    { warn: 3, stale: 10, label: "/fpms/camera/fps" },
+  cam_age:    { warn: 3, stale: 10, label: "/fpms/camera/frame_age_s" },
+  cam_stale:  { warn: 3, stale: 10, label: "/fpms/camera/stale" },
+  cam_res:    { warn: 3, stale: 10, label: "/fpms/camera/resolution" },
+
+  npu_state:  { warn: 3, stale: 10, label: "/fpms/npu/state" },
+  npu_health: { warn: 3, stale: 10, label: "/fpms/npu/health" },
+  npu_det:    { warn: 3, stale: 10, label: "/fpms/npu/detection_available" },
+  npu_loaded: { warn: 3, stale: 10, label: "/fpms/npu/model_loaded" },
+  npu_sha:    { warn: 3, stale: 10, label: "/fpms/npu/model_sha_state" },
+  npu_p50:    { warn: 3, stale: 10, label: "/fpms/npu/p50_ms" },
+  npu_p90:    { warn: 3, stale: 10, label: "/fpms/npu/p90_ms" },
+  npu_rate:   { warn: 3, stale: 10, label: "/fpms/npu/infer_per_s" },
+  npu_drops:  { warn: 3, stale: 10, label: "/fpms/npu/drops" },
+  npu_consec: { warn: 3, stale: 10, label: "/fpms/npu/consecutive_failures" },
+  npu_cores:  { warn: 3, stale: 10, label: "/fpms/npu/core_mask" },
+
+  /* --- the two fault mirrors. EDGES: fpms-npud and the rover agent emit them
+         once, on a transition. A long age here is a rover that has not
+         faulted, which is the good case, so they are aged and labelled and
+         never allowed to colour a tile by their age alone. -------------- */
+  npu_fault:   { warn: 60, stale: 300, event: true, label: "/fpms/npu/fault" },
+  agent_fault: { warn: 60, stale: 300, event: true, label: "/fpms/agent/fault" },
+
   /* --- residuals: one per SETTLED SEGMENT. Event-driven by nature. ----- */
   res_raw:     { warn: 60, stale: 300, event: true, label: "/fpms/residual/raw" },
   res_mm:      { warn: 60, stale: 300, event: true, label: "/fpms/residual/drive_mm" },

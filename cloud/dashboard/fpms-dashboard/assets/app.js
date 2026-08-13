@@ -328,6 +328,102 @@ function subscribeAll(L) {
     try { txt = JSON.stringify(JSON.parse(m.data)); } catch (e) {}
     log(txt.slice(0, 300));
   }, { throttle: 100 });
+
+  /* ---- camera + NPU health ------------------------------------------
+     Mirrored onto the graph by the rover's fpms-telemetry-ros, which reads
+     the agent's and fpms-npud's MQTT and republishes the HEALTH of both
+     under /fpms/ — inside topics_glob, which was NOT widened for it.
+
+     It does not carry the picture, and this page does not ask for one: a
+     40 kB base64 JPEG at 6 Hz on the socket that carries the LaserScan is a
+     different engineering problem. The question here is whether the camera
+     is ALIVE.
+
+     NO `expectS` ON ANY OF THESE, AND THAT IS DELIBERATE. expectS feeds the
+     silence banner, which accuses a topic of being wrongly quiet. These
+     topics are quiet on any rover whose image predates fpms-telemetry-ros,
+     and shouting "CONNECTED BUT NO DATA" at an operator whose rover simply
+     does not run that unit yet is a false alarm — and a false alarm is how
+     an alarm becomes worthless on the day it is right. Their absence is
+     already reported, precisely and quietly, by the tiles themselves.
+
+     Two classes, and the difference is the whole contract:
+       state/health  ALWAYS published, from process start, carrying the word
+                     "unknown" when the mirror has heard nothing. Silence on
+                     these means THE MIRROR is gone.
+       everything    published only WHILE ITS SOURCE IS FRESH, and stopped
+       else          otherwise. Never zero-filled, never frozen. So a missing
+                     scalar is a silent source, not a zero. ---------------- */
+  L.subscribe("/fpms/camera/state", "std_msgs/String", function (m) {
+    F.mark("cam_state", String(m.data), String(m.data));
+  });
+  L.subscribe("/fpms/camera/health", "std_msgs/String", function (m) {
+    /* The whole snapshot, as JSON. `why` inside it is written for direct
+       display and is shown verbatim — see healthTile(). */
+    var j = null; try { j = JSON.parse(m.data); } catch (e) {}
+    F.mark("cam_health", (j && j.state) ? String(j.state) : "unparsable", j);
+  });
+  L.subscribe("/fpms/camera/stale", "std_msgs/Bool", function (m) {
+    F.mark("cam_stale", m.data ? "stale" : "fresh", !!m.data);
+  });
+  L.subscribe("/fpms/camera/frame_age_s", "std_msgs/Float32", f32("cam_age"));
+  L.subscribe("/fpms/camera/fps", "std_msgs/Float32", f32("cam_fps"));
+  L.subscribe("/fpms/camera/resolution", "std_msgs/String", function (m) {
+    F.mark("cam_res", String(m.data), String(m.data));
+  });
+
+  L.subscribe("/fpms/npu/state", "std_msgs/String", function (m) {
+    F.mark("npu_state", String(m.data), String(m.data));
+  });
+  L.subscribe("/fpms/npu/health", "std_msgs/String", function (m) {
+    var j = null; try { j = JSON.parse(m.data); } catch (e) {}
+    F.mark("npu_health", (j && j.state) ? String(j.state) : "unparsable", j);
+  });
+  /* The single most consequential boolean on this page. false is fpms-npud
+     saying THE ROVER IS NOT DETECTING. */
+  L.subscribe("/fpms/npu/detection_available", "std_msgs/Bool", function (m) {
+    F.mark("npu_det", m.data ? "yes" : "NO", !!m.data);
+  });
+  L.subscribe("/fpms/npu/model_loaded", "std_msgs/Bool", function (m) {
+    F.mark("npu_loaded", m.data ? "yes" : "NO", !!m.data);
+  });
+  L.subscribe("/fpms/npu/model_sha_state", "std_msgs/String", function (m) {
+    F.mark("npu_sha", String(m.data), String(m.data));
+  });
+  L.subscribe("/fpms/npu/p50_ms", "std_msgs/Float32", f32("npu_p50"));
+  L.subscribe("/fpms/npu/p90_ms", "std_msgs/Float32", f32("npu_p90"));
+  L.subscribe("/fpms/npu/infer_per_s", "std_msgs/Float32", f32("npu_rate"));
+  L.subscribe("/fpms/npu/drops", "std_msgs/Int32", function (m) {
+    F.mark("npu_drops", String(m.data), m.data);
+  });
+  L.subscribe("/fpms/npu/consecutive_failures", "std_msgs/Int32", function (m) {
+    F.mark("npu_consec", String(m.data), m.data);
+  });
+  L.subscribe("/fpms/npu/core_mask", "std_msgs/String", function (m) {
+    F.mark("npu_cores", String(m.data), String(m.data));
+  });
+
+  /* ---- the two fault mirrors: EDGES, not cadence -------------------- */
+  L.subscribe("/fpms/npu/fault", "std_msgs/String", function (m) {
+    var j = null; try { j = JSON.parse(m.data); } catch (e) {}
+    F.mark("npu_fault", faultWord(j, m.data), j || m.data);
+    log("NPU " + (j && j._topic ? j._topic : "fault") + ": " + faultWord(j, m.data));
+  });
+  L.subscribe("/fpms/agent/fault", "std_msgs/String", function (m) {
+    var j = null; try { j = JSON.parse(m.data); } catch (e) {}
+    F.mark("agent_fault", faultWord(j, m.data), j || m.data);
+    log("agent " + (j && j._topic ? j._topic : "fault") + ": " + faultWord(j, m.data));
+  });
+}
+
+/* The one human-readable word out of a mirrored event, whatever shape the
+   emitter used. Never throws, never returns empty: an event this page cannot
+   name still has to be visible. */
+function faultWord(j, raw) {
+  if (!j || typeof j !== "object") { return String(raw || "").slice(0, 120); }
+  var w = j.fault || j.error || j.component || j.cleared || j._topic || "event";
+  if (j.detail || j.fault_detail) { w += " — " + (j.detail || j.fault_detail); }
+  return String(w).slice(0, 160);
 }
 
 /* ======================================================================
@@ -489,26 +585,34 @@ function checkIdentity() {
 /* ======================================================================
    4. LINK HEALTH TILES
    ----------------------------------------------------------------------
-   FOUR subsystems were asked for. Two of them have a ROS source and two do
-   not, and this panel says which is which rather than inventing a colour.
+   FOUR subsystems, and ALL FOUR now have a ROS source.
 
-     LIDAR  — real. /scan_lidar arrivals here + /fpms/mission/lidar_ok +
-              the Pi's own ros/scan_lidar diagnostic.
-     ESP32  — real. /fpms_health flag bit4 is the micro-ROS agent session,
-              which IS the board link, corroborated by /wheel_ticks arriving.
-     CAMERA — NO ROS PUBLISHER EXISTS. The rover agent sends frames straight
-              to MQTT; nothing mirrors them onto the graph. The best evidence
-              on the graph is that the agent's own MQTT heartbeat is fresh,
-              which says the camera-owning PROCESS is alive and says nothing
-              about the camera. The tile reports exactly that and no more.
-     NPU    — NO ROS PUBLISHER EXISTS AT ALL. FPMS_NPU_REQUIRED=1 makes a
-              blind rover a declared fault, but that fault is published on
-              MQTT, not on any topic inside topics_glob. Widening the
-              whitelist to reach it is not on the table, so the tile is
-              permanently "no ROS source" with the reason attached.
+     LIDAR  — /scan_lidar arrivals here + /fpms/mission/lidar_ok + the Pi's
+              own ros/scan_lidar diagnostic.
+     ESP32  — /fpms_health flag bit4 is the micro-ROS agent session, which IS
+              the board link, corroborated by /wheel_ticks arriving.
+     CAMERA — /fpms/camera/state + /fpms/camera/health, and the scalars.
+     NPU    — /fpms/npu/state + /fpms/npu/health, and the scalars.
 
+   The last two used to read NO ROS SOURCE, hatched grey, because nothing
+   published camera or NPU health onto the graph at all — the agent sent
+   frames straight to MQTT and fpms-npud raised its faults there. The rover
+   now runs fpms-telemetry-ros, which mirrors both onto /fpms/*, inside
+   topics_glob, WITHOUT WIDENING IT. That was always the fix: a rover-side
+   publisher, not a dashboard that guesses.
+
+   THE RULE THE COLOUR MAPPING EXISTS TO ENFORCE
    Guessing green here would be the worst possible failure of this dashboard:
-   a blind fire-detection rover reported healthy.
+   a blind fire-detection rover reported healthy. So "unknown" — the word the
+   mirror publishes when it is running and its own source is silent — is
+   still rendered as NO ROS SOURCE, hatched grey. It is neither good news nor
+   bad news, and it must never be painted as either. Likewise a mirror that
+   has gone quiet, or never spoke: that is a missing BRIDGE, and "NO ROS
+   SOURCE" remains the honest answer for it.
+
+   And in the other direction: `off` is a deliberate operator action — the
+   camera stream was switched off on purpose — so it is amber, never red. Red
+   for a thing somebody chose is how an operator learns to ignore red.
    ====================================================================== */
 function decodeHealth() {
   if (!healthWords || healthWords.length < 12 || F.isStale("health")) { return null; }
@@ -527,6 +631,115 @@ function decodeHealth() {
     heapKb:       w[10],
     uptimeS:      w[11]
   };
+}
+
+/* THE STATE WORD -> TILE CLASS MAP. It lives in exactly one place so the
+   camera and the NPU can never drift apart, and so the rule is readable:
+
+     unknown   nosrc   the mirror is UP and says it cannot see its source.
+                       Not green, not red. From the operator's chair that is
+                       still "no source" — and an "unknown" painted green is
+                       a blind fire-detection rover reported healthy.
+     ok        ok
+     warn      warn    arriving, slower than it should be
+     off       warn    DELIBERATE. Streaming was switched off by an operator.
+                       Not a fault, and colouring it like one teaches the
+                       operator to ignore the colour that means fault.
+     degraded  warn    serving, but not as configured
+     stale     down    it was alive and it has stopped
+     fault     down    named, declared, by the daemon that owns it
+
+   Any word not in this table is treated as nosrc, not as ok. A dashboard
+   that colours a word it does not understand is guessing. */
+var STATE_CLS = {
+  unknown: "nosrc",
+  ok: "ok",
+  warn: "warn", off: "warn", degraded: "warn",
+  stale: "down", fault: "down"
+};
+
+/* The shared skeleton of the CAMERA and NPU tiles: bridge liveness first,
+   then the state word, then the mirror's own `why` verbatim.
+
+   FRESHNESS IS OURS, ALWAYS. Every level and every age below comes from
+   F.*(stateKey) — measured in this browser from the moment the message
+   arrived. The snapshot carries its own ages (frame_age_s, telemetry_age_s,
+   ts); those are DATA ABOUT THE ROVER'S SOURCES and are displayed as such,
+   never used to decide whether what is on this screen is fresh. */
+function healthTile(o) {
+  var lv = F.level(o.stateKey);
+  var src = o.topic + " + " + o.healthTopic;
+
+  /* 1. IS THE MIRROR THERE AT ALL? /fpms/<x>/state is published at 1 Hz from
+        process start, unconditionally, carrying "unknown" when the mirror has
+        heard nothing. So silence on it is a statement about fpms-telemetry-ros
+        and about NOTHING ELSE. Grey, not red: a missing bridge is not
+        evidence that the sensor is broken. */
+  if (lv === "never") {
+    return { name: o.name, cls: "nosrc", val: "NO ROS SOURCE",
+             age: "never seen", src: src,
+             note: "Nothing has ever published " + o.topic + " to this browser. " +
+                   "fpms-telemetry-ros is what mirrors " + o.what + " health from " +
+                   "MQTT onto the graph; if that unit is not running on the rover, " +
+                   "or this image predates it, there is no source here. That is " +
+                   "not evidence about the " + o.what + " in either direction — " +
+                   "check systemctl status fpms-telemetry-ros on the Pi." };
+  }
+  if (lv === "stale") {
+    return { name: o.name, cls: "nosrc", val: "NO ROS SOURCE",
+             age: F.ageText(o.stateKey), src: src,
+             note: o.topic + " was arriving and has stopped (" +
+                   F.ageText(o.stateKey) + "). That mirror publishes at 1 Hz " +
+                   "whatever it knows, including the word \"unknown\", so silence " +
+                   "means fpms-telemetry-ros itself is down or unreachable — " +
+                   "which says nothing about the " + o.what + "." };
+  }
+
+  var word = String((F.get(o.stateKey) || {}).v || "").toLowerCase();
+  var cls = STATE_CLS[word];
+  var notes = [];
+  if (!cls) {
+    cls = "nosrc";
+    notes.push("the mirror reports a state this dashboard does not recognise (\"" +
+               word + "\"). It will not colour a word it cannot interpret.");
+  }
+
+  /* 2. THE MIRROR'S OWN WORDS. `why` is written by fpms-telemetry-ros for
+        direct display — it names the specific evidence behind the state, and
+        it is shown VERBATIM. Composing our own sentence here would be a
+        second opinion assembled from less information than the mirror had. */
+  var health = F.fresh(o.healthKey);
+  if (health && typeof health.why === "string" && health.why) {
+    notes.push(health.why);
+  } else if (F.seen(o.healthKey)) {
+    notes.push("the health snapshot on " + o.healthTopic + " is stale (" +
+               F.ageText(o.healthKey) + ") while the state word is fresh — " +
+               "showing the state alone rather than an old explanation of it.");
+  }
+
+  /* 3. A REFUSED MQTT SUBSCRIPTION LOOKS EXACTLY LIKE A DEAD SENSOR, and it
+        is the difference between "the camera failed" and "the broker ACL does
+        not grant this bridge". The mirror checks the SUBACK rather than the
+        return of subscribe() precisely so this can be said out loud. */
+  if (health && health.mqtt) {
+    var ref = health.mqtt.refused || [];
+    if (ref.length) {
+      notes.unshift("BROKER REFUSED THE SUBSCRIPTION for " +
+        ref.map(function (r) { return r.topic + " (" + r.code + ")"; }).join(", ") +
+        ". The mirror is connected and granted nothing, which from here is " +
+        "indistinguishable from a dead sensor — but it is an ACL, not the " +
+        o.what + ". Check /etc/mosquitto/fpms.acl against FPMS_THING_NAME.");
+      if (cls === "ok") { cls = "warn"; }
+    } else if (health.mqtt.state && health.mqtt.state !== "connected") {
+      notes.unshift("the mirror's own MQTT link is \"" + health.mqtt.state +
+        "\", so it is reporting on a source it currently cannot hear.");
+      if (cls === "ok") { cls = "warn"; }
+    }
+  }
+
+  return { name: o.name, cls: cls,
+           val: (word === "unknown") ? "UNKNOWN — NO SOURCE" : word.toUpperCase(),
+           age: F.ageText(o.stateKey), src: src, notes: notes, word: word };
 }
 
 function linkTiles() {
@@ -579,30 +792,125 @@ function linkTiles() {
 
   /* ---- Camera ---- */
   (function () {
-    var dg = diagStatus["mqtt/telemetry/pose"];
-    var val = "NO ROS SOURCE", cls = "nosrc", note =
-      "Nothing publishes camera frames or camera health onto the ROS graph; " +
-      "the rover agent sends them straight to MQTT. Porting this needs a " +
-      "rover-side publisher, not a dashboard change.";
-    if (dg && !F.isStale("diag")) {
-      note = "PROCESS only: the rover-agent heartbeat that owns the camera is " +
-             dg.message + ". That is evidence the process is alive, and no " +
-             "evidence at all about the camera. " + note;
+    var t = healthTile({ name: "CAMERA", what: "camera",
+                         stateKey: "cam_state", healthKey: "cam_health",
+                         topic: "/fpms/camera/state",
+                         healthTopic: "/fpms/camera/health" });
+    if (t.notes) {
+      var health = F.fresh("cam_health") || {};
+      var fps = F.fresh("cam_fps");
+      if (t.cls === "ok" && fps !== null) { t.val = "OK · " + fps.toFixed(1) + " fps"; }
+
+      /* CROSS-CHECK, not decoration. The mirror computes `state` and `stale`
+         in the same tick from the same snapshot, so they cannot honestly
+         disagree — if they do, something between here and there is rewriting
+         one of them, and the safe reading is the pessimistic one. */
+      if (F.fresh("cam_stale") === true && t.cls === "ok") {
+        t.cls = "warn";
+        t.notes.push("the mirror says state=ok while /fpms/camera/stale is true; " +
+                     "those two are computed in the same tick and cannot both be " +
+                     "right — treating it as the worse of the two.");
+      }
+
+      var res = F.fresh("cam_res");
+      if (res) { t.notes.push(res); }
+      /* The mirror's own measurement of the frame's age AT THE MIRROR. It is a
+         fact about the rover's camera, published as data — never this page's
+         idea of whether the tile is fresh, which is the age line above. */
+      var fa = F.fresh("cam_age");
+      if (fa !== null) {
+        t.notes.push("last frame reached the rover-side mirror " + fa.toFixed(1) +
+                     "s before it sent this");
+      }
+      if (fps !== null) { t.notes.push(fps.toFixed(1) + " fps into the mirror"); }
+      if (typeof health.agent_fps === "number") {
+        t.notes.push("the agent's own encoder is at " + health.agent_fps.toFixed(1) +
+                     " fps (if that climbs while the mirror's rate does not, the " +
+                     "frames are being lost on the link, not at the camera)");
+      }
+      if (health.agent_heartbeat) {
+        t.notes.push("agent heartbeat " + health.agent_heartbeat +
+                     (health.agent_camera_ok === false ? ", and it reports camera_ok=FALSE" : ""));
+      }
+      if (health.camera_fault_active) {
+        t.notes.push("agent fault standing: " + health.camera_fault_active);
+      }
+      if (F.seen("agent_fault")) {
+        t.notes.push("last agent event: " + F.get("agent_fault").v + " (" +
+                     F.ageText("agent_fault") + ")");
+      }
+      t.note = t.notes.join(" · ");
     }
-    tiles.push({ name: "CAMERA", cls: cls, val: val,
-                 age: F.seen("diag") ? "via /diagnostics " + F.ageText("diag") : "never seen",
-                 src: "none on the whitelist", note: note });
+    tiles.push(t);
   })();
 
   /* ---- NPU ---- */
-  tiles.push({
-    name: "NPU", cls: "nosrc", val: "NO ROS SOURCE", age: "n/a",
-    src: "none on the whitelist",
-    note: "FPMS_NPU_REQUIRED=1 makes a blind rover a declared fault, but that " +
-          "fault is published on MQTT and has no mirror inside rosbridge's " +
-          "topics_glob. This dashboard will not colour a tile it cannot " +
-          "justify — check the rover agent's log or the MQTT dashboard."
-  });
+  (function () {
+    var t = healthTile({ name: "NPU", what: "NPU",
+                         stateKey: "npu_state", healthKey: "npu_health",
+                         topic: "/fpms/npu/state",
+                         healthTopic: "/fpms/npu/health" });
+    if (t.notes) {
+      var health = F.fresh("npu_health") || {};
+      var p50 = F.fresh("npu_p50");
+      if (t.cls === "ok" && p50 !== null) { t.val = "OK · p50 " + p50.toFixed(0) + " ms"; }
+
+      /* THE ONE THAT MATTERS. detection_available=false is fpms-npud stating
+         that this rover is not detecting anything. The mirror already turns
+         that into state=fault, and this check does not trust it to: a
+         DETECTING=false tile must not be green no matter what word arrived
+         alongside it. Only ok/warn are overridden — an "unknown" stays grey,
+         because the rule that "unknown" is never coloured runs in both
+         directions. */
+      if (F.fresh("npu_det") === false) {
+        if (t.cls === "ok" || t.cls === "warn") {
+          t.cls = "down";
+          t.val = "NOT DETECTING";
+        }
+        t.notes.unshift("detection_available=FALSE — THE ROVER IS NOT DETECTING. " +
+                        "Fire detection is not running; nothing on this screen " +
+                        "should be read as if it were.");
+      }
+      if (F.fresh("npu_loaded") === false) {
+        t.notes.push("no model is loaded");
+        if (t.cls === "ok") { t.cls = "warn"; }
+      }
+      var sha = F.fresh("npu_sha");
+      if (sha === "mismatch") {
+        t.notes.push("model SHA MISMATCH against /etc/fpms/models.json — the " +
+                     "weights running are not the weights on record");
+        if (t.cls === "ok") { t.cls = "warn"; }
+      } else if (sha) {
+        t.notes.push("model sha " + sha);
+      }
+      var lat = [];
+      if (p50 !== null) { lat.push("p50 " + p50.toFixed(0) + " ms"); }
+      var p90 = F.fresh("npu_p90");
+      if (p90 !== null) { lat.push("p90 " + p90.toFixed(0) + " ms"); }
+      var rate = F.fresh("npu_rate");
+      if (rate !== null) { lat.push(rate.toFixed(1) + " infer/s"); }
+      if (lat.length) { t.notes.push(lat.join(" / ")); }
+      var drops = F.fresh("npu_drops");
+      if (drops !== null && drops > 0) { t.notes.push(drops + " drops"); }
+      var consec = F.fresh("npu_consec");
+      if (consec !== null && consec > 0) {
+        t.notes.push(consec + " consecutive failures");
+        if (t.cls === "ok") { t.cls = "warn"; }
+      }
+      var cores = F.fresh("npu_cores");
+      if (cores) { t.notes.push("cores " + cores + " (in force, not requested)"); }
+      if (health.fault) {
+        t.notes.push("fault: " + health.fault +
+                     (health.fault_detail ? " — " + health.fault_detail : ""));
+      }
+      if (F.seen("npu_fault")) {
+        t.notes.push("last NPU event: " + F.get("npu_fault").v + " (" +
+                     F.ageText("npu_fault") + ")");
+      }
+      t.note = t.notes.join(" · ");
+    }
+    tiles.push(t);
+  })();
 
   return tiles;
 }

@@ -190,6 +190,48 @@ const opts = (url, label, extra) =>
   await sleep(100);
 
   /* ------------------------------------------------------------------- */
+  console.log("\n6c. the camera/NPU health mirror — restored on reconnect, never accused");
+  /* app.js subscribes these WITHOUT expectS, deliberately: they are published
+     by fpms-telemetry-ros, and a rover whose image predates that unit is
+     silent on all of them while being perfectly healthy. Accusing it would be
+     a false alarm on a working rover, and a false alarm is how an alarm
+     becomes worth nothing on the day it is right. The tiles report the
+     absence themselves, quietly. This proves both halves: no alarm, and no
+     lost subscription across a reconnect. */
+  const M = "ws://rover-mirror:9090";
+  const LM = new RosLink(opts(M, "mirror"));
+  const MIRROR = ["/fpms/camera/state", "/fpms/camera/health",
+                  "/fpms/camera/frame_age_s", "/fpms/npu/state",
+                  "/fpms/npu/health", "/fpms/npu/detection_available",
+                  "/fpms/npu/fault", "/fpms/agent/fault"];
+  MIRROR.forEach((t) => LM.subscribe(t, "std_msgs/String", () => {}));
+  LM.subscribe("/scan_lidar", "sensor_msgs/LaserScan", () => {}, { expectS: 0.6 });
+  await sleep(30);
+  latest(M).accept();
+  await sleep(30);
+  const subbed = (s) => MIRROR.every((t) => s.sent.some((m) => m.op === "subscribe" && m.topic === t));
+  ok(subbed(latest(M)), "all " + MIRROR.length + " mirror topics subscribed on open");
+  /* Keep the LiDAR flowing so the link is provably live while every mirror
+     topic stays silent — exactly a rover without fpms-telemetry-ros. */
+  const quiet = setInterval(() => {
+    const s = latest(M);
+    if (s && s.readyState === 1) { s.answerProbe(); s.deliver({ op: "publish", topic: "/scan_lidar", msg: {} }); }
+  }, 40);
+  await sleep(900);
+  ok(LM.snapshot().phase === "live",
+     "the link is provably live with every /fpms/camera and /fpms/npu topic silent");
+  ok(LM.snapshot().silent.length === 0,
+     "and NOTHING is reported silent — a rover with no health mirror raises no alarm");
+  clearInterval(quiet);
+  LM.reconnectNow();
+  await sleep(20);
+  latest(M).accept();
+  await sleep(30);
+  ok(subbed(latest(M)),
+     "every mirror topic is resubscribed on the new socket (rosbridge keeps no state)");
+  LM.dispose();
+
+  /* ------------------------------------------------------------------- */
   console.log("\n7. a socket hung in CONNECTING is abandoned, not waited on");
   const V = "ws://rover-hung:9090";
   const L7 = new RosLink(opts(V, "hung", { expectsData: false, connectTimeoutMs: 200 }));
