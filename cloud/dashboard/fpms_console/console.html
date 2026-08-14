@@ -152,10 +152,12 @@ td.v{text-align:right;color:#e8f7ff;font-weight:900}
     <div class="h">COMMANDS</div>
     <div class="grid2">
       <button class="yellow" id="btnPlan">PLAN M2 (preview)</button>
+      <button class="yellow" id="btnPlan1">PLAN M1 (preview)</button>
       <button class="green"  id="btnArm">ARM</button>
       <button id="btnDisarm">DISARM</button>
       <button class="green"  id="btnRun" disabled>RUN M2</button>
-      <button id="btnReset">RESET POSE 972,228</button>
+      <button class="green"  id="btnRun1" disabled>RUN M1</button>
+      <button id="btnReset">RESET POSE (start box)</button>
       <button id="btnEnc">READ ENCODERS</button>
     </div>
     <div class="card"><div class="small">LAST COMMAND</div><div id="cmdMsg" class="tiny">--</div></div>
@@ -537,15 +539,22 @@ function svc(name, args, label){
   });
 }
 document.getElementById("btnPlan").onclick  = () => svc("/fpms/plan_m2", {}, "PLAN M2 (preview, cannot move)");
-document.getElementById("btnReset").onclick = () => svc("/fpms/reset_pose", {}, "RESET POSE 972,228");
+/* The label carries no coordinates on purpose: the service anchors to
+   FPMS_RESET_X_MM / FPMS_RESET_Y_MM in /etc/fpms/config.env (1322,178 today),
+   and a number baked into the button drifts from it silently -- this one still
+   read 972,228 long after the start box moved. */
+document.getElementById("btnReset").onclick = () => svc("/fpms/reset_pose", {}, "RESET POSE (start box)");
+document.getElementById("btnPlan1").onclick = () => svc("/fpms/plan_m1", {}, "PLAN M1 (preview, cannot move)");
 document.getElementById("btnEnc").onclick   = () => svc("/fpms/read_encoders", {}, "READ ENCODERS");
 document.getElementById("btnArm").onclick   = () => { armedAt = performance.now(); svc("/fpms/arm", {data:true}, "ARM"); };
 document.getElementById("btnDisarm").onclick= () => { armedAt = 0; svc("/fpms/arm", {data:false}, "DISARM"); };
-document.getElementById("btnRun").onclick   = () => {
+function runMission(name){
   if (!runAllowed().ok) return;                 // belt: the button is also disabled
   armedAt = 0;                                  // one ARM buys exactly one RUN
-  svc("/fpms/run_m2", {}, "RUN M2");
-};
+  svc("/fpms/run_" + name, {}, "RUN " + name.toUpperCase());
+}
+document.getElementById("btnRun").onclick   = () => runMission("m2");
+document.getElementById("btnRun1").onclick  = () => runMission("m1");
 
 function runAllowed(){
   if (!ros.open) return {ok:false, why:"rosbridge link is DOWN."};
@@ -611,6 +620,7 @@ function tick(){
   /* RUN gating — a property, not a class. */
   const allow = runAllowed();
   document.getElementById("btnRun").disabled = !allow.ok;
+  document.getElementById("btnRun1").disabled = !allow.ok;
   const why = document.getElementById("runWhy");
   why.textContent = allow.why;
   why.style.borderLeftColor = allow.ok ? "#3af07a" : "#ffbf00";
