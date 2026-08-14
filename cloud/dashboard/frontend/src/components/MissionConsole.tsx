@@ -338,7 +338,45 @@ export type PlanStatus =
   | { kind: "refused"; error: string }
   | { kind: "ready"; rec: PlanRec; ageMs: number; expired: boolean };
 
-type LogEntry = { at: number; kind: "ok" | "bad" | "gate"; text: string };
+/**
+ * What a console log line MEANS, which is what decides how it is painted.
+ *
+ *   ok    a command left the browser and was accepted.
+ *   info  something is IN FLIGHT and has no outcome yet. Never a success.
+ *   gate  the arm gate opened or shut — the operator's own safety state.
+ *   bad   a refusal, or a precondition that failed before anything was sent.
+ *   err   a command that HAD to work and did not. The loudest kind there is.
+ *
+ * This alias exists because the union used to be written out twice — once on
+ * LogEntry and once on say() — and both copies drifted from the calls. abort()
+ * was already saying "info" and "err" against a union containing neither,
+ * which is the three TS2345 errors that made `tsc -b` fail and therefore
+ * blocked every Windows rebuild. One name, one place to add a kind.
+ */
+type LogKind = "ok" | "info" | "gate" | "bad" | "err";
+
+type LogEntry = { at: number; kind: LogKind; text: string };
+
+/**
+ * How each kind is painted.
+ *
+ * A RECORD, not the if/else chain this used to be. Adding a kind to LogKind
+ * without giving it a tone is now a compile error, where before it silently
+ * fell through to the neutral default — which is how an "err" on the ABORT
+ * path would have been painted identically to an "ok".
+ *
+ * `err` is deliberately louder than `bad`: a heavier border and a filled
+ * background, matching the banner style the Telemetry page already uses for
+ * its two unmissable states. The one control that has to work when everything
+ * else has failed does not get to look like ordinary bad news.
+ */
+const LOG_TONE: Record<LogKind, string> = {
+  ok: "border border-white/10 bg-white/[0.04] text-slate-300",
+  info: "border border-sky-500/30 bg-sky-500/[0.06] text-sky-100/90",
+  gate: "border border-amber-500/30 bg-amber-500/[0.06] text-amber-100/90",
+  bad: "border border-rose-500/40 bg-rose-500/10 text-rose-100",
+  err: "border-2 border-rose-500/60 bg-rose-950/40 text-rose-100",
+};
 
 /** The bare shape of a `useChannel` result — only the parts the console reads. */
 type Feed = { data: unknown; messages: number; lastAt: number | null };
@@ -444,7 +482,7 @@ export function useMissionConsole(input: MissionConsoleInput): MissionConsoleSta
 
   /* ------------------------------------------------------------ the log --- */
   const [log, setLog] = useState<LogEntry[]>([]);
-  const say = (kind: "ok" | "bad" | "gate", text: string) =>
+  const say = (kind: LogKind, text: string) =>
     setLog((prev) => [{ at: Date.now(), kind, text }, ...prev].slice(0, 8));
 
   /* ------------------------------------------------------------- ARM/SAFE --
@@ -640,8 +678,32 @@ export function useMissionConsole(input: MissionConsoleInput): MissionConsoleSta
    */
   const abort = () => {
     if (!thing) return;
-    say("ok", `ABORT (${MISSION_ABORT_ACTION}) — sent`);
-    void postMissionAbort(thing);
+    // FIXED 2026-08-07. This used to say("ok", "… — sent") on the line BEFORE
+    // the post, and postMissionAbort swallows its own failure
+    // (lib/mission.ts: `.catch(() => undefined)`). So a 500, a dead backend or
+    // a dropped request painted a green "sent" for a command that never left
+    // the browser — on the one control that has to work exactly when
+    // everything else has gone wrong. Report the attempt, then correct it from
+    // the outcome, which is what the sibling send() at :553 already does.
+    say("info", `ABORT (${MISSION_ABORT_ACTION}) — sending…`);
+    postMissionAbort(thing)
+      .then((ok) =>
+        ok
+          ? say("ok", `ABORT (${MISSION_ABORT_ACTION}) — sent`)
+          : say(
+              "err",
+              `ABORT (${MISSION_ABORT_ACTION}) — NOT SENT. The rover did not ` +
+                `receive it. Use the physical stop.`,
+            ),
+      )
+      .catch(() =>
+        say(
+          "err",
+          `ABORT (${MISSION_ABORT_ACTION}) — NOT SENT. Use the physical stop.`,
+        ),
+      );
+    // Disarm regardless: the console's own gate must shut even if the wire
+    // failed, so nothing else can be launched on the strength of it.
     disarm("aborted");
   };
 
@@ -952,13 +1014,7 @@ export function MissionConsole({
           {mc.log.map((e) => (
             <div
               key={`${e.at}-${e.text}`}
-              className={`rounded px-2 py-1 font-mono text-[11px] ${
-                e.kind === "bad"
-                  ? "border border-rose-500/40 bg-rose-500/10 text-rose-100"
-                  : e.kind === "gate"
-                    ? "border border-amber-500/30 bg-amber-500/[0.06] text-amber-100/90"
-                    : "border border-white/10 bg-white/[0.04] text-slate-300"
-              }`}
+              className={`rounded px-2 py-1 font-mono text-[11px] ${LOG_TONE[e.kind]}`}
             >
               <span className="opacity-60">
                 {new Date(e.at).toLocaleTimeString()}
@@ -1421,13 +1477,24 @@ export function MissionEncoders({ mc }: { mc: MissionConsoleState }) {
       />
 
       <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
-        <b>There are no encoder ticks on this rover.</b> The Yahboom MicroROS
-        Board V2.0 publishes an integrated pose and a twist on{" "}
+        <b>This test reads odometry, not ticks.</b> <span className="font-mono">
+        read_encoders</span> is answered by fpms-teleop from the ROS side, which
+        publishes an integrated pose and a twist on{" "}
         <span className="font-mono">/odom_raw</span> and nothing else — no{" "}
-        <span className="font-mono">/wheel_ticks</span>, no joint states, no
-        per-wheel counters. What this test proves is that <i>odometry is moving
-        and plausible</i>, which is the thing every mission's dead reckoning
-        depends on. It does not prove a wheel turned.
+        <span className="font-mono">/wheel_ticks</span>, no joint states. What
+        this test proves is that <i>odometry is moving and plausible</i>, which
+        is the thing every mission's dead reckoning depends on. It does not
+        prove a wheel turned.
+        <br />
+        <br />
+        <b className="text-amber-100">Raw per-wheel counts do now exist</b> —
+        just not in this reply.{" "}
+        <span className="font-mono">fpms_stm32_bridge</span> reads all four
+        counters off the board and publishes them at 5 Hz on{" "}
+        <span className="font-mono">board:&lt;thing&gt;</span>, with the
+        millimetres each wheel has travelled at 6.00 counts/mm. Read them on the{" "}
+        <b>Telemetry</b> tab, BOARD card. That feed is what proves a wheel
+        turned.
       </div>
 
       {waiting ? (
@@ -1457,7 +1524,7 @@ export function MissionEncoders({ mc }: { mc: MissionConsoleState }) {
                   ? `${r.ticksLeft ?? "--"} / ${r.ticksRight ?? "--"}`
                   : "not published"
               }
-              note={r.ticksAvailable ? "left / right" : "this board has no counters"}
+              note={r.ticksAvailable ? "left / right" : "not in this reply — see board:"}
             />
             <Stat label="odom x" value={metres(r.xM)} note={r.sourceTopic ?? undefined} />
             <Stat label="odom y" value={metres(r.yM)} />

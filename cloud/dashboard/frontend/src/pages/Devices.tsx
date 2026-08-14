@@ -48,9 +48,19 @@ type Health = {
 /**
  * The telemetry streams a rover can publish, and the MQTT topic behind each.
  *
- * This list is a copy of TOPIC_FILTERS in backend/mqtt_bridge.py, minus the
- * derived thermal-analysis channel and the shared `events` stream. Channel name
- * is always `<subtype>:<thing>` — that is what /ws/{channel} expects.
+ * THIS IS A HAND-COPIED MIRROR OF `TOPIC_FILTERS` IN
+ * `backend/mqtt_bridge.py` (see the list at the top of that file, and the
+ * channel-naming comment just under it). Channel name is always
+ * `<subtype>:<thing>` — that is what /ws/{channel} expects. The only entries
+ * deliberately omitted are the derived thermal-analysis channel and the shared
+ * `events` stream.
+ *
+ * KEEP IT IN STEP WITH THAT LIST. This copy silently drifting is not a
+ * hypothetical: `board` was added to TOPIC_FILTERS on 2026-08-13 and never
+ * added here, so the whole IMU / encoder / voltage / health feed reached the
+ * backend and then had no consumer in the entire React app for a day. Nothing
+ * anywhere reported the gap — a subtype missing from this array simply never
+ * gets a socket, and the card it would have drawn is not drawn either.
  *
  * It is a module constant, and every RoverCard maps over the whole of it in
  * order, so the useChannel calls inside that map are a fixed-length, fixed-order
@@ -58,6 +68,7 @@ type Health = {
  */
 const FEEDS = [
   { key: "drive", what: "battery, micro-ROS link, cmd_vel, arena pose", from: "fpms-teleop" },
+  { key: "board", what: "IMU, per-wheel ticks, voltage, board health", from: "fpms-stm32-bridge" },
   { key: "pose", what: "position + heading", from: "rover agent" },
   { key: "lidar", what: "scan ranges", from: "fpms-lidar-ros" },
   { key: "camera", what: "JPEG frames", from: "rover agent" },
@@ -69,7 +80,7 @@ const FEEDS = [
 /** Older than this and we stop calling a feed live. Rovers publish at >= 1 Hz. */
 const LIVE_WINDOW_S = 20;
 
-/** Bound on how many rovers get their own socket set. 7 feeds each adds up. */
+/** Bound on how many rovers get their own socket set. 8 feeds each adds up. */
 const MAX_CARDS = 6;
 
 function useHealth(): { health: Health | null; err: string | null } {

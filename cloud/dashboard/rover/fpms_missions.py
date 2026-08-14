@@ -519,7 +519,7 @@ def _boot_time():
 # corner.
 # OPERATOR-MEASURED 2026-08-13. The arena is RECTANGULAR, not square.
 ARENA_W_MM = 1500.0     # x extent (left-right)
-ARENA_H_MM = 1400.0     # y extent (bottom-top, the direction the rover faces)
+ARENA_H_MM = 1200.0     # y extent; 200mm shorter, operator-measured 2026-08-14 (was 1400.0)
 # The occupancy grid and the planner costmap are square and sized off this one
 # number, so it must be the LARGER extent or the far side of the arena falls
 # outside the grid and mark() silently discards every return there.
@@ -908,6 +908,16 @@ DOCK_STEP_MM = _floor_note(
 # Floored at MIN_MOVE_MM for the same reason BEARING_TOL_DEG is floored at
 # MIN_TURN_DEG. 75 mm is also inside the zone rect (150 mm wide), so arriving
 # within tolerance means physically standing in the zone.
+#
+# DO NOT "OPTIMISE" THIS FLOOR AWAY. It looks like a slack tolerance and it is
+# not: it is the thing that stops the arrival oscillation described above, and
+# that oscillation is what the operator saw as a random 45 degree turn. Drop
+# ARRIVE_TOL_MM below MIN_MOVE_MM and the rover can no longer make the move
+# that would close the gap, so it re-plans from the same spot forever while the
+# bearing to a target a few millimetres away swings through tens of degrees.
+# ROTATION_BUDGET_DEG is the structural backstop under this floor; it turns
+# that failure into an abort instead of a spin, but the FLOOR is what stops it
+# happening at all.
 ARRIVE_TOL_MM = _floor_note(
     "ARRIVE_TOL_MM", _cfg_float("FPMS_MISSION_ARRIVE_TOL_MM", 75.0, 10.0, 400.0),
     MIN_MOVE_MM, "mm", "minimum-pulse")
@@ -1043,6 +1053,46 @@ DUTY_TURN_SIGN_MEASURED = False
 # exceeds its own FPMS_BRIDGE_MAX_DUTY (40). power + correction must stay
 # inside it, so the clamp is applied per element in `publish_duty`.
 DUTY_MAX = _cfg_float("FPMS_MISSION_DUTY_MAX", 40.0, 8.0, 40.0)
+# --------------------------------------------- THE TURN ON THE SAME WIRE
+# M1 NEEDS A ~50 DEGREE TURN AND THE M2 RUN THAT WORKED NEVER TURNED AT ALL.
+# Turns still ran on /cmd_vel, whose dead zone and ramp are precisely what made
+# short drive bursts fail until `_drive_crawl` moved them to raw duty -- and a
+# 50 degree turn IS a short burst. Golden never had the problem because golden
+# never used velocity: `_p5_navdrive._spin` writes set_motor(-pw,-pw,+pw,+pw)
+# directly and closes on the integrated gyro. This is that, on this stack.
+#
+# ON BY DEFAULT WITH THE VELOCITY TURN KEPT BEHIND FPMS_MISSION_DUTY_TURN=0 --
+# the same shape as DUTY_CRAWL and for the same reason: the velocity path is
+# what has driven every mission so far and stays available unchanged.
+DUTY_TURN = CFG.get("FPMS_MISSION_DUTY_TURN", "1") not in ("0", "false", "no")
+# GOLDEN'S _TRN IS 50 AND THAT NUMBER CANNOT BE USED HERE. The bridge refuses
+# the WHOLE Int32MultiArray and zeroes the wire if any element exceeds its own
+# FPMS_BRIDGE_MAX_DUTY of 40, so a 50 would not be trimmed to 40 -- it would
+# stop the rover mid-turn and log a refusal. Clamped to DUTY_MAX, and the
+# startup log says the clamp happened rather than leaving it to be discovered.
+# A spin is a pure differential with no forward term, so unlike the crawl there
+# is no heading correction to leave headroom for and the full 40 is available.
+GOLDEN_TRN_POWER = 50.0        # golden's _TRN, recorded because it is over cap
+TURN_DUTY = min(_cfg_float("FPMS_MISSION_TURN_DUTY", 40.0, 8.0, 40.0), DUTY_MAX)
+# ONE CONVENTION, TWO DUTY USERS, CHECKED RATHER THAN ASSUMED. The duty turn
+# takes its direction from TURN_WIRE_SIGN (see `_turn`); the crawl's heading
+# hold takes its from DUTY_TURN_SIGN * DUTY_FORWARD_SIGN and applies it to the
+# same four motors in the same order. A positive correction slows the M1/M2
+# pair and speeds the M3/M4 pair, which after the 2026-08-01 rewiring (M1/M2
+# are now the RIGHT side) is a CW, negative-yaw rotation -- so the two agree
+# exactly while TURN_WIRE_SIGN == -(DUTY_TURN_SIGN * DUTY_FORWARD_SIGN). At
+# today's defaults they do: -1 == -(+1 * +1). That agreement was reached twice
+# by different routes rather than assumed once, which is the only reason it is
+# worth trusting. Flipping DUTY_FORWARD_SIGN after a wheels-up check without
+# flipping TURN_WIRE_SIGN would break it, and this is where that gets said.
+if TURN_WIRE_SIGN != -(DUTY_TURN_SIGN * DUTY_FORWARD_SIGN):
+    CFG_NOTES.append(
+        "TURN_WIRE_SIGN=%+d disagrees with the crawl's duty steering "
+        "(-(DUTY_TURN_SIGN %+d * DUTY_FORWARD_SIGN %+d) = %+d): the duty TURN "
+        "and the crawl's heading HOLD would rotate this chassis OPPOSITE ways. "
+        "One of the three is wrong. The duty turn follows TURN_WIRE_SIGN"
+        % (TURN_WIRE_SIGN, DUTY_TURN_SIGN, DUTY_FORWARD_SIGN,
+           -(DUTY_TURN_SIGN * DUTY_FORWARD_SIGN)))
 # Golden FINE_FORWARD_POWER = 18 for the fine approach, FORWARD_POWER = 24
 # for travel. The dock crawls at the fine power; the one-motion return uses
 # the travel power because it is metres long and 18 may not clear stiction
@@ -1077,14 +1127,50 @@ CRAWL_COAST_FACTOR = _cfg_float("FPMS_MISSION_CRAWL_COAST", 0.93, 0.50, 1.0)
 # cap off a fast speed capped a 150 mm crawl at 2.9 s -- tighter than the
 # velocity path it replaces, and it would have aborted every dock.
 #
-# CAP is the slowest the crawl is expected to move, so the cap is an upper
-# bound on how long a healthy crawl can take. MIN is slower still, so the
-# timeout always sits just outside the cap and the cap is what fires first.
+# MEASURED 2026-08-14, ON THE M2 RUN THAT COMPLETED. Both were guesses until
+# that run logged real numbers, one for each crawl power:
 #
-# BOTH ARE UNMEASURED -- raw duty 18 has never been timed on this chassis;
-# 0.02 m/s is the speed the ramp-limited velocity burst achieved on
-# 2026-08-14, used here as a plausible floor. The first real crawl measures
-# them: the segment log prints mm and seconds.
+#     crawl FWD asked  +340mm at duty +18 -> ticks  +252mm ... 1.84s
+#     crawl BWD asked -1001mm at duty -24 -> ticks -1026mm ... 4.68s
+#
+# Read naively those are 137 and 219 mm/s. But `seg.elapsed_s` is stamped
+# AFTER the STOP_SETTLE_S poll, while the cap and the timeout are compared
+# against `now - t0` INSIDE the loop -- so the speeds these two guards
+# actually see are 252/(1.84-0.45) = 0.181 m/s at duty 18 and
+# 1026/(4.68-0.45) = 0.243 m/s at duty 24. Either reading is an ORDER OF
+# MAGNITUDE above the 0.020/0.012 guessed here before, which had made both
+# guards ~10x looser than they were ever meant to be: a 1000mm return was
+# capped at 82s of blind running, about 18m of travel in a 1.2m arena.
+#
+# WHICH WAY EACH ONE HAS TO BE WRONG, since both divide distance BY a speed
+# and a LARGER value therefore gives a TIGHTER bound:
+#
+#   * CAP is the runaway bound, so it OVER-estimates the true speed
+#     (0.25 > 0.243 > 0.181) and buys the tightest honest ceiling.
+#   * MIN is the "making no progress" timeout, so it UNDER-estimates it
+#     (0.08 < 0.181) and stays outside the cap.
+#
+# AND THE CAP STILL CANNOT FIRE ON HEALTHY TRAVEL, because burst_cap_s
+# multiplies by BURST_CAP_SLACK (1.6) and adds STOP_SETTLE_S +
+# CRAWL_START_ALLOWANCE_S (1.95s) on top. The cap beats a real crawl for as
+# long as CAP < BURST_CAP_SLACK x the true speed -- 0.29 m/s at the dock
+# power, 0.39 m/s at the return power -- and 0.25 sits under both with the
+# whole additive term still spare. Worked, at the power each distance
+# actually uses (outbound crawls are docks at CRAWL_POWER; only a retrace
+# crawl is long, and it runs at CRAWL_RETURN_POWER):
+#
+#   150mm dock    @ duty 18 = 0.181 m/s -> 0.83s of travel
+#       cap     = 0.150/0.25*1.6 + 0.45 + 1.5       =  2.91s   (3.5x)
+#       timeout = max(6.0, 0.150/0.08 + 0.45 + 2.0) =  6.00s
+#   1000mm return @ duty 24 = 0.243 m/s -> 4.12s of travel
+#       cap     = 1.000/0.25*1.6 + 0.45 + 1.5       =  8.35s   (2.0x)
+#       timeout = max(6.0, 1.000/0.08 + 0.45 + 2.0) = 14.95s
+#
+# cap < timeout in both -- and in fact at EVERY distance, because the cap
+# grows at BURST_CAP_SLACK/CAP = 6.4 s/m while the timeout grows at
+# 1/MIN = 12.5 s/m. That inequality IS the design ("the cap is what fires
+# first"), so it is checked next to BURST_CAP_SLACK rather than left to
+# whoever next overrides one of these in config.env.
 #
 # AND THE CRAWL HAS A GUARD THE VELOCITY PATH NEVER HAD. burst_cap_s exists
 # because "garbage odometry silently DISABLES the distance limit". The crawl
@@ -1092,11 +1178,70 @@ CRAWL_COAST_FACTOR = _cfg_float("FPMS_MISSION_CRAWL_COAST", 0.93, 0.50, 1.0)
 # independent sensor, and aborts outright if those go stale. So the crawl
 # cannot run blind in the way that incident described, and this cap is the
 # backstop rather than the only line of defence.
-CRAWL_CAP_MPS = _cfg_float("FPMS_MISSION_CRAWL_CAP_MPS", 0.020, 0.002, 1.00)
-CRAWL_MIN_MPS = _cfg_float("FPMS_MISSION_CRAWL_MIN_MPS", 0.012, 0.002, 0.20)
+CRAWL_CAP_MPS = _cfg_float("FPMS_MISSION_CRAWL_CAP_MPS", 0.25, 0.002, 1.00)
+CRAWL_MIN_MPS = _cfg_float("FPMS_MISSION_CRAWL_MIN_MPS", 0.08, 0.002, 0.20)
 CRAWL_NOMINAL_MPS = _cfg_float("FPMS_MISSION_CRAWL_NOMINAL_MPS", 0.05, 0.005, 0.50)
 CRAWL_START_ALLOWANCE_S = _cfg_float("FPMS_MISSION_CRAWL_START_S", 1.5, 0.0, 5.0)
 CRAWL_STALL_CHECK_S = _cfg_float("FPMS_MISSION_CRAWL_STALL_S", 3.0, 1.0, 10.0)
+# ======================== THE ROTATION BUDGET: NEVER SPIN AT RANDOM =========
+# A 45 DEGREE TURN NOBODY PLANNED. On an earlier run the rover reached its
+# target and then "randomly turned left 45 degrees and drove 300mm". Nothing
+# was broken. `_drive_to` re-measures the bearing every time round the loop and
+# inserts a correction turn past BEARING_TOL_DEG -- and a few millimetres from
+# the target, a few millimetres of position noise IS a bearing error of tens of
+# degrees. Every one of those turns was legal on its own. Their SUM was the
+# phantom spin, and no single guard could see it because no single guard was
+# looking at the sum.
+#
+# ARRIVE_TOL_MM FLOORED AT MIN_MOVE_MM IS THE FIX FOR THE CAUSE -- see the long
+# comment at its definition, and do not "optimise" that floor away. This is the
+# structural backstop UNDER it, for the case where something else starts the
+# same oscillation:
+#
+#   * every phase of a mission opens a rotation allowance sized to the rotation
+#     its PLAN asked for, plus this tolerance;
+#   * every turn is charged against that allowance in `_run_one`, the one
+#     funnel every segment passes through, so there is no second path;
+#   * when the allowance is gone the mission ABORTS. It does not correct again.
+#
+# A rover that cannot converge on a bearing must STOP, not keep turning. 12deg
+# is three BEARING_TOL_DEG of honest correction and well under the 45 that was
+# actually seen.
+ROTATION_BUDGET_DEG = _cfg_float("FPMS_MISSION_ROTATION_BUDGET_DEG",
+                                 12.0, 2.0, 90.0)
+# A DRIVE'S ROTATION BUDGET IS ZERO, and that is not a tuning choice. A drive
+# holds heading with a TRIM and nothing else -- the +/-CRAWL_CORR_MAX duty
+# counts on the crawl, the clamped yaw rate on the velocity path -- and it may
+# never issue a turn PRIMITIVE. If a drive ever wants a turn, that is a bug in
+# whatever built the segment, and it is aborted and named rather than performed.
+DRIVE_ROTATION_BUDGET_DEG = 0.0
+# A DEAD GYRO SPINS FOREVER. The duty turn closes on the integrated /imu rate,
+# so a gyro that has stopped reporting motion never reaches the coast point and
+# the only thing left holding the wheels is the segment timeout -- seconds of
+# unbounded rotation on a wire with no ramp. While turn duty is on the wire the
+# rate must be REAL: below this for this long and the segment stops.
+#
+# THE THRESHOLD IS ABOVE THE DEADBAND ON PURPOSE. This gyro has a +/-0.01 rad/s
+# deadband and a HEALTHY one reads exactly 0.0 while parked, so 0.02 rad/s
+# (1.1 deg/s) is above the noise floor and orders of magnitude below any real
+# spin. Only checked while duty is actually commanded, so a parked reading can
+# never trip it.
+TURN_GYRO_MIN_RADPS = _cfg_float("FPMS_MISSION_TURN_GYRO_MIN_RADPS",
+                                 0.02, 0.005, 0.20)
+TURN_GYRO_DEAD_S = _cfg_float("FPMS_MISSION_TURN_GYRO_DEAD_S", 1.0, 0.3, 5.0)
+# ======================== THE DISTANCE BUDGET: NEVER OVERSHOOT ==============
+# No burst may be COMMANDED past the point it is aimed at, so that even a burst
+# which runs to its full time cap cannot travel beyond the target. Every drive
+# segment built against a live target carries the distance the plan had
+# REMAINING at the moment it was built, and `_run_one` refuses a command longer
+# than that plus this allowance.
+#
+# SIZED AT ONE /wheel_ticks FRAME OF CRAWL TRAVEL. Those land at 2 Hz, and the
+# crawl measured 0.243 m/s at return power, so ~120 mm is the finest the loop
+# can actually stop on. An allowance tighter than the sensor's own resolution
+# would abort on the quantisation rather than on an overshoot.
+OVERSHOOT_ALLOW_MM = _cfg_float("FPMS_MISSION_OVERSHOOT_ALLOW_MM",
+                                120.0, 10.0, 400.0)
 # ------------------------------------------------- THE LIDAR TERMINATOR
 # Golden stopped the fine approach on `marker.dist <= _stop_at`, not on the
 # encoders. This rover has no marker system, so the terminator is the FRONT
@@ -1188,7 +1333,58 @@ if DOCK_FRONT_LIMIT_MM >= DOCK_LIDAR_STOP_MM - 20.0:
 # has not confirmed" (the same surface, seen by the cone). A thing you are
 # driving AT is not a thing in your way.
 TARGET_EXCLUDE_MM = _cfg_float("FPMS_MISSION_TARGET_EXCLUDE_MM", 220.0, 0.0, 800.0)
-SELF_FILTER_MM = _cfg_float("FPMS_MISSION_SELF_FILTER_MM", 140.0, 0.0, 400.0)
+# ...AND THE WALL PAD MUST NOT BLOCK THE TARGET EITHER, for the same reason and
+# by the same argument. BOTH ZONES SIT INSIDE THE WALL PAD: their centres are
+# 135 mm from two arena edges each and WALL_PAD_MM is ROBOT_RADIUS_MM = 170, so
+# `CostMap.clear_mm` scores every zone centre at -35 mm and A* answers "the
+# target is inside an obstacle". That is not a planner fault, it is the arena:
+# the zones ARE in the corners, and a rover 340 mm across cannot put its CENTRE
+# on one. It does not have to -- it docks at the LiDAR stand-off, 350 mm short.
+#
+# So within this radius of the leg's own target the STATIC wall pad is dropped
+# to zero, exactly as `set_exclusion` drops the target's own surface out of the
+# obstacle layer. Two things are NOT dropped: the arena bounds themselves (the
+# centre may approach a wall, never leave the field) and the entire obstacle
+# layer (a real obstacle in front of the zone still blocks it). Sized at
+# TARGET_EXCLUDE_MM so the two exemptions are one number, and verified by
+# planning a route to each zone rather than by argument.
+GOAL_WALL_EXEMPT_MM = _cfg_float("FPMS_MISSION_GOAL_WALL_EXEMPT_MM",
+                                 TARGET_EXCLUDE_MM, 0.0, 800.0)
+# ------------------------------------- THE CHASSIS IN ITS OWN BEAM
+# MEASURED 2026-08-14, ROVER PARKED, SIX CONSECUTIVE SCANS. Bins 194-197 --
+# FOUR bins, about four degrees -- return 130, 140 or 150 mm on every single
+# scan. Filter above 150 mm and the nearest return behind the rover jumps to
+# 1220 mm. That shape is the diagnosis: a WALL subtends a broad arc (a surface
+# 140 mm behind would still be only 162 mm away at 30 degrees off, so it would
+# paint returns across dozens of bins), while a fixed four-bin cluster at a
+# fixed bearing with nothing else inside 1.2 m is a piece of the ROVER.
+#
+# 140 WAS TOO SMALL FOR THIS CHASSIS, and it was compared with a strict `<`, so
+# the returns at exactly 140 and at 150 leaked through both here and in the
+# grid. Raised to the CIRCUMSCRIBED RADIUS, which is the principled number
+# rather than another measurement to re-take: anything inside ROBOT_RADIUS_MM
+# of the scanner is inside the rover's own footprint, so it cannot be a
+# free-standing obstacle the guard could still do something about -- the
+# chassis would have hit it while it was still outside. The measured 130-150 mm
+# band sits inside that with 20 mm to spare. Written as a literal because
+# ROBOT_RADIUS_MM is defined with the planner constants, below this.
+#
+# WHAT THIS FIXES. `front_clearance_mm` had NO self-filter at all, so with
+# FRONT_STOP_MM at 400 every `check_abort(reverse=True)` saw 130-150 mm and
+# raised ABORT_OBSTACLE -- the one-motion reverse return could not run to
+# completion. `min_clearance_mm` shares the same function, so the ROTATE guard
+# saw it too, at 130 mm against ROTATE_CLEAR_MM of 80: 50 mm from aborting
+# every turn M1 needs.
+# FLOORED, because /etc/fpms/config.env still carries golden's 140 and 140 is
+# BELOW the band this chassis actually returns (130-150 mm, six scans). A
+# self-filter under the measured chassis return does not filter the chassis --
+# it is the bug with a number attached. The floor is 10 mm above the highest
+# measured return, and `_floor_note` announces the raise at startup so the
+# config value is never silently ignored.
+SELF_FILTER_MM = _floor_note(
+    "SELF_FILTER_MM",
+    _cfg_float("FPMS_MISSION_SELF_FILTER_MM", 170.0, 0.0, 400.0),
+    160.0, "mm", "measured-chassis-return")
 # ------------------------------------------------ THE ONE-MOTION RETURN
 # "reverses, so encoders go back, slowly, one motion" -- the retrace merges
 # ADJACENT drives into a single reverse instead of replaying every outbound
@@ -1427,6 +1623,13 @@ class Segment:
     approach: bool = False    # aimed at the leg's REAL target, not a via point
     handover: bool = False    # ended early: the LiDAR says the dock takes over
     docked: bool = False      # ended AT the stand-off -- an arrival, not a stop
+    # WHAT THE PLAN ASKED FOR, stamped by whatever built this Segment against a
+    # live target. These are what the budget guards in `_run_one` measure the
+    # COMMAND against, and a Segment that cannot say what it was planned to do
+    # cannot be checked -- so the default means "unbudgeted" and is used only
+    # by motions whose plan IS their target: a retrace replaying a measured
+    # rotation, or the home trim closing a residual it has just measured.
+    plan_remaining_mm: float = -1.0   # distance left to the target; <0 = unknown
 
     @property
     def executed(self):
@@ -1716,6 +1919,21 @@ def apply_segments(pose, segs, measured=True):
 # the wheels barely turning. Configurable so a firmware swap can move it back.
 FULL_DUTY_MPS = _cfg_float("FPMS_MISSION_FULL_DUTY_MPS", 0.65, 0.05, 1.50)
 BURST_CAP_SLACK = 1.6
+# THE ORDERING OF THE TWO CRAWL BOUNDS IS THE DESIGN, SO IT IS CHECKED. The
+# crawl's burst cap grows at BURST_CAP_SLACK/CRAWL_CAP_MPS seconds per metre
+# and its segment timeout at 1/CRAWL_MIN_MPS, so "the cap always fires first"
+# is exactly CRAWL_CAP_MPS > BURST_CAP_SLACK * CRAWL_MIN_MPS -- true at every
+# distance when it holds and false at every distance when it does not. Both
+# are config-overridable, and an override that inverts them would not fail, it
+# would quietly demote the tight sensor-independent bound behind the loose
+# slow-progress one. Announced instead.
+if CRAWL_CAP_MPS <= BURST_CAP_SLACK * CRAWL_MIN_MPS:
+    CFG_NOTES.append(
+        "CRAWL_CAP_MPS %.3f m/s is not above BURST_CAP_SLACK x CRAWL_MIN_MPS "
+        "(%.1f x %.3f = %.3f), so the segment TIMEOUT fires before the burst "
+        "cap at every distance and the crawl's blind-running bound is inert"
+        % (CRAWL_CAP_MPS, BURST_CAP_SLACK, CRAWL_MIN_MPS,
+           BURST_CAP_SLACK * CRAWL_MIN_MPS))
 # Fixed time a burst spends accelerating before it is at speed, measured on
 # this chassis. Applies to every segment; it dominates the SHORT ones.
 RAMP_ALLOWANCE_S = _cfg_float("FPMS_MISSION_RAMP_ALLOWANCE_S", 1.5, 0.0, 4.0)
@@ -1867,7 +2085,7 @@ def remaining_distance_mm(segs):
 
 # ============================================================ OBSTACLE GUARD
 def front_clearance_mm(ranges_m, cone_deg=FRONT_CONE_DEG, reverse=False,
-                       range_max_m=6.0):
+                       range_max_m=6.0, self_filter_mm=None):
     """Nearest return inside the cone the rover is moving towards, mm or None.
 
     Fed from fpms-rover-agent's `telemetry/lidar` payload, because that agent
@@ -1882,9 +2100,17 @@ def front_clearance_mm(ranges_m, cone_deg=FRONT_CONE_DEG, reverse=False,
     Zeros are "no return", not "obstacle at the sensor" — the same trap Nav2
     falls into with a zero-filled LaserScan. Saturated bins are the driver's max
     range, not a surface (arena.ts RANGE_SATURATION_FRAC).
+
+    AND THE CHASSIS IS NOT AN OBSTACLE. This function had no self-filter while
+    the grid path had one, so the two disagreed about what "in front" contains:
+    the grid dropped the rover's own bodywork and this guard aborted on it. See
+    SELF_FILTER_MM for the six-scan measurement and for why the comparison is
+    `<=` in BOTH places -- the returns land on exactly 140 and exactly 150, so a
+    strict `<` leaked the very samples the filter exists to remove.
     """
     if not ranges_m:
         return None
+    selff = SELF_FILTER_MM if self_filter_mm is None else float(self_filter_mm)
     n = len(ranges_m)
     step = 360.0 / n
     centre = 180.0 if reverse else 0.0
@@ -1900,15 +2126,25 @@ def front_clearance_mm(ranges_m, cone_deg=FRONT_CONE_DEG, reverse=False,
         if abs(wrap180(i * step - centre)) > cone_deg:
             continue
         mm = rv * 1000.0
+        if mm <= selff:
+            continue
         if best is None or mm < best:
             best = mm
     return best
 
 
-def min_clearance_mm(ranges_m, range_max_m=6.0):
-    """Nearest return at any bearing — the guard used while turning in place."""
+def min_clearance_mm(ranges_m, range_max_m=6.0, self_filter_mm=None):
+    """Nearest return at any bearing — the guard used while turning in place.
+
+    IT SHARES `front_clearance_mm`'S SELF-FILTER, and it is the caller that
+    needed it most: a 360 degree minimum sees the chassis return at EVERY
+    bearing, so before the filter existed this read 130 mm against a
+    ROTATE_CLEAR_MM of 80 on a parked, unobstructed rover -- 50 mm away from
+    aborting every turn, including the ~50 degree turn M1 is built around.
+    """
     return front_clearance_mm(ranges_m, cone_deg=180.0, reverse=False,
-                              range_max_m=range_max_m)
+                              range_max_m=range_max_m,
+                              self_filter_mm=self_filter_mm)
 
 
 
@@ -2289,11 +2525,38 @@ class OccupancyGrid:
     # held at its old place by a hundred stale samples.
     MEAN_CAP = 16
 
-    def __init__(self, cell_mm=None, arena_mm=ARENA_MM, ttl_s=None,
-                 min_hits=None, max_range_mm=None):
+    def __init__(self, cell_mm=None, arena_mm=None, ttl_s=None,
+                 min_hits=None, max_range_mm=None,
+                 arena_w_mm=None, arena_h_mm=None):
         self.cell_mm = float(GRID_MM if cell_mm is None else cell_mm)
-        self.arena_mm = float(arena_mm)
-        self.n = max(1, int(math.ceil(self.arena_mm / self.cell_mm)))
+        # ================= PER AXIS. THE ARENA IS 1500 x 1200, NOT SQUARE ====
+        # `ARENA_MM = max(W, H)` was used as ONE scalar for BOTH axes, and every
+        # boundary test in this file and in CostMap inherited it. Three wrong
+        # answers came out of that one substitution:
+        #
+        #   * the arena clip in `in_grid` accepted y up to 1500, so 300 mm of
+        #     room floor beyond the real top edge could be folded in as arena
+        #     obstacles;
+        #   * `points()` scored the real top wall at y=1200 as edge = 300 mm,
+        #     far outside WALL_BAND_MM, so the wall was classified OBSTACLE
+        #     instead of WALL and was padded as an unknown surface;
+        #   * the static layer modelled the top boundary at y = 1330 instead of
+        #     y = 1030, which is a planner that will happily route the rover
+        #     130 mm OUTSIDE the arena.
+        #
+        # `arena_mm` still works and still means "square", for the tests and
+        # for any caller that has not been updated; it is not used internally.
+        if arena_mm is not None and arena_w_mm is None and arena_h_mm is None:
+            arena_w_mm = arena_h_mm = float(arena_mm)
+        self.arena_w_mm = float(ARENA_W_MM if arena_w_mm is None else arena_w_mm)
+        self.arena_h_mm = float(ARENA_H_MM if arena_h_mm is None else arena_h_mm)
+        self.nx = max(1, int(math.ceil(self.arena_w_mm / self.cell_mm)))
+        self.ny = max(1, int(math.ceil(self.arena_h_mm / self.cell_mm)))
+        # DEPRECATED SQUARE ALIASES. Kept so an un-updated caller gets the
+        # LARGER extent and therefore still sees every real cell, rather than
+        # silently cropping the arena; nothing in this file reads them.
+        self.n = max(self.nx, self.ny)
+        self.arena_mm = max(self.arena_w_mm, self.arena_h_mm)
         self.ttl_s = float(OCC_TTL_S if ttl_s is None else ttl_s)
         self.min_hits = int(OCC_MIN_HITS if min_hits is None else min_hits)
         self.max_range_mm = float(OCC_MAX_RANGE_MM if max_range_mm is None
@@ -2342,7 +2605,9 @@ class OccupancyGrid:
         return ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
 
     def in_grid(self, ix, iy):
-        return 0 <= ix < self.n and 0 <= iy < self.n
+        # PER AXIS -- this is the arena clip, and a square one accepted returns
+        # 300 mm beyond the real top edge as though they were arena obstacles.
+        return 0 <= ix < self.nx and 0 <= iy < self.ny
 
     # -- writing ----------------------------------------------------------
     def mark(self, x_mm, y_mm, now=None):
@@ -2413,7 +2678,7 @@ class OccupancyGrid:
             # anything this close is the rover's own bodywork in the beam, and
             # marking it puts a permanent blob under the robot that the planner
             # then has to route around.
-            if mm < SELF_FILTER_MM:
+            if mm <= SELF_FILTER_MM:
                 continue
             # Mount sign applied HERE so the grid and the ROS scan agree.
             b = math.radians(ph + LIDAR_ROTATION_SIGN * (i * step)
@@ -2477,7 +2742,11 @@ class OccupancyGrid:
             if e[0] < self.min_hits or (now - e[1]) > self.ttl_s:
                 continue
             x, y = e[2], e[3]
-            edge = min(x, y, self.arena_mm - x, self.arena_mm - y)
+            # PER AXIS. Square, the real top wall at y = 1200 scored
+            # edge = 300 mm -- way outside WALL_BAND_MM -- so it was classified
+            # OBSTACLE and padded as an unknown surface instead of being
+            # absorbed into the static layer that already models it exactly.
+            edge = min(x, y, self.arena_w_mm - x, self.arena_h_mm - y)
             out.append((x, y, edge <= band))
         return out
 
@@ -2508,7 +2777,8 @@ class OccupancyGrid:
 
 
 def inflate_blocked(occupied, n, cell_mm, radius_mm=None, wall_pad_mm=None,
-                    arena_mm=ARENA_MM, free=()):
+                    arena_mm=None, free=(), n_h=None,
+                    arena_w_mm=None, arena_h_mm=None):
     """Cells the rover's CENTRE may not enter. Pure; no clock, no state.
 
     Two sources, one answer:
@@ -2532,6 +2802,14 @@ def inflate_blocked(occupied, n, cell_mm, radius_mm=None, wall_pad_mm=None,
     """
     radius_mm = ROBOT_RADIUS_MM if radius_mm is None else float(radius_mm)
     wall_pad_mm = WALL_PAD_MM if wall_pad_mm is None else float(wall_pad_mm)
+    # PER AXIS -- see OccupancyGrid.__init__. Square, the static top boundary
+    # was modelled 300 mm too high and this function would hand the search
+    # cells that are outside the real arena.
+    if arena_mm is not None and arena_w_mm is None and arena_h_mm is None:
+        arena_w_mm = arena_h_mm = float(arena_mm)
+    arena_w_mm = float(ARENA_W_MM if arena_w_mm is None else arena_w_mm)
+    arena_h_mm = float(ARENA_H_MM if arena_h_mm is None else arena_h_mm)
+    n_h = int(n if n_h is None else n_h)
     reach = radius_mm + cell_mm / 2.0
     span = int(math.ceil(reach / cell_mm))
     blocked = set()
@@ -2539,18 +2817,18 @@ def inflate_blocked(occupied, n, cell_mm, radius_mm=None, wall_pad_mm=None,
         for dx in range(-span, span + 1):
             for dy in range(-span, span + 1):
                 ix, iy = ox + dx, oy + dy
-                if not (0 <= ix < n and 0 <= iy < n):
+                if not (0 <= ix < n and 0 <= iy < n_h):
                     continue
                 if math.hypot(dx * cell_mm, dy * cell_mm) <= reach:
                     blocked.add((ix, iy))
     if wall_pad_mm > 0.0:
         for ix in range(n):
             cx = (ix + 0.5) * cell_mm
-            for iy in range(n):
+            for iy in range(n_h):
                 cy = (iy + 0.5) * cell_mm
                 if (cx < wall_pad_mm or cy < wall_pad_mm
-                        or cx > arena_mm - wall_pad_mm
-                        or cy > arena_mm - wall_pad_mm):
+                        or cx > arena_w_mm - wall_pad_mm
+                        or cy > arena_h_mm - wall_pad_mm):
                     blocked.add((ix, iy))
     for c in free:
         blocked.discard(tuple(c))
@@ -2588,12 +2866,35 @@ class CostMap:
     human chose; keeping one unit is the only way the weights stay arguable.
     """
 
-    def __init__(self, points, n, cell_mm, arena_mm=ARENA_MM, radius_mm=None,
+    def __init__(self, points, n, cell_mm, arena_mm=None, radius_mm=None,
                  wall_pad_mm=None, point_pad_mm=None, free=(),
-                 absorb_walls=True, decay_mm=None):
+                 absorb_walls=True, decay_mm=None, n_h=None,
+                 arena_w_mm=None, arena_h_mm=None, goal=None,
+                 goal_exempt_mm=None):
         self.n = int(n)
         self.cell_mm = float(cell_mm)
-        self.arena_mm = float(arena_mm)
+        # PER AXIS -- see OccupancyGrid.__init__ for the three wrong answers a
+        # single square extent produced. `n` is the WIDTH in cells; `n_h` the
+        # height, defaulting to a square so an un-updated caller behaves as it
+        # always did.
+        if arena_mm is not None and arena_w_mm is None and arena_h_mm is None:
+            arena_w_mm = arena_h_mm = float(arena_mm)
+        self.arena_w_mm = float(ARENA_W_MM if arena_w_mm is None else arena_w_mm)
+        self.arena_h_mm = float(ARENA_H_MM if arena_h_mm is None else arena_h_mm)
+        self.nx = int(n)
+        self.ny = int(self.n if n_h is None else n_h)
+        self.arena_mm = max(self.arena_w_mm, self.arena_h_mm)   # deprecated
+        # THE GOAL IS EXEMPT FROM THE WALL PAD, NOT FROM THE OBSTACLES. See
+        # GOAL_WALL_EXEMPT_MM: both zones sit inside the wall pad by 35 mm, so
+        # without this every route to a zone is refused as "target inside an
+        # obstacle" -- and it is refused on the X axis TODAY, before the arena
+        # was even made rectangular.
+        if goal is None:
+            self.goal = None
+        else:
+            gr = (GOAL_WALL_EXEMPT_MM if goal_exempt_mm is None
+                  else float(goal_exempt_mm))
+            self.goal = (float(goal[0]), float(goal[1]), float(gr))
         self.radius_mm = ROBOT_RADIUS_MM if radius_mm is None else float(radius_mm)
         self.wall_pad_mm = WALL_PAD_MM if wall_pad_mm is None else float(wall_pad_mm)
         self.point_pad_mm = (OCC_POINT_PAD_MM if point_pad_mm is None
@@ -2636,7 +2937,7 @@ class CostMap:
             for dx in range(-span, span + 1):
                 for dy in range(-span, span + 1):
                     ix, iy = cx0 + dx, cy0 + dy
-                    if 0 <= ix < self.n and 0 <= iy < self.n:
+                    if 0 <= ix < self.nx and 0 <= iy < self.ny:
                         self._near.setdefault((ix, iy), []).append((ox, oy))
 
         # The cell view, for the search and for `astar_cells`. A cell is blocked
@@ -2644,8 +2945,8 @@ class CostMap:
         # what the search expands over, and every candidate it produces is then
         # re-checked continuously by `segment_ok` before it becomes a route.
         self.blocked = set()
-        for ix in range(self.n):
-            for iy in range(self.n):
+        for ix in range(self.nx):
+            for iy in range(self.ny):
                 if (ix, iy) in self.free:
                     continue
                 c = ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
@@ -2668,11 +2969,22 @@ class CostMap:
             # `inflate_blocked`'s `free`: a rover that has parked inside the pad
             # must still be able to plan the route out of it.
             return float(self.reach)
-        # Static layer: the arena boundary, from a number that is known and not
-        # measured, so no padding for sensor error is owed on it.
-        m = min(x - self.wall_pad_mm, y - self.wall_pad_mm,
-                (self.arena_mm - self.wall_pad_mm) - x,
-                (self.arena_mm - self.wall_pad_mm) - y)
+        # Static layer: the arena boundary, from numbers that are KNOWN and
+        # not measured, so no padding for sensor error is owed on it. PER AXIS:
+        # square, this modelled the top boundary at y = 1330 in a 1200 mm
+        # arena, and a planner that believes that will route the rover 130 mm
+        # outside the field.
+        wp = self.wall_pad_mm
+        if self.goal is not None:
+            # WITHIN THE GOAL EXEMPTION THE WALL PAD IS DROPPED, and ONLY the
+            # wall pad -- the arena bounds below still hold, so the centre may
+            # approach a wall but can never leave the field, and the obstacle
+            # layer further down is untouched. See GOAL_WALL_EXEMPT_MM.
+            if math.hypot(x - self.goal[0], y - self.goal[1]) <= self.goal[2]:
+                wp = 0.0
+        m = min(x - wp, y - wp,
+                (self.arena_w_mm - wp) - x,
+                (self.arena_h_mm - wp) - y)
         # Obstacle layer: the true distance to the nearest believed surface.
         for (ox, oy) in self._near.get(
                 (int(x // self.cell_mm), int(y // self.cell_mm)), ()):
@@ -2714,11 +3026,11 @@ class CostMap:
         because it is O(cells) whatever the influence radius, and the influence
         radius here (3 * decay, ~750 mm) is most of the arena.
         """
-        n, cell = self.n, self.cell_mm
-        INF = float(self.arena_mm * 2.0)
+        nx, ny, cell = self.nx, self.ny, self.cell_mm
+        INF = float(max(self.arena_w_mm, self.arena_h_mm) * 2.0)
         d = {}
-        for ix in range(n):
-            for iy in range(n):
+        for ix in range(nx):
+            for iy in range(ny):
                 c = ((ix + 0.5) * cell, (iy + 0.5) * cell)
                 m = self.clear_mm(c[0], c[1])
                 d[(ix, iy)] = 0.0 if m <= 0.0 else min(m, INF)
@@ -2726,14 +3038,14 @@ class CostMap:
                (-1, -1, cell * DIAG_COST), (1, -1, cell * DIAG_COST))
         bwd = ((1, 0, cell), (0, 1, cell),
                (1, 1, cell * DIAG_COST), (-1, 1, cell * DIAG_COST))
-        for ix in range(n):
-            for iy in range(n):
+        for ix in range(nx):
+            for iy in range(ny):
                 for dx, dy, w in fwd:
                     o = d.get((ix + dx, iy + dy))
                     if o is not None and o + w < d[(ix, iy)]:
                         d[(ix, iy)] = o + w
-        for ix in range(n - 1, -1, -1):
-            for iy in range(n - 1, -1, -1):
+        for ix in range(nx - 1, -1, -1):
+            for iy in range(ny - 1, -1, -1):
                 for dx, dy, w in bwd:
                     o = d.get((ix + dx, iy + dy))
                     if o is not None and o + w < d[(ix, iy)]:
@@ -2789,10 +3101,10 @@ class CostMap:
         return ((ix + 0.5) * self.cell_mm, (iy + 0.5) * self.cell_mm)
 
     def in_grid(self, ix, iy):
-        return 0 <= ix < self.n and 0 <= iy < self.n
+        return 0 <= ix < self.nx and 0 <= iy < self.ny
 
 
-def astar_cells(blocked, n, start, goal):
+def astar_cells(blocked, n, start, goal, n_h=None):
     """8-connected A* over an n x n grid. [cell, ...] or None. PURE.
 
     Deterministic by construction, in two places that both matter:
@@ -2813,9 +3125,12 @@ def astar_cells(blocked, n, start, goal):
     """
     start = (int(start[0]), int(start[1]))
     goal = (int(goal[0]), int(goal[1]))
-    if not (0 <= start[0] < n and 0 <= start[1] < n):
+    # PER AXIS. `n` is the WIDTH in cells and `n_h` the height; it defaults to a
+    # square so the pure-function tests keep working unchanged.
+    n_h = int(n if n_h is None else n_h)
+    if not (0 <= start[0] < n and 0 <= start[1] < n_h):
         return None
-    if not (0 <= goal[0] < n and 0 <= goal[1] < n):
+    if not (0 <= goal[0] < n and 0 <= goal[1] < n_h):
         return None
     if start == goal:
         return [start]
@@ -2850,7 +3165,7 @@ def astar_cells(blocked, n, start, goal):
             return path
         for dx, dy in NEIGHBOURS:
             nx, ny = cx + dx, cy + dy
-            if not (0 <= nx < n and 0 <= ny < n):
+            if not (0 <= nx < n and 0 <= ny < n_h):
                 continue
             nb = (nx, ny)
             if nb in blocked or nb in closed:
@@ -3321,7 +3636,8 @@ def _search(cmap, x_mm, y_mm, heading_deg, tx_mm, ty_mm, planner):
         # any-angle part is given up.
         here = cmap.cell_of(x_mm, y_mm)
         goal = cmap.cell_of(tx_mm, ty_mm)
-        cells = astar_cells(cmap.blocked - {here, goal}, cmap.n, here, goal)
+        cells = astar_cells(cmap.blocked - {here, goal}, cmap.nx, here, goal,
+                            n_h=cmap.ny)
         if cells is None:
             return None
         pts = [(float(x_mm), float(y_mm))]
@@ -3362,6 +3678,29 @@ def plan_detour(x_mm, y_mm, tx_mm, ty_mm, grid, now=None, heading_deg=None,
         return out
     out.walls = sum(1 for p in pts if p[2])
     out.obstacles = len(pts) - out.walls
+    # NOTHING TO ROUTE AROUND. Every believed cell is the ARENA WALL, which is
+    # static, known exactly, and modelled by WALL_PAD_MM -- you cannot detour
+    # around the edge of the field. Without this the planner detoured around
+    # walls it could never avoid: in THIS arena the start box and both zones
+    # sit ~135 mm from a wall while WALL_PAD_MM is ROBOT_RADIUS_MM = 170, so
+    # the straight line up either side column is "unsafe" for its whole length
+    # and `segment_ok` fails on the static layer alone. That turned the proven
+    # straight M2 run (2 segments) into a detour with an extra 27 deg turn --
+    # the exact "jerky, re-planned" behaviour the one-motion design exists to
+    # avoid, bought for no safety at all.
+    #
+    # THE GUARD IS NOT WEAKENED. A real obstacle produces a non-wall point and
+    # this returns immediately to searching; the LiDAR cone guard and the dock
+    # terminator are untouched and remain the physical backstop. This only says
+    # that the arena's own boundary is not an obstacle to be planned around.
+    if out.obstacles == 0:
+        # PlanOutcome.note is the field this reasoning belongs in -- `notes` is a
+        # parameter of plan_multi_route, not of this function, and referencing it
+        # here raised NameError on EVERY mission command (including previews).
+        out.note = ("straight line kept: all %d believed cell(s) are the "
+                    "arena wall, which the wall pad models and no detour "
+                    "can avoid" % out.walls)
+        return out
     here = grid.cell_of(x_mm, y_mm)
     if heading_deg is None:
         # No heading offered: assume the rover is already pointing at the
@@ -3373,9 +3712,16 @@ def plan_detour(x_mm, y_mm, tx_mm, ty_mm, grid, now=None, heading_deg=None,
     base = None
     for (name, wall_s, rad_s) in (RELAX_LADDER if PLAN_RELAX
                                   else RELAX_LADDER[:1]):
-        cmap = CostMap(pts, grid.n, grid.cell_mm, arena_mm=grid.arena_mm,
+        cmap = CostMap(pts, grid.nx, grid.cell_mm, n_h=grid.ny,
+                       arena_w_mm=grid.arena_w_mm, arena_h_mm=grid.arena_h_mm,
                        radius_mm=ROBOT_RADIUS_MM * rad_s,
-                       wall_pad_mm=WALL_PAD_MM * wall_s, free=(here,))
+                       wall_pad_mm=WALL_PAD_MM * wall_s, free=(here,),
+                       # THE LEG'S OWN TARGET IS EXEMPT FROM THE WALL PAD, the
+                       # same target `set_exclusion` already exempts from the
+                       # obstacle layer. Without it both zones -- which are 135
+                       # mm from two walls each, inside a 170 mm pad -- are
+                       # unreachable at every rung of the relaxation ladder.
+                       goal=(tx_mm, ty_mm))
         if base is None:
             base = cmap
             if cmap.segment_ok(x_mm, y_mm, tx_mm, ty_mm):
@@ -3698,6 +4044,11 @@ ABORT_STALL = "segment stalled"
 ABORT_WIRE = "another /cmd_vel writer"
 ABORT_SHUTDOWN = "service shutting down"
 ABORT_TURN_SIGN = "turn went the WRONG WAY"
+ABORT_ROT_BUDGET = "rotation budget exhausted"
+ABORT_ROT_OVERRUN = "turn rotated past its own target"
+ABORT_TURN_GYRO_DEAD = "gyro reads no rotation while turn duty is commanded"
+ABORT_DRIVE_TURN = "a DRIVE segment tried to issue a turn primitive"
+ABORT_OVERSHOOT = "commanded distance exceeds the distance remaining"
 ABORT_DISARMED = "rover is not armed"
 
 
@@ -4865,6 +5216,15 @@ class DeadReckonBackend:
         return self._drive(seg)
 
     def _turn(self, seg):
+        # THE ONLY PLACE A TURN PRIMITIVE EXISTS, AND ONLY A TURN REACHES IT.
+        # A drive holds heading with a trim and nothing else; if a drive ever
+        # arrives here, something built the wrong Segment and the rover must
+        # not perform the rotation to find out.
+        if seg.kind != "turn":
+            raise MissionAbort(
+                f"{ABORT_DRIVE_TURN}: _turn was handed a {seg.kind!r} segment. "
+                f"A drive's rotation budget is {DRIVE_ROTATION_BUDGET_DEG:.0f} "
+                "degrees -- it may trim its heading, never rotate on purpose.")
         node, runner = self.node, self.runner
         t0 = time.monotonic()
         yaw0 = node.yaw()
@@ -4896,6 +5256,33 @@ class DeadReckonBackend:
         # return had all succeeded.
         cap = burst_cap_s(seg)
 
+        # ------------------------------------------- WHICH WIRE THIS TURN USES
+        # RAW DUTY, golden `_p5_navdrive._spin`, with the velocity turn kept
+        # behind FPMS_MISSION_DUTY_TURN=0. EVERYTHING ELSE IN THIS METHOD IS
+        # UNTOUCHED and shared by both wires -- the coast, the wrong-way guard,
+        # the stall check, the settle and the measurement -- so changing wires
+        # cannot change what a turn MEANS, only how it is commanded.
+        #
+        # THE SIGN GOES THROUGH TURN_WIRE_SIGN AND NOTHING ELSE. Golden is
+        # `d = (1 if deg>0 else -1) * TURN_SIGN`, and TURN_SIGN is this file's
+        # TURN_WIRE_SIGN -- the very constant `MissionNode.publish` applies to
+        # angular.z on the velocity path. So both wires take seg.target in the
+        # ARENA sense (positive = CCW), both are re-pointed by one flip of
+        # FPMS_MISSION_TURN_WIRE_SIGN, and the wrong-way abort below can go on
+        # naming that constant as the remedy without lying about which path
+        # ran. Nothing here hard-codes a direction. The cross-check against the
+        # crawl's own duty steering is done once at import; see TURN_DUTY.
+        duty_turn = bool(DUTY_TURN)
+        # Golden: if d>0: set_motor(-pw,-pw,+pw,+pw) else (+pw,+pw,-pw,-pw) --
+        # which is exactly the p=0 case of the crawl's [p-c, p-c, p+c, p+c].
+        turn_d = 1 if (sign * TURN_WIRE_SIGN) >= 0 else -1
+        tpw = int(round(clamp(TURN_DUTY, 0.0, DUTY_MAX)))
+        turn_duty_cmd = (-turn_d * tpw, -turn_d * tpw, turn_d * tpw, turn_d * tpw)
+        # Last time the gyro reported REAL rotation. Starts at t0, so the dead
+        # gyro guard below gives the spin TURN_GYRO_DEAD_S to get going before
+        # it can fire.
+        gyro_live_t = t0
+
         node.state.driving = True
         node.state.reversing = False
         detour_reason = None
@@ -4925,6 +5312,31 @@ class DeadReckonBackend:
                 turned = sign * (node.yaw() - yaw0)
                 if turned >= stop_at:
                     break
+                # NEVER ROTATE PAST WHAT WAS ASKED. The coast is supposed to cut
+                # the drive at TURN_COAST_FACTOR of the target. Being past the
+                # FULL target by more than the correction tolerance means the
+                # stop condition is not working -- a latched wire, a target of
+                # the wrong sign, a gyro that has stopped advancing -- and the
+                # answer is to stop the wheels, not to keep turning and explain
+                # it in the measurement afterwards.
+                if (math.degrees(abs(turned))
+                        > abs(float(seg.target)) + ROTATION_BUDGET_DEG):
+                    reason = ABORT_ROT_OVERRUN
+                    break
+                # A DEAD GYRO SPINS FOREVER. This loop closes on the integrated
+                # /imu rate, so a gyro that has stopped reporting motion never
+                # reaches the coast point and only the segment timeout is left
+                # holding a wire that has no ramp. Checked ONLY while duty is
+                # commanded, so a parked reading -- which is exactly 0.0 on a
+                # healthy gyro, because of the +/-0.01 rad/s deadband -- can
+                # never trip it.
+                if duty_turn:
+                    if abs(float(getattr(node, "gyro_z", 0.0) or 0.0)) \
+                            >= TURN_GYRO_MIN_RADPS:
+                        gyro_live_t = now
+                    elif now - gyro_live_t > TURN_GYRO_DEAD_S:
+                        reason = ABORT_TURN_GYRO_DEAD
+                        break
                 if turned <= -math.radians(TURN_WRONG_WAY_DEG):
                     # See TURN_WIRE_SIGN. Its value is derived from the rewiring,
                     # not measured, so this is the check that makes a wrong guess
@@ -4946,9 +5358,25 @@ class DeadReckonBackend:
                     # setpoint. Continuing to command it only stores up a lurch.
                     reason = ABORT_STALL
                     break
-                node.publish(0.0, sign * TURN_RADPS)
+                if duty_turn:
+                    # No ramp, no PID, no dead zone to fall into: these four
+                    # numbers ARE the wire. Closed on the same integrated /imu
+                    # gyro the velocity turn closes on (`node.yaw()` above, the
+                    # /imu angular_velocity.z integral), so `turned`, the coast
+                    # at TURN_COAST_FACTOR, the wrong-way guard and `measured`
+                    # all keep meaning precisely what they meant. CONTROL_DT is
+                    # 1/20 s, which is golden's own _HZ.
+                    node.publish_duty(*turn_duty_cmd)
+                else:
+                    node.publish(0.0, sign * TURN_RADPS)
                 time.sleep(CONTROL_DT)
         finally:
+            # THE DUTY WIRE FIRST, and unconditionally. `_drive_crawl` gives
+            # the reason -- the path that raised the duty is the path that must
+            # zero it, not a zero Twist landing on a last-writer-wins bridge as
+            # a side effect -- and a turn that ran on velocity loses nothing by
+            # writing four zeros it had never raised.
+            node.stop_duty(3)
             node.publish(0.0, 0.0)
             node.state.driving = False
 
@@ -4974,7 +5402,11 @@ class DeadReckonBackend:
                 f"side), so TURN_WIRE_SIGN={TURN_WIRE_SIGN:+d} is wrong for this "
                 "chassis. Set FPMS_MISSION_TURN_WIRE_SIGN="
                 f"{-TURN_WIRE_SIGN:+d} in /etc/fpms/config.env and re-run.")
-        if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL):
+        if reason in (ABORT_SEG_TIMEOUT, ABORT_STALL, ABORT_ROT_OVERRUN,
+                      ABORT_TURN_GYRO_DEAD):
+            # MEASURED FIRST, RAISED SECOND -- every one of these stops the
+            # wheels, settles and records the rotation that really happened, so
+            # the retrace can still give it back.
             raise MissionAbort(f"{reason} (turn asked {seg.target:+.1f}deg, "
                                f"measured {seg.measured:+.1f}deg)")
         # LAST, deliberately: a wrong-way turn or a stall is a fault and wins
@@ -4985,6 +5417,14 @@ class DeadReckonBackend:
         return seg
 
     def _drive(self, seg):
+        # A DRIVE'S ROTATION BUDGET IS ZERO. Both drive paths hold heading with
+        # a TRIM -- the clamped yaw rate here, the +/-CRAWL_CORR_MAX duty counts
+        # in `_drive_crawl` -- and neither can reach `_turn` from inside this
+        # method. This assertion is the statement of that, checked rather than
+        # documented, so "a drive never turns" is a property of the code.
+        if seg.kind != "drive":
+            raise MissionAbort(
+                f"{ABORT_DRIVE_TURN}: _drive was handed a {seg.kind!r} segment")
         # A CRAWL SEGMENT TAKES THE OTHER WIRE ENTIRELY. Nothing below this
         # line changed: the velocity path is the one that drove every mission
         # so far and stays byte-for-byte what it was.
@@ -5565,7 +6005,7 @@ class MissionRunner:
                 # still planning from the OLD origin. Every route would be
                 # silently offset by however far the rover had been moved, and
                 # the preview would draw that wrong route confidently.
-                self._reload_anchor()
+                self._reload_anchor(payload)
                 return
             if action != "mission":
                 return
@@ -6003,25 +6443,79 @@ class MissionRunner:
                 "resulting map matches itself perfectly while being reflected"),
         }
 
-    def _reload_anchor(self):
-        """Re-read teleop's origin file after a set_coordinate.
+    def _reload_anchor(self, payload=None):
+        """Re-anchor after a set_coordinate — from the PAYLOAD, not the file.
 
         Refused while a mission is running. Moving the arena frame under a route
         that is being driven would leave the executor steering toward a target
         that has silently jumped, using distances measured against the old
         frame — the rover would keep driving and every number would be wrong.
         The operator can stop, re-zero, and start again.
+
+        WHY THE FILE IS NO LONGER THE SOURCE. `set_coordinate` is delivered to
+        every subscriber of the command topic, so teleop and this node receive
+        it CONCURRENTLY. Teleop answers by WRITING the origin file; this method
+        used to answer the same message by RE-READING it. Nothing orders those
+        two. A single press therefore re-anchored from the file's PREVIOUS
+        contents — or, when those predated the boot and were refused as stale,
+        from the assumed start pose, which is the
+
+            anchor established from assumed start pose: ... <- odom (+0.000, +0.000)
+
+        in the log while the file already held a real ref_x. The pose came out
+        ~500 mm wrong, and pressing RESET POSE a second time appeared to "fix"
+        it only because by then the file held the first press's values. That is
+        operator-visible and it bites every single run.
+
+        The payload carries the arena coordinate the operator typed (x_mm,
+        y_mm), which is the whole of what teleop is about to write that this
+        node does not already have. The other half of the pair — "odom was
+        here" — this node reads from its OWN /odom subscription, the same
+        physical reading teleop pairs it with. So the anchor built here is the
+        anchor the file is about to hold, without waiting for it to be written:
+        no file, no round trip, no race, and one press is correct.
+
+        `established` is left False on purpose. The two YAW references are
+        filled by `_establish_anchor` off the next /odom sample exactly as they
+        are for a file-sourced anchor, and because `source` is not "assumed
+        start pose" that call keeps the odom pair set here instead of
+        overwriting it. set_coordinate has no heading argument, so the heading
+        half stays assumed either way.
+
+        The file re-read survives as the fallback for a payload without usable
+        coordinates, and is still the boot-time source in `_initial_anchor`.
         """
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 log("set_coordinate ignored: a mission is running and the arena "
                     "frame must not move under it. Stop the mission first.")
                 return
-        a = self.node._initial_anchor()
+        a = None
+        try:
+            if payload is not None:
+                x_mm = float(payload["x_mm"])
+                y_mm = float(payload["y_mm"])
+                ox, oy = self.node.odom_xy()
+                if math.isfinite(x_mm) and math.isfinite(y_mm) and ox is not None:
+                    a = Anchor()
+                    a.odom_x, a.odom_y = float(ox), float(oy)
+                    a.arena_x_mm, a.arena_y_mm = x_mm, y_mm
+                    a.source = "set_coordinate payload (in-process)"
+                    a.established = False
+        except Exception:
+            # A payload this node cannot read is not a reason to refuse to
+            # re-anchor at all — fall through to the file, race and all.
+            a = None
+        if a is None:
+            log("set_coordinate: no usable x_mm/y_mm in the payload (or no "
+                "odometry yet) — falling back to re-reading "
+                f"{TELEOP_ORIGIN_FILE}, which can race teleop's write of it")
+            a = self.node._initial_anchor()
         with self.node.lock:
             self.node.anchor = a
         log(f"anchor reloaded after set_coordinate: "
-            f"({a.arena_x_mm:.0f}, {a.arena_y_mm:.0f}) mm")
+            f"({a.arena_x_mm:.0f}, {a.arena_y_mm:.0f}) mm <- odom "
+            f"({a.odom_x:+.3f}, {a.odom_y:+.3f}) m, from {a.source}")
 
     def _preview(self, name, backend):
         """Publish the route this mission WOULD drive. Commands nothing.
@@ -6544,6 +7038,12 @@ class MissionRunner:
         st.leg_i = leg_i
         st.leg_segment_i = 0
         st.leg_budget = int(budget)
+        # AND A FRESH ROTATION ALLOWANCE, for the same reason and in the same
+        # place: a leg cannot be started without one. `_drive_to` re-opens it
+        # with the bearing its plan actually asks for the moment it knows the
+        # pose; until then the allowance is correction-only, so a turn issued
+        # before any plan exists is charged against nothing and aborts.
+        self.open_rotation_budget(0.0, f"leg {leg_i} {leg_name!r}")
         # The target-exclusion range belongs to ONE leg. Cleared here so the
         # retrace, the reface and the home trim -- none of which is driving at a
         # target -- get the full-strength front cone back. The DOCK floor is NOT
@@ -6567,10 +7067,97 @@ class MissionRunner:
         if st.segment_i > MAX_ROUTE_SEGMENTS:
             raise MissionAbort(f"route segment ceiling exhausted "
                                f"({MAX_ROUTE_SEGMENTS} across all legs)")
+        # ================= THE TWO BUDGETS, ENFORCED AT THE ONE FUNNEL =======
+        # Every segment this mission runs passes through here, so a budget
+        # enforced here cannot be bypassed by a caller that builds a Segment
+        # some other way. That is the whole reason it lives in this method and
+        # not in `_drive_to`, which is only one of four callers.
+        if seg.kind == "turn":
+            # A RETRACE TURN CARRIES ITS OWN PLAN. It replays a rotation that
+            # was MEASURED on the way out, so that measurement IS its budget --
+            # it opens a fresh allowance rather than spending the outbound
+            # leg's, which by then is long closed.
+            if seg.retrace:
+                self.open_rotation_budget(abs(float(seg.target)),
+                                          "retrace of a measured turn")
+            self.spend_rotation(seg)
+        elif seg.kind == "drive":
+            # A DRIVE'S ROTATION BUDGET IS ZERO -- it spends nothing here, and
+            # `DeadReckonBackend._drive`/`._drive_crawl` assert that they were
+            # handed a drive so a drive can never reach the turn primitive.
+            #
+            # AND IT MAY NOT BE COMMANDED PAST ITS TARGET. `plan_remaining_mm`
+            # is the distance the plan had left when this segment was built,
+            # measured from the LAST MEASURED POSE -- see `_drive_to`, which
+            # re-reads the pose every time round rather than banking what it
+            # commanded. A command longer than that plus OVERSHOOT_ALLOW_MM
+            # could travel past the target even if it ran to its full time cap,
+            # so it is refused before the wheels turn.
+            rem = float(getattr(seg, "plan_remaining_mm", -1.0))
+            if rem >= 0.0 and abs(float(seg.target)) > rem + OVERSHOOT_ALLOW_MM:
+                raise MissionAbort(
+                    f"{ABORT_OVERSHOOT}: segment asks {abs(float(seg.target)):.0f}"
+                    f"mm with only {rem:.0f}mm left to the target (allowance "
+                    f"{OVERSHOOT_ALLOW_MM:.0f}mm). A burst that can outrun its "
+                    "own target is refused before it is commanded, not "
+                    "corrected afterwards.")
+        else:
+            raise MissionAbort(f"unknown segment kind {seg.kind!r}")
         out = backend.run_segment(seg)
         if out.kind == "drive":
+            # NEVER BANK COMMANDED DISTANCE AS TRAVELLED. `measured` is filled
+            # by the segment from /wheel_ticks or odometry and is never a copy
+            # of `target` -- that was B8B's TIMEOUT bug, which reported the
+            # distance REQUESTED, so a segment that timed out having moved
+            # nothing still advanced the odometer and the retrace then tried to
+            # give back travel that had never happened.
+            over = abs(float(out.measured)) - abs(float(out.target))
+            if over > OVERSHOOT_ALLOW_MM:
+                # Already happened, so this is REPORTED, not aborted: the
+                # measurement is honest history and the retrace needs it. It is
+                # logged loudly because it means a terminator did not fire.
+                log(f"OVERSHOOT: segment asked {out.target:+.0f}mm and MEASURED "
+                    f"{out.measured:+.0f}mm -- {over:.0f}mm past the request, "
+                    f"outside the {OVERSHOOT_ALLOW_MM:.0f}mm allowance. The "
+                    f"encoder stop and the LiDAR terminator both let this run "
+                    f"long ({out.reason}).")
             st.distance_travelled_mm += abs(out.measured)
         return out
+
+    # -------------------------------------------------------- rotation budget
+    def open_rotation_budget(self, planned_deg, why):
+        """Start a fresh rotation allowance for one phase of the mission.
+
+        `planned_deg` is the rotation the PLAN asks for; everything past it plus
+        ROTATION_BUDGET_DEG is correction the rover has not earned. Opened at
+        the top of every leg, again for a re-face, and again per retrace turn --
+        each of those is a separate thing to have a plan about.
+        """
+        self._rot_planned_deg = abs(float(planned_deg))
+        self._rot_budget_deg = self._rot_planned_deg + ROTATION_BUDGET_DEG
+        self._rot_used_deg = 0.0
+        self._rot_why = str(why)
+
+    def spend_rotation(self, seg):
+        """Charge one turn against the open allowance, or abort the mission."""
+        budget = getattr(self, "_rot_budget_deg", None)
+        if budget is None:
+            # No phase opened one. Refuse to invent an allowance: a turn nobody
+            # planned is exactly what this guard exists to stop.
+            self.open_rotation_budget(0.0, "no phase opened a budget")
+            budget = self._rot_budget_deg
+        self._rot_used_deg = (getattr(self, "_rot_used_deg", 0.0)
+                              + abs(float(seg.target)))
+        if self._rot_used_deg > budget + 1e-6:
+            raise MissionAbort(
+                f"{ABORT_ROT_BUDGET}: {self._rot_why} planned "
+                f"{self._rot_planned_deg:.0f}deg of rotation and this turn "
+                f"would take the total to {self._rot_used_deg:.0f}deg, past the "
+                f"{budget:.0f}deg allowance ({ROTATION_BUDGET_DEG:.0f}deg of "
+                "correction). The rover is NOT converging on a bearing, and a "
+                "rover that cannot converge must stop rather than keep turning "
+                "-- this is the guard that makes the phantom 45deg spin "
+                "structurally impossible instead of merely unlikely.")
 
     def detour_armed(self):
         """True while an obstacle should become a reroute rather than an abort.
@@ -6705,6 +7292,18 @@ class MissionRunner:
         via = []          # A* waypoints still to be passed through, in order
         replans = 0
         dock_now = False  # the LiDAR has handed over; the rest is one crawl
+        # THE LEG'S ROTATION ALLOWANCE, SIZED FROM THE PLAN, OPENED ONCE, HERE.
+        # What the plan asks for is the bearing error from the pose this leg
+        # STARTS at -- one turn, computed once. Every correction turn the loop
+        # below inserts is then charged against that plus ROTATION_BUDGET_DEG,
+        # and when it is gone the leg aborts instead of correcting again. See
+        # ROTATION_BUDGET_DEG for the phantom 45deg spin this makes impossible.
+        _p0 = self.node.pose()
+        _planned_rot = 0.0
+        if _p0 is not None:
+            _planned_rot = abs(heading_error_deg(
+                bearing_deg(tx - _p0[0], ty - _p0[1]), _p0[2]))
+        self.open_rotation_budget(_planned_rot, f"leg to ({tx:.0f}, {ty:.0f})mm")
         while True:
             cur = None
             try:
@@ -6785,8 +7384,16 @@ class MissionRunner:
                 st.segments_n = max(st.segments_n, st.segment_i + len(legs))
                 st.eta_s = eta_seconds([Segment("drive", m, dock=d)
                                         for m, d in legs])
+                # NEVER COMMAND PAST THE TARGET, AND NEVER BANK THE COMMAND.
+                # `dist` is recomputed at the TOP of this loop from the pose the
+                # node has just MEASURED -- not from what the last burst was
+                # asked for -- so the segment below is sized against where the
+                # rover actually is. Stamping it onto the Segment is what lets
+                # `_run_one` refuse a command longer than the distance left.
+                mm = min(mm, dist)
                 cur = Segment("drive", mm, dock=dock, approach=final,
-                              crawl=bool(dock and DUTY_CRAWL))
+                              crawl=bool(dock and DUTY_CRAWL),
+                              plan_remaining_mm=dist)
                 executed.append(self._run_one(backend, cur))
                 if cur.docked:
                     # ARRIVING IS SUCCESS, NOT AN ABORT, AND IT ENDS THE LEG.
@@ -6878,6 +7485,10 @@ class MissionRunner:
             log(f"re-face SKIPPED: heading error {err:+.1f}deg exceeds "
                 f"{MAX_REFACE_DEG:.0f}deg — reporting instead of spinning")
             return executed
+        # A RE-FACE IS ITS OWN PLAN, so it opens its own allowance: the error it
+        # has just measured, plus the usual correction tolerance. It is bounded
+        # by MAX_REFACE_DEG above as well, and this is the accounting under it.
+        self.open_rotation_budget(abs(err), "re-face to the start heading")
         seg = Segment("turn", err)
         try:
             executed.append(self._run_one(self.backends["deadreckon"], seg))
@@ -7133,6 +7744,49 @@ def main():
         "Every commanded rotation is multiplied by this on the way to the wire, "
         "and the retrace replays MEASURED rotations through the very same sign, "
         "so outbound and return can never disagree about which way is positive.")
+    if DUTY_TURN:
+        log(f"RAW-DUTY TURNS are ON: _turn spins on /cmd_duty at "
+            f"{CONTROL_HZ:.0f}Hz with "
+            f"[-d,-d,+d,+d] x {TURN_DUTY:.0f} duty, d = sign(target) x "
+            f"TURN_WIRE_SIGN({TURN_WIRE_SIGN:+d}) -- golden _spin. Golden's own "
+            f"_TRN is {GOLDEN_TRN_POWER:.0f}, which EXCEEDS this bridge's "
+            f"MAX_DUTY of {DUTY_MAX:.0f}; the bridge refuses the whole message "
+            f"and zeroes the wire when any element is over, so it is CLAMPED to "
+            f"{TURN_DUTY:.0f} rather than sent and refused. Rotation is closed "
+            f"on the integrated /imu gyro, cut at TURN_COAST_FACTOR="
+            f"{TURN_COAST_FACTOR:.2f}, then MEASURED after the settle and it is "
+            f"the measurement the retrace replays.")
+        log(f"raw-duty turn rate at {TURN_DUTY:.0f} duty is UNMEASURED. The "
+            f"wrong-way guard (TURN_WRONG_WAY_DEG={TURN_WRONG_WAY_DEG:.0f}) and "
+            f"the stall guard are live, and the segment timeout is still "
+            f"derived from TURN_RADPS={TURN_RADPS:.2f}rad/s (a /cmd_vel "
+            f"setpoint, unrelated to duty) -- generous, not tight. If the first "
+            f"measured turn OVERSHOOTS, the loop samples at "
+            f"{CONTROL_HZ:.0f}Hz so a fast spin quantises coarsely: lower "
+            f"FPMS_MISSION_TURN_DUTY rather than touching the coast factor.")
+    else:
+        log("RAW-DUTY TURNS are OFF (FPMS_MISSION_DUTY_TURN=0): turns run on "
+            "/cmd_vel, through the dead zone and ramp that short bursts fail in.")
+    log(f"arena {ARENA_W_MM:.0f} x {ARENA_H_MM:.0f}mm, grid "
+        f"{node.occ.nx}x{node.occ.ny} cells of {node.occ.cell_mm:.0f}mm -- PER "
+        f"AXIS. The wall pad {WALL_PAD_MM:.0f}mm is dropped within "
+        f"{GOAL_WALL_EXEMPT_MM:.0f}mm of the leg's own target, because both "
+        f"zones sit 135mm from two walls each and a rover {2*ROBOT_RADIUS_MM:.0f}"
+        f"mm across cannot put its CENTRE there. Arena bounds and the whole "
+        f"obstacle layer still apply inside that circle.")
+    log(f"lidar self-filter {SELF_FILTER_MM:.0f}mm (<=), applied to the cone "
+        f"guard AND the grid. The chassis returns 130-150mm at bins 194-197 on "
+        f"every scan; the next real surface is 1220mm. NOTE this sits ABOVE "
+        f"ROTATE_CLEAR_MM ({ROTATE_CLEAR_MM:.0f}mm), so the rotate guard can "
+        f"now only fire on returns the filter has already removed -- it is "
+        f"effectively inert and should be re-sized from the CHASSIS EDGE, not "
+        f"the scanner, before it is relied on.")
+    log(f"motion budgets: rotation {ROTATION_BUDGET_DEG:.0f}deg of correction "
+        f"per phase on top of what the plan asked for (a drive's budget is "
+        f"{DRIVE_ROTATION_BUDGET_DEG:.0f}), overshoot "
+        f"{OVERSHOOT_ALLOW_MM:.0f}mm past the distance remaining, dead-gyro "
+        f"spin abort below {TURN_GYRO_MIN_RADPS:.3f}rad/s for "
+        f"{TURN_GYRO_DEAD_S:.1f}s of commanded turn duty.")
     log("odom SCALE is uncorrected and unresolved: 6.00 counts/mm (derived, "
         "30:1 gearbox assumed) vs 14.8 counts/mm (tape-measured over 800mm). "
         "Distances may read ~2.5x long. Settle it with a hand-push over a "
@@ -7190,8 +7844,10 @@ def main():
             f"m/s, timeout from CRAWL_MIN_MPS={CRAWL_MIN_MPS:.3f} m/s, "
             f"ticks stale at {TICKS_STALE_S:.1f}s (they arrive at 2Hz), "
             f"heading runaway at {CRAWL_RUNAWAY_DEG:.0f}deg. BOTH SPEED "
-            "BOUNDS ARE UNMEASURED -- raw duty has never been timed on this "
-            "chassis; the first run is what measures them.")
+            "BOUNDS ARE NOW MEASURED, from the M2 run of 2026-08-14: 0.181 m/s "
+            "at duty 18 and 0.243 m/s at duty 24, in-loop (elapsed_s includes "
+            "the settle). CAP over-estimates them and MIN under-estimates them, "
+            "so the cap is the tighter bound at every distance.")
         log(f"return: RETRACE_ONE_MOTION="
             f"{'on' if RETRACE_ONE_MOTION else 'OFF'} -- adjacent outbound "
             f"drives are merged into ONE reverse crawl (capped at "

@@ -1,0 +1,278 @@
+# nav2_forest.yaml -- the Nav2 stack for a wheeled rover under trees.
+#
+# STATUS: written against Nav2 (Humble/Iron) parameter names. NOT LOADED, NOT
+# TESTED -- there is no ROS 2 environment or forest rover in this project.
+#
+# BASED ON: github.com/Ellakiya15/ros2-dynamic-obstacle-avoidance-bot, which was
+# fetched and read first. That project is bot_description + bot_gazebo + bot_nav,
+# runs the STOCK Nav2 stack in Gazebo (static + obstacle + inflation layers) and
+# adds a C++ navigation_node for interactive goals. Its layer stack is kept
+# underneath here unchanged; the forest-specific parts are the fourth layer, the
+# voxel obstacle layer's ground handling, the planner choice, and the controller
+# tuning. None of that is in the upstream project.
+#
+# THE FOUR THINGS A FOREST CHANGES, AND WHERE EACH ONE IS ANSWERED BELOW
+#   ground and canopy returns  -> forest_scan_filter (upstream of this file) plus
+#                                 the voxel layer's min/max obstacle height
+#   irregular, non-convex trunks -> footprint (not robot_radius) + the dynamic
+#                                 layer's polygon rasterisation
+#   moving obstacles           -> forest_dynamic_layer, and a controller with a
+#                                 real simulation horizon
+#   nothing straight to localise against -> amcl is NOT in this file. See the
+#                                 note at the bottom; this is the honest gap.
+
+amcl:
+  ros__parameters:
+    # DELIBERATELY MINIMAL AND DELIBERATELY DISTRUSTED. AMCL's likelihood-field
+    # model wants a static map with structure; a forest gives it a map that is
+    # mostly empty with a few hundred round things that all look alike, and it
+    # will happily converge to a wrong pose among identical trunks. It is left
+    # here for the case where a surveyed plot map exists, with alpha values
+    # raised so it trusts odometry more than the scan match.
+    use_map_topic: true
+    laser_model_type: "likelihood_field"
+    max_beams: 90
+    alpha1: 0.4    # rotation noise from rotation -- high: skid steer on litter
+    alpha2: 0.4
+    alpha3: 0.4    # translation noise from translation -- high: wheels slip
+    alpha4: 0.4
+    update_min_d: 0.20
+    update_min_a: 0.15
+    laser_max_range: 25.0
+    scan_topic: scan_filtered      # the FILTERED scan, never the raw one
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0
+    # MPPI, not DWB, and the reason is dynamic obstacles. DWB scores a fan of
+    # constant-curvature rollouts against the costmap AS IT IS NOW. MPPI samples
+    # full trajectories and can express "wait, then go behind it", which is the
+    # correct answer to a crossing animal and the one manoeuvre DWB structurally
+    # cannot produce. RPP is worse still here: it is a pure path follower and
+    # will not deviate from the global path at all.
+    controller_plugins: ["FollowPath"]
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 40
+      model_dt: 0.05          # 40 * 0.05 = 2.0 s horizon
+      batch_size: 1000
+      vx_max: 0.8
+      vx_min: -0.20           # reverse allowed: a rover wedged between two
+                              # trunks has no turning circle out
+      vy: 0.0
+      wz_max: 1.2
+      # THE HORIZON MUST MATCH THE DYNAMIC LAYER'S prediction_horizon_s (2.0 s).
+      # Predicting obstacle motion further than the controller plans is not
+      # caution: it is a wall of cost the controller cannot reason about, and it
+      # will simply refuse to enter it and stop.
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic",
+                "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+                "PathAngleCritic", "PreferForwardCritic"]
+      CostCritic:
+        cost_weight: 3.81
+        # Not 253. The dynamic layer writes PREDICTED cells at up to 200 and it
+        # writes them on purpose as bendable, not lethal -- so the critic must be
+        # allowed to traverse them at a price rather than treat them as walls.
+        critical_cost: 253.0
+        consider_footprint: true
+      PathFollowCritic:
+        # Low, because the global path through a forest is a suggestion. The
+        # local controller has the only up-to-date view of what has moved.
+        cost_weight: 3.0
+      PreferForwardCritic:
+        cost_weight: 5.0
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 2.0     # REPLANS CONTINUOUSLY. Indoors 1 Hz or
+                                        # on-demand is fine; here the map is
+                                        # changing under the robot.
+    planner_plugins: ["GridBased"]
+    GridBased:
+      # SMAC HYBRID-A*, not NavFn. Three reasons, all forest reasons:
+      #  * it plans in SE(2) with a turning radius, so the route it returns is
+      #    one this chassis can actually drive between two trunks -- NavFn's
+      #    8-connected grid path is not kinematically feasible and the controller
+      #    then has to invent the difference;
+      #  * its analytic expansions produce smooth curves through gaps instead of
+      #    staircases that each cost a real turn;
+      #  * it costs the inflation gradient properly, so it prefers the middle of
+      #    a gap rather than grazing a trunk that is 5 cm inside tolerance.
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      tolerance: 0.30
+      downsample_costmap: false
+      allow_unknown: true       # a forest costmap is mostly unknown; refusing
+                                # unknown space means never leaving the clearing
+      max_iterations: 1000000
+      max_planning_time: 2.0
+      motion_model_for_search: "DUBIN"
+      minimum_turning_radius: 0.40
+      analytic_expansion_ratio: 3.5
+      cost_penalty: 2.0
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: odom        # NOT map. See the localisation note below.
+      robot_base_frame: base_link
+      resolution: 0.10
+      # ROLLING, because there is no global map to be absolute against. The
+      # global costmap is a large local window that travels with the robot -- the
+      # standard answer for outdoor work without a survey.
+      rolling_window: true
+      width: 60
+      height: 60
+      track_unknown_space: true
+      # FOOTPRINT, NOT robot_radius. A circular approximation of a rover between
+      # two trunks either forbids a gap it fits through or permits one it does
+      # not. The real rectangle costs one polygon test per cell and is worth it.
+      footprint: "[[0.45, 0.32], [0.45, -0.32], [-0.45, -0.32], [-0.45, 0.32]]"
+      plugins: ["obstacle_layer", "forest_dynamic_layer", "inflation_layer"]
+      # NO static_layer: there is no surveyed map of a forest. If a plot map
+      # exists, add it first in this list -- it must be the BOTTOM layer so the
+      # observed layers can only add to it.
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+        # VOXEL, NOT the 2D ObstacleLayer, wherever a 3D lidar exists. The 2D
+        # layer collapses every return onto one plane, so a branch at head height
+        # and a root at ankle height are the same cell -- and one of the two is
+        # drivable. The voxel layer keeps the z structure and only projects what
+        # is inside the vehicle's own height band.
+        publish_voxel_map: true
+        origin_z: 0.0
+        z_resolution: 0.10
+        z_voxels: 16
+        # THE TWO NUMBERS THAT MAKE THIS A FOREST CONFIG. Below min is ground,
+        # litter and root flare the chassis clears; above max is canopy it drives
+        # under. They are properties of the VEHICLE and must match
+        # forest_scan_filter's trunk_z_min_m / trunk_z_max_m or the two disagree
+        # about what an obstacle is.
+        min_obstacle_height: 0.15
+        max_obstacle_height: 1.40
+        mark_threshold: 1
+        # Only the FILTERED sources. Subscribing the raw scan here would undo the
+        # ground and canopy work upstream and re-mark the forest floor.
+        observation_sources: trunk_scan trunk_cloud
+        trunk_scan:
+          topic: /scan_filtered
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          obstacle_max_range: 20.0
+          raytrace_max_range: 22.0
+        trunk_cloud:
+          topic: /obstacle_points
+          data_type: "PointCloud2"
+          marking: true
+          # CLEARING IS OFF FOR THE CLOUD. Ray-casting through a canopy clears
+          # real trunks whenever foliage occludes them for a cycle. The 2D
+          # filtered scan does the clearing (it has already had foliage removed);
+          # the cloud only ever marks.
+          clearing: false
+          obstacle_max_range: 20.0
+
+      forest_dynamic_layer:
+        plugin: "forest_nav::DynamicObstacleLayer"
+        enabled: true
+        topic: /tracked_obstacles
+        prediction_horizon_s: 2.0        # == MPPI time_steps * model_dt
+        prediction_step_s: 0.25
+        prediction_growth_m_per_s: 0.25
+        static_speed_m_s: 0.15
+        decay_time_s: 3.0
+        min_confidence: 0.30
+        current_cost: 254
+        predicted_cost: 200              # bendable, NOT lethal, on purpose
+        combination_method: 1            # MAX: may add danger, never clear it
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # Wide and soft. Indoors a tight inflation is fine because walls are
+        # where the map says. Here a trunk's measured position carries range
+        # noise, pose drift and mount-yaw error, so the route should prefer the
+        # middle of a gap by a real margin rather than grazing one side of it.
+        inflation_radius: 1.20
+        cost_scaling_factor: 2.5
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 12
+      height: 12
+      resolution: 0.05
+      footprint: "[[0.45, 0.32], [0.45, -0.32], [-0.45, -0.32], [-0.45, 0.32]]"
+      plugins: ["obstacle_layer", "forest_dynamic_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        min_obstacle_height: 0.15
+        max_obstacle_height: 1.40
+        observation_sources: trunk_scan
+        trunk_scan:
+          topic: /scan_filtered
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          obstacle_max_range: 12.0
+          raytrace_max_range: 13.0
+      forest_dynamic_layer:
+        plugin: "forest_nav::DynamicObstacleLayer"
+        topic: /tracked_obstacles
+        prediction_horizon_s: 2.0
+        decay_time_s: 3.0
+        combination_method: 1
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 0.90
+        cost_scaling_factor: 3.0
+
+behavior_server:
+  ros__parameters:
+    behavior_plugins: ["spin", "backup", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    wait:
+      # THE MOST USEFUL RECOVERY IN A FOREST, and it is usually configured last.
+      # When the blocker is an animal crossing the path, waiting solves the
+      # problem and every other recovery makes it worse: spinning re-observes the
+      # same moving thing from a worse pose and backing up gives up ground.
+      plugin: "nav2_behaviors/Wait"
+
+bt_navigator:
+  ros__parameters:
+    global_frame: odom
+    robot_base_frame: base_link
+    # Replan on a costmap update, not only on a stuck condition, because the
+    # thing that invalidates the path here is usually something that moved
+    # rather than something the robot did.
+    default_nav_to_pose_bt_xml: ""
+
+# ==========================================================================
+# THE HONEST GAP: LOCALISATION.
+#
+# `global_frame` is `odom` in both costmaps, not `map`, and that is not an
+# oversight. There is no reliable map->odom in a forest: AMCL needs a static map
+# with distinguishable structure and there is none, and identical trunks are the
+# textbook failure case for scan matching -- it will converge, confidently, to
+# the wrong stand of trees. Running with `odom` as the global frame means the
+# whole stack is honest about being a DEAD-RECKONED, ROLLING local navigator: it
+# will drift, and it will not pretend otherwise.
+#
+# The real answers, none of which are implemented here and all of which are
+# platform decisions rather than config: RTK GNSS fused into odom (works in
+# clearings, degrades under canopy exactly when it is needed); a LiDAR-inertial
+# odometry package such as LIO-SAM or KISS-ICP feeding odom; or tree-stem
+# landmark SLAM, which is the literature's forest-specific answer and is a
+# project of its own. Until one of those exists, goals should be given in `odom`
+# and kept short.
+# ==========================================================================

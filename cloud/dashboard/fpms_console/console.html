@@ -219,11 +219,12 @@ td.v{text-align:right;color:#e8f7ff;font-weight:900}
       derives it (ARENA_MM, ZONE_FRAC, MARGIN_FRAC), so a rescale is one
       number here as well as there.
    ====================================================================== */
-/* OPERATOR-MEASURED 2026-08-13: the arena is RECTANGULAR, not square.
+/* OPERATOR-MEASURED 2026-08-14: the arena is RECTANGULAR, not square.
+   The y (drive) extent was SHORTENED by 200 mm to 1200 mm.
    These mirror fpms_missions.py ARENA_W_MM / ARENA_H_MM / ZONE_FRAC /
    MARGIN_FRAC / ROVER_LEN_MM exactly, and the zone centres and start box
    are DERIVED from them here just as they are there. */
-const ARENA_W_MM = 1500.0, ARENA_H_MM = 1400.0;
+const ARENA_W_MM = 1500.0, ARENA_H_MM = 1200.0;
 const ARENA_MM = Math.max(ARENA_W_MM, ARENA_H_MM);   // square-sized things only
 const ZONE_FRAC = 0.10, MARGIN_FRAC = 0.04;
 const ZONE = ZONE_FRAC * ARENA_W_MM, MARGIN = MARGIN_FRAC * ARENA_W_MM;  // 150, 60

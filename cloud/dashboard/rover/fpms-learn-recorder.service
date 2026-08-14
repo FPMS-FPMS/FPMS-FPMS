@@ -1,0 +1,113 @@
+[Unit]
+Description=FPMS run recorder (subscribe-only drive + grid dataset, offline calibration)
+Documentation=file:/home/ubuntu/fpms_learn_recorder.py
+# ---------------------------------------------------------------------------
+# THIS NODE CANNOT MOVE THE ROVER, AND THAT IS ENFORCED IN THREE PLACES IN THE
+# CODE, NOT PROMISED HERE: the node class overrides create_publisher to raise
+# for every topic but rclpy's own /parameter_events, a once-a-second audit
+# kills the process if any other publisher is ever held, and the MQTT client
+# class overrides publish() and will_set(). It has ten subscriptions, an MQTT
+# SUBSCRIBE, and two files on disk. Nothing else.
+#
+# Because of that, this unit deliberately declares NO ordering against
+# fpms-missions, fpms-stm32-bridge, fpms-teleop or fpms-cored. A recorder that
+# can delay, block or restart the thing it is recording is worse than no
+# recorder: the whole point is that turning it on changes nothing about how the
+# rover drives. If it is down, the only consequence is a gap in a dataset.
+#
+# mosquitto IS wanted, because the `asked` value for each segment, the arena
+# pose, the planned route and the obstacle events all come from fpms_missions'
+# MQTT telemetry. Wants=, not Requires=: a ROS-only dataset is still useful,
+# and it is the half that fits counts/mm.
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+
+# MANDATORY, AND THEY BELONG IN THE UNIT. /etc/fpms/config.env does not set
+# ROS_DOMAIN_ID and never has -- every other fpms-*.service carries it here for
+# the same reason. The board publishes on domain 20 and nowhere else; on any
+# other domain this node sees no topics and silently writes an empty dataset,
+# which is the worst possible failure for a recorder because it looks exactly
+# like a rover that never moved.
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+# THE SINGLE MOST IMPORTANT LINE IN THIS FILE. Fast DDS shared memory is DEAD
+# across process eras on this Pi: discovery succeeds, every topic is advertised,
+# subscriber counts are correct, and NO DATA FLOWS. It is what made /scan_lidar
+# "not deliver" on 2026-08-07 while its producer logged 9.5 Hz with zero drops,
+# and it is why rosbridge appeared to wedge. Without this profile the recorder
+# starts cleanly, reports no error, and records nothing at all.
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/ubuntu
+
+# WHERE THE DATA LANDS, AND WHY NOT /tmp OR /home. /var/lib is where machine
+# state belongs and this stack already uses /var/lib/fpms for exactly that;
+# /tmp is wiped on boot and this rover is stopped by unplugging its battery.
+# The `learn` subdirectory and the prior file are chowned to `ubuntu` by the
+# installer so this can stay a non-root service -- running a recorder as root
+# to write into a root-owned tree would be trading a real privilege for a
+# directory permission.
+Environment=FPMS_LEARN_DIR=/var/lib/fpms/learn
+Environment=FPMS_LEARNED_GRID=/var/lib/fpms/learned_grid.json
+Environment=FPMS_MISSIONS_SRC=/home/ubuntu/fpms_missions.py
+
+# Disk bounds, enforced in the process on every write: one file rolls at 48 MB,
+# the directory is capped at 384 MB by deleting the OLDEST files, and nothing
+# is written at all below 256 MB free. A recorder that fills the disk takes the
+# mission executor down with it, which is far worse than a gap in a dataset.
+Environment=FPMS_LEARN_MAX_FILE_MB=48
+Environment=FPMS_LEARN_MAX_DIR_MB=384
+Environment=FPMS_LEARN_MIN_FREE_MB=256
+
+ExecStartPre=/bin/mkdir -p /var/lib/fpms/learn
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_learn_recorder.py'
+
+# LAST IN THE QUEUE, ALWAYS. The one measurable cost of this node is CPU: it
+# ray-casts 360 bearings once a second to keep the grid prior. On a four-core
+# Pi that is nothing -- until the mission executor needs a core to run its
+# 20 Hz control loop, and then it must lose. Nice and a low CPU weight say so
+# to the scheduler rather than relying on there being headroom.
+Nice=10
+CPUWeight=20
+IOWeight=20
+
+# SIGTERM lands on the python process, which banks the grid prior, writes a
+# footer, flushes and closes. There is no motion to stop, so the timeout is
+# short -- at worst the last record is lost, and every record is fsync'd as it
+# is written precisely so that loss is bounded to one line.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+Restart=always
+# Unhurried on purpose. A recorder that restart-loops during a DDS outage adds
+# discovery churn to a domain the mission executor is trying to use. A ten
+# second hole in the dataset costs nothing; ten restarts a second might cost
+# the run being recorded.
+RestartSec=10
+
+# The dataset is append-only and this node has no reason to touch anything else
+# on the filesystem. Cheap to state, and it means a bug here cannot damage the
+# stack it is observing. /var/lib/fpms rather than /var/lib/fpms/learn because
+# the learned grid prior is written one level up, at the path the planner was
+# told to read, and an atomic replace needs write permission on the DIRECTORY
+# holding the file, not just on the file.
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/var/lib/fpms
+PrivateTmp=false
+NoNewPrivileges=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

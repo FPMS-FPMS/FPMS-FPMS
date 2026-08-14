@@ -1,0 +1,13 @@
+<library path="forest_nav_layers">
+  <class name="forest_nav::DynamicObstacleLayer"
+         type="forest_nav::DynamicObstacleLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>
+      Costmap layer for MOVING, NON-CONVEX obstacles. Stamps the predicted swept
+      volume of tracked dynamic obstacles, rasterises concave support outlines
+      as measured, and clears by confidence decay rather than by ray-casting --
+      because a canopy occludes real trunks constantly and ray-cast clearing
+      deletes them. NOT COMPILED AND NOT RUN: no ROS 2 build exists here.
+    </description>
+  </class>
+</library>

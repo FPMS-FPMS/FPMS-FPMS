@@ -85,15 +85,25 @@ export const MISSION_ABORT_NOTE =
  * Send the abort. Never gated on anything: an abort has to work precisely when
  * every other check has decided things are wrong.
  *
- * Errors are swallowed by design for the callers that have no log of their own
- * — the acknowledgement lands in the Control and Drive command logs either way,
- * and a toast here would be one more thing between the operator and a second
- * press.
+ * RESOLVES TO WHETHER IT ACTUALLY WENT (changed 2026-08-07). It used to
+ * `.catch(() => undefined)` and the docstring justified that by saying "the
+ * acknowledgement lands in the Control and Drive command logs either way".
+ * That was not true of either caller: MissionConsole logged a green
+ * "ABORT — sent" on the line BEFORE this call, and MissionStrip's fleet-bar
+ * abort has no log and no state at all. So a failed abort rendered as a
+ * successful one, on the single control whose whole purpose is to work when
+ * nothing else does.
+ *
+ * Still never throws — a rejected promise here would be one more thing between
+ * the operator and a second press. Callers get `false` and must SAY so.
  */
-export function postMissionAbort(thing: string): Promise<unknown> {
+export function postMissionAbort(thing: string): Promise<boolean> {
   return apiPostJson<unknown>(`/api/control/${thing}/${MISSION_ABORT_ACTION}`, {
     params: {},
-  }).catch(() => undefined);
+  }).then(
+    () => true,
+    () => false,
+  );
 }
 
 /**
@@ -475,13 +485,23 @@ export const PLAN_WAIT_MS = 8000;
 /**
  * The answer to `read_encoders`.
  *
- * NAMED FOR WHAT THE BOARD ACTUALLY HAS. The Yahboom MicroROS Board V2.0
- * publishes an integrated pose and a twist on /odom_raw and nothing else — no
- * /wheel_ticks, no joint_states, no per-wheel counters. `ticksAvailable` is
- * therefore false on this rover and `ticksLeft`/`ticksRight` stay null; they
- * are kept in the shape so that a board which DOES publish counts is rendered
- * rather than ignored, and so that a consumer cannot mistake a pose for a tick
- * count. Every numeric field is `number | null` for the usual reason.
+ * NAMED FOR WHAT THIS REPLY ACTUALLY CARRIES. `read_encoders` is answered by
+ * fpms-teleop out of the ROS side, which publishes an integrated pose and a
+ * twist on /odom_raw and nothing else — no /wheel_ticks, no joint_states, no
+ * per-wheel counters. `ticksAvailable` is therefore false in this reply and
+ * `ticksLeft`/`ticksRight` stay null; they are kept in the shape so that a
+ * source which DOES carry counts is rendered rather than ignored, and so that
+ * a consumer cannot mistake a pose for a tick count.
+ *
+ * RAW PER-WHEEL COUNTS DO NOW EXIST — just not here. fpms_stm32_bridge.py
+ * reads all four off the Rosmaster board and publishes them 5 Hz on
+ * `fpms/<thing>/telemetry/board` -> the `board:<thing>` channel, alongside the
+ * mm each has travelled at 6.00 counts/mm. The Telemetry page's BOARD card is
+ * where those are read. Do not "fix" this type by pointing it at that feed:
+ * they are two different questions, and the honest answer to "what did
+ * read_encoders say" is still no ticks.
+ *
+ * Every numeric field is `number | null` for the usual reason.
  */
 export type EncoderReading = {
   ok: boolean | null;

@@ -68,14 +68,19 @@
  */
 
 /**
- * Side length of the (square) arena in millimetres — 120 cm x 120 cm.
+ * Arena extents in millimetres — 150 cm wide x 120 cm tall (RECTANGULAR).
  *
- * This is the single source of truth. Zones, grid spacing, wall-detection
- * thresholds and the rover start pose are all expressed as fractions of it,
- * so changing this one number rescales the entire map coherently.
+ * These mirror fpms_missions.py ARENA_W_MM / ARENA_H_MM exactly and are the
+ * single source of truth here. Zones, grid spacing, wall-detection thresholds
+ * and the rover start pose are all expressed as fractions of them, so changing
+ * these numbers rescales the entire map coherently.
+ *
+ * OPERATOR-MEASURED 2026-08-14: the y (drive) extent was SHORTENED by 200 mm.
+ * The start box is measured from the BOTTOM edge, so ROVER_START is unchanged
+ * at (1322, 178); only the two top zones moved down with the far wall.
  */
 export const ARENA_W_MM = 1500;
-export const ARENA_H_MM = 1400;
+export const ARENA_H_MM = 1200;
 
 /**
  * The SQUARE extent everything sized off one number still uses: the viewport,
