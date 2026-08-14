@@ -5699,7 +5699,7 @@ class MissionRunner:
                 # which is the opposite of what the operator asked for.
                 self._begin_leg("reface", len(legs) + 1)
                 st.phase = "reface"
-                executed += self._reface(final_heading)
+                self._reface(final_heading, out=executed)
             else:
                 self._begin_leg("home", len(legs) + 1)
                 st.phase = "return"
@@ -5734,7 +5734,7 @@ class MissionRunner:
                     st.fix_note = self.try_arena_fix("home, after planned return")
                     self._begin_leg("home-trim", len(legs) + 1,
                                     budget=HOME_TRIM_TRIES + 1)
-                    executed += self._home_trim(start_pose)
+                    self._home_trim(start_pose, out=executed)
                 else:
                     if ret == "planned":
                         used_return = "retrace"
@@ -5758,7 +5758,20 @@ class MissionRunner:
                     # list holds would be a bug, not slow progress.
                     self._begin_leg("home", len(legs) + 1, budget=len(retrace))
                     for seg in retrace:
-                        executed.append(self._run_one(backend, seg))
+                        # THE SAME RESCUE `_drive_to` MAKES, for the same
+                        # reason. `_run_one` never returns when the segment
+                        # raises, so the `append` never ran and a replay segment
+                        # that HAD already measured itself vanished from
+                        # history -- which is precisely the record a second
+                        # recovery attempt needs to know what is still owed.
+                        try:
+                            executed.append(self._run_one(backend, seg))
+                        except MissionAbort:
+                            if seg.executed:
+                                executed.append(seg)
+                                if seg.kind == "drive":
+                                    st.distance_travelled_mm += abs(seg.measured)
+                            raise
                     # The rover is stopped at the start box and the retrace has
                     # already put the heading back, so this is the second most
                     # valuable moment in the whole run to take a fix — and the
@@ -5770,10 +5783,11 @@ class MissionRunner:
                     # abort the run for "not converging".
                     self._begin_leg("home-trim", len(legs) + 1,
                                     budget=HOME_TRIM_TRIES + 1)
-                    executed += self._home_trim(start_pose)
+                    self._home_trim(start_pose, out=executed)
                 self._begin_leg("reface", len(legs) + 2)
                 st.phase = "reface"
-                executed += self._reface(ROVER_START["heading_deg"], start_yaw=start_yaw)
+                self._reface(ROVER_START["heading_deg"], start_yaw=start_yaw,
+                             out=executed)
 
             st.phase = "idle"
         except MissionAbort as e:
@@ -6070,7 +6084,7 @@ class MissionRunner:
             finally:
                 self._detour_armed = False
 
-    def _reface(self, heading_deg, start_yaw=None):
+    def _reface(self, heading_deg, start_yaw=None, out=None):
         """Re-face the start heading — a correction, not the plan.
 
         After a retrace the rover should already be within a couple of degrees:
@@ -6079,7 +6093,11 @@ class MissionRunner:
         turned out — spinning the rover to hide a broken heading estimate would
         destroy the evidence and probably point it somewhere worse.
         """
-        executed = []
+        # THE ACCUMULATOR IS THE CALLER'S, NOT OURS -- see `_drive_to`. A local
+        # list is only ever handed back by `return`, so a MissionAbort raised in
+        # here never reached the caller's `+=` and the reface's measured
+        # rotation was dropped exactly when a recovery would have needed it.
+        executed = [] if out is None else out
         pose = self.node.pose()
         if pose is None:
             raise MissionAbort(ABORT_LINK)
@@ -6104,11 +6122,17 @@ class MissionRunner:
             log(f"re-face SKIPPED: heading error {err:+.1f}deg exceeds "
                 f"{MAX_REFACE_DEG:.0f}deg — reporting instead of spinning")
             return executed
-        executed.append(self._run_one(self.backends["deadreckon"],
-                                      Segment("turn", err)))
+        seg = Segment("turn", err)
+        try:
+            executed.append(self._run_one(self.backends["deadreckon"], seg))
+        except MissionAbort:
+            # It measured itself before raising; that rotation really happened.
+            if seg.executed:
+                executed.append(seg)
+            raise
         return executed
 
-    def _home_trim(self, start_pose):
+    def _home_trim(self, start_pose, out=None):
         """Close the residual gap to the start pose WITHOUT turning.
 
         GOLDEN TECHNIQUE, from phase6_latest.py `_p5_navdrive`'s final HOME
@@ -6127,7 +6151,10 @@ class MissionRunner:
         Every nudge is recorded in `executed`, so it appears in the measured log
         exactly like any other segment.
         """
-        executed = []
+        # THE ACCUMULATOR IS THE CALLER'S, NOT OURS -- see `_drive_to`. An abort
+        # part way through the trim used to throw away every nudge already
+        # driven, including the ones that had moved the rover.
+        executed = [] if out is None else out
         for _ in range(HOME_TRIM_TRIES):
             self.check_abort()
             pose = self.node.pose()
@@ -6150,8 +6177,14 @@ class MissionRunner:
                 return executed
             log(f"home trim: {gap:.0f}mm from the start box, nudging "
                 f"{step:+.0f}mm along the current heading, no turn")
-            executed.append(self._run_one(self.backends["deadreckon"],
-                                          Segment("drive", step, dock=True)))
+            seg = Segment("drive", step, dock=True)
+            try:
+                executed.append(self._run_one(self.backends["deadreckon"], seg))
+            except MissionAbort:
+                if seg.executed:
+                    executed.append(seg)
+                    self.state.distance_travelled_mm += abs(seg.measured)
+                raise
         return executed
 
     # --------------------------------------------------------------- report
@@ -6336,6 +6369,14 @@ def main():
            if ODOM_POSE_SIGN < 0 else
            "(RAW board convention — every measured forward move so far has "
            "reported NEGATIVE with this setting)"))
+    _tws_note = ("CONFIRMED by a real measured turn" if TURN_WIRE_SIGN_MEASURED
+                 else "DERIVED from the 2026-08-01 rewiring, NOT measured; "
+                      "_turn aborts on a wrong-way rotation past "
+                      "%.0fdeg rather than trusting it" % TURN_WRONG_WAY_DEG)
+    log(f"turn wire polarity TURN_WIRE_SIGN={TURN_WIRE_SIGN:+d} ({_tws_note}). "
+        "Every commanded rotation is multiplied by this on the way to the wire, "
+        "and the retrace replays MEASURED rotations through the very same sign, "
+        "so outbound and return can never disagree about which way is positive.")
     log("odom SCALE is uncorrected and unresolved: 6.00 counts/mm (derived, "
         "30:1 gearbox assumed) vs 14.8 counts/mm (tape-measured over 800mm). "
         "Distances may read ~2.5x long. Settle it with a hand-push over a "
