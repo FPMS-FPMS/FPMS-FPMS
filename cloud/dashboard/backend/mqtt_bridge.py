@@ -77,6 +77,25 @@ TOPIC_FILTERS = [
     # rather than on a heartbeat, so a dropped message is not corrected a moment
     # later by the next one. It just leaves a map with no route on it.
     ("fpms/+/telemetry/mission_plan", 1),
+    # Raw board telemetry straight off the Yahboom Rosmaster, from
+    # fpms_stm32_bridge.py: IMU accel/gyro, the four raw encoder counts (plus
+    # the same counts converted at 0.16657 mm/tick), battery volts, and the
+    # bridge's own health — firmware version, arm/estop latches, the dead-link
+    # latch and the measured publish rates.
+    #
+    # None of this existed on MQTT before: the bridge published it as ROS
+    # topics only, so a dashboard — which speaks MQTT, not ROS — could never
+    # see a single encoder count or a volt. Publishing it from the rover is
+    # only half the fix; without this line the messages arrive at the broker
+    # and are dropped here, which looks exactly like a rover that is not
+    # sending them.
+    #
+    # qos=0 like the other heartbeats: it is published on a 5 Hz timer, so a
+    # dropped sample is corrected 200 ms later. Read `fresh` / `link_dead` in
+    # the payload before trusting any value in it — the board's receive thread
+    # can die while every getter keeps returning its last cached number, so
+    # frozen data on this topic is plausible-looking and self-consistent.
+    ("fpms/+/telemetry/board", 0),
     ("fpms/+/events/#", 1),
 ]
 
@@ -93,6 +112,7 @@ TOPIC_FILTERS = [
 #   drive:<thing>            <- fpms/+/telemetry/drive
 #   mission:<thing>          <- fpms/+/telemetry/mission
 #   mission_plan:<thing>     <- fpms/+/telemetry/mission_plan
+#   board:<thing>            <- fpms/+/telemetry/board
 #   events                   <- fpms/+/events/#
 
 # Broker reason codes that mean "your credentials were refused", as opposed to
@@ -621,9 +641,18 @@ class Bridge:
         # it data. The cloud uplink below is deliberately left running either
         # way — it archives telemetry and has nothing to do with which source
         # draws the panel.
-        if channel in _ros_claimed_channels():
-            _ros_note_suppressed(channel, payload)
-        else:
+        #
+        # The hand-over happens BEFORE the claim is read, and on every message
+        # rather than only on suppressed ones. That ordering is load-bearing for
+        # `drive:`, which the ROS bridge enriches rather than replaces: the call
+        # below is what causes it to emit the enriched envelope, and emitting is
+        # what establishes the claim that makes the check underneath skip the
+        # plain copy. Read the claim first and the same message would go out
+        # twice — once plain, once enriched — every time ownership began.
+        # The ROS side ignores channels it cannot use, so this costs a dict
+        # write on the channels it can.
+        _ros_note_suppressed(channel, payload)
+        if channel not in _ros_claimed_channels():
             self._broadcast(channel, envelope)
         # Throttled copy to the cloud app. The local dashboard always sees the
         # full rate; only the uplink is rate-limited.

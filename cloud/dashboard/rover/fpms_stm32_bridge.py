@@ -94,6 +94,7 @@ operator's explicit consent to motion and a stale latch from a previous run
 would otherwise leave the rover silently dead.
 """
 
+import json
 import math
 import os
 import threading
@@ -108,6 +109,9 @@ from sensor_msgs.msg import Imu, BatteryState
 from std_msgs.msg import Int32MultiArray, Bool
 
 from Rosmaster_Lib import Rosmaster
+
+import paho.mqtt.client as mqtt
+from paho.mqtt.client import CallbackAPIVersion
 
 PORT = os.environ.get("FPMS_STM32_PORT", "/dev/ttyUSB0")
 ODOM_FRAME = os.environ.get("FPMS_ODOM_FRAME", "odom")
@@ -135,6 +139,168 @@ MAX_DUTY = int(float(os.environ.get("FPMS_BRIDGE_MAX_DUTY", "40")))
 
 def _truthy(v):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ============================================================ MQTT TELEMETRY
+# WHY THIS NODE ALSO SPEAKS MQTT
+# ------------------------------
+# The operator's dashboards are MQTT clients, not ROS ones. Everything this
+# node reads off the board -- IMU, the four raw encoder counts, battery volts,
+# and its own health -- existed ONLY as ROS topics, so none of it could ever
+# reach a dashboard. The rest of this stack (fpms_teleop.py, fpms_cored.py)
+# already publishes to Mosquitto with the idiom copied below; this is the same
+# idiom, nothing new.
+#
+# THE CONTROL PATH MUST NOT BE ABLE TO NOTICE THIS EXISTS. Two guarantees:
+#   1. connect_async + loop_start, exactly as fpms_teleop.py's Bus does. paho
+#      owns a background network thread, retries a down broker forever, and
+#      publish() only enqueues -- it never writes the socket on the caller's
+#      thread.
+#   2. The payload is assembled and published on a DEDICATED daemon thread, not
+#      on a ROS timer. Even a pathologically slow paho could not then delay
+#      /cmd_vel relay, the deadman, or the sensor timers, because it does not
+#      share their executor.
+# The publisher only ever READS cached values that the ROS timers already
+# produced. It performs no serial I/O of its own, so it cannot add a single
+# byte of traffic to a link this project has repeatedly found fragile.
+def load_config(path="/etc/fpms/config.env"):
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+CFG = load_config()
+
+
+def _cfg(key, default):
+    """Environment wins over /etc/fpms/config.env wins over the default."""
+    return os.environ.get(key, CFG.get(key, default))
+
+
+THING = _cfg("FPMS_THING_NAME", "rover2")
+MQTT_HOST = _cfg("FPMS_MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(float(_cfg("FPMS_MQTT_PORT", "1883")))
+MQTT_USER = _cfg("FPMS_MQTT_USER", "")
+MQTT_PASS = _cfg("FPMS_MQTT_PASS", "")
+
+# 1 = publish board telemetry to MQTT (default). 0 = ROS only, exactly the
+# behaviour before this existed.
+MQTT_ENABLE = _truthy(_cfg("FPMS_BRIDGE_MQTT", "1"))
+# Publish rate. Deliberately decoupled from every ROS rate: this is a dashboard
+# heartbeat, not a control feed.
+MQTT_HZ = float(_cfg("FPMS_BRIDGE_MQTT_HZ", "5"))
+MQTT_TOPIC = "telemetry/board"
+
+# TICKS -> MILLIMETRES, per wheel.
+# 0.16657 mm/tick = 6.00 counts/mm -- the value fpms_phase6_M1_M2_WORKING.py
+# (the program that actually completed M1 and M2 on this board) used, and which
+# matches the 6.12 counts/mm measured on this chassis. It is NOT 14.8: that
+# figure is 2.7x wrong and is the single cause behind this project's history of
+# distance overshoot. Publishing raw counts alone was what let that error hide.
+MM_PER_TICK = float(_cfg("FPMS_BRIDGE_MM_PER_TICK", "0.16657"))
+
+# Window over which the published rates are measured. Long enough that the
+# 2 Hz encoder feed is not quantised into nonsense (a 1 s window can only ever
+# report 1.0 or 2.0 for it), short enough to notice a feed dying.
+RATE_WINDOW_S = 4.0
+
+
+class BoardBus:
+    """MQTT publisher that never raises into the caller and reconnects forever.
+
+    Lifted from fpms_teleop.py's Bus. connect_async rather than connect: a
+    broker that is down at boot must delay the dashboards, not prevent this
+    node -- which is the thing that stops the motors -- from starting.
+    """
+
+    def __init__(self, client_id, log):
+        self.log = log
+        self.connected = False
+        self.published = 0
+        self.errors = 0
+        self.last_error = None
+        self.client = mqtt.Client(client_id=client_id,
+                                  callback_api_version=CallbackAPIVersion.VERSION2)
+        if MQTT_USER:
+            self.client.username_pw_set(MQTT_USER, MQTT_PASS or None)
+        self.client.reconnect_delay_set(min_delay=1, max_delay=15)
+        # A dashboard must be able to tell "the bridge stopped publishing"
+        # from "the bridge is fine and the rover is parked". The will is the
+        # only signal that survives this process being killed.
+        self.client.will_set("fpms/%s/events/offline" % THING,
+                             json.dumps({"thing": THING, "status": "offline",
+                                         "svc": "stm32_bridge",
+                                         "reason": "unexpected disconnect"}),
+                             qos=1, retain=False)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+
+    def start(self):
+        try:
+            self.client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+            self.client.loop_start()
+            self.log("MQTT: connecting to %s:%d as %s (async, retries forever); "
+                     "publishing fpms/%s/%s at %.1f Hz"
+                     % (MQTT_HOST, MQTT_PORT, MQTT_USER or "<anonymous>",
+                        THING, MQTT_TOPIC, MQTT_HZ))
+        except Exception as e:
+            self.log("MQTT: start failed (%s); node continues without MQTT" % e)
+
+    def stop(self):
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+
+    def _on_connect(self, _c, _u, _f, reason_code, _p=None):
+        try:
+            if getattr(reason_code, "is_failure", False):
+                self.connected = False
+                self.log("MQTT: connect refused (%s); will retry" % reason_code)
+                return
+            self.connected = True
+            self.log("MQTT: connected to %s:%d (%s)"
+                     % (MQTT_HOST, MQTT_PORT, reason_code))
+            self.publish("events/online",
+                         {"svc": "stm32_bridge", "status": "online",
+                          "topic": "fpms/%s/%s" % (THING, MQTT_TOPIC),
+                          "hz": MQTT_HZ, "mm_per_tick": MM_PER_TICK,
+                          "port": PORT}, qos=1)
+        except Exception as e:
+            self.log("MQTT: on_connect error %s" % e)
+
+    def _on_disconnect(self, _c, _u, *args):
+        self.connected = False
+
+    def publish(self, suffix, payload, qos=0):
+        """Enqueue one message. Total: it swallows everything."""
+        if not self.connected:
+            # Dropped, not queued: a dashboard wants the CURRENT sample, and a
+            # burst of stale ones on reconnect would be worse than a gap.
+            return
+        try:
+            # allow_nan=False turns an accidental NaN into an exception here
+            # rather than into invalid JSON on the dashboard's parser.
+            body = json.dumps(payload, allow_nan=False)
+        except Exception as e:
+            self.errors += 1
+            self.last_error = "payload not JSON-safe: %s" % e
+            return
+        try:
+            self.client.publish("fpms/%s/%s" % (THING, suffix), body, qos=qos)
+            self.published += 1
+        except Exception as e:
+            self.errors += 1
+            self.last_error = "publish failed: %s" % e
 
 
 def yaw_to_quat(yaw):
@@ -200,6 +366,25 @@ class Stm32Bridge(Node):
         self._wire_mode = "vel"
         self._lock = threading.Lock()
         self._warned_disarmed = 0.0
+
+        # --- MQTT telemetry state -------------------------------------------
+        # Snapshots of what the ROS timers last published, each stamped with the
+        # MONOTONIC instant it was read off the board. The MQTT thread only ever
+        # reads these, and each is replaced as a whole dict, so a reader can
+        # never see a half-updated sample.
+        self._boot_t = time.monotonic()
+        self._last_imu = None
+        self._last_enc = None
+        self._last_volt = None
+        self._n_odom = 0
+        self._n_imu = 0
+        self._n_ticks = 0
+        self._n_mqtt = 0
+        self._rate_t0 = time.monotonic()
+        self._rates = None          # None until the first window closes
+        self._mqtt_stop = threading.Event()
+        self._mqtt_thread = None
+        self.bus = None
 
         self.pub_odom = self.create_publisher(Odometry, "/odom_raw", 10)
         self.pub_imu = self.create_publisher(Imu, "/imu", 10)
@@ -504,6 +689,7 @@ class Stm32Bridge(Node):
         m.twist.twist.linear.y = vy
         m.twist.twist.angular.z = w
         self.pub_odom.publish(m)
+        self._n_odom += 1
 
     def _tick_imu(self):
         # Publish NOTHING rather than a frozen value. A topic that stops is a
@@ -531,6 +717,12 @@ class Stm32Bridge(Node):
         # from trusting a yaw this node did not measure.
         m.orientation_covariance[0] = -1.0
         self.pub_imu.publish(m)
+        self._n_imu += 1
+        # Snapshot for the MQTT publisher. Whole-dict replacement, so the other
+        # thread reads a consistent sample or the previous one, never a mix.
+        self._last_imu = {"ax": float(ax), "ay": float(ay), "az": float(az),
+                          "gx": float(gx), "gy": float(gy), "gz": float(gz),
+                          "t": time.monotonic()}
 
     def _check_link(self):
         """Detect a silently dead receive thread.
@@ -561,20 +753,176 @@ class Stm32Bridge(Node):
         b.voltage = v
         b.present = True
         self.pub_batt.publish(b)
+        # NaN is a read failure, not a voltage. Kept out of the snapshot so it
+        # can never reach the dashboard's JSON parser as a bare NaN token.
+        self._last_volt = {"v": v, "t": time.monotonic()} if math.isfinite(v) else None
 
         try:
             enc = self.bot.get_motor_encoder()
             t = Int32MultiArray()
             t.data = [int(e) for e in enc]
             self.pub_ticks.publish(t)
+            self._n_ticks += 1
+            self._last_enc = {"ticks": list(t.data), "t": time.monotonic()}
         except Exception as e:
             self.get_logger().error("encoder read failed: %s" % e)
+
+
+    # ---------------------------------------------------------- MQTT publish
+    def _board_payload(self):
+        """One consolidated telemetry sample. Pure: reads snapshots, no I/O.
+
+        Every section carries its own `age_s` and the payload carries `fresh`.
+        That is not decoration. This project has repeatedly been fooled by a
+        feed that kept arriving with frozen values -- the Rosmaster receive
+        thread dies silently and every getter is a cached-field read, so the
+        numbers stay perfectly plausible forever. A consumer that trusts a
+        value here without reading `fresh`/`age_s` is making exactly that
+        mistake, so both are unmissable and the values are never omitted (a
+        blank panel is indistinguishable from a parked rover).
+        """
+        now_m = time.monotonic()
+        self._n_mqtt += 1
+
+        dt = now_m - self._rate_t0
+        if dt >= RATE_WINDOW_S:
+            self._rates = {"odom": round(self._n_odom / dt, 2),
+                           "imu": round(self._n_imu / dt, 2),
+                           "ticks": round(self._n_ticks / dt, 2),
+                           "mqtt": round(self._n_mqtt / dt, 2)}
+            self._rate_t0 = now_m
+            self._n_odom = self._n_imu = self._n_ticks = self._n_mqtt = 0
+
+        dead = bool(self._link_dead)
+
+        imu = self._last_imu
+        if imu is None:
+            imu_out = {"accel": None, "gyro": None, "age_s": None,
+                       "units": {"accel": "m/s^2", "gyro": "rad/s"}}
+        else:
+            imu_out = {"accel": {"x": imu["ax"], "y": imu["ay"], "z": imu["az"]},
+                       "gyro": {"x": imu["gx"], "y": imu["gy"], "z": imu["gz"]},
+                       "age_s": round(now_m - imu["t"], 3),
+                       "units": {"accel": "m/s^2", "gyro": "rad/s"}}
+
+        enc = self._last_enc
+        if enc is None:
+            enc_out = {"ticks": None, "mm": None, "mm_per_tick": MM_PER_TICK,
+                       "counts_per_mm": round(1.0 / MM_PER_TICK, 3),
+                       "order": ["M1_left", "M2_left", "M3_right", "M4_right"],
+                       "age_s": None}
+        else:
+            enc_out = {"ticks": list(enc["ticks"]),
+                       "mm": [round(t * MM_PER_TICK, 2) for t in enc["ticks"]],
+                       "mm_per_tick": MM_PER_TICK,
+                       "counts_per_mm": round(1.0 / MM_PER_TICK, 3),
+                       "order": ["M1_left", "M2_left", "M3_right", "M4_right"],
+                       "age_s": round(now_m - enc["t"], 3)}
+
+        volt = self._last_volt
+        volt_out = None if volt is None else round(volt["v"], 3)
+        volt_age = None if volt is None else round(now_m - volt["t"], 3)
+
+        # Freshest thing we have actually read off the board. Once the link is
+        # dead nothing advances it, so it is the age of the whole payload.
+        ages = [a for a in (imu_out["age_s"], enc_out["age_s"], volt_age)
+                if a is not None]
+        data_age = min(ages) if ages else None
+
+        payload = {
+            "thing": THING,
+            "ts": time.time(),
+            "svc": "stm32_bridge",
+            # Read these two before any number above them.
+            "fresh": (not dead) and data_age is not None and data_age < 3.0,
+            "link_dead": dead,
+            "data_age_s": data_age,
+            "imu": imu_out,
+            "encoders": enc_out,
+            "voltage": volt_out,
+            "voltage_age_s": volt_age,
+            "health": {
+                "fw": self.fw,
+                "armed": bool(self.armed),
+                "estop": bool(self.estop),
+                "link_dead": dead,
+                "port": PORT,
+                "rates_hz": self._rates,
+                "target_rates_hz": {"odom": ODOM_HZ, "imu": IMU_HZ,
+                                    "ticks": SLOW_HZ, "mqtt": MQTT_HZ},
+                "uptime_s": round(now_m - self._boot_t, 1),
+                "mqtt_published": self.bus.published if self.bus else 0,
+                "mqtt_errors": self.bus.errors if self.bus else 0,
+            },
+        }
+        if dead:
+            payload["stale_reason"] = (
+                "BOARD LINK DEAD: the Rosmaster receive thread has exited. "
+                "Every imu/encoder/voltage value in this payload is FROZEN at "
+                "its last-read value and must not be trusted. Restart "
+                "fpms-stm32-bridge.")
+        elif not payload["fresh"]:
+            payload["stale_reason"] = (
+                "No board sample in the last 3 s -- values below are stale.")
+        return payload
+
+    def _mqtt_run(self):
+        """Publish on a fixed period, forever, on our own daemon thread.
+
+        ON A TIMER, NOT ON CHANGE. A parked rover produces identical samples
+        for minutes, and a feed that only speaks when something moves is
+        indistinguishable from a dead one -- which is precisely how this stack
+        has previously mistaken a crashed publisher for a stationary rover.
+        Silence on this topic therefore means one thing: the process stopped.
+        """
+        period = 1.0 / MQTT_HZ if MQTT_HZ > 0 else 0.2
+        nxt = time.monotonic()
+        while not self._mqtt_stop.is_set():
+            try:
+                self.bus.publish(MQTT_TOPIC, self._board_payload())
+            except Exception as e:
+                # This thread must outlive anything it observes: if it dies the
+                # dashboards go dark with no other symptom.
+                self.get_logger().warn("MQTT board publish failed: %s" % e)
+            nxt += period
+            delay = nxt - time.monotonic()
+            if delay < 0.0:
+                nxt = time.monotonic()
+                delay = 0.0
+            if self._mqtt_stop.wait(delay):
+                break
+
+    def start_mqtt(self):
+        if not MQTT_ENABLE:
+            self.get_logger().warn(
+                "MQTT board telemetry DISABLED (FPMS_BRIDGE_MQTT=0) -- the "
+                "operator dashboards will show no board data.")
+            return
+        self.bus = BoardBus("%s-stm32-bridge" % THING,
+                            lambda s: self.get_logger().info(s))
+        self.bus.start()
+        self._mqtt_thread = threading.Thread(target=self._mqtt_run, daemon=True,
+                                             name="fpms-bridge-mqtt")
+        self._mqtt_thread.start()
+
+    def stop_mqtt(self):
+        self._mqtt_stop.set()
+        if self._mqtt_thread is not None:
+            try:
+                self._mqtt_thread.join(timeout=2.0)
+            except Exception:
+                pass
+        if self.bus is not None:
+            self.bus.stop()
 
 
 def main():
     os.environ.setdefault("ROS_DOMAIN_ID", "20")
     rclpy.init()
     node = Stm32Bridge()
+    # Started AFTER the node is fully constructed, so the publisher thread can
+    # never observe a half-built node.
+    node.start_mqtt()
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
@@ -586,6 +934,10 @@ def main():
     finally:
         try:
             node._stop_wire()
+        except Exception:
+            pass
+        try:
+            node.stop_mqtt()
         except Exception:
             pass
         try:

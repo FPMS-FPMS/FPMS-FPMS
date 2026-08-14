@@ -92,6 +92,9 @@ button:disabled{opacity:.32;cursor:not-allowed}
 #overlay{position:absolute;left:10px;top:10px;z-index:10;width:250px;background:rgba(2,7,17,.88);border:1px solid #1d4163;border-radius:10px;padding:9px;font-size:12px;line-height:1.5;color:#98d4ff}
 #overlay .title{color:#00b7ff;letter-spacing:2px;font-weight:900;margin-bottom:5px}
 #overlay b{color:#e8f7ff}
+#boardbox{position:absolute;left:10px;bottom:8px;z-index:10;background:rgba(2,7,17,.88);border:1px solid #1d4163;border-radius:8px;padding:6px 8px;font-size:10px;line-height:1.5;color:#98d4ff;white-space:nowrap}
+#boardbox .title{color:#00b7ff;letter-spacing:2px;font-weight:900;font-size:9px;margin-bottom:3px}
+#boardbox b{color:#e8f7ff}
 #maphint{position:absolute;right:10px;bottom:8px;z-index:10;font-size:10px;color:#6f9fc4;background:rgba(2,7,17,.85);border:1px solid #143050;border-radius:8px;padding:5px 8px}
 #lidarDead{position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);z-index:9;color:#ff4b70;font-weight:900;letter-spacing:5px;font-size:20px;text-align:center;display:none;background:rgba(2,7,17,.82);border:2px solid #ff4b70;border-radius:12px;padding:14px 20px}
 table{width:100%;border-collapse:collapse;font-size:11px}
@@ -127,6 +130,19 @@ td.v{text-align:right;color:#e8f7ff;font-weight:900}
       </div>
       <div id="lidarDead">LIDAR ABSENT<div style="font-size:11px;letter-spacing:1px;margin-top:6px">no frame within <span id="staleSecs">3</span>s &mdash; nothing drawn on purpose</div></div>
       <canvas id="grid"></canvas><canvas id="dyn"></canvas>
+      <!-- BOARD READOUT. The same four things fpms_stm32_bridge.py now also
+           publishes on MQTT as fpms/<thing>/telemetry/board, read here over
+           rosbridge from the ROS topics it has always published. Always
+           visible, because the failure this guards against is a feed that
+           quietly stops: every value carries the shared STALE badge, so a
+           frozen number cannot pass for a live one. -->
+      <div id="boardbox">
+        <div class="title">BOARD &mdash; stm32 bridge</div>
+        <div>batt <b><span data-feed="batt">--</span></b> V &nbsp; gyro z <b><span data-feed="gyro">--</span></b> &deg;/s</div>
+        <div>enc <b><span data-feed="ticks">--</span></b></div>
+        <div>mm &nbsp;<b><span data-feed="ticks_mm">--</span></b></div>
+        <div>arm <b><span data-feed="armed">--</span></b> &nbsp; link <b><span data-feed="link">--</span></b> &nbsp; <b><span id="boardHz">--</span></b></div>
+      </div>
       <div id="maphint">LEFT-CLICK = place marker &nbsp;|&nbsp; RIGHT-CLICK = keep-out disk &nbsp;|&nbsp; SHIFT+RIGHT-CLICK = clear all</div>
     </div>
   </div>
@@ -224,6 +240,12 @@ const VIEW_MIN = -180, VIEW_MAX = ARENA_MM + 180;
 const ROBOT_W = 230, ROBOT_NOSE = 160, ROBOT_TAIL = -80;               // phase6 numbers
 const FRONT_STOP_MM = 400;                                             // config.env FPMS_MISSION_FRONT_STOP_MM
 const STALE_S = 3.0;                                                   // the whole staleness contract
+/* 0.16657 mm/tick = 6.00 counts/mm. The value fpms_phase6_M1_M2_WORKING.py
+   used and which matches 6.12 measured on this chassis -- NOT 14.8, which is
+   2.7x wrong and is where this project's distance overshoot came from. It is
+   the same constant fpms_stm32_bridge.py publishes in its MQTT payload, so the
+   console and the dashboards cannot disagree about how far a wheel has gone. */
+const MM_PER_TICK = 0.16657;
 const KEEPOUT_R = 120;                                                 // phase6 right-click disk radius
 
 /* Which feeds must be FRESH for RUN to be permitted. Deliberately short:
@@ -440,6 +462,7 @@ ros.subscribe("/battery", null, (m) => {
 }, 500);
 ros.subscribe("/wheel_ticks", "std_msgs/Int32MultiArray", (m) => {
   mark("ticks", (m.data||[]).join(" "), m);
+  mark("ticks_mm", (m.data||[]).map(t => (t*MM_PER_TICK).toFixed(0)).join(" "), m);
 }, 250);
 ros.subscribe("/wheel_duty", "std_msgs/Int32MultiArray", (m) => {
   mark("duty", (m.data||[]).join(" "), m);
@@ -568,6 +591,14 @@ function tick(){
   if (isStale("scan")) scan = null;
   document.getElementById("lidarDead").style.display = (isStale("scan") ? "block" : "none");
   document.getElementById("scanHz").textContent = isStale("scan") ? "0.0" : ((rates.scan && rates.scan.hz)||0).toFixed(1);
+
+  /* Board health: the rate this browser actually receives odom/imu/ticks at.
+     A stale feed reports 0.0 rather than its last smoothed value -- a plausible
+     Hz on a dead feed is the exact lie the staleness contract exists to stop. */
+  const hzOf = (k) => isStale(k) ? 0 : ((rates[k] && rates[k].hz) || 0);
+  document.getElementById("boardHz").textContent =
+    hzOf("odom").toFixed(0) + "/" + hzOf("imu").toFixed(0) + "/" +
+    hzOf("ticks").toFixed(0) + " Hz";
 
   /* Pose: only from FRESH mission mirror values. A stale pose is no pose,
      and the rover is then drawn where it was with a loud STALE badge

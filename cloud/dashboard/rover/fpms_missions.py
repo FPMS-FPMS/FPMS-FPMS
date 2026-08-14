@@ -379,7 +379,7 @@ try:
     from geometry_msgs.msg import Twist, PoseStamped
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Imu, BatteryState
-    from std_msgs.msg import UInt16
+    from std_msgs.msg import UInt16, Int32MultiArray
     HAVE_ROS = True
     ROS_IMPORT_ERROR = ""
 except Exception as _e:                                     # pragma: no cover
@@ -873,7 +873,15 @@ ARM_TIMEOUT_S = _cfg_float("FPMS_MISSION_ARM_TIMEOUT_S", 120.0, 10.0, 3600.0)
 
 
 # ================================================== SEGMENTATION / TOLERANCES
-MAX_LEG_MM = _cfg_float("FPMS_MISSION_MAX_LEG_MM", 300.0, 50.0, 600.0)
+# CEILING RAISED 600 -> 3000 ON 2026-08-13, so the operator's "one real time
+# mathematical encoder movement" can actually be one. FPMS_MISSION_MAX_LEG_MM
+# was set to 2000 in config.env and fell OUTSIDE this range -- and `_cfg_float`
+# answers an out-of-range value with the DEFAULT (300), so the setting made the
+# outbound MORE fragmented, not less. A long leg is not an unguarded leg:
+# `burst_cap_s` (which reads no odometry at all), `segment_timeout_s`, the
+# tick-staleness abort and the heading-runaway abort all scale with the segment
+# and all still fire.
+MAX_LEG_MM = _cfg_float("FPMS_MISSION_MAX_LEG_MM", 300.0, 50.0, 3000.0)
 # Shorter than this is stop-settle noise, so it is folded into the previous
 # segment instead of commanded — and it can never be shorter than the shortest
 # burst the firmware will act on at all.
@@ -887,7 +895,22 @@ DOCK_STEP_MM = _floor_note(
     "DOCK_STEP_MM", _cfg_float("FPMS_MISSION_DOCK_STEP_MM", 70.0, 15.0, 150.0),
     MIN_MOVE_MM, "mm", "minimum-pulse")
 
-ARRIVE_TOL_MM = 25.0     # closer than this and another leg is noise, not progress
+# THE ARRIVAL CHASE, measured 2026-08-14. This was 25.0 while MIN_MOVE_MM is
+# 63 mm -- the smallest motion the chassis can express. A tolerance TIGHTER than
+# the minimum move is unsatisfiable by construction: every correction the rover
+# commands is at least 63 mm, so it lands on the far side of a 25 mm window,
+# re-faces (and near the target a few mm of position error is a huge BEARING
+# error), drives again, and oscillates until something aborts. The operator saw
+# it as "went there perfectly, then randomly turned left 45 degrees and drove
+# 300 mm"; the log shows it as an extra 6th segment and `asked +66mm,
+# measured -21mm`.
+#
+# Floored at MIN_MOVE_MM for the same reason BEARING_TOL_DEG is floored at
+# MIN_TURN_DEG. 75 mm is also inside the zone rect (150 mm wide), so arriving
+# within tolerance means physically standing in the zone.
+ARRIVE_TOL_MM = _floor_note(
+    "ARRIVE_TOL_MM", _cfg_float("FPMS_MISSION_ARRIVE_TOL_MM", 75.0, 10.0, 400.0),
+    MIN_MOVE_MM, "mm", "minimum-pulse")
 # A correction smaller than the chassis can express must be REPORTED, not
 # commanded: commanding it produces a burst too short to move, which the stall
 # detector then correctly aborts the mission over.
@@ -976,6 +999,223 @@ ROTATE_CLEAR_MM = 80.0    # any bearing, while turning in place
 LIDAR_STALE_S = 3.0       # older than this and the obstacle guard is blind
 ROS_DEAD_S = 3.0          # no odometry for this long => micro-ROS link is down
 BATT_LOW_V = 11.1
+
+
+# ================================================ THE RAW-DUTY CRAWL
+# Ported from /home/ubuntu/fpms_phase6_M1_M2_WORKING.py `_p5_navdrive._fwd`
+# -- the program that actually completed M1 and M2 on this same Yahboom
+# chassis. Its pipeline, verbatim:
+#
+#     pwr = -_DRV if rev else _DRV
+#     dm  = mean(|e[i]-e0[i]|) * _TKMM          # distance from TICKS
+#     if marker locked and marker.dist <= _stop_at: STOP  # LIDAR takes over
+#     if dm >= mm: STOP
+#     hd += gz*dt ; c = clamp(hd*_KPH, -6, +6)
+#     set_motor(pwr-c, pwr-c, pwr+c, pwr+c)     # RAW DUTY + heading hold
+#
+# WHY IT EXISTS HERE. /cmd_vel is a velocity SETPOINT the board closes a PID
+# around, and that path has an acceleration ramp: a 70 mm dock burst measured
+# 37 mm in 1.88 s (~20 mm/s against a 180 mm/s setpoint) on 2026-08-14,
+# because it spent its whole life accelerating and never reached speed. Raw
+# duty has no ramp and no PID, so it is the ONLY path on this chassis that
+# can genuinely crawl. `burst_cap_s` says as much in its own comment.
+#
+# DUTY POLARITY IS NOT ASSUMED ANYWHERE ELSE IN THIS FILE. The bridge passes
+# /cmd_duty through UNCHANGED ("the caller owns polarity"), so the forward
+# sign lives in exactly one constant below and every wire value is built from
+# it. Golden used POSITIVE for forward (B6_FORWARD_POWER = 26  # PHASE5:
+# flipped, and `pwr = -_DRV if rev else _DRV`), so that is the default -- but
+# a note from the REMOVED ESP32 board claims positive drove BACKWARD, and
+# nobody has measured it on the v3 board. It is UNVERIFIED. Check it with the
+# wheels off the ground before the first real run; see the startup log.
+DUTY_CRAWL = CFG.get("FPMS_MISSION_DUTY_CRAWL", "1") not in ("0", "false", "no")
+DUTY_FORWARD_SIGN = _cfg_sign("FPMS_MISSION_DUTY_FORWARD_SIGN", 1)
+DUTY_FORWARD_SIGN_MEASURED = False   # flip ONLY after wheels-up confirms it
+# Does SUBTRACTING the correction from the LEFT pair steer the way golden
+# assumed, given THIS board's gyro sign as /imu reports it? Golden read the
+# board directly; this file integrates /imu. Same physical quantity, but the
+# convention has never been checked end to end, and a heading hold with an
+# inverted sign is POSITIVE FEEDBACK. Hence its own constant AND the runaway
+# abort below, which turns a wrong guess into one aborted segment.
+DUTY_TURN_SIGN = _cfg_sign("FPMS_MISSION_DUTY_TURN_SIGN", 1)
+DUTY_TURN_SIGN_MEASURED = False
+# The bridge REFUSES the whole message and zeroes the wire if any element
+# exceeds its own FPMS_BRIDGE_MAX_DUTY (40). power + correction must stay
+# inside it, so the clamp is applied per element in `publish_duty`.
+DUTY_MAX = _cfg_float("FPMS_MISSION_DUTY_MAX", 40.0, 8.0, 40.0)
+# Golden FINE_FORWARD_POWER = 18 for the fine approach, FORWARD_POWER = 24
+# for travel. The dock crawls at the fine power; the one-motion return uses
+# the travel power because it is metres long and 18 may not clear stiction
+# over that distance.
+CRAWL_POWER = _cfg_float("FPMS_MISSION_CRAWL_POWER", 18.0, 8.0, 40.0)
+CRAWL_RETURN_POWER = _cfg_float("FPMS_MISSION_CRAWL_RETURN_POWER", 24.0, 8.0, 40.0)
+CRAWL_HZ = _cfg_float("FPMS_MISSION_CRAWL_HZ", 20.0, 5.0, 50.0)   # golden _HZ
+CRAWL_DT = 1.0 / CRAWL_HZ
+CRAWL_KPH = _cfg_float("FPMS_MISSION_CRAWL_KPH", 10.0, 0.0, 60.0)  # golden _KPH
+CRAWL_CORR_MAX = _cfg_float("FPMS_MISSION_CRAWL_CORR_MAX", 6.0, 0.0, 20.0)
+# THE POSITIVE-FEEDBACK CATCH. A heading hold with the wrong sign does not
+# fail loudly, it curves -- and every number in the log stays plausible while
+# it does. Past this much drift the segment stops and names the constant,
+# exactly as `_turn` does with TURN_WRONG_WAY_DEG.
+CRAWL_RUNAWAY_DEG = _cfg_float("FPMS_MISSION_CRAWL_RUNAWAY_DEG", 15.0, 3.0, 90.0)
+# GOLDEN'S OWN SCALE: pi * 70 mm wheel / 1320 ticks-per-rev = 0.16657 mm/tick
+# = 6.00 ticks/mm, which independently matches the 6.12 ticks/mm measured on
+# this board. Config-overridable because the 14.8 ticks/mm tape measurement
+# has never been reconciled -- but the default is the one that drove M1/M2.
+TICK_MM = _cfg_float("FPMS_MISSION_TICK_MM", math.pi * 70.0 / 1320.0, 0.02, 2.0)
+# /wheel_ticks publishes at 2.0 Hz (measured). That is the resolution of the
+# whole distance loop: the crawl cannot know it has arrived until the next
+# frame lands, so it can overshoot by up to one frame of travel. At the crawl
+# speeds this is for that is millimetres, and it is why the loop stops at
+# CRAWL_COAST_FACTOR of the target rather than at the target.
+TICKS_STALE_S = _cfg_float("FPMS_MISSION_TICKS_STALE_S", 2.0, 0.8, 6.0)
+CRAWL_COAST_FACTOR = _cfg_float("FPMS_MISSION_CRAWL_COAST", 0.93, 0.50, 1.0)
+# TIME BOUNDS FOR THE CRAWL, so the existing guards keep working instead of
+# firing on a slow motion they were never sized for. Both are SLOW speeds,
+# and that is not a mistake: burst_cap_s and segment_timeout_s both divide
+# distance BY a speed, so a bigger number makes a TIGHTER bound. Sizing the
+# cap off a fast speed capped a 150 mm crawl at 2.9 s -- tighter than the
+# velocity path it replaces, and it would have aborted every dock.
+#
+# CAP is the slowest the crawl is expected to move, so the cap is an upper
+# bound on how long a healthy crawl can take. MIN is slower still, so the
+# timeout always sits just outside the cap and the cap is what fires first.
+#
+# BOTH ARE UNMEASURED -- raw duty 18 has never been timed on this chassis;
+# 0.02 m/s is the speed the ramp-limited velocity burst achieved on
+# 2026-08-14, used here as a plausible floor. The first real crawl measures
+# them: the segment log prints mm and seconds.
+#
+# AND THE CRAWL HAS A GUARD THE VELOCITY PATH NEVER HAD. burst_cap_s exists
+# because "garbage odometry silently DISABLES the distance limit". The crawl
+# does not close on odometry at all -- it closes on /wheel_ticks, a second
+# independent sensor, and aborts outright if those go stale. So the crawl
+# cannot run blind in the way that incident described, and this cap is the
+# backstop rather than the only line of defence.
+CRAWL_CAP_MPS = _cfg_float("FPMS_MISSION_CRAWL_CAP_MPS", 0.020, 0.002, 1.00)
+CRAWL_MIN_MPS = _cfg_float("FPMS_MISSION_CRAWL_MIN_MPS", 0.012, 0.002, 0.20)
+CRAWL_NOMINAL_MPS = _cfg_float("FPMS_MISSION_CRAWL_NOMINAL_MPS", 0.05, 0.005, 0.50)
+CRAWL_START_ALLOWANCE_S = _cfg_float("FPMS_MISSION_CRAWL_START_S", 1.5, 0.0, 5.0)
+CRAWL_STALL_CHECK_S = _cfg_float("FPMS_MISSION_CRAWL_STALL_S", 3.0, 1.0, 10.0)
+# ------------------------------------------------- THE LIDAR TERMINATOR
+# Golden stopped the fine approach on `marker.dist <= _stop_at`, not on the
+# encoders. This rover has no marker system, so the terminator is the FRONT
+# CLEARANCE from the same `front_clearance_mm` the obstacle guard uses -- one
+# function, so the guard and the terminator can never disagree about what
+# "in front" means.
+#
+# THIS IS SCANNER-TO-TARGET, NOT BUMPER-TO-TARGET. The LiDAR sits BEHIND the
+# nose (config.env says so about FRONT_STOP_MM, and the operator's own prior
+# working code stopped at 310-410 mm raw for the same reason). Subtract the
+# scanner-to-bumper offset yourself when choosing this number.
+#
+# IT MUST SIT ABOVE FRONT_STOP_MM. Below it, `check_abort` would raise
+# ABORT_OBSTACLE on the same reading that was supposed to mean "arrived", and
+# every dock would end as an aborted mission instead of a dock. Floored, and
+# the floor is announced, rather than left as a trap.
+# THE HARD FLOOR THAT NEVER GOES AWAY. While the dock owns the front cone (see
+# `MissionRunner.front_limit_mm`) the ABORT does not disappear -- it drops to
+# this. Above it the LiDAR terminator is what stops the rover, at it the guard
+# is what stops the rover, and there is no window in which nothing does. It is
+# scanner-to-obstacle like every other number here, so it is deliberately well
+# outside the nose: the operator's own prior working code stopped at 310-410 mm
+# raw, so 200 mm is already closer than this rover has ever knowingly parked.
+DOCK_MIN_CLEAR_MM = _cfg_float("FPMS_MISSION_DOCK_MIN_CLEAR_MM", 200.0, 80.0, 400.0)
+# STAND-OFF LOWERED 450 -> 350 ON 2026-08-13, and the floor under it changed.
+#
+# It used to be floored at FRONT_STOP_MM + 20 because `check_abort` would
+# otherwise raise ABORT_OBSTACLE on the very reading that meant "arrived". That
+# floor is gone because the CAUSE is gone: a dock segment now owns the front
+# cone down to DOCK_MIN_CLEAR_MM, so the terminator no longer has to hide above
+# a guard it was fighting. Held above the collision floor instead, which is the
+# constraint that is actually physical.
+#
+# 450 was never a dock, it was a stop 450 mm away: on the 2026-08-13 run the
+# target read 390 mm with 136 mm of encoder travel still owed, so a 450 mm
+# terminator would have parked the rover ~200 mm short of zone-b. 350 sits in
+# the middle of the 310-410 mm raw band the operator's own working code used.
+DOCK_LIDAR_STOP_MM = _floor_note(
+    "DOCK_LIDAR_STOP_MM",
+    _cfg_float("FPMS_MISSION_DOCK_LIDAR_STOP_MM", 350.0, 60.0, 2000.0),
+    DOCK_MIN_CLEAR_MM + 50.0, "mm", "dock-collision-floor")
+# The terminator is ARMED only once the encoders say this little is left, so
+# a wall noticed early in a long run cannot be mistaken for the target. With
+# no return inside the stand-off the encoders finish the segment as normal --
+# an open arena is not an error.
+DOCK_LIDAR_HANDOVER_MM = _cfg_float("FPMS_MISSION_DOCK_LIDAR_HANDOVER_MM",
+                                    250.0, 0.0, 1000.0)
+# ...OR ON THE LIDAR ITSELF, WHICHEVER COMES FIRST. Encoder-remaining was the
+# only arming condition until 2026-08-13 and it is the wrong one to rely on
+# alone: this rover's counts/mm is still unresolved (6.00 derived vs 14.8
+# tape-measured), so "250 mm of encoder left" can be anywhere. Once the front
+# range is inside this band the target is close enough to be the target, and
+# the band is also where a CRUISE segment on the final approach hands over to
+# the dock crawl -- see `_drive`.
+DOCK_LIDAR_ARM_MM = DOCK_LIDAR_STOP_MM + DOCK_LIDAR_HANDOVER_MM
+# ========= THE ONE PLACE THE SUPPRESSION AND THE STAND-OFF ARE DECIDED =========
+# The stand-off (350 mm) sits INSIDE the front-cone guard (400 mm) on purpose,
+# so the dock can only ever reach it if the guard really is lowered while the
+# dock is running. Those two facts are decided HERE, in one expression, because
+# separated they drift: the 2026-08-13 bug was exactly a terminator and a guard
+# tuned in different places until the guard fired first, and lowering the
+# stand-off to 350 without this would have moved that same bug 50 mm, not fixed
+# it.
+#
+#   * This is the ONLY value ever handed to `MissionRunner.arm_front_floor`,
+#     and the ONLY number `front_limit_mm` returns when the front cone has been
+#     lowered for any reason. There is no second knob.
+#   * It is FLOORED BELOW the terminator, so "the guard fires before the dock
+#     can arrive at its stand-off" is not expressible in this configuration.
+#   * It is never ABOVE FRONT_STOP_MM, so arming the dock can only ever loosen
+#     the forward guard toward the target, never silently tighten it.
+DOCK_FRONT_LIMIT_MM = min(FRONT_STOP_MM, DOCK_MIN_CLEAR_MM)
+if DOCK_FRONT_LIMIT_MM >= DOCK_LIDAR_STOP_MM - 20.0:
+    _dfl = max(60.0, DOCK_LIDAR_STOP_MM - 100.0)
+    CFG_NOTES.append(
+        "the dock's front-cone floor %.0fmm would fire before the dock could "
+        "reach its %.0fmm stand-off; lowered to %.0fmm so the LiDAR "
+        "terminator, not an abort, is what ends the dock"
+        % (DOCK_FRONT_LIMIT_MM, DOCK_LIDAR_STOP_MM, _dfl))
+    DOCK_FRONT_LIMIT_MM = _dfl
+# ------------------------------------------- GOLDEN'S TARGET EXCLUSION
+# `_p5.planning_obstacles` in fpms_phase6_M1_M2_WORKING.py:
+#     P5_ROBOT_FOOTPRINT_MM = 140   # self-filter, these returns are the chassis
+#     P5_TARGET_EXCLUDE_MM  = 220   # don't let inflation block the target itself
+# Neither existed here, and the absence is visible in both 2026-08-13 aborts:
+# the planner said "theta found no clear route to the target ... at any padding"
+# (the target's own surface, folded into the grid, had blocked the goal) and
+# then "the occupancy grid is empty ... the cone guard saw something the grid
+# has not confirmed" (the same surface, seen by the cone). A thing you are
+# driving AT is not a thing in your way.
+TARGET_EXCLUDE_MM = _cfg_float("FPMS_MISSION_TARGET_EXCLUDE_MM", 220.0, 0.0, 800.0)
+SELF_FILTER_MM = _cfg_float("FPMS_MISSION_SELF_FILTER_MM", 140.0, 0.0, 400.0)
+# ------------------------------------------------ THE ONE-MOTION RETURN
+# "reverses, so encoders go back, slowly, one motion" -- the retrace merges
+# ADJACENT drives into a single reverse instead of replaying every outbound
+# burst as its own segment. The correctness argument is already written in
+# `invert_segments`: two drives with no turn between them share a heading and
+# genuinely sum. Capped so a merged run can never become an unbounded blind
+# motion.
+RETRACE_ONE_MOTION = CFG.get("FPMS_MISSION_RETRACE_ONE_MOTION", "1") not in ("0", "false", "no")
+RETRACE_MAX_MOTION_MM = _cfg_float("FPMS_MISSION_RETRACE_MAX_MOTION_MM",
+                                   2000.0, 100.0, 6000.0)
+ABORT_TICKS = "wheel ticks stale: the crawl closes distance on /wheel_ticks and lost them"
+ABORT_CRAWL_HEADING = "crawl heading runaway (FPMS_MISSION_DUTY_TURN_SIGN may be inverted)"
+
+
+def ticks_distance_mm(t0, t1):
+    """Distance from two /wheel_ticks frames, by golden `_fwd`'s own formula.
+
+    The MEAN of the four per-wheel ABSOLUTE deltas, times TICK_MM. Absolute
+    PER WHEEL is the load-bearing part: this chassis has its left encoders
+    inverted relative to its right, so a signed mean would subtract one pair
+    from the other and read ~0 mm on a rover that is genuinely moving. It also
+    means this returns a MAGNITUDE and cannot tell forward from backward --
+    which is exactly what golden did, and is safe here because the caller
+    commands one direction for the whole segment and owns the sign.
+    """
+    return sum(abs(t1[i] - t0[i]) for i in range(4)) / 4.0 * TICK_MM
+
 
 TELEM_HZ = 2.0
 # POSE FRAME. teleop anchors from /odom_raw; if missions integrates the
@@ -1180,9 +1420,13 @@ class Segment:
     measured: float = 0.0
     dock: bool = False        # bounded dock burst rather than a cruise leg
     retrace: bool = False     # part of the replayed return
+    crawl: bool = False       # runs on RAW DUTY (/cmd_duty), not /cmd_vel
     reason: str = ""
     elapsed_s: float = 0.0
     lateral_mm: float = 0.0   # drift across the leg, reported not corrected
+    approach: bool = False    # aimed at the leg's REAL target, not a via point
+    handover: bool = False    # ended early: the LiDAR says the dock takes over
+    docked: bool = False      # ended AT the stand-off -- an arrival, not a stop
 
     @property
     def executed(self):
@@ -1237,7 +1481,15 @@ def split_legs(dist_mm, dock=True):
         out.append((leg, False))
         cruise -= leg
 
-    if dock_total > 1e-6:
+    if dock_total > 1e-6 and DUTY_CRAWL:
+        # ONE SEGMENT, NOT A CHAIN OF BURSTS. The chopping below exists for a
+        # reason this file states plainly -- "that, NOT a lower speed, is the
+        # only way this firmware can dock slowly" -- and that reason is a
+        # property of the /cmd_vel path, not of the chassis. On raw duty a
+        # lower speed DOES exist, so the dock is one slow crawl and the
+        # stop-settle-stop staircase is no longer buying anything.
+        out.append((dock_total, True))
+    elif dock_total > 1e-6:
         # Two bounds, and the SMALLER wins: at most DOCK_STEP_MM per burst so the
         # approach is slow, but never so many bursts that each one drops under
         # MIN_MOVE_MM and stops moving. 150 mm of approach in 70 mm steps is 3
@@ -1267,7 +1519,8 @@ def plan_route(x_mm, y_mm, heading_deg, tx_mm, ty_mm, dock=True):
         if abs(turn) >= BEARING_TOL_DEG:
             segs.append(Segment("turn", turn))
         for mm, is_dock in split_legs(dist, dock=dock):
-            segs.append(Segment("drive", mm, dock=is_dock))
+            segs.append(Segment("drive", mm, dock=is_dock,
+                                crawl=bool(is_dock and DUTY_CRAWL)))
     return segs
 
 
@@ -1376,7 +1629,18 @@ def _retrace_walk(segs):
     def flush():
         nonlocal carry_kind, carry
         if carry_kind is not None and abs(carry) > 1e-9:
-            residual[key[carry_kind]] += carry
+            # A MERGED DRIVE IS EMITTED, NOT DISCARDED. Under
+            # RETRACE_ONE_MOTION the drives are deliberately carried until a
+            # turn intervenes, so the carry arriving here is the whole run
+            # home -- handing it to the residual would silently refuse to
+            # drive back. Anything still under the minimum move becomes
+            # residual exactly as it always did.
+            if (carry_kind == "drive" and RETRACE_ONE_MOTION
+                    and min_pulse_ok("drive", carry)):
+                out.append(Segment("drive", carry, retrace=True,
+                                   crawl=DUTY_CRAWL))
+            else:
+                residual[key[carry_kind]] += carry
         carry_kind, carry = None, 0.0
 
     for s in reversed(segs):
@@ -1389,6 +1653,16 @@ def _retrace_walk(segs):
             flush()
         carry_kind = s.kind
         carry -= s.measured
+        if s.kind == "drive" and RETRACE_ONE_MOTION:
+            # ONE MOTION, not one per outbound burst. Keep summing while the
+            # kind does not change; `flush` emits it when a turn intervenes
+            # or the walk ends. The cap is the only thing that can split it,
+            # so a merged run can never become unbounded blind travel.
+            if abs(carry) >= RETRACE_MAX_MOTION_MM:
+                out.append(Segment("drive", carry, retrace=True,
+                                   crawl=DUTY_CRAWL))
+                carry_kind, carry = None, 0.0
+            continue
         if min_pulse_ok(s.kind, carry):
             out.append(Segment(s.kind, carry, dock=s.dock, retrace=True))
             carry_kind, carry = None, 0.0
@@ -1442,6 +1716,9 @@ def apply_segments(pose, segs, measured=True):
 # the wheels barely turning. Configurable so a firmware swap can move it back.
 FULL_DUTY_MPS = _cfg_float("FPMS_MISSION_FULL_DUTY_MPS", 0.65, 0.05, 1.50)
 BURST_CAP_SLACK = 1.6
+# Fixed time a burst spends accelerating before it is at speed, measured on
+# this chassis. Applies to every segment; it dominates the SHORT ones.
+RAMP_ALLOWANCE_S = _cfg_float("FPMS_MISSION_RAMP_ALLOWANCE_S", 1.5, 0.0, 4.0)
 
 
 def burst_cap_s(seg):
@@ -1464,9 +1741,29 @@ def burst_cap_s(seg):
     # that constant must OVER-estimate chassis speed for the bound to mean
     # anything, and 0.10 had quietly granted a 425mm segment 6.8s of blind
     # running. The fixed ramp+settle term buys the headroom without the bound.
+    # MEASURED RAMP, 2026-08-14. A 70 mm dock burst achieved 37 mm in 1.88 s
+    # (~20 mm/s) against a 180 mm/s setpoint: on a burst this short the velocity
+    # path spends its whole life accelerating and never reaches speed, so a cap
+    # derived from cruise speed fires before the distance can land. It aborted
+    # m2 in the DOCKING phase at 993 of 1088 mm. The additive term therefore has
+    # to cover a full ramp, not just the pulse floor and the settle.
+    #
+    # This is a mitigation, not the fix. The golden program drove fine moves on
+    # RAW DUTY (FINE_FORWARD_POWER = 18), which has no ramp at all; /cmd_duty
+    # now exists on the bridge for exactly that. Once dock segments use it, this
+    # term should come back down.
+    # A RAW-DUTY CRAWL IS NOT A FULL-DUTY BURST, and the bound has to be sized
+    # for the motion actually commanded or the guard fires on healthy travel.
+    # FULL_DUTY_MPS is 0.18 here, so a 150 mm crawl would be capped at ~3.6 s
+    # -- less than it legitimately takes. Same guard, same shape, same
+    # sensor-independence: only the worst-case speed changes.
+    if getattr(seg, "crawl", False) and DUTY_CRAWL:
+        return max(MIN_PULSE_S + 0.2,
+                   (mm / 1000.0) / CRAWL_CAP_MPS * BURST_CAP_SLACK
+                   + STOP_SETTLE_S + CRAWL_START_ALLOWANCE_S)
     return max(MIN_PULSE_S + 0.2,
                (mm / 1000.0) / FULL_DUTY_MPS * BURST_CAP_SLACK
-               + MIN_PULSE_S + STOP_SETTLE_S)
+               + MIN_PULSE_S + STOP_SETTLE_S + RAMP_ALLOWANCE_S)
 
 
 def segment_timeout_s(seg):
@@ -1480,6 +1777,13 @@ def segment_timeout_s(seg):
     ceiling; this remains as the slow-progress backstop it was written to be.
     """
     if seg.kind == "drive":
+        # The crawl backstop is derived from CRAWL_MIN_MPS, a LOWER bound on
+        # crawl speed, for the mirror of burst_cap_s's reason: a timeout
+        # derived from CRUISE_MPS is far too tight for a motion deliberately
+        # slower than cruise, and would end every long return as a fault.
+        if getattr(seg, "crawl", False) and DUTY_CRAWL:
+            return max(6.0, abs(seg.target) / 1000.0 / max(CRAWL_MIN_MPS, 1e-6)
+                       + STOP_SETTLE_S + 2.0)
         nominal = abs(seg.target) / 1000.0 / max(CRUISE_MPS, 1e-6)
         return max(3.0, nominal * 3.0 + STOP_SETTLE_S + 2.0)
     nominal = math.radians(abs(seg.target)) / max(TURN_RADPS, 1e-6)
@@ -1534,7 +1838,10 @@ def eta_seconds(segs):
     total = 0.0
     for s in segs:
         if s.kind == "drive":
-            total += abs(s.target) / 1000.0 / max(CRUISE_MPS, 1e-6) + STOP_SETTLE_S
+            mps = (CRAWL_NOMINAL_MPS
+                   if (getattr(s, "crawl", False) and DUTY_CRAWL)
+                   else CRUISE_MPS)
+            total += abs(s.target) / 1000.0 / max(mps, 1e-6) + STOP_SETTLE_S
         else:
             total += math.radians(abs(s.target)) / max(TURN_RADPS, 1e-6) + TURN_SETTLE_S
     return total
@@ -2008,6 +2315,23 @@ class OccupancyGrid:
         self._lock = threading.Lock()
         self.scans = 0
         self.last_scan_t = 0.0
+        # (x_mm, y_mm, r_mm) or None -- golden's P5_TARGET_EXCLUDE_MM. Returns
+        # inside this circle are the THING BEING DOCKED AGAINST and are never
+        # folded in, because a grid that marks the goal cell occupied makes the
+        # goal unreachable and the planner then refuses to route anywhere.
+        # A plain tuple, assigned whole, so no lock is needed to read it.
+        self.exclude = None
+
+    def set_exclusion(self, x_mm, y_mm, r_mm=None):
+        """Stop folding in whatever sits within r_mm of this arena point."""
+        r = TARGET_EXCLUDE_MM if r_mm is None else float(r_mm)
+        if r <= 0.0:
+            self.exclude = None
+            return
+        self.exclude = (float(x_mm), float(y_mm), r)
+
+    def clear_exclusion(self):
+        self.exclude = None
 
     # -- geometry ---------------------------------------------------------
     def cell_of(self, x_mm, y_mm):
@@ -2074,6 +2398,7 @@ class OccupancyGrid:
         sat = float(range_max_m) * 0.995
         now = time.monotonic() if now is None else now
         marked = 0
+        ex = self.exclude          # read ONCE: it is replaced, never mutated
         for i, r in enumerate(ranges_m):
             try:
                 rv = float(r)
@@ -2084,10 +2409,23 @@ class OccupancyGrid:
             mm = rv * 1000.0
             if mm > self.max_range_mm:
                 continue
+            # THE CHASSIS IS NOT AN OBSTACLE. Golden's P5_ROBOT_FOOTPRINT_MM:
+            # anything this close is the rover's own bodywork in the beam, and
+            # marking it puts a permanent blob under the robot that the planner
+            # then has to route around.
+            if mm < SELF_FILTER_MM:
+                continue
             # Mount sign applied HERE so the grid and the ROS scan agree.
             b = math.radians(ph + LIDAR_ROTATION_SIGN * (i * step)
                              + LIDAR_ZERO_OFFSET_DEG)
-            if self.mark(px + mm * math.cos(b), py + mm * math.sin(b), now):
+            hx = px + mm * math.cos(b)
+            hy = py + mm * math.sin(b)
+            # ...AND NEITHER IS THE TARGET. See `set_exclusion`. Returns outside
+            # the arena are already dropped by `mark` (`in_grid`), which is this
+            # file's version of golden's arena clip.
+            if ex is not None and math.hypot(hx - ex[0], hy - ex[1]) <= ex[2]:
+                continue
+            if self.mark(hx, hy, now):
                 marked += 1
         with self._lock:
             self.scans += 1
@@ -3563,6 +3901,11 @@ class MissionNode(Node):
                          history=HistoryPolicy.KEEP_LAST, depth=10)
 
         self.pub_cmd = self.create_publisher(Twist, "/cmd_vel", qos)
+        # THE RAW-DUTY WIRE, for the crawl and for nothing else. It goes
+        # through the SAME bridge gates as /cmd_vel -- arm, /estop, link-dead
+        # latch and the 0.7 s deadman -- so nothing here weakens consent; it
+        # only changes which of the board's two inputs the command arrives on.
+        self.pub_duty = self.create_publisher(Int32MultiArray, "/cmd_duty", qos)
 
         # Position from /odom when fpms-odom-tf is running (it fuses pose with a
         # bias-corrected gyro heading and stamps with the Pi's clock), falling
@@ -3576,6 +3919,12 @@ class MissionNode(Node):
         # turns keep their +/-1-4 deg accuracy whether or not odom-tf is up.
         self.create_subscription(Imu, "/imu", self._on_imu, qos)
         self.create_subscription(BatteryState, "/battery", self._on_battery, qos)
+        # RAW WHEEL COUNTS at 2.0 Hz (measured). The crawl closes distance on
+        # these, differenced exactly as golden `_fwd` differenced the board's
+        # encoders -- NOT on odometry, which is the sensor whose scale is
+        # still unreconciled.
+        self.create_subscription(Int32MultiArray, "/wheel_ticks",
+                                 self._on_ticks, qos)
         # Listening to our own output topic is how a second writer is detected.
         self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, qos)
 
@@ -3621,6 +3970,10 @@ class MissionNode(Node):
 
         self.battery_raw = None
         self.battery_last = 0.0
+
+        self._ticks = None            # last 4 raw counts from /wheel_ticks
+        self._ticks_last = 0.0
+        self._ticks_n = 0
 
         self.lidar = None
         self.lidar_last = 0.0
@@ -3860,6 +4213,35 @@ class MissionNode(Node):
         # proves nothing on its own — see `foreign_writer()` for the comparison
         # that does.
         self._rx_times.append(time.monotonic())
+
+    def _on_ticks(self, msg):
+        """Store the raw counts. NOTHING is interpreted here.
+
+        No scale, no sign, no direction: this callback only records what the
+        board said and when. `ticks_distance_mm` owns the interpretation, in
+        one place, so the known left-encoder inversion is handled once.
+        """
+        try:
+            d = [int(x) for x in msg.data]
+        except (TypeError, ValueError):
+            return
+        if len(d) != 4:
+            return
+        with self.lock:
+            self._ticks = d
+            self._ticks_last = time.monotonic()
+            self._ticks_n += 1
+
+    def ticks(self):
+        """(4 raw counts, age in seconds), or (None, inf) if none yet."""
+        with self.lock:
+            if self._ticks is None:
+                return None, float("inf")
+            return list(self._ticks), time.monotonic() - self._ticks_last
+
+    def ticks_fresh(self):
+        tk, age = self.ticks()
+        return tk is not None and age <= TICKS_STALE_S
 
     def on_lidar(self, payload):
         try:
@@ -4258,6 +4640,47 @@ class MissionNode(Node):
         except Exception as e:
             log(f"cmd_vel publish failed {e}")
 
+    def publish_duty(self, m1, m2, m3, m4):
+        """The ONLY place a non-zero RAW DUTY leaves this process.
+
+        The halt latch is honoured HERE, for the same reason `publish` honours
+        it here: a `stop` landing between a worker's abort check and its write
+        must not be able to put motion on the wire.
+
+        NO SIGN TRANSFORM IS APPLIED. Unlike `publish`, which converts an
+        arena-sense yaw rate through TURN_WIRE_SIGN, the caller has already
+        built these four numbers out of DUTY_FORWARD_SIGN and DUTY_TURN_SIGN.
+        The bridge passes them through unchanged, so this is the wire.
+
+        THE PER-ELEMENT CLAMP IS NOT COSMETIC. The bridge refuses the entire
+        message and ZEROES the wire if any element exceeds its MAX_DUTY, so a
+        power of 40 plus a correction of 6 would not merely be trimmed -- it
+        would stop the rover mid-crawl and log a refusal.
+        """
+        try:
+            if self.halt.is_set() or self.shutdown.is_set():
+                m1 = m2 = m3 = m4 = 0
+            d = [int(clamp(float(v), -DUTY_MAX, DUTY_MAX))
+                 for v in (m1, m2, m3, m4)]
+            msg = Int32MultiArray()
+            msg.data = d
+            self.pub_duty.publish(msg)
+            if any(v != 0 for v in d):
+                self.still_since = time.monotonic()
+        except Exception as e:
+            log(f"cmd_duty publish failed {e}")
+
+    def stop_duty(self, n=3):
+        """Zero the duty wire. Safe from any state, like `stop_wire`."""
+        for _ in range(max(1, n)):
+            try:
+                msg = Int32MultiArray()
+                msg.data = [0, 0, 0, 0]
+                self.pub_duty.publish(msg)
+            except Exception:
+                pass
+            time.sleep(0.02)
+
     def stop_wire(self, n=3):
         """Command a dead stop. A zero Twist is the one message that is always
         safe to send from any process in any state, so this never checks
@@ -4267,6 +4690,15 @@ class MissionNode(Node):
                 t = Twist()
                 self.pub_cmd.publish(t)
                 self._pub_times.append(time.monotonic())
+            except Exception:
+                pass
+            # BOTH WIRES. The board takes motion from /cmd_vel OR /cmd_duty,
+            # last writer wins, so a stop that zeroed only one of them would
+            # leave a crawl coasting until the bridge deadman caught it.
+            try:
+                z = Int32MultiArray()
+                z.data = [0, 0, 0, 0]
+                self.pub_duty.publish(z)
             except Exception:
                 pass
             time.sleep(0.02)
@@ -4553,6 +4985,17 @@ class DeadReckonBackend:
         return seg
 
     def _drive(self, seg):
+        # A CRAWL SEGMENT TAKES THE OTHER WIRE ENTIRELY. Nothing below this
+        # line changed: the velocity path is the one that drove every mission
+        # so far and stays byte-for-byte what it was.
+        if getattr(seg, "crawl", False) and DUTY_CRAWL:
+            if self.node.ticks_fresh():
+                return self._drive_crawl(seg)
+            # SAY IT OUT LOUD. Falling back silently would leave the operator
+            # watching the old ramp-limited burst and wondering why the crawl
+            # did nothing.
+            log("crawl requested but /wheel_ticks is stale -- falling back to "
+                "the /cmd_vel path for this segment")
         node, runner = self.node, self.runner
         t0 = time.monotonic()
         x0, y0 = node.odom_xy()
@@ -4577,6 +5020,11 @@ class DeadReckonBackend:
         timeout = segment_timeout_s(seg)
         cap = burst_cap_s(seg)
         speed = DOCK_MPS if seg.dock else CRUISE_MPS
+        # The velocity path is the CRUISE. Any forward segment reaching here is
+        # not a dock (a dock only lands here if /wheel_ticks went stale and the
+        # crawl fell back), so the front cone goes back to full strength.
+        if not reverse and not seg.dock:
+            runner.arm_front_floor(None)
         reason = "done"
         along = lateral = 0.0
 
@@ -4591,6 +5039,21 @@ class DeadReckonBackend:
         detour_reason = None
         try:
             while True:
+                # HAND OVER TO THE DOCK ON THE LIDAR, NOT ONLY ON THE ENCODERS.
+                # This is the last cruise of a final approach; once the front
+                # range is inside the handover band the rest of the distance
+                # belongs to the slow, LiDAR-terminated dock crawl, whatever the
+                # encoders believe. Ending here is a NORMAL completion: the
+                # segment measures itself as usual and `_drive_to` plans the
+                # dock next. It also keeps the cruise clear of FRONT_STOP_MM,
+                # which is what aborted the 2026-08-13 runs mid-cruise.
+                if not reverse and seg.approach and not seg.dock:
+                    front = node.clearance_mm(reverse=False)
+                    if front is not None and front <= DOCK_LIDAR_ARM_MM:
+                        seg.handover = True
+                        reason = (f"handover to the dock at {front:.0f}mm "
+                                  f"front (band {DOCK_LIDAR_ARM_MM:.0f}mm)")
+                        break
                 try:
                     runner.check_abort(reverse=reverse)
                 except ObstacleDetour as det:
@@ -4680,6 +5143,198 @@ class DeadReckonBackend:
                                f"{seg.elapsed_s:.2f}s)")
         # LAST: a timeout or a stall is a fault and wins over a detour. The
         # segment is fully measured by now either way.
+        if detour_reason:
+            raise ObstacleDetour(detour_reason)
+        return seg
+
+    def _drive_crawl(self, seg):
+        """THE SLOW APPROACH: raw duty, closed on ticks, ended by the LiDAR.
+
+        Golden `_p5_navdrive._fwd`, on this stack's topics:
+
+          * RAW DUTY on /cmd_duty at CRAWL_HZ, so there is no PID and no
+            acceleration ramp to hide inside -- the one path on this chassis
+            that can actually go slowly;
+          * distance from /wheel_ticks differenced and scaled by TICK_MM,
+            never from odometry;
+          * heading held by the gyro exactly as golden held it:
+            c = clamp(drift * KPH, -6, +6) applied as [p-c, p-c, p+c, p+c];
+          * FORWARD ONLY: once the encoders say the target is close, the front
+            clearance takes over and stops the rover at the stand-off. That is
+            golden's `marker.dist <= _stop_at` with the front cone standing in
+            for the marker this rover does not have.
+
+        WHAT IS MEASURED IS WHAT WAS CLOSED ON. seg.measured comes from the
+        ticks, not from odometry, so the retrace inverts the same quantity the
+        outbound leg controlled on and the two cannot disagree about scale.
+        The odometry number is logged beside it -- that comparison, run once,
+        is what finally settles 6.00 vs 14.8 ticks/mm.
+
+        EVERY GUARD IS STILL HERE. check_abort is polled at the top of every
+        tick with the same obstacle/link/battery/timeout/foreign-writer set,
+        the burst cap and segment timeout are the same functions (sized for a
+        crawl, see burst_cap_s), and the arm gate, /estop and deadman live on
+        the bridge and apply to /cmd_duty identically.
+        """
+        node, runner = self.node, self.runner
+        t0 = time.monotonic()
+        x0, y0 = node.odom_xy()
+        if x0 is None:
+            raise MissionAbort(ABORT_LINK)
+        fyaw0 = node.forward_yaw_odom()
+        if fyaw0 is None:
+            raise MissionAbort(ABORT_LINK)
+        epoch0 = node.odom_epoch()
+        gyaw0 = node.yaw()
+        ticks0, _age0 = node.ticks()
+        if ticks0 is None:
+            raise MissionAbort(ABORT_TICKS + " -- none received at all")
+        sign = 1.0 if seg.target >= 0 else -1.0
+        reverse = sign < 0
+        target_mm = abs(float(seg.target))
+        if target_mm < 1.0:
+            seg.measured = 0.0
+            seg.reason = "skipped: under 1mm"
+            return seg
+        # Stop a touch early: /wheel_ticks lands at 2 Hz, so the loop learns it
+        # has arrived up to half a second late. Golden used the same 0.93.
+        stop_at = target_mm * CRAWL_COAST_FACTOR
+        timeout = segment_timeout_s(seg)
+        cap = burst_cap_s(seg)
+        power = CRAWL_RETURN_POWER if seg.retrace else CRAWL_POWER
+        dirsign = -1.0 if reverse else 1.0
+        # THE ONE PLACE POLARITY IS DECIDED. wire_sign is the sign the duty
+        # actually carries on the wire; the heading correction is multiplied by
+        # it too, because "subtract from the left pair" steers the opposite way
+        # when the pair is being driven the opposite way. Golden did the same
+        # thing for reverse only (`c * (1 if not rev else -1)`) because its
+        # forward sign was fixed at +1; this generalises it so flipping
+        # DUTY_FORWARD_SIGN cannot silently invert the heading hold.
+        wire_sign = float(DUTY_FORWARD_SIGN) * dirsign
+        # THE DOCK OWNS THE FRONT CONE, AND ONLY THE DOCK. A forward dock
+        # segment is driving AT the target: the terminator below is what stops
+        # the rover, so the front-cone ABORT drops to DOCK_MIN_CLEAR_MM and
+        # stays there as the collision backstop. Any other forward crawl hands
+        # the guard straight back. A REVERSE crawl touches nothing -- it is
+        # guarded on the rear cone, and the floor stays latched behind it
+        # because the rover is still backing away from what it docked against.
+        if not reverse:
+            runner.arm_front_floor(DOCK_FRONT_LIMIT_MM if seg.dock else None)
+        reason = "done"
+        detour_reason = None
+        dm = 0.0
+        lidar_note = ""
+        node.state.driving = True
+        node.state.reversing = reverse
+        try:
+            while True:
+                # THE TERMINATOR RUNS FIRST, BEFORE check_abort. It used to run
+                # at the bottom of the loop, so on the tick where the front
+                # range crossed the stand-off the guard had already turned the
+                # DOCKING TARGET into ABORT_OBSTACLE and the dock never got a
+                # vote. That is the 2026-08-13 failure, twice.
+                #
+                # ARMED BY WHICHEVER COMES FIRST: the encoders saying the target
+                # is close, or the front range itself entering the handover
+                # band. Encoder-only arming is the wrong thing to trust alone on
+                # a rover whose counts/mm is unresolved.
+                if not reverse and seg.dock:
+                    front = node.clearance_mm(reverse=False)
+                    armed = ((target_mm - dm) <= DOCK_LIDAR_HANDOVER_MM
+                             or (front is not None
+                                 and front <= DOCK_LIDAR_ARM_MM))
+                    if armed and front is not None and front <= DOCK_LIDAR_STOP_MM:
+                        lidar_note = (f"lidar stop at {front:.0f}mm "
+                                      f"scanner-to-target (stand-off "
+                                      f"{DOCK_LIDAR_STOP_MM:.0f}mm)")
+                        seg.docked = True
+                        reason = "arrived (lidar)"
+                        break
+                try:
+                    runner.check_abort(reverse=reverse)
+                except ObstacleDetour as det:
+                    # Measured before anyone reroutes -- see `_drive`.
+                    detour_reason = det.reason
+                    reason = det.reason
+                    break
+                now = time.monotonic()
+                tk, age = node.ticks()
+                if tk is None or age > TICKS_STALE_S:
+                    # The distance sensor for this loop is GONE. Not a
+                    # tolerance: without ticks the crawl has no idea how far
+                    # it has come and only the clock would ever stop it.
+                    reason = (f"{ABORT_TICKS} ({age:.1f}s old, limit "
+                              f"{TICKS_STALE_S:.1f}s)")
+                    break
+                dm = ticks_distance_mm(ticks0, tk)
+                # (the LiDAR terminator now runs at the TOP of this loop, ahead
+                # of check_abort -- see the comment there)
+                if dm >= stop_at:
+                    reason = "done"
+                    break
+                if cap is not None and now - t0 > cap:
+                    reason = ABORT_BURST_CAP
+                    break
+                if node.odom_epoch() != epoch0:
+                    reason = ABORT_ODOM_FRAME
+                    break
+                if now - t0 > timeout:
+                    reason = ABORT_SEG_TIMEOUT
+                    break
+                if now - t0 > CRAWL_STALL_CHECK_S and dm < STALL_MIN_MM:
+                    reason = ABORT_STALL
+                    break
+                hd = wrap_pi(node.yaw() - gyaw0)
+                if abs(hd) > math.radians(CRAWL_RUNAWAY_DEG):
+                    reason = (f"{ABORT_CRAWL_HEADING}: {math.degrees(hd):+.0f}"
+                              f"deg off the segment heading, past "
+                              f"{CRAWL_RUNAWAY_DEG:.0f}deg")
+                    break
+                # Golden verbatim: hd is the drift SINCE THE SEGMENT STARTED,
+                # c is duty counts, and the left pair gets -c while the right
+                # pair gets +c.
+                c = clamp(hd * CRAWL_KPH, -CRAWL_CORR_MAX, CRAWL_CORR_MAX)
+                c = c * float(DUTY_TURN_SIGN) * wire_sign
+                p = int(round(wire_sign * power))
+                ci = int(round(c))
+                node.publish_duty(p - ci, p - ci, p + ci, p + ci)
+                node.state.distance_remaining_mm = max(0.0, target_mm - dm)
+                time.sleep(CRAWL_DT)
+        finally:
+            # THE DUTY WIRE FIRST. `settle` below writes zero Twists, and on a
+            # last-writer-wins bridge that is also a stop -- but the duty must
+            # be zeroed by the path that raised it, not by a side effect.
+            node.stop_duty(3)
+            node.state.driving = False
+            node.state.reversing = False
+
+        runner.settle(STOP_SETTLE_S,
+                      ignore_obstacle=(detour_reason is not None
+                                       or runner.detour_armed()))
+        tk, age = node.ticks()
+        if tk is not None and age <= TICKS_STALE_S:
+            dm = ticks_distance_mm(ticks0, tk)
+        try:
+            along, lateral = self._displacement(x0, y0, fyaw0)
+        except MissionAbort:
+            along, lateral = sign * dm, 0.0
+        seg.measured = sign * dm
+        seg.lateral_mm = lateral
+        seg.elapsed_s = time.monotonic() - t0
+        seg.reason = reason
+        log(f"crawl {'BWD' if reverse else 'FWD'} asked "
+            f"{seg.target:+.0f}mm at duty {int(round(wire_sign * power)):+d} "
+            f"-> ticks {seg.measured:+.0f}mm, odom {along:+.0f}mm, "
+            f"drift {math.degrees(wrap_pi(node.yaw() - gyaw0)):+.1f}deg, "
+            f"{seg.elapsed_s:.2f}s ({reason})"
+            + (f" [{lidar_note}]" if lidar_note else ""))
+        if (reason in (ABORT_SEG_TIMEOUT, ABORT_STALL, ABORT_BURST_CAP,
+                       ABORT_ODOM_FRAME)
+                or reason.startswith(ABORT_TICKS)
+                or reason.startswith(ABORT_CRAWL_HEADING)):
+            raise MissionAbort(f"{reason} (crawl asked {seg.target:+.0f}mm, "
+                               f"measured {seg.measured:+.0f}mm in "
+                               f"{seg.elapsed_s:.2f}s)")
         if detour_reason:
             raise ObstacleDetour(detour_reason)
         return seg
@@ -4848,6 +5503,18 @@ class MissionRunner:
         self._detour_armed = False      # obstacle -> ObstacleDetour, not abort
         self._obstacle_muted = False    # ...and this suppresses it entirely,
                                         # only inside a settle at zero speed
+        # THE DOCK OWNS THE FRONT CONE. None means FRONT_STOP_MM: the guard
+        # exactly as it has always been. A number means "a dock is in charge
+        # down to here". Set when a dock segment starts and LATCHED afterwards,
+        # because a rover parked at its stand-off is legitimately closer to the
+        # target than FRONT_STOP_MM, and every `settle` on the way home would
+        # otherwise abort the return on the thing it just docked against. It is
+        # cleared by the next forward NON-dock drive and by every new mission.
+        self._front_floor_mm = None
+        # Straight-line range to the CURRENT leg's own target, mm, while a leg
+        # is being driven -- golden's P5_TARGET_EXCLUDE_MM applied to the cone
+        # guard rather than to the grid.
+        self._target_range_mm = None
         self.lock = threading.Lock()
         self.backends = {"deadreckon": DeadReckonBackend(node, self),
                          "nav2": Nav2Backend(node, self)}
@@ -5558,6 +6225,41 @@ class MissionRunner:
         # An abort with nothing running still leaves the rover commanded-stopped
         # and the latch clears on the next accepted mission.
 
+    def arm_front_floor(self, mm):
+        """Hand the front cone to the dock (a number), or take it back (None)."""
+        self._front_floor_mm = None if mm is None else float(mm)
+
+    def front_limit_mm(self, clear):
+        """The FORWARD stop distance in force right now, in mm.
+
+        FRONT_STOP_MM normally, and that is still the answer for the rear cone
+        on a reverse and for ROTATE_CLEAR_MM while turning -- neither is touched
+        by anything here. Two documented reductions, both to the single
+        DOCK_FRONT_LIMIT_MM -- which is derived in the same expression as the
+        stand-off it has to sit under -- and never to nothing:
+
+          * A DOCK SEGMENT IS RUNNING (`_front_floor_mm`). The segment is
+            driving AT the target, so the LiDAR terminator at
+            DOCK_LIDAR_STOP_MM is what ends it; this guard stays underneath as
+            the collision backstop. Without this the terminator could never
+            fire, because `check_abort` saw the same reading first and turned
+            "arrived" into ABORT_OBSTACLE -- twice, on 2026-08-13.
+
+          * THE NEAREST THING AHEAD IS AT OR BEYOND THE TARGET
+            (`_target_range_mm`, golden's P5_TARGET_EXCLUDE_MM). You cannot be
+            blocked by the thing you are driving at. Note this is the NEAREST
+            return: a genuine obstacle in front of the target is nearer than
+            the target, fails this test, and gets the full FRONT_STOP_MM guard
+            and the reroute exactly as before.
+        """
+        if self._front_floor_mm is not None:
+            return self._front_floor_mm
+        tr = self._target_range_mm
+        if (tr is not None and clear is not None
+                and clear >= tr - TARGET_EXCLUDE_MM):
+            return DOCK_FRONT_LIMIT_MM
+        return FRONT_STOP_MM
+
     def check_abort(self, reverse=False, turning=False, nav2_active=False):
         """Polled at every control tick and inside every settle."""
         if self.abort_reason:
@@ -5573,7 +6275,11 @@ class MissionRunner:
             raise MissionAbort(f"{ABORT_BATT}: {v:.1f}V")
         if not nav2_active:
             clear = self.node.clearance_mm(reverse=reverse, any_bearing=turning)
-            limit = ROTATE_CLEAR_MM if turning else FRONT_STOP_MM
+            # THE REAR CONE AND THE ROTATE CONE ARE UNCHANGED. Only the FORWARD
+            # limit can move, and only for the two reasons in `front_limit_mm`.
+            limit = (ROTATE_CLEAR_MM if turning
+                     else (FRONT_STOP_MM if reverse
+                           else self.front_limit_mm(clear)))
             if clear is not None and clear < limit and not self._obstacle_muted:
                 where = "any bearing" if turning else ("rear" if reverse else "front")
                 why = (f"{ABORT_OBSTACLE}: {clear:.0f}mm {where} "
@@ -5635,6 +6341,11 @@ class MissionRunner:
         an assumption buried in the geometry.
         """
         st = self.state
+        # EVERY MISSION STARTS WITH THE GUARD AT FULL STRENGTH. The dock floor is
+        # latched across the hold and the whole return on purpose; it must not
+        # outlive the mission that docked.
+        self._front_floor_mm = None
+        self._target_range_mm = None
         backend = self.backends[backend_name]
         executed = []
         outcome = "completed"
@@ -5833,6 +6544,12 @@ class MissionRunner:
         st.leg_i = leg_i
         st.leg_segment_i = 0
         st.leg_budget = int(budget)
+        # The target-exclusion range belongs to ONE leg. Cleared here so the
+        # retrace, the reface and the home trim -- none of which is driving at a
+        # target -- get the full-strength front cone back. The DOCK floor is NOT
+        # cleared here: the rover is still parked at the thing it docked against
+        # while the return is being set up.
+        self._target_range_mm = None
 
     def _run_one(self, backend, seg):
         st = self.state
@@ -5977,8 +6694,17 @@ class MissionRunner:
         # rover could not retrace a metre it had genuinely driven. Appending
         # into the caller's list makes the history survive the exception.
         executed = [] if out is None else out
+        # GOLDEN'S TARGET EXCLUSION, ON THE GRID. The thing the rover docks
+        # against stands AT the target, so folding its returns in marks the goal
+        # cell occupied and the planner answers "no clear route to the target,
+        # at any padding on the relaxation ladder" -- which is what the first of
+        # the two 2026-08-13 aborts actually said. This leg's own target only.
+        occ = getattr(self.node, "occ", None)
+        if occ is not None:
+            occ.set_exclusion(tx, ty, TARGET_EXCLUDE_MM)
         via = []          # A* waypoints still to be passed through, in order
         replans = 0
+        dock_now = False  # the LiDAR has handed over; the rest is one crawl
         while True:
             cur = None
             try:
@@ -6003,6 +6729,9 @@ class MissionRunner:
                 # jumped every time a waypoint was retired would read as the
                 # rover losing ground.
                 st.distance_remaining_mm = math.hypot(tx - pose[0], ty - pose[1])
+                # What the cone guard measures "is that return the target?"
+                # against -- see `MissionRunner.front_limit_mm`.
+                self._target_range_mm = st.distance_remaining_mm
                 if dist <= (ARRIVE_TOL_MM if final else VIA_TOL_MM):
                     if final:
                         return executed
@@ -6045,12 +6774,39 @@ class MissionRunner:
                     st.distance_remaining_mm = dist
                     return executed
                 mm, dock = legs[0]
+                if dock_now and final:
+                    # THE LIDAR HANDED OVER ON THE LAST SEGMENT. Everything left
+                    # of this approach is ONE slow crawl, whatever the encoders
+                    # think the distance is, and the terminator ends it at the
+                    # stand-off. Re-planning a cruise here is exactly what would
+                    # put the "jerks and short movements" back.
+                    mm, dock = min(dist, MAX_LEG_MM), True
                 st.phase = "docking" if dock else st.phase
                 st.segments_n = max(st.segments_n, st.segment_i + len(legs))
                 st.eta_s = eta_seconds([Segment("drive", m, dock=d)
                                         for m, d in legs])
-                cur = Segment("drive", mm, dock=dock)
+                cur = Segment("drive", mm, dock=dock, approach=final,
+                              crawl=bool(dock and DUTY_CRAWL))
                 executed.append(self._run_one(backend, cur))
+                if cur.docked:
+                    # ARRIVING IS SUCCESS, NOT AN ABORT, AND IT ENDS THE LEG.
+                    # The dock stopped the rover at its stand-off, so there is
+                    # nothing left to converge on: returning normally is what
+                    # lets `_run` go on to the hold and then the one-motion
+                    # reverse retrace home. Looping instead would re-plan a
+                    # drive at a target the rover is already parked in front of,
+                    # and every one of those would stop dead on the same
+                    # reading until the leg budget ran out.
+                    st.distance_remaining_mm = 0.0
+                    log(f"DOCKED on the LiDAR at the stand-off "
+                        f"({DOCK_LIDAR_STOP_MM:.0f}mm scanner-to-target, "
+                        f"NOT bumper-to-target); the encoders still had "
+                        f"{max(0.0, dist - abs(cur.measured)):.0f}mm to run. "
+                        f"This is an ARRIVAL: the mission continues into the "
+                        f"hold and the return.")
+                    return executed
+                if cur.handover:
+                    dock_now = True
             except ObstacleDetour as det:
                 # The segment measured itself BEFORE raising (see
                 # DeadReckonBackend._drive / ._turn), so it is real history: it
@@ -6381,6 +7137,70 @@ def main():
         "30:1 gearbox assumed) vs 14.8 counts/mm (tape-measured over 800mm). "
         "Distances may read ~2.5x long. Settle it with a hand-push over a "
         "tape measure — it costs no battery.")
+    if DUTY_CRAWL:
+        log(f"RAW-DUTY CRAWL is ON: dock and return run on /cmd_duty at "
+            f"{CRAWL_HZ:.0f}Hz, power {CRAWL_POWER:.0f} (dock) / "
+            f"{CRAWL_RETURN_POWER:.0f} (return), distance from /wheel_ticks "
+            f"x {TICK_MM:.5f}mm/tick ({1.0 / TICK_MM:.2f} ticks/mm), heading "
+            f"held at KPH={CRAWL_KPH:.0f} clamped +/-{CRAWL_CORR_MAX:.0f} "
+            f"duty. This is golden _fwd on this stack's topics.")
+        _dfs = ("CONFIRMED by a wheels-up check" if DUTY_FORWARD_SIGN_MEASURED
+                else "UNVERIFIED ON THIS BOARD -- golden's value, NOT measured")
+        log(f"duty polarity DUTY_FORWARD_SIGN={DUTY_FORWARD_SIGN:+d} ({_dfs}). "
+            "TEN-SECOND CHECK, WHEELS OFF THE GROUND: arm, then publish "
+            "[18,18,18,18] on /cmd_duty for a second and watch the wheel "
+            "tops. All four rolling FORWARD means +1 is right; all four "
+            "rolling BACKWARD means set FPMS_MISSION_DUTY_FORWARD_SIGN=-1; "
+            "the two sides opposing each other means the wiring, not this "
+            "constant, and nothing should be driven until it is fixed.")
+        _dts = ("CONFIRMED" if DUTY_TURN_SIGN_MEASURED
+                else "UNVERIFIED -- a wrong value curves the crawl instead of "
+                     "holding it, so a segment aborts past "
+                     "%.0fdeg of drift rather than spiralling"
+                     % CRAWL_RUNAWAY_DEG)
+        log(f"duty steering polarity DUTY_TURN_SIGN={DUTY_TURN_SIGN:+d} "
+            f"({_dts}).")
+        log(f"lidar terminator: the dock stops when the FRONT clearance "
+            f"reaches {DOCK_LIDAR_STOP_MM:.0f}mm, armed by whichever comes "
+            f"FIRST -- the last {DOCK_LIDAR_HANDOVER_MM:.0f}mm of the encoder "
+            f"target, or the front range entering the "
+            f"{DOCK_LIDAR_ARM_MM:.0f}mm handover band. THIS IS "
+            f"SCANNER-TO-TARGET, NOT BUMPER-TO-TARGET: the LiDAR sits behind "
+            f"the nose. With nothing inside the stand-off the encoders finish "
+            f"the segment.")
+        log(f"dock owns the front cone: while a dock segment runs, and until "
+            f"the rover next drives forward on a non-dock segment, the "
+            f"front-cone abort drops from FRONT_STOP_MM ({FRONT_STOP_MM:.0f}mm) "
+            f"to DOCK_FRONT_LIMIT_MM ({DOCK_FRONT_LIMIT_MM:.0f}mm) -- lowered, "
+            f"never removed, and derived in the same expression as the "
+            f"stand-off so the two cannot drift apart. The terminator stops "
+            f"the rover at "
+            f"{DOCK_LIDAR_STOP_MM:.0f}mm; the guard is the collision backstop "
+            f"underneath it. Rear cone on reverse, rotate cone, estop, arm, "
+            f"deadman, tick-staleness and heading-runaway are all untouched.")
+        log(f"target exclusion (golden P5_TARGET_EXCLUDE_MM): returns within "
+            f"{TARGET_EXCLUDE_MM:.0f}mm of the leg's own target are not folded "
+            f"into the occupancy grid and cannot trip the front cone, so the "
+            f"thing being docked against can no longer make its own goal "
+            f"unreachable. Self-filter drops returns inside "
+            f"{SELF_FILTER_MM:.0f}mm of the robot centre (golden "
+            f"P5_ROBOT_FOOTPRINT_MM); returns outside the arena were already "
+            f"dropped by the grid bounds.")
+        log(f"crawl guards: burst cap from CRAWL_CAP_MPS={CRAWL_CAP_MPS:.3f} "
+            f"m/s, timeout from CRAWL_MIN_MPS={CRAWL_MIN_MPS:.3f} m/s, "
+            f"ticks stale at {TICKS_STALE_S:.1f}s (they arrive at 2Hz), "
+            f"heading runaway at {CRAWL_RUNAWAY_DEG:.0f}deg. BOTH SPEED "
+            "BOUNDS ARE UNMEASURED -- raw duty has never been timed on this "
+            "chassis; the first run is what measures them.")
+        log(f"return: RETRACE_ONE_MOTION="
+            f"{'on' if RETRACE_ONE_MOTION else 'OFF'} -- adjacent outbound "
+            f"drives are merged into ONE reverse crawl (capped at "
+            f"{RETRACE_MAX_MOTION_MM:.0f}mm), closed on encoder ticks, with "
+            "the same gyro heading hold. It stops on the encoders and the "
+            "arena fix plus home-trim is what recentres afterwards.")
+    else:
+        log("RAW-DUTY CRAWL is OFF (FPMS_MISSION_DUTY_CRAWL=0): docks run on "
+            "the /cmd_vel burst staircase, which cannot crawl.")
     try:
         rclpy.spin(node)
     except Exception as e:
