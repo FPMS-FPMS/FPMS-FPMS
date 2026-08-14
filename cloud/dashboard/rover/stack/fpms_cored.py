@@ -731,7 +731,11 @@ def _note_mission(payload):
     else:
         norm = str(phase).strip().lower()
     idle = {"", "none", "null", "idle", "done", "aborted", "abort", "error",
-            "ready", "cooldown", "complete", "completed", "stopped", "failed"}
+            "ready", "cooldown", "complete", "completed", "stopped", "failed",
+            # STATIONARY phases the executor really publishes
+            # (fpms_missions.py:4318). Without these a healthy executor
+            # reads as "driving" and gets SIGTERMed 3s after a stop.
+            "planning", "hold", "aborting"}
     LAST_MISSION["driving"] = norm not in idle
 
 

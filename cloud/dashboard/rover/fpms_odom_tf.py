@@ -384,7 +384,7 @@ M_PER_TICK = MM_PER_TICK / 1000.0
 #   2. the linear velocity republished on /odom, so downstream consumers never
 #      see the board's inverted number.
 # ============================================================================
-ODOM_TWIST_SIGN = -1
+ODOM_TWIST_SIGN = +1   # STM32 bridge emits correct signs (was -1 for the ESP32 board)
 
 # ============================================================================
 # FRAMES
@@ -586,7 +586,7 @@ SCAN_TOPIC = "/scan_lidar"   # published by fpms_lidar_ros.py; NOT the dead /sca
 # The arena, mirrored from frontend/src/lib/arena.ts via fpms_missions.py.
 # Mirrored as the same one number that file uses, so a rescale there stays a
 # one-number change here.
-ARENA_MM = 1200.0
+ARENA_MM = 1500.0   # larger extent of the 1500x1400 arena (fpms_missions.py)
 ARENA_M = ARENA_MM / 1000.0
 
 # A fix is only ever ACCEPTED while the rover is confirmed stationary. The scan
@@ -1594,7 +1594,8 @@ class FpmsOdomTf(Node):
             # Once a /cmd_vel has been seen, its absence means "unknown", which
             # is treated as moving. Before the first one ever arrives, nothing
             # is driving the robot, so stillness is a safe assumption.
-            commanded_still = (self._last_cmd_t is None)
+            commanded_still = (self._last_odom_t is not None
+                               and (now - self._last_odom_t) < ODOM_STALE_SEC)
         if commanded_still and self._wheels_still:
             if self._still_since is None:
                 self._still_since = now

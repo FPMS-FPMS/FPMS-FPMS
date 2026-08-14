@@ -1,0 +1,25 @@
+[Unit]
+# Replaces micro-ros-agent for Rover 2. The STM32 board is not a micro-ROS
+# client, so the XRCE agent could never establish a session with it; this node
+# speaks the board's native Rosmaster protocol instead and republishes the
+# identical topic contract the rest of the stack already consumes.
+Description=FPMS STM32 bridge (Yahboom Rosmaster -> /odom_raw /imu /battery /wheel_ticks)
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=-/etc/fpms/config.env
+Environment=ROS_DOMAIN_ID=20
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=FASTRTPS_DEFAULT_PROFILES_FILE=/etc/fpms/fastdds_udp_only.xml
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && exec python3 /home/ubuntu/fpms_stm32_bridge.py'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -203,38 +203,33 @@ td.v{text-align:right;color:#e8f7ff;font-weight:900}
       derives it (ARENA_MM, ZONE_FRAC, MARGIN_FRAC), so a rescale is one
       number here as well as there.
    ====================================================================== */
-const ARENA_MM = 1200.0, ZONE_FRAC = 0.30, MARGIN_FRAC = 0.04;
-const ZONE = ZONE_FRAC * ARENA_MM, MARGIN = MARGIN_FRAC * ARENA_MM;
+/* OPERATOR-MEASURED 2026-08-13: the arena is RECTANGULAR, not square.
+   These mirror fpms_missions.py ARENA_W_MM / ARENA_H_MM / ZONE_FRAC /
+   MARGIN_FRAC / ROVER_LEN_MM exactly, and the zone centres and start box
+   are DERIVED from them here just as they are there. */
+const ARENA_W_MM = 1500.0, ARENA_H_MM = 1400.0;
+const ARENA_MM = Math.max(ARENA_W_MM, ARENA_H_MM);   // square-sized things only
+const ZONE_FRAC = 0.10, MARGIN_FRAC = 0.04;
+const ZONE = ZONE_FRAC * ARENA_W_MM, MARGIN = MARGIN_FRAC * ARENA_W_MM;  // 150, 60
+const ROVER_LEN_MM = 235.0, START_BOX = ROVER_LEN_MM;   // the start box IS the rover
 const ZONES = [
-  {id:"zone-a", label:"M1 / ZONE A (top-LEFT)",  x:MARGIN,                 y:ARENA_MM-MARGIN-ZONE, c:"#ff4b70"},
-  {id:"zone-b", label:"M2 / ZONE B (top-RIGHT)", x:ARENA_MM-MARGIN-ZONE,   y:ARENA_MM-MARGIN-ZONE, c:"#ffbf00"},
-  {id:"water",  label:"WATER (bottom-LEFT)",     x:MARGIN,                 y:MARGIN,               c:"#00b7ff"},
+  {id:"zone-a", label:"M1 / ZONE A (top-LEFT)",  x:MARGIN,                   y:ARENA_H_MM-MARGIN-ZONE, c:"#ff4b70"},
+  {id:"zone-b", label:"M2 / ZONE B (top-RIGHT)", x:ARENA_W_MM-MARGIN-ZONE,   y:ARENA_H_MM-MARGIN-ZONE, c:"#ffbf00"},
+  {id:"water",  label:"WATER (bottom-LEFT)",     x:MARGIN,                   y:MARGIN,                 c:"#00b7ff"},
 ];
-const HOME = {x: ARENA_MM-MARGIN-ZONE/2, y: MARGIN+ZONE/2, hdg: 90};   // = 972,228
+const HOME = {x: ARENA_W_MM-MARGIN-START_BOX/2, y: MARGIN+START_BOX/2, hdg: 90};  // = 1322,178
+/* One square view window big enough for the LONGER extent, so the uniform
+   mm->pixel scale below still shows the whole rectangle with both margins. */
 const VIEW_MIN = -180, VIEW_MAX = ARENA_MM + 180;
 const ROBOT_W = 230, ROBOT_NOSE = 160, ROBOT_TAIL = -80;               // phase6 numbers
 const FRONT_STOP_MM = 400;                                             // config.env FPMS_MISSION_FRONT_STOP_MM
 const STALE_S = 3.0;                                                   // the whole staleness contract
 const KEEPOUT_R = 120;                                                 // phase6 right-click disk radius
 
-/* Which feeds must be FRESH for RUN to be permitted.
-   Deliberately TWO, and deliberately these two:
-
-     scan  /scan_lidar          ~10 Hz. If it is stale the rover is blind,
-                                and the obstacle guard fails OPEN on absent
-                                data (STACK.md risk 7) — so blind is the one
-                                state where RUN must not be available.
-     x     /fpms/mission/x_mm   ~1 Hz. THE POSE THE MAP IS DRAWING. Gating on
-                                the number the operator is actually looking at
-                                is the point: if the rectangle on screen is not
-                                where the rover is, RUN is not safe to press.
-
-   /odom_raw is displayed but does NOT gate. It is upstream of x_mm, so a dead
-   odometry chain already shows up here; adding it would only add a third way
-   for the button to lock itself at a competition without adding information.
-   A RUN button that is disabled for a reason nobody can find is its own
-   hazard. */
-const RUN_CRITICAL = ["scan", "x"];
+/* Which feeds must be FRESH for RUN to be permitted. Deliberately short:
+   the two continuous sensor streams. Both are ~10 Hz, so a 3 s stale on
+   either means the rover genuinely cannot see or cannot localise. */
+const RUN_CRITICAL = ["scan", "odom"];
 
 document.getElementById("host").textContent = location.host;
 document.getElementById("staleSecs").textContent = STALE_S;
@@ -462,13 +457,7 @@ ros.subscribe("/fpms/mission/x_mm",  "std_msgs/Float32", f32("x"));
 ros.subscribe("/fpms/mission/y_mm",  "std_msgs/Float32", f32("y"));
 ros.subscribe("/fpms/mission/heading_deg", "std_msgs/Float32", f32("hdg"));
 ros.subscribe("/fpms/mission/front_mm", "std_msgs/Float32", (m)=>{ mark("front", m.data.toFixed(0), m.data); mark("front2", m.data.toFixed(0), m.data); });
-/* Fallback battery source. Used when /battery has not arrived OR has gone
-   stale — not merely when it has never arrived, because "we saw a voltage
-   once, an hour ago" is exactly the frozen-but-plausible reading this
-   console exists to stop showing. */
-ros.subscribe("/fpms/mission/batt_v", "std_msgs/Float32", (m)=>{
-  if (!feeds.batt || isStale("batt")) mark("batt", m.data.toFixed(2), m.data);
-});
+ros.subscribe("/fpms/mission/batt_v", "std_msgs/Float32", (m)=>{ if(!feeds.batt) mark("batt", m.data.toFixed(2), m.data); });
 ros.subscribe("/fpms/mission/distance_remaining_mm", "std_msgs/Float32", f32("drem", 0));
 ros.subscribe("/fpms/mission/distance_travelled_mm", "std_msgs/Float32", f32("dtrav", 0));
 ros.subscribe("/fpms/mission/state", "std_msgs/String", (m)=>mark("state", m.data, m.data));
@@ -486,20 +475,13 @@ ros.subscribe("/fpms/residual/lateral_mm", "std_msgs/Float32", f32("res_lat"));
 ros.subscribe("/fpms/residual/cumulative_drive_mm", "std_msgs/Float32", f32("res_cum_mm"));
 ros.subscribe("/fpms/residual/cumulative_turn_deg", "std_msgs/Float32", f32("res_cum_deg"));
 
-/* ---- events + the plan mirror (fpms_console.py) ----------------------
-   THROTTLED ON PURPOSE, and this is not cosmetic. Measured on the running
-   rover, /fpms/events burst to ~330 Hz during a plan. rosbridge serialises
-   every subscription onto one protocol thread and one WebSocket, so an
-   event storm does not just fill the log — it starves /odom_raw and
-   /scan_lidar on the SAME socket, and a frozen map with a scrolling log is
-   the exact failure this console exists to prevent. 10 Hz is a readable
-   log; the Pi's journal keeps the ones that are dropped. */
+/* ---- events + the plan mirror (fpms_console.py) ---------------------- */
 ros.subscribe("/fpms/events", "std_msgs/String", (m) => {
   mark("events", "1", m);
   let txt = m.data;
   try { const j = JSON.parse(m.data); txt = JSON.stringify(j); } catch(e){}
   logEvent(txt, /nack|refus|fail|abort|error/i.test(txt) ? "bad" : "");
-}, 100);
+});
 ros.subscribe("/fpms/plan/route", "std_msgs/String", (m) => {
   let j; try { j = JSON.parse(m.data); } catch(e){ return; }
   plan = j;
@@ -657,11 +639,11 @@ function drawGrid(){
     g.beginPath(); g.moveTo(x0,pyv); g.lineTo(x1,pyv); g.stroke();
   }
   // arena boundary
-  const [ax0,ay0] = mmToPix(0, ARENA_MM), [ax1,ay1] = mmToPix(ARENA_MM, 0);
+  const [ax0,ay0] = mmToPix(0, ARENA_H_MM), [ax1,ay1] = mmToPix(ARENA_W_MM, 0);
   g.strokeStyle = "#00ff88"; g.lineWidth = 3; g.strokeRect(ax0,ay0,ax1-ax0,ay1-ay0);
   g.fillStyle = "rgba(0,255,136,.05)"; g.fillRect(ax0,ay0,ax1-ax0,ay1-ay0);
   g.fillStyle = "#00ff88"; g.font = "bold 11px Consolas"; g.textAlign = "center";
-  g.fillText(ARENA_MM+" mm", (ax0+ax1)/2, ay1+15);
+  g.fillText(ARENA_W_MM+" x "+ARENA_H_MM+" mm", (ax0+ax1)/2, ay1+15);
   // zones
   g.font = "bold 10px Consolas";
   for (const z of ZONES){
@@ -672,9 +654,13 @@ function drawGrid(){
   }
   // home / start box
   const [hx,hy] = mmToPix(HOME.x, HOME.y);
-  g.strokeStyle = "#3af07a"; g.lineWidth = 2;
+  const [sx0,sy0] = mmToPix(HOME.x-START_BOX/2, HOME.y+START_BOX/2);
+  const [sx1,sy1] = mmToPix(HOME.x+START_BOX/2, HOME.y-START_BOX/2);
+  g.strokeStyle = "#3af07a"; g.lineWidth = 2; g.setLineDash([6,5]);
+  g.strokeRect(sx0,sy0,sx1-sx0,sy1-sy0); g.setLineDash([]);
   g.beginPath(); g.arc(hx,hy,13,0,Math.PI*2); g.stroke();
-  g.fillStyle = "#3af07a"; g.fillText("HOME 972,228", hx, hy-18);
+  g.fillStyle = "#3af07a";
+  g.fillText("HOME "+Math.round(HOME.x)+","+Math.round(HOME.y), hx, sy0-5);
   g.textAlign = "left";
 }
 

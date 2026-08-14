@@ -378,7 +378,7 @@ try:
                            HistoryPolicy)
     from geometry_msgs.msg import Twist, PoseStamped
     from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import Imu
+    from sensor_msgs.msg import Imu, BatteryState
     from std_msgs.msg import UInt16
     HAVE_ROS = True
     ROS_IMPORT_ERROR = ""
@@ -517,11 +517,23 @@ def _boot_time():
 # rover/tests parse arena.ts and compare it against these values, so a drift
 # between the two files fails a test instead of driving the rover to the wrong
 # corner.
-ARENA_MM = 1200.0
-ZONE_FRAC = 0.30        # arena.ts: const Z
+# OPERATOR-MEASURED 2026-08-13. The arena is RECTANGULAR, not square.
+ARENA_W_MM = 1500.0     # x extent (left-right)
+ARENA_H_MM = 1400.0     # y extent (bottom-top, the direction the rover faces)
+# The occupancy grid and the planner costmap are square and sized off this one
+# number, so it must be the LARGER extent or the far side of the arena falls
+# outside the grid and mark() silently discards every return there.
+ARENA_MM = max(ARENA_W_MM, ARENA_H_MM)
+ZONE_FRAC = 0.10        # was 0.30 -- zones 3x smaller, operator request
 MARGIN_FRAC = 0.04      # arena.ts: const M
-ZONE_MM = ZONE_FRAC * ARENA_MM
-MARGIN_MM = MARGIN_FRAC * ARENA_MM
+ZONE_MM = ZONE_FRAC * ARENA_W_MM
+MARGIN_MM = MARGIN_FRAC * ARENA_W_MM
+
+# THE START BOX IS THE ROVER, NOT A ZONE. Wheelbase (rear axle to front axle)
+# measured at 170 mm; adding one 65 mm wheel diameter gives the footprint the
+# chassis actually occupies. Overridable once the width is measured too.
+ROVER_LEN_MM = _cfg_float("FPMS_ROVER_LEN_MM", 235.0, 80.0, 600.0)
+START_BOX_MM = ROVER_LEN_MM
 
 # arena.ts: FORWARD_HEADING_DEG. +y is up and psi is CCW from +x, so "up the
 # arena" is 90 and nothing else.
@@ -530,10 +542,10 @@ FORWARD_HEADING_DEG = 90.0
 # Rects anchored BOTTOM-LEFT, exactly as arena.ts ZONES.
 ZONES = {
     "zone-a": {"label": "ZONE A", "x_mm": MARGIN_MM,
-               "y_mm": ARENA_MM - MARGIN_MM - ZONE_MM,           # top-left
+               "y_mm": ARENA_H_MM - MARGIN_MM - ZONE_MM,         # top-left
                "w_mm": ZONE_MM, "h_mm": ZONE_MM},
-    "zone-b": {"label": "ZONE B", "x_mm": ARENA_MM - MARGIN_MM - ZONE_MM,
-               "y_mm": ARENA_MM - MARGIN_MM - ZONE_MM,           # top-right
+    "zone-b": {"label": "ZONE B", "x_mm": ARENA_W_MM - MARGIN_MM - ZONE_MM,
+               "y_mm": ARENA_H_MM - MARGIN_MM - ZONE_MM,         # top-right
                "w_mm": ZONE_MM, "h_mm": ZONE_MM},
     "water-station": {"label": "WATER", "x_mm": MARGIN_MM,
                       "y_mm": MARGIN_MM,                         # bottom-left
@@ -542,8 +554,8 @@ ZONES = {
 
 # arena.ts ROVER_START: the bottom-right start box, nose FORWARD.
 ROVER_START = {
-    "x_mm": ARENA_MM - MARGIN_MM - ZONE_MM / 2.0,
-    "y_mm": MARGIN_MM + ZONE_MM / 2.0,
+    "x_mm": ARENA_W_MM - MARGIN_MM - START_BOX_MM / 2.0,
+    "y_mm": MARGIN_MM + START_BOX_MM / 2.0,
     "heading_deg": FORWARD_HEADING_DEG,
 }
 
@@ -659,8 +671,8 @@ def route_description(name):
 
 
 def in_arena(x_mm, y_mm, pad_mm=0.0):
-    return (pad_mm <= x_mm <= ARENA_MM - pad_mm
-            and pad_mm <= y_mm <= ARENA_MM - pad_mm)
+    return (pad_mm <= x_mm <= ARENA_W_MM - pad_mm
+            and pad_mm <= y_mm <= ARENA_H_MM - pad_mm)
 
 
 # ================================================================ CALIBRATION
@@ -701,7 +713,7 @@ def in_arena(x_mm, y_mm, pad_mm=0.0):
 # NOTE: the dead zone is on the VELOCITY path only. The golden B8B driver
 # bypassed it by sending RAW DUTY through the Rosmaster framed protocol, where
 # 26/100 really is 26%%. That is the path to move to.
-CMD_SCALE = 6.1
+CMD_SCALE = 1.0   # STM32 board takes TRUE m/s (was 6.1 for the ESP32 dead zone)
 WIRE_FLOOR_MPS = 0.0145
 
 
@@ -771,156 +783,59 @@ HEADING_CORR_MAX_RADPS = 0.25
 TURN_WIRE_SIGN = _cfg_sign("FPMS_MISSION_TURN_WIRE_SIGN", -1)
 TURN_WIRE_SIGN_MEASURED = False     # flip this ONLY after a real turn confirms it
 
-
-# ============================================================================
-# THE MEASURED CALIBRATION PROFILE
-# ============================================================================
-# Written by `stack/fpms_charact.py` after an operator joystick run, read here.
-# It is the mechanism by which a number the OPERATOR measured beats a number
-# somebody DERIVED, without anyone editing this file.
-#
-# Only one field is consumed today, and it is the important one:
-#
-#   odom_scale   true_mm / odom_reported_mm.
-#
-# WHY A SCALE FACTOR IS THE RIGHT LEVER, AND WHY IT NEEDS NO REFLASH
-#   /odom_raw arrives in METRES, already integrated on the board using its
-#   COUNTS_PER_REV. If that constant is wrong, every distance this node
-#   measures is wrong by the same ratio — and counts/mm is the longest-running
-#   unresolved number in this project: 6.00 derived (11 lines x 30:1 x4) vs
-#   14.8 tape-measured over 800 mm vs a 0.743x hand-push reading, plus a
-#   possible factor of 2 from attachHalfQuad. 14.8/6.00 = 2.467 = exactly
-#   74/30, i.e. a 74:1 gearbox where 30:1 was assumed.
-#   Multiplying the reported position by a measured ratio corrects all of it at
-#   the boundary, and can be re-derived from a tape measure in a minute.
-#
-# DEFAULT IS 1.0 — NO CORRECTION. An absent or unparseable profile changes
-# nothing, so this is safe to ship before anyone has run a characterisation.
-# A profile is only ever ADOPTED when it carries `measured: true`, so a
-# half-finished run cannot quietly rescale the rover.
-CALIB_FILE = os.environ.get("FPMS_CALIB_FILE", "/etc/fpms/calibration.json")
-
-
-def load_calibration(path=CALIB_FILE):
-    """Load the operator-measured profile. Never raises; never guesses."""
-    prof = {}
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("not a JSON object")
-        if not data.get("measured"):
-            CFG_NOTES.append(
-                f"calibration {path} exists but is not marked measured:true — "
-                "IGNORED. Finish the characterisation run before trusting it.")
-            return {}
-        prof = data
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        CFG_NOTES.append(f"calibration {path} unreadable ({e}); using defaults")
-        return {}
-    return prof
-
-
-CALIB = load_calibration()
-
-
-def _calib_float(key, default, lo, hi):
-    """Adopt a measured constant, or say why it was refused. Never silently."""
-    raw = CALIB.get(key)
-    if raw is None:
-        return default
-    try:
-        v = float(raw)
-    except Exception:
-        CFG_NOTES.append(f"calibration {key}={raw!r} is not a number; "
-                         f"using {default:g}")
-        return default
-    if not (lo <= v <= hi):
-        # A calibration far outside plausibility is far more likely to be a
-        # botched run than a discovery. Refuse it and keep driving on the
-        # default rather than acting on it.
-        CFG_NOTES.append(f"calibration {key}={v:g} is outside [{lo:g}, {hi:g}] "
-                         f"and was REFUSED; using {default:g}")
-        return default
-    CFG_NOTES.append(f"calibration {key}={v:g} ADOPTED (measured "
-                     f"{CALIB.get('measured_at', 'date unknown')})")
-    return v
-
-
-# Bounds are deliberately wide enough to admit the real contested values
-# (2.467 is the 74/30 gearbox ratio; 0.405 is its reciprocal) and narrow enough
-# to reject a decimal-point slip.
-ODOM_SCALE = _calib_float("odom_scale", 1.0, 0.2, 5.0)
-
-
-# ============================================================================
-# ODOM POSE SIGN — THE ONE SWITCH THAT MUST CHANGE WHEN THE FIRMWARE CHANGES
-# ============================================================================
-# WHAT IT DOES
-#   Multiplies the x/y POSITION arriving on /odom_raw (and /odom). It does not
-#   touch twist, heading, the gyro, or the commanded direction. It exists for
-#   exactly one reason: to correct a firmware that integrates position with the
-#   wrong sign.
-#
-# WHAT TO SET IT TO
-#   -1  Yahboom FACTORY firmware v2.0.0 (what is on the board TODAY, 2026-08-06).
-#       Confirmed 5/5 against operator observation: the rover drove forward and
-#       the reported position went backwards.
-#   +1  FPMS firmware v3 (firmware_v3/fpms_config.h). Its header states plainly:
-#       "This firmware integrates with the CORRECT sign, so that compensation
-#       must be set back to +1."
-#
-# WHY IT IS DECLARED HERE, ONCE, RATHER THAN FIXED AT EACH USE SITE
-#   Before this existed the compensation was NOT IMPLEMENTED AT ALL on the Pi,
-#   while firmware_v3/fpms_config.h:28-31 asserted that the Pi was applying it.
-#   Two documents, one of them a header comment nobody executes, disagreeing
-#   about a sign — and the disagreement is invisible until the rover drives the
-#   wrong way. Making it one named constant, applied at ONE place
-#   (`MissionNode._take_odom`), means the contradiction can be read off in a
-#   single grep instead of inferred from behaviour.
-#
-# GETTING IT WRONG IS SILENT AND TOTAL
-#   Every displacement measurement in this file comes from differencing pose.
-#   With the sign inverted, a forward burst measures as reverse travel, the
-#   residual correction pushes the wrong way, and the retrace home replays the
-#   whole error a second time. It does NOT look like a sign bug from the
-#   dashboard; it looks like the rover is possessed. If motion and odometry
-#   disagree about direction, CHECK THIS FIRST.
-#
-# HOW TO CHECK IT WITHOUT DRIVING (costs no battery, takes 30 seconds)
-#   Power the board, leave the motors idle, and PUSH the rover forward by hand
-#   along a tape measure while watching /odom_raw x (or run
-#   `stack/fpms_charact.py --push-check`). Pushed FORWARD, x must INCREASE.
-#   If it decreases, flip this constant. That test involves no actuation and is
-#   the only honest way to settle it — this rover's odometry has reported clean
-#   travel for a chassis that was spinning in place.
-# CHANGING THIS INVALIDATES THE SAVED ANCHOR. MUST RE-ZERO.
-#   `.fpms_teleop_origin.json` records a PAIR — "odom was at (ref_x, ref_y),
-#   the arena was at (x_mm, y_mm)". `ref_x/ref_y` were captured through
-#   whatever sign was active at the time, so flipping the sign silently
-#   reflects the anchor through the origin and every arena coordinate derived
-#   from it is wrong by twice the offset. There is no way to detect this from
-#   the file alone, because both conventions produce a perfectly plausible
-#   number.
-#   So: after changing this constant, issue `set_coordinate` (re-zero) BEFORE
-#   the next mission. The stale-anchor refusal below catches the reboot case
-#   but NOT this one — a sign change without a reboot leaves a same-boot anchor
-#   that looks valid and is not.
-ODOM_POSE_SIGN = _cfg_sign("FPMS_MISSION_ODOM_POSE_SIGN", -1)
-ODOM_POSE_SIGN_MEASURED = False   # set True only after the hand-push check
-if ODOM_POSE_SIGN != -1:
-    CFG_NOTES.append(
-        f"FPMS_MISSION_ODOM_POSE_SIGN={ODOM_POSE_SIGN:+d} (factory firmware "
-        "wants -1, FPMS firmware v3 wants +1). RE-ZERO with set_coordinate "
-        "before the next mission: the saved teleop origin was captured under "
-        "the other sign.")
-
 # How far a turn may rotate the WRONG way before it is called wrong rather than
 # noisy. Comfortably above gyro noise over a couple of seconds and well below any
 # turn the planner emits, so it can only fire on a genuine polarity error.
 TURN_WRONG_WAY_DEG = _cfg_float("FPMS_MISSION_TURN_WRONG_WAY_DEG", 8.0, 3.0, 45.0)
+
+# THE BOARD'S ODOMETRY POSITION RUNS BACKWARDS. Measured, operator-observed,
+# five times out of five — never once inferred from odometry alone:
+#
+#   2026-08-05 12:47  operator watched the rover move FORWARD ~50mm.
+#                     /odom_raw pose moved (-182.4, -30.7) mm in its own frame
+#                     -> `along` measured -182mm on a +250mm command.
+#   2026-08-05 12:45  +250mm commanded, measured   -3mm.
+#   2026-08-05 11:43  +250mm commanded, measured -351mm.
+#   2026-08-05 11:41  +250mm commanded, measured -120mm.
+#   2026-08-04        +564mm commanded, -2080mm of "travel" (fpms_config.h:153).
+#
+# Every forward command has produced a NEGATIVE pose delta. This is the same
+# fact `_take_odom` already recorded from the other side — "msg.twist.linear.x
+# is SIGN-INVERTED relative to this very pose" — read the right way round:
+# the twist was telling the truth and the integrated POSE is the liar. The
+# encoder-inversion table in fpms_config.h:122-158 is the mechanism (all four
+# encoders count negative when the wheel is driven forward), and because the
+# board integrates x += d*cos(theta), y += d*sin(theta) from that same signed
+# d, BOTH position components flip together — which is why the correction is a
+# scalar on the displacement vector and not an axis flip.
+#
+# THIS IS A SIGN, NOT A SCALE. The magnitude is separately and independently
+# wrong (182mm reported for ~50mm of real travel) and is NOT corrected here.
+# See the ODOM SCALE note below. Nothing in this file scales odometry.
+#
+# Applied at exactly TWO places, both of which differentiate position against a
+# reference so the reference itself cancels: `arena_from_odom` (the telemetry
+# pose) and `_displacement` (the measured distance). Set
+# FPMS_MISSION_ODOM_POSE_SIGN=+1 in /etc/fpms/config.env to revert to the raw
+# board convention without editing this file.
+ODOM_POSE_SIGN = _cfg_sign("FPMS_MISSION_ODOM_POSE_SIGN", -1)
+
+# ODOM SCALE IS UNRESOLVED AND IS DELIBERATELY NOT CORRECTED HERE.
+# Two independently derived numbers disagree by 2.47x:
+#   6.00 counts/mm  = pi*70/1320, from 11 magnetic lines x 30:1 gear x 4
+#                     quadrature (fpms_phase6_LATEST.py:1309 `_TKMM`, and the
+#                     teach-in server). DERIVED from an assumed gearbox.
+#  14.8 counts/mm  = operator tape measure over 800mm of real travel,
+#                     2026-08-04 (fpms_config.h:96). MEASURED.
+# 14.8/6.00 = 2.467, which is exactly 74/30: a 74:1 gearbox where 30:1 was
+# assumed. 14.8 * pi * 70mm = 3255 counts/rev, and 44 counts/motor-rev x 74 =
+# 3256. The MEASURED number is the one consistent with the observed
+# over-reporting, and a board dividing counts by the SMALLER constant reports
+# 2.47x too much distance — which is the direction and roughly the size of the
+# error the operator saw. It is not corrected here because the scale lives in
+# the BOARD firmware, not in this file, and because one eyeball estimate is not
+# a calibration. See the deliverable note: a hand-push over a tape settles it
+# without spending any battery.
 
 
 # ================================================= THE MINIMUM COMMANDED MOTION
@@ -1041,6 +956,11 @@ HOLD_S = _cfg_float("FPMS_MISSION_HOLD_S", 2.0, 0.0, 30.0)
 # Segment stall detection — commanded, but not moving. On this chassis that
 # means the firmware dead zone swallowed the setpoint; continuing to command it
 # just winds up integrator state for a lurch later.
+# How far from the origin the rover must be before a jump TO the origin is read
+# as the board having restarted its odometry rather than as real motion. Only
+# used by that one test, which also requires landing within a millimetre of
+# exactly (0,0) — a coincidence real travel does not produce.
+ODOM_RESET_MM = _cfg_float("FPMS_MISSION_ODOM_RESET_MM", 200.0, 50.0, 2000.0)
 STALL_CHECK_S = 2.0
 STALL_MIN_MM = 5.0
 TURN_STALL_CHECK_S = 2.5
@@ -1515,7 +1435,12 @@ def apply_segments(pose, segs, measured=True):
 # ~50% duty floor. It is not a setpoint and cannot be tuned down: the firmware's
 # PWM_MOTOR_DEAD_ZONE (200 of 400 ticks) is ADDED as feed-forward, so 50.25%
 # duty is the smallest non-zero output that exists. See research/R4_FIRMWARE.md.
-FULL_DUTY_MPS = 0.65
+# Was a hard 0.65: the speed Yahboom FACTORY firmware forced on EVERY command,
+# because its dead zone discarded amplitude. Under linorobot firmware cmd_vel
+# amplitude is honoured, so the rover really travels at CRUISE_MPS and a cap
+# derived from 0.65 fires roughly 3.6x too early — it aborted m2 in 1s with
+# the wheels barely turning. Configurable so a firmware swap can move it back.
+FULL_DUTY_MPS = _cfg_float("FPMS_MISSION_FULL_DUTY_MPS", 0.65, 0.05, 1.50)
 BURST_CAP_SLACK = 1.6
 
 
@@ -1529,7 +1454,19 @@ def burst_cap_s(seg):
     if seg.kind != "drive":
         return None
     mm = abs(seg.target)
-    return max(MIN_PULSE_S + 0.2, (mm / 1000.0) / FULL_DUTY_MPS * BURST_CAP_SLACK)
+    # ADDITIVE RAMP ALLOWANCE. The multiplicative slack alone models a chassis
+    # ALREADY AT SPEED. A short burst spends most of its life accelerating, so a
+    # 92mm segment needed ~1.16s against a 0.67s cap and aborted 6mm short of
+    # landing -- it had measured +86mm of the +92mm asked. The encoders were
+    # never the problem; this formula was.
+    #
+    # Fixing it by tuning FULL_DUTY_MPS DOWN inverts the guard's own argument:
+    # that constant must OVER-estimate chassis speed for the bound to mean
+    # anything, and 0.10 had quietly granted a 425mm segment 6.8s of blind
+    # running. The fixed ramp+settle term buys the headroom without the bound.
+    return max(MIN_PULSE_S + 0.2,
+               (mm / 1000.0) / FULL_DUTY_MPS * BURST_CAP_SLACK
+               + MIN_PULSE_S + STOP_SETTLE_S)
 
 
 def segment_timeout_s(seg):
@@ -1780,6 +1717,14 @@ OCC_MIN_HITS = int(_cfg_float("FPMS_MISSION_OCC_MIN_HITS", 2, 1, 20))
 
 # Beyond the arena diagonal (1697 mm) a return is somebody's furniture, not an
 # obstacle on this route, and folding it in would only invent walls off-field.
+# THE SCANNER MOUNT. Single source of truth is fpms_lidar_ros.py:164-168;
+# these mirror it so the occupancy grid folds bearings the SAME way the
+# ROS LaserScan does. -1 = scanner degrees increase clockwise (mirrored
+# relative to ROS). STILL UNVERIFIED -- run the wall test before trusting
+# the map's left/right; the FRONT cone is symmetric and unaffected either way.
+LIDAR_ZERO_OFFSET_DEG = _cfg_float("FPMS_LIDAR_ZERO_OFFSET_DEG", 0.0, -180.0, 180.0)
+LIDAR_ROTATION_SIGN = _cfg_float("FPMS_LIDAR_ROTATION_SIGN", -1.0, -1.0, 1.0)
+
 OCC_MAX_RANGE_MM = _cfg_float("FPMS_MISSION_OCC_MAX_RANGE_MM", 1800.0,
                               200.0, 6000.0)
 
@@ -2139,7 +2084,9 @@ class OccupancyGrid:
             mm = rv * 1000.0
             if mm > self.max_range_mm:
                 continue
-            b = math.radians(ph + i * step)
+            # Mount sign applied HERE so the grid and the ROS scan agree.
+            b = math.radians(ph + LIDAR_ROTATION_SIGN * (i * step)
+                             + LIDAR_ZERO_OFFSET_DEG)
             if self.mark(px + mm * math.cos(b), py + mm * math.sin(b), now):
                 marked += 1
         with self._lock:
@@ -3272,7 +3219,8 @@ class Anchor:
     source: str = "assumed start pose"
 
 
-def arena_from_odom(anchor, odom_x, odom_y, odom_yaw_deg, gyro_yaw_deg=None):
+def arena_from_odom(anchor, odom_x, odom_y, odom_yaw_deg, gyro_yaw_deg=None,
+                    pose_sign=None):
     """odom metres -> arena millimetres + heading degrees.
 
     POSITION is rotated by the BOARD yaw the anchor was taken at, because
@@ -3284,9 +3232,13 @@ def arena_from_odom(anchor, odom_x, odom_y, odom_yaw_deg, gyro_yaw_deg=None):
     board's dead-reckoned yaw is mirrored by it. `gyro_yaw_deg=None` keeps the
     old board-yaw-only behaviour so the geometry stays testable on its own.
     """
+    # POLARITY FIRST, on the DISPLACEMENT — see ODOM_POSE_SIGN. The anchor is
+    # the raw board reading it was captured as, so it cancels out of the
+    # difference and only the travel since the anchor is corrected.
+    sgn = ODOM_POSE_SIGN if pose_sign is None else pose_sign
     rot = math.radians(anchor.arena_heading_deg - anchor.odom_yaw_deg)
-    dx = (odom_x - anchor.odom_x) * 1000.0
-    dy = (odom_y - anchor.odom_y) * 1000.0
+    dx = sgn * (odom_x - anchor.odom_x) * 1000.0
+    dy = sgn * (odom_y - anchor.odom_y) * 1000.0
     c, s = math.cos(rot), math.sin(rot)
     if gyro_yaw_deg is None:
         heading = wrap180(odom_yaw_deg + math.degrees(rot))
@@ -3623,7 +3575,7 @@ class MissionNode(Node):
         # publishes identity on every message. Integrating locally also means
         # turns keep their +/-1-4 deg accuracy whether or not odom-tf is up.
         self.create_subscription(Imu, "/imu", self._on_imu, qos)
-        self.create_subscription(UInt16, "/battery", self._on_battery, qos)
+        self.create_subscription(BatteryState, "/battery", self._on_battery, qos)
         # Listening to our own output topic is how a second writer is detected.
         self.create_subscription(Twist, "/cmd_vel", self._on_cmd_vel, qos)
 
@@ -3660,6 +3612,11 @@ class MissionNode(Node):
         self.gyro_z = 0.0
         self.gyro_bias = 0.0
         self.gyro_bias_n = 0
+        # Counted rather than sampled, so "the gyro is dead" is a statement
+        # about every message since boot and not about the instant somebody
+        # happened to look.
+        self._imu_n = 0
+        self._imu_nonzero_n = 0
         self._imu_prev_t = None
 
         self.battery_raw = None
@@ -3739,18 +3696,8 @@ class MissionNode(Node):
 
     def _take_odom(self, msg, source):
         try:
-            # THE ONLY PLACE ODOM_POSE_SIGN IS APPLIED. See its declaration for
-            # what it is and how to check it without driving. Applied here, at
-            # the boundary, so that every consumer downstream — the displacement
-            # projection, the arena fix, the retrace, the telemetry — sees one
-            # consistent frame. Applying it anywhere else would leave two
-            # conventions in the same file, which is how the original mismatch
-            # survived undetected in the first place.
-            # ODOM_SCALE is applied at the same boundary and for the same
-            # reason: one frame convention, established once, before anything
-            # downstream differentiates it. Default 1.0 = no correction.
-            x = float(msg.pose.pose.position.x) * ODOM_POSE_SIGN * ODOM_SCALE
-            y = float(msg.pose.pose.position.y) * ODOM_POSE_SIGN * ODOM_SCALE
+            x = float(msg.pose.pose.position.x)
+            y = float(msg.pose.pose.position.y)
             if not (math.isfinite(x) and math.isfinite(y)):
                 return
             q = msg.pose.pose.orientation
@@ -3776,19 +3723,50 @@ class MissionNode(Node):
                     log(f"odom orientation on {source} is {what}")
                 elif self.odom_yaw_identity and not identity:
                     self.odom_yaw_identity = False
-                    self.odom_frame_epoch += 1
+                    # NO LONGER A FRAME CHANGE FOR ANY MEASUREMENT. Distance is
+                    # projected onto `forward_yaw_odom()`, which is built from
+                    # the ANCHOR board yaw plus the gyro delta and never reads
+                    # this live orientation — so the board deciding to start
+                    # populating its quaternion changes nothing that is being
+                    # measured, and must not abort a segment that is in flight.
+                    # Before 2026-08-05 this bumped the epoch and ABORT_ODOM_FRAME
+                    # was the NORMAL outcome of a mission rather than a backstop.
                     log(f"odom orientation on {source} started publishing a real "
-                        "yaw; distance projection now uses it. Any segment in "
-                        "flight is now unmeasurable and will abort: it was "
-                        "referenced to the identity frame it started in.")
+                        "yaw. Distance is projected onto the anchor yaw plus the "
+                        "gyro delta and never onto this, so nothing in flight is "
+                        "affected and no segment aborts.")
                 self._odom_times.append(now)
                 prev = self._probe_pose_prev
                 if prev is not None and now - prev[0] > 0.0:
-                    dx = (x - prev[1]) * 1000.0
-                    dy = (y - prev[2]) * 1000.0
-                    self._probe_along_mm = (dx * math.cos(prev[3])
-                                            + dy * math.sin(prev[3]))
+                    # Same polarity and same basis as the real measurement, or
+                    # the probe would report a different sign to the executor
+                    # and whoever read it would trust the wrong one.
+                    dx = ODOM_POSE_SIGN * (x - prev[1]) * 1000.0
+                    dy = ODOM_POSE_SIGN * (y - prev[2]) * 1000.0
+                    fwd = self._forward_yaw_odom_locked()
+                    if fwd is None:
+                        fwd = prev[3]
+                    self._probe_along_mm = (dx * math.cos(fwd)
+                                            + dy * math.sin(fwd))
                 self._probe_pose_prev = (now, x, y, byaw)
+                # THE ODOM FRAME BREAK THAT IS REAL: the board rebooted and
+                # restarted its odometry at the origin. Every displacement
+                # measured across that instant is the rover's whole distance
+                # from the origin, with the wrong sign, and no projection can
+                # rescue it. Deliberately the narrowest possible test — a jump
+                # TO within a millimetre of exactly (0,0) from at least
+                # ODOM_RESET_MM away — so it cannot fire on real motion however
+                # fast, however badly scaled. This replaces the orientation flip
+                # as what ABORT_ODOM_FRAME is for.
+                if (self.odom_x is not None
+                        and abs(x) < 1e-3 and abs(y) < 1e-3
+                        and math.hypot(self.odom_x, self.odom_y) * 1000.0
+                        > ODOM_RESET_MM):
+                    self.odom_frame_epoch += 1
+                    log(f"odom on {source} RESET to the origin from "
+                        f"({self.odom_x:+.3f}, {self.odom_y:+.3f}) m — the board "
+                        "restarted its odometry. Any segment in flight is "
+                        "unmeasurable and will abort.")
                 try:
                     self._probe_twist_x = float(msg.twist.twist.linear.x)
                 except Exception:
@@ -3841,6 +3819,10 @@ class MissionNode(Node):
                 raw = float(msg.angular_velocity.z)
                 if not math.isfinite(raw):
                     return
+                self._imu_n += 1
+                if raw != 0.0:
+                    self._imu_nonzero_n += 1
+                self._imu_times.append(now)
                 # Zero-rate bias dominates an integrated heading, so estimate it
                 # only while genuinely parked — commanded zero AND no measured
                 # wheel motion — or a slow real rotation gets eaten as drift.
@@ -3862,7 +3844,13 @@ class MissionNode(Node):
     def _on_battery(self, msg):
         try:
             with self.lock:
-                self.battery_raw = int(msg.data)   # DECIVOLTS
+                # Two firmwares, two conventions: factory publishes UInt16
+                # DECIVOLTS on .data; linorobot publishes BatteryState with
+                # .voltage in VOLTS. Accept either so a firmware swap cannot
+                # silently fail the 11.1V interlock OPEN.
+                volts = getattr(msg, "voltage", None)
+                self.battery_raw = (int(round(volts * 10.0))
+                                    if volts is not None else int(msg.data))
                 self.battery_last = time.monotonic()
         except Exception as e:
             log(f"battery callback error {e}")
@@ -3875,39 +3863,6 @@ class MissionNode(Node):
 
     def on_lidar(self, payload):
         try:
-            # ---- THE STALE CONTRACT (2026-08-06) -------------------------
-            # fpms-rover-agent now publishes telemetry/lidar on a FIXED CADENCE
-            # whether or not the scanner is returning anything, so that a dead
-            # LiDAR shows up as a declared fault instead of as silence the
-            # dashboard renders as a frozen last frame.
-            #
-            # That guarantee has a sharp edge on this side. `lidar_last` is
-            # what `clearance_mm()` and `lidar_ok()` gate on, and a dead payload
-            # carries ranges of all zeros. Storing it would refresh
-            # `lidar_last`, so the obstacle guard would consider itself SIGHTED,
-            # find no returns anywhere, and conclude the path is clear —
-            # turning "the sensor is broken" into "full speed ahead". That is
-            # strictly worse than the pre-existing fail-open, because the guard
-            # would be confidently wrong rather than merely blind.
-            #
-            # So a stale payload is DROPPED here: `lidar_last` is not touched,
-            # the scan is not stored, and nothing is folded into the occupancy
-            # grid. Within LIDAR_STALE_S the existing guard notices the feed has
-            # aged out and behaves exactly as it always has when the LiDAR is
-            # missing. This ADDS a refusal; it removes no guard.
-            #
-            # `stale` is additive and absent on an un-upgraded agent, so a
-            # missing key is treated as fresh and behaviour is unchanged.
-            if isinstance(payload, dict) and payload.get("stale") is True:
-                now = time.monotonic()
-                if now - getattr(self, "_stale_lidar_logged", 0.0) > 10.0:
-                    self._stale_lidar_logged = now
-                    log(f"lidar payload marked stale "
-                        f"(health={payload.get('health')!r} "
-                        f"age={payload.get('scan_age_s')}s) — dropped, so the "
-                        "obstacle guard ages out rather than reading a dead "
-                        "scan as clear space")
-                return
             # The pose is read BEFORE the scan is stored, so the two describe
             # the same instant as closely as this rover can manage. (self.lock
             # is an RLock, so `pose()` re-entering it below would be legal --
@@ -4001,10 +3956,65 @@ class MissionNode(Node):
             return self.odom_frame_epoch
 
     def board_yaw(self):
-        """The BOARD's own yaw, radians. The frame odom_xy lives in — the ONLY
-        angle an odom-frame displacement may be projected onto."""
+        """The BOARD's own yaw, radians, exactly as published.
+
+        NOT the projection basis — see `forward_yaw_odom`. Kept for the arena
+        fix composition, which needs the board's own frame, and for telemetry.
+        """
         with self.lock:
             return self.odom_yaw
+
+    def forward_yaw_odom(self):
+        """Which way the rover FACES, expressed in the odom position frame.
+
+        THIS IS THE ONLY THING A DISPLACEMENT MAY BE PROJECTED ONTO, and it is
+        built so that it can never change underneath a segment:
+
+            forward = anchor.odom_yaw + (gyro_now - anchor.gyro_yaw)
+
+        Both terms are fixed references plus a physical sensor. The board's
+        LIVE orientation is not read at all, so the identity-vs-real-yaw flip
+        that used to abort every mission cannot reach this number.
+
+        IT IS EXACTLY THE ARENA PROJECTION, not an approximation of it.
+        `arena_from_odom` rotates a displacement by
+        rot = arena_heading_anchor - odom_yaw_anchor and reports a heading of
+        h = arena_heading_anchor + (gyro_now - gyro_anchor). Projecting the
+        ARENA displacement onto the arena heading is
+
+            (R(rot) . d) . u(h)  ==  d . u(h - rot)
+
+        and h - rot = odom_yaw_anchor + (gyro_now - gyro_anchor), which is this
+        function. So projecting the raw odom delta onto this angle and
+        projecting the arena delta onto the arena heading are the SAME NUMBER —
+        proved by `test_projection_equals_arena_projection`. Doing it here
+        avoids rotating into the arena frame and back for every control tick.
+
+        WHY NOT THE LIVE BOARD YAW, which is what this used to use: while the
+        board publishes an identity quaternion its yaw is 0 forever, so the
+        projection collapsed to the odom +x axis no matter which way the rover
+        was pointing. On a leg driven after a 90 degree turn that measures the
+        SIDEWAYS component of the motion and reports a real forward drive as
+        roughly zero, or negative once drift crosses the axis. m2 leg 1 happens
+        to start at the anchor heading, which is the only reason that bug was
+        not also the m2 failure.
+
+        Returns None until the anchor has been established, because before that
+        both of its references are 0.0 by default rather than by measurement.
+        """
+        with self.lock:
+            return self._forward_yaw_odom_locked()
+
+    def _forward_yaw_odom_locked(self):
+        """`forward_yaw_odom` for callers that already hold the lock.
+
+        `_take_odom` runs inside `with self.lock`, and this lock is not
+        reentrant, so it cannot call the public accessor.
+        """
+        if not self.anchor.established:
+            return None
+        return (math.radians(self.anchor.odom_yaw_deg)
+                + (self.yaw_int - math.radians(self.anchor.gyro_yaw_deg)))
 
     def pose_source(self):
         """Which of the two localisation states the current pose came from.
@@ -4134,6 +4144,36 @@ class MissionNode(Node):
             f"({fix_pose[0]:.0f}, {fix_pose[1]:.0f})mm h={fix_pose[2]:.0f}deg"
             + caveat)
         return True, "adopted"
+
+    def gyro_alive(self):
+        """(alive, note). Has the gyro EVER reported a non-zero rate?
+
+        A MEMS gyro at rest is noisy, not silent: its zero-rate output
+        wanders at the LSB. A rate that has been bit-for-bit 0.0 for every
+        sample since boot is not a still rover, it is an absent sensor —
+        measured 2026-08-05, all three axes zero across 251 samples while
+        the accelerometer read gravity with normal noise.
+
+        This is the sensor `pose()` takes its HEADING from and the one
+        `_turn` measures against, so when it is dead every turn reports
+        exactly 0 degrees and the heading in telemetry can never change.
+        Reported, never enforced — see this patch's docstring.
+        """
+        with self.lock:
+            n = self._imu_n
+            nz = self._imu_nonzero_n
+        if n < 20:
+            return None, f"only {n} /imu samples so far — too few to judge"
+        if nz == 0:
+            return False, (f"angular_velocity.z has been EXACTLY 0.0 for all "
+                           f"{n} /imu samples: the gyro is not being "
+                           "populated. Heading cannot change, every turn will "
+                           "measure 0deg and stall out after "
+                           f"{TURN_STALL_CHECK_S:.1f}s with the heading "
+                           "destroyed. A straight run with no turns is "
+                           "unaffected. Power-cycle the board to re-init the "
+                           "IMU, then re-check before arming.")
+        return True, f"{nz}/{n} /imu samples carry a non-zero rate"
 
     def yaw(self):
         with self.lock:
@@ -4288,6 +4328,7 @@ class MissionNode(Node):
             "batt_v": jnum(self.battery_v(), 1),
             "front_mm": jnum(self.clearance_mm(reverse=st.reversing), 0),
             "lidar_ok": self.lidar_fresh(),
+            "gyro_ok": self.gyro_alive()[0],
             # Additive: what the planner can currently see. `cells` is what A*
             # would treat as obstacles right now, so an operator can tell an
             # empty grid apart from a blocked one without reading a log.
@@ -4517,14 +4558,17 @@ class DeadReckonBackend:
         x0, y0 = node.odom_xy()
         if x0 is None:
             raise MissionAbort(ABORT_LINK)
-        # THE BOARD's yaw, not the gyro's. dx/dy below are in the board's odom
-        # frame and only the board's own yaw describes that frame's orientation;
-        # projecting them onto the gyro integral mixes two frames with different
-        # zeros and silently scales every distance the retrace depends on. This
-        # is NAV2_BRIEF section 3a's prescription, and what fpms_teleop.py
-        # `summarize_leg` and fpms_odom_tf.py `travel_sign()` already do.
-        byaw0 = node.board_yaw()
-        epoch0 = node.odom_epoch()          # the frame byaw0 belongs to
+        # THE DIRECTION THIS SEGMENT IS COMMANDED IN, in the odom position
+        # frame, captured ONCE at the start and held. Held rather than
+        # re-read so that a heading change during the burst — drift, or the
+        # heading hold working — cannot retroactively re-reference a
+        # measurement that is already part way through. See
+        # `forward_yaw_odom` for why this is the arena projection and why the
+        # board's live orientation must not be used.
+        fyaw0 = node.forward_yaw_odom()
+        if fyaw0 is None:
+            raise MissionAbort(ABORT_LINK)
+        epoch0 = node.odom_epoch()          # the odom position frame, not yaw
         gyaw0 = node.yaw()                  # for heading hold only
         sign = 1.0 if seg.target >= 0 else -1.0
         reverse = sign < 0
@@ -4558,7 +4602,7 @@ class DeadReckonBackend:
                     reason = det.reason
                     break
                 now = time.monotonic()
-                along, lateral = self._displacement(x0, y0, byaw0)
+                along, lateral = self._displacement(x0, y0, fyaw0)
                 # THE MINIMUM PULSE IS A FLOOR ON TIME, NOT ONLY ON DISTANCE. The
                 # firmware is converging a PID onto a velocity setpoint; cutting
                 # the burst early because the coast target was met on a noisy
@@ -4584,12 +4628,12 @@ class DeadReckonBackend:
                 if cap is not None and now - t0 > cap:
                     reason = ABORT_BURST_CAP
                     break
-                # THE FRAME THIS SEGMENT IS BEING MEASURED IN CHANGED. Not a
-                # tolerance and not recoverable: `along` below is projected onto
-                # `byaw0`, captured before the change, so the number would be
-                # measured in one frame and referenced to another. Stop and say
-                # so rather than record a distance nobody can trust -- this is
-                # the "moved 1533.6 mm" report from a rover that went ~2 m.
+                # THE ODOM POSITION FRAME ITSELF BROKE — the board restarted its
+                # odometry, so x0/y0 refer to an origin that no longer exists and
+                # the displacement is the whole distance from it. Not a tolerance
+                # and not recoverable. This is now a BACKSTOP: since 2026-08-05
+                # the board merely starting to publish a real quaternion no longer
+                # bumps the epoch, because nothing in the measurement reads it.
                 if node.odom_epoch() != epoch0:
                     reason = ABORT_ODOM_FRAME
                     break
@@ -4624,7 +4668,7 @@ class DeadReckonBackend:
         runner.settle(STOP_SETTLE_S,
                       ignore_obstacle=(detour_reason is not None
                                        or runner.detour_armed()))
-        along, lateral = self._displacement(x0, y0, byaw0)
+        along, lateral = self._displacement(x0, y0, fyaw0)
         seg.measured = along
         seg.lateral_mm = lateral
         seg.elapsed_s = time.monotonic() - t0
@@ -4640,21 +4684,32 @@ class DeadReckonBackend:
             raise ObstacleDetour(detour_reason)
         return seg
 
-    def _displacement(self, x0, y0, board_yaw0):
+    def _displacement(self, x0, y0, fwd_yaw0):
         """Signed travel along the leg heading, and drift across it, in mm.
 
-        `board_yaw0` is the BOARD's yaw at the start of the segment, from the
-        same message stream as x0/y0. If the board publishes an identity
-        orientation this degenerates to `dx`, which is exactly the signed
-        quantity NAV2_BRIEF's measured twist-vs-pose table was read from — the
-        identity case is the measured case, not a fallback.
+        `fwd_yaw0` is `MissionNode.forward_yaw_odom()` captured at the start of
+        the segment: the direction the rover was FACING, expressed in the odom
+        position frame. Projecting onto it gives the component of the
+        displacement along the commanded direction, which is identically the
+        arena-frame displacement projected onto the segment's arena heading —
+        see `forward_yaw_odom` for the identity and the test that proves it.
+
+        THERE IS NO SPECIAL CASE FOR dx. The previous version projected onto the
+        board's live yaw, which is 0 for as long as the board publishes an
+        identity quaternion, so `along` silently became "displacement along odom
+        +x" regardless of heading — right only for a leg driven at the anchor
+        heading and wrong for every leg after a turn.
+
+        ODOM_POSE_SIGN is applied here, on the displacement, for the same reason
+        it is applied in `arena_from_odom`: the board integrates its position
+        backwards. x0/y0 are raw board readings and cancel out of the difference.
         """
         x, y = self.node.odom_xy()
         if x is None:
             raise MissionAbort(ABORT_LINK)
-        dx = (x - x0) * 1000.0
-        dy = (y - y0) * 1000.0
-        c, s = math.cos(board_yaw0), math.sin(board_yaw0)
+        dx = ODOM_POSE_SIGN * (x - x0) * 1000.0
+        dy = ODOM_POSE_SIGN * (y - y0) * 1000.0
+        c, s = math.cos(fwd_yaw0), math.sin(fwd_yaw0)
         return (dx * c + dy * s, -dx * s + dy * c)
 
 
@@ -4921,6 +4976,12 @@ class MissionRunner:
                 self._nack(f"{ABORT_LINK}: no odometry for >{ROS_DEAD_S:.0f}s "
                            "(not restarting the agent — it self-reconnects in 90-225s)")
                 return
+            # NOT a refusal — see the gyro_alive docstring. A straight route
+            # still runs; a route with a turn will lose its heading, and the
+            # operator is told which they are about to spend the charge on.
+            g_ok, g_note = self.node.gyro_alive()
+            if g_ok is False:
+                log("WARNING before mission: " + g_note)
             v = self.node.battery_v()
             if v is not None and v < BATT_LOW_V:
                 self._nack(f"{ABORT_BATT}: {v:.1f}V < {BATT_LOW_V}V threshold")
@@ -5607,9 +5668,9 @@ class MissionRunner:
                     backend.goto(sx, sy, approach)
                     # Nav2 got us close; the dock is always ours.
                     st.phase = "docking"
-                    executed += self._drive_to(tx, ty, dock_only=True)
+                    self._drive_to(tx, ty, dock_only=True, out=executed)
                 else:
-                    executed += self._drive_to(tx, ty)
+                    self._drive_to(tx, ty, out=executed)
 
                 # A full stop at every target. On this firmware a stop IS the
                 # speed control (see the docstring), so the hold is doing triple
@@ -5650,7 +5711,7 @@ class MissionRunner:
                         raise MissionAbort(ABORT_LINK)
                     sx, sy = standoff_point(here[0], here[1], hx, hy)
                     backend.goto(sx, sy, hh)
-                    executed += self._drive_to(hx, hy, dock_only=True)
+                    self._drive_to(hx, hy, dock_only=True, out=executed)
                 elif ret == "planned" and self.node.pose_source() == POSE_SLAM:
                     # A PLANNED RETURN, AND ONLY WHEN LOCALISATION IS STILL LIVE.
                     # This is not the default and never becomes it by accident:
@@ -5669,7 +5730,7 @@ class MissionRunner:
                     log(f"return: PLANNED from a localised pose "
                         f"(fix {self.node.fix_age_s():.1f}s old) rather than a "
                         "retrace")
-                    executed += self._drive_to(hx, hy)
+                    self._drive_to(hx, hy, out=executed)
                     st.fix_note = self.try_arena_fix("home, after planned return")
                     self._begin_leg("home-trim", len(legs) + 1,
                                     budget=HOME_TRIM_TRIES + 1)
@@ -5778,74 +5839,7 @@ class MissionRunner:
         out = backend.run_segment(seg)
         if out.kind == "drive":
             st.distance_travelled_mm += abs(out.measured)
-        self._publish_residual(out)
         return out
-
-    def _publish_residual(self, seg):
-        """Emit commanded-vs-MEASURED for one segment, the instant it settles.
-
-        This is the single most diagnostic number this rover produces and until
-        now nothing displayed it. Every segment ends with a full stop, a settle
-        and a measurement at rest — that is the whole B8B method — so at this
-        exact point we know both what was asked for and what actually happened,
-        with the chassis stationary and the measurement therefore trustworthy.
-
-        Watching `residual` accumulate live is how an operator distinguishes
-        the three failures that look identical from the arena map:
-
-          * a CONSTANT RATIO between measured and target (every drive short or
-            long by the same factor) is a SCALE error — counts/mm, i.e. set
-            `odom_scale` in the calibration profile. 2.467 is the known
-            74/30 gearbox candidate.
-          * a constant OFFSET on every segment regardless of length is COAST:
-            the rover keeps moving after the burst is cut.
-          * a residual that grows only on TURNS is a heading/gyro problem, and
-            a residual that grows only after a turn is heading leaking into the
-            next drive.
-
-        Published per segment rather than per leg because a leg is several
-        segments and averaging them hides exactly the pattern above.
-        `lateral_mm` is carried too: it is drift ACROSS the leg, which the
-        executor reports and deliberately does not correct.
-        """
-        try:
-            st = self.state
-            target = float(seg.target)
-            measured = float(seg.measured)
-            resid = measured - target
-            unit = "deg" if seg.kind == "turn" else "mm"
-            # Ratio only where it means something. Near zero target it is
-            # numerically meaningless and would swamp the useful cases.
-            ratio = None
-            if abs(target) > (2.0 if seg.kind == "turn" else 20.0):
-                ratio = round(measured / target, 4)
-            self._resid_total = getattr(self, "_resid_total", {})
-            key = seg.kind
-            self._resid_total[key] = self._resid_total.get(key, 0.0) + resid
-            self.bus.publish("telemetry/residual", {
-                "mission": st.name,
-                "leg_i": st.leg_i, "legs_n": st.legs_n, "leg": st.leg_name,
-                "segment_i": st.segment_i, "segments_n": st.segments_n,
-                "kind": seg.kind,
-                "unit": unit,
-                "target": round(target, 2),
-                "measured": round(measured, 2),
-                "residual": round(resid, 2),
-                "ratio": ratio,
-                "cumulative_residual": round(self._resid_total[key], 2),
-                "lateral_mm": round(float(seg.lateral_mm), 2),
-                "elapsed_s": round(float(seg.elapsed_s), 3),
-                "reason": seg.reason,
-                "dock": bool(seg.dock),
-                "retrace": bool(seg.retrace),
-                # So a reader can tell which calibration produced these numbers
-                # without cross-referencing a log.
-                "odom_scale": ODOM_SCALE,
-                "odom_pose_sign": ODOM_POSE_SIGN,
-            }, qos=0)
-        except Exception:
-            # Telemetry must never be able to abort a mission.
-            pass
 
     def detour_armed(self):
         """True while an obstacle should become a reroute rather than an abort.
@@ -5936,7 +5930,7 @@ class MissionRunner:
         }, qos=1)
         return list(pts)
 
-    def _drive_to(self, tx, ty, dock_only=False):
+    def _drive_to(self, tx, ty, dock_only=False, out=None):
         """Adaptive turn-and-drive: re-measure the bearing after every leg.
 
         The plan is recomputed from the CURRENT estimated pose each time round,
@@ -5962,7 +5956,13 @@ class MissionRunner:
         """
         st = self.state
         backend = self.backends["deadreckon"]   # docking is always local
-        executed = []
+        # THE ACCUMULATOR IS THE CALLER'S, NOT OURS. A local list is only ever
+        # handed back by `return`, and a MissionAbort raised anywhere in this
+        # loop never reaches the caller's `+=` -- so the whole leg's MEASURED
+        # history was garbage-collected exactly when it was needed most, and the
+        # rover could not retrace a metre it had genuinely driven. Appending
+        # into the caller's list makes the history survive the exception.
+        executed = [] if out is None else out
         via = []          # A* waypoints still to be passed through, in order
         replans = 0
         while True:
@@ -6054,6 +6054,19 @@ class MissionRunner:
                 # side of an obstacle to pass on every flicker of the grid and
                 # spending a turn each time (see PLAN_HYSTERESIS_FRAC).
                 via = self._reroute(tx, ty, det, replans, committed=list(via))
+            except MissionAbort:
+                # SAME RESCUE, FOR THE CASE THAT ENDS THE MISSION. The detour
+                # handler above already knew that a segment which raised had
+                # still measured itself first; an abort is no different, and
+                # losing it is worse -- it is the last thing the retrace would
+                # have needed to unwind. ORDER MATTERS: ObstacleDetour subclasses
+                # MissionAbort, so this clause must stay BELOW it or it would
+                # swallow every detour and turn a reroute into an abort.
+                if cur is not None and cur.executed:
+                    executed.append(cur)
+                    if cur.kind == "drive":
+                        st.distance_travelled_mm += abs(cur.measured)
+                raise
             finally:
                 self._detour_armed = False
 
@@ -6225,9 +6238,36 @@ class MissionRunner:
             payload["final_pose"] = {"x_mm": jnum(pose[0], 1),
                                      "y_mm": jnum(pose[1], 1),
                                      "heading_deg": jnum(pose[2], 1)}
+        # AFTER AN ABORT, SAY HOW TO GET IT BACK -- AND DRIVE NOTHING.
+        # An abort leaves the rover stopped wherever it stopped, and the return
+        # legs live inside the same `try` the abort just unwound, so no return
+        # happens. `home` is a first-class mission that plans a FRESH route from
+        # the live pose, which is exactly the right tool here. It is NOT sent
+        # automatically: an abort can mean an obstacle in the way or a wedged
+        # sensor, and auto-driving a rover that has just failed is how a failure
+        # becomes a collision. So the report carries the instruction, not the
+        # motion. Two messages, because `request_abort` and the `finally` in
+        # `_run` both disarm, and `arm` returns early in `_cmd_mission` rather
+        # than falling through to the mission in the same payload.
+        recovery = None
+        if outcome == "aborted":
+            recovery = (
+                "the rover is stopped where it aborted and has DISARMED itself; "
+                "no return was driven. Clear whatever stopped it, then send TWO "
+                f"messages to fpms/{THING}/commands/mission: "
+                '{"arm": true} and then {"name": "home"} '
+                "to drive back to the start box (`home` plans a fresh route from "
+                "the live pose). Nothing moves until you do.")
+            payload["recovery"] = recovery
+            payload["recovery_command"] = {
+                "topic": f"fpms/{THING}/commands/mission",
+                "send": [{"arm": True}, {"name": "home"}],
+                "auto": False}
         log(f"mission {name!r} {outcome}: {reason}; {travelled:.0f}mm travelled, "
             f"{len(executed)} segments over {len(legs)} leg(s) "
             f"(last: {st.leg_name!r}), {elapsed:.1f}s")
+        if recovery:
+            log("RECOVERY: " + recovery)
         self.bus.publish("events/mission_done", payload, qos=1)
         self.bus.publish("telemetry/mission", self.node.snapshot())
 
@@ -6288,6 +6328,18 @@ def main():
     log(f"fpms_missions up: thing={THING} backend_default={DEFAULT_BACKEND} "
         f"cruise={CRUISE_MPS:.3f}m/s (wire {to_cmd(CRUISE_MPS):.4f}) "
         f"dock_step={DOCK_STEP_MM:.0f}mm")
+    log(f"odom pose polarity ODOM_POSE_SIGN={ODOM_POSE_SIGN:+d} "
+        + ("(the board integrates its position BACKWARDS: measured "
+           "2026-08-05, a watched +50mm forward move reported -182mm). "
+           "Distance is projected onto the anchor yaw plus the gyro delta, "
+           "never onto the board's live orientation."
+           if ODOM_POSE_SIGN < 0 else
+           "(RAW board convention — every measured forward move so far has "
+           "reported NEGATIVE with this setting)"))
+    log("odom SCALE is uncorrected and unresolved: 6.00 counts/mm (derived, "
+        "30:1 gearbox assumed) vs 14.8 counts/mm (tape-measured over 800mm). "
+        "Distances may read ~2.5x long. Settle it with a hand-push over a "
+        "tape measure — it costs no battery.")
     try:
         rclpy.spin(node)
     except Exception as e:

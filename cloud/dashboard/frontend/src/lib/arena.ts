@@ -74,10 +74,20 @@
  * thresholds and the rover start pose are all expressed as fractions of it,
  * so changing this one number rescales the entire map coherently.
  */
-export const ARENA_MM = 1200;
+export const ARENA_W_MM = 1500;
+export const ARENA_H_MM = 1400;
+
+/**
+ * The SQUARE extent everything sized off one number still uses: the viewport,
+ * the grid pitch, the y flip and the in-bounds checks. It must be the LARGER
+ * of the two extents, or the far side of the arena falls outside the drawing
+ * window and a legitimate pose is refused as "outside the arena" — which is
+ * exactly the bug that drew the rover off the grid when this was 1200.
+ */
+export const ARENA_MM = Math.max(ARENA_W_MM, ARENA_H_MM);
 
 /** Rover chassis footprint, millimetres. Nose-to-tail x beam. */
-export const ROVER_LEN_MM = 240;
+export const ROVER_LEN_MM = 235;
 export const ROVER_WID_MM = 180;
 
 /**
@@ -198,8 +208,8 @@ export type Zone = {
 };
 
 /** Zone side and margin, as fractions of the arena so a rescale is free. */
-export const ZONE_SIDE_MM = 0.3 * ARENA_MM;
-export const ZONE_MARGIN_MM = 0.04 * ARENA_MM;
+export const ZONE_SIDE_MM = 0.1 * ARENA_W_MM;
+export const ZONE_MARGIN_MM = 0.04 * ARENA_W_MM;
 const Z = ZONE_SIDE_MM;
 const M = ZONE_MARGIN_MM;
 
@@ -233,7 +243,7 @@ export const ZONES: readonly Zone[] = [
     role: "FIRE ZONE",
     kind: "fire",
     x_mm: M,
-    y_mm: ARENA_MM - M - Z, // top-left
+    y_mm: ARENA_H_MM - M - Z, // top-left
     w_mm: Z,
     h_mm: Z,
     stroke: "#c084fc",
@@ -244,8 +254,8 @@ export const ZONES: readonly Zone[] = [
     corner: "TOP-RIGHT",
     role: "FIRE ZONE",
     kind: "fire",
-    x_mm: ARENA_MM - M - Z,
-    y_mm: ARENA_MM - M - Z, // top-right
+    x_mm: ARENA_W_MM - M - Z,
+    y_mm: ARENA_H_MM - M - Z, // top-right
     w_mm: Z,
     h_mm: Z,
     stroke: "#a3e635",
@@ -291,10 +301,10 @@ export const FORWARD_HEADING_DEG = 90;
  * derived from it so the box and the glyph can never disagree.
  */
 export const START_BOX = {
-  x_mm: ARENA_MM - M - Z,
+  x_mm: ARENA_W_MM - M - ROVER_LEN_MM,
   y_mm: M,
-  w_mm: Z,
-  h_mm: Z,
+  w_mm: ROVER_LEN_MM,
+  h_mm: ROVER_LEN_MM,
   label: "START",
   corner: "BOTTOM-RIGHT" as ArenaCorner,
 } as const;
@@ -674,7 +684,7 @@ export const DRIFT_SPREAD_FRAC = 0.06;
  * start box, so the ring opens at the box's half-width and the operator reads
  * "somewhere in there", which is all anybody actually knows.
  */
-export const ASSUMED_SPREAD_MM = ZONE_SIDE_MM / 2;
+export const ASSUMED_SPREAD_MM = START_BOX.w_mm / 2;
 
 /** Rendering-only. See DRIFT_SPREAD_FRAC — never label the result as an error. */
 export function driftSpreadMm(drivenMm: number): number {

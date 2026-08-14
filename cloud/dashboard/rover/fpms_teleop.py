@@ -106,7 +106,7 @@ STARTED = time.time()
 # REVERTED 2026-08-02: the custom firmware boot-looped, so the board is back
 # on Yahboom stock, which needs these workarounds again. See
 # rover/firmware/README.md -- do NOT change these without changing the image.
-CMD_SCALE = 6.1
+CMD_SCALE = 1.0   # STM32 board takes TRUE m/s (was 6.1 for the ESP32 dead zone)
 
 
 def to_cmd(desired_mps):
@@ -153,7 +153,7 @@ def to_cmd_ang(desired_radps):
 # REVERTED 2026-08-02: the custom firmware boot-looped, so the board is back
 # on Yahboom stock, which needs these workarounds again. See
 # rover/firmware/README.md -- do NOT change these without changing the image.
-ODOM_TWIST_SIGN = -1
+ODOM_TWIST_SIGN = +1   # STM32 bridge emits correct signs (was -1 for the ESP32 board)
 
 # Angular twist is NOT corrected: no trial above exercised rotation, so whether
 # twist.angular.z shares the inversion is unknown. Assuming it does would be
@@ -1089,14 +1089,6 @@ class TeleopNode(Node):
         # lists publishers, the topic looks alive, and battery_v just stays None
         # forever. It presented as "the dashboard shows no battery" both times.
         # _on_battery accepts either message shape, so only this line matters.
-        #
-        # 2026-08-06: flipped to BatteryState again, and this time it is not a
-        # guess. Firmware v3 publishes it — `fpms_main.cpp:835` inits the
-        # publisher as sensor_msgs/BatteryState with .voltage in VOLTS — and
-        # `ros2 topic info /battery -v` on the rover shows the single PUBLISHER
-        # as BatteryState with fpms_teleop and fpms_missions both subscribing as
-        # BatteryState. The "going back to factory firmware flips it back" note
-        # above no longer applies: the board does not run factory firmware.
         self.create_subscription(BatteryState, "/battery", self._on_battery, qos)
         # /scan is deliberately NOT subscribed: every range on this board reads
         # 0.0, so a subscription would only produce a plausible-looking stream of
