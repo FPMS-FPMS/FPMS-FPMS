@@ -14,6 +14,7 @@ Built by **Aryan Wadhawan** and **Alex Tang** — Grade 8, David Leeder Middle S
 - [The two halves of the mission](#the-two-halves-of-the-mission)
 - [Why this matters — the cultural heart](#why-this-matters--the-cultural-heart)
 - [How the rover sees](#how-the-rover-sees)
+- [The rover in detail](ROVER.md) — dashboard, navigation, honest limits
 - [System architecture](#system-architecture)
 - [Hardware](#hardware)
 - [Software stack](#software-stack)
@@ -64,6 +65,10 @@ The rover carries two cameras that see the world in fundamentally different ways
 | **Thermal camera** | Infrared heat directly | Detecting embers under leaves, heat behind smoke, hot ground before flames appear |
 
 **Only when both cameras agree does the rover act.** This one requirement — cross-validated perception — is how a system built by two Grade 8 students avoids the false positives (shadows, sun-warmed rocks) that would otherwise waste water and undermine trust.
+
+
+> **See it working:** [dashboard screenshots and a walk-through of the
+> navigation stack](ROVER.md).
 
 ## System architecture
 
@@ -147,27 +152,24 @@ Both team members are cross-trained on the full stack for judge Q&A. Both speak 
 
 ## Repository structure
 
+This repository is the public-facing home of the project — the story, the outreach
+work, and how to get involved.
+
 ```
-fpms/
-├── README.md              ← you are here
-├── docs/                  ← engineering documentation, design decisions
-│   ├── architecture.md
-│   ├── hardware-bom.md
-│   └── outreach-notes.md
-├── rover1/                ← reactive suppression rover
-│   ├── firmware/          ← ESP32 bridge, V3.0 motor firmware
-│   ├── ros2_ws/           ← ROS2 packages, Nav2 config, behavior tree
-│   ├── perception/        ← YOLO26 RKNN deployment, thermal fusion
-│   └── cad/               ← chassis STL files
-├── rover2/                ← proactive documentation rover (in progress)
-├── station/               ← water refill station
-│   └── firmware/          ← ESP32-S3 pour sequence controller
-├── cloud/                 ← AWS deployment
-│   ├── iot-core/          ← MQTT topic setup, certificates
-│   ├── lambda/            ← event routing, alert dispatch
-│   └── dashboard/         ← FastAPI + public frontend
-└── media/                 ← photos, video, explainer materials
+FPMS-FPMS/
+├── README.md           ← you are here
+├── ROVER.md            ← what the rover does, with dashboard screenshots
+├── Sponsors.md         ← sponsors and supporters
+├── CONTRIBUTING.md     ← how to get involved
+├── outreach-notes.md   ← cultural outreach and community engagement
+├── screenshots/        ← live captures from the rover's dashboard
+└── LICENSE
 ```
+
+**Engineering documentation lives in a separate repository:**
+[**FPMS-Industrial**](https://github.com/FPMS-FPMS/FPMS-Industrial) — architecture,
+rover navigation, calibration data, the aerial platform, bills of materials, and
+the mission source code.
 
 ## Acknowledgments
 
