@@ -12,7 +12,7 @@ Open an issue. Especially welcome:
 
 ## If you'd like to help
 
-We are two Grade 7 students, and we welcome mentorship. Areas where we know we could learn more:
+We are two Grade 8 students, and we welcome mentorship. Areas where we know we could learn more:
 
 - ROS2 Nav2 tuning for small indoor rovers
 - YOLO training on domain-specific data (fire, brush, heritage markers)

@@ -4,7 +4,7 @@
 
 Two small autonomous rovers keeping quiet watch over the land where cultural heritage sites meet the growing risk of wildfire.
 
-Built by **Aryan Wadhawan** and **Alex Tang** — Grade 8, David Leeder Middle School, Toronto. Gold medal at WRO Canada Nationals 2026. Advancing to WRO International Finals, San Juan, Puerto Rico — December 2026.
+Built by **Aryan Wadhawan** and **Alex Tang** — Grade 8, David Leeder Middle School, Mississauga, Ontario. 1st place, Future Innovators Junior Division, WRO Canada National Final 2026. Advancing to WRO International Finals, San Juan, Puerto Rico — December 2026.
 
 ---
 
@@ -87,7 +87,7 @@ Four tiers, all designed to be inspectable and transparent:
 
 **Key design principle:** the system is event-based, not streaming. Video does not go to the cloud — only state changes do (a fire detected, a heritage marker documented, a mission completed). This keeps bandwidth minimal, storage predictable, and the public dashboard readable.
 
-Everything the rover does is public by default. Trust in a system like this only works when what it does is visible.
+Heritage records stay private unless a community explicitly wants them public (see [outreach-notes.md](outreach-notes.md)).
 
 ## Hardware
 
@@ -136,15 +136,17 @@ Whether this idea grows into anything larger depends not on us. It depends on th
 
 ## The team
 
-**Aryan Wadhawan** — Systems, programming, cultural outreach lead. Nav2 integration, cloud/AWS pipeline, first-cup outreach with Indigenous leadership.
+**Aryan Wadhawan** — Robot hardware, software and testing.
 
-**Alex Tang** — Hardware, mechanical design, integration lead. Chassis CAD, wiring architecture, servo/actuator subsystems, assembly.
+**Alex Tang** — Research, outreach to experts and communities, and the business plan.
+
+Together we built the booth, the video and the presentation.
 
 Both team members are cross-trained on the full stack for judge Q&A. Both speak during the pitch. Both are credited on every deliverable.
 
 ## Recognition & competition
 
-🥇 **Gold, WRO Canada Nationals 2026** — Montreal, May 30, 2026
+🥇 **1st place, Future Innovators Junior Division, WRO Canada National Final** — Centre des sciences de Montréal, May 31, 2026 (as Team SPMF)
 
 🌎 **Advancing to WRO International Finals** — San Juan, Puerto Rico, December 2026
 
@@ -175,7 +177,7 @@ the mission source code.
 
 To the Indigenous fire stewards whose thousands of years of practice inform the proactive half of this project, and to the communities we hope to learn from.
 
-To Deputy Grand Chief Mike Metatawabin of Nishnawbe Aski Nation, for engaging with a first-cup outreach from a Grade 8 student.
+To Deputy Grand Chief Mike Metatawabin of Nishnawbe Aski Nation, for replying to our first-cup outreach and taking the time to talk with us (video call, July 2026).
 
 To our teachers, mentors, and families at David Leeder Middle School.
 
