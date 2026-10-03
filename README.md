@@ -36,7 +36,7 @@ FPMS is a system of two small autonomous rovers, a set of ground sensors, and a 
 
 **🔥 Reactive** — *When something is already burning*
 
-The rover's thermal and vision AI detect the hotspot. Both cameras must agree before it acts. It drives to the source, releases water from a small onboard pump, and logs every decision to the cloud.
+The rover's thermal and vision AI detect the hotspot. It drives to the source, releases water from a small onboard pump, and logs every decision to the cloud.
 
 **🌱 Proactive** — *Before anything is burning*
 
@@ -64,7 +64,7 @@ The rover carries two cameras that see the world in fundamentally different ways
 | **RGB camera** | Visible light, like human eyes | Recognizing shapes — trees, fire, ground features via YOLO vision AI |
 | **Thermal camera** | Infrared heat directly | Detecting embers under leaves, heat behind smoke, hot ground before flames appear |
 
-**Only when both cameras agree does the rover act.** This one requirement — cross-validated perception — is how a system built by two Grade 8 students avoids the false positives (shadows, sun-warmed rocks) that would otherwise waste water and undermine trust.
+**On our competition rover, the LiDAR decides where things are; the camera checks and logs what it sees.** We tested camera-only decisions and the vision model mislabelled our targets, so the camera does not decide when to spray.
 
 
 > **See it working:** [dashboard screenshots and a walk-through of the
@@ -91,35 +91,42 @@ Heritage records stay private unless a community explicitly wants them public (s
 
 ## Hardware
 
-### Rover 1 — Reactive suppression
+### Rover 1 — sensing rover (does not drive yet)
 
 | Component | Purpose |
 |---|---|
-| Radxa ROCK 5B+ (RK3588) | Main compute — Nav2, SLAM, YOLO26 inference on 6 TOPS NPU |
+| Orange Pi 5 Max (RK3588) | Main compute — runs the LiDAR, thermal camera and IMU on ROS 2 Humble |
 | Yahboom V3.0 motor board (STM32F103) | Motor control, encoder/IMU fusion |
 | 4× Yahboom 520 motors, 86mm off-road wheels | Locomotion — carpet traction |
 | LDROBOT D500 LiDAR | 2D SLAM mapping |
 | HBV RGB camera | YOLO vision |
-| Waveshare thermal camera (LWIR) | Heat detection |
+| Thermal Master P1 thermal camera (160×120) | Heat detection, temperature per pixel |
 | MG90S servo | Shared camera pan for heritage + thermal scanning |
 | R385 pump | Water suppression |
 | Yahboom 9600mAh 12V Li-ion battery | Main power |
 
-### Rover 2 — Proactive documentation
+### Rover 2 — our competition robot
 
-Details in `/hardware/rover2/` — architecture in progress.
+| Component | Purpose |
+|---|---|
+| Orange Pi 5B | Main compute — runs our autonomy software on ROS 2 Humble |
+| Yahboom STM32 board | 4 drive motors with encoders, IMU, battery, refill-tube servo |
+| LDROBOT D500 LiDAR | Finds the site and obstacles; measures every turn to 0.09° |
+| Camera | Checks and logs the target |
+| ESP32-S3 water board | Spray pump, refill pump, water-level sensor, its own safety cut-offs |
+
+It drives a route with at most two turns and two straight moves around an obstacle, sprays, returns home (within 9–33 mm in tagged runs) and refills itself.
 
 ### Water refill station
 
-XIAO ESP32-S3 + PCA9685 + 2× MG996R servos + 6V NiMH pack — autonomous refill with ArUco docking alignment.
+Designed, not built yet (XIAO ESP32-S3 + PCA9685 + 2× MG996R servos, ArUco docking). Today Rover 2 refills itself: a servo lowers a tube into a water source and a pump refills its tank.
 
 ## Software stack
 
 - **OS:** Ubuntu 22.04 LTS
 - **Middleware:** ROS2 Humble + Cyclone DDS
-- **Navigation:** Nav2 (composed mode), SLAM Toolbox, `ldlidar_ros2`
+- **Navigation (Rover 2):** our own planner (at most two turns and two straight moves), LiDAR scan-match turns, wheel encoders — 8 Python modules, only 1 talks to ROS, 125 automatic checks
 - **Perception:** YOLO26 via Rockchip RKNN toolkit (FP16, 15+ FPS measured)
-- **Sensor fusion:** EKF via `robot_localization` (encoders + IMU)
 - **Cloud:** AWS IoT Core (MQTT/TLS), S3 (archive), Lambda + SNS (alerts)
 - **Dashboard:** FastAPI + SQLite + Foxglove Studio + Chromium kiosk
 - **Voice announcements:** Piper TTS (offline)
