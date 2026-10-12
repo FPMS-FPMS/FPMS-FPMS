@@ -21,6 +21,7 @@ Built by **Aryan Wadhawan** and **Alex Tang** — Grade 8, David Leeder Middle S
 - [Honest limits](#honest-limits)
 - [The team](#the-team)
 - [Recognition & competition](#recognition--competition)
+- [Orange Pi — official sponsor](#orange-pi--official-sponsor)
 - [Repository structure](#repository-structure)
 - [Acknowledgments](#acknowledgments)
 
@@ -149,6 +150,37 @@ Both team members are cross-trained on the full stack for judge Q&A. Both speak 
 🌎 **Advancing to WRO International Finals** — San Juan, Puerto Rico, December 2026
 
 📚 **Category:** Future Innovators, Junior · Theme: *Robots Meet Culture*
+
+## Orange Pi — Official Sponsor
+
+<p align="center">
+  <a href="https://www.orangepi.org/">
+    <img src="https://avatars.githubusercontent.com/u/10287101?v=4" width="150" alt="Orange Pi logo">
+  </a>
+</p>
+
+> **“FPMS and Team Canada are proudly supported by Orange Pi, whose high-performance computing platforms help power our autonomous wildfire robotics system.”**
+
+Orange Pi / Shenzhen Xunlong Software Co., Limited has approved sponsorship support for FPMS as we prepare to represent **Canada at the WRO International Final in San Juan, Puerto Rico**.
+
+Orange Pi is supporting our international development with:
+
+- **Orange Pi 5B — 16GB RAM + 256GB eMMC**
+- **Orange Pi 5 MAX — 16GB RAM**
+- **4 × Orange Pi camera modules**
+- **1 × 256GB eMMC module**
+- **5V / 4A power supply** for the Orange Pi 5B
+- **5V / 5A power supply** for the Orange Pi 5 MAX
+
+The Orange Pi platforms support FPMS development across **ROS 2, autonomous navigation, LiDAR processing, computer vision, environmental sensor processing, mission logic, rover development, and the aerial platform**.
+
+For the WRO International Final, Orange Pi approved the following acknowledgement:
+
+> **“We would like to thank Orange Pi for supporting FPMS and Team Canada on our journey to the World Robot Olympiad International Final. Orange Pi technology plays an important role in the computing and autonomous robotics behind our system.”**
+
+We will display Orange Pi branding at our international booth and provide Orange Pi with high-quality photos and videos from the competition and FPMS demonstrations.
+
+➡️ [Read more about our sponsors and supporters](Sponsors.md)
 
 ## Repository structure
 
