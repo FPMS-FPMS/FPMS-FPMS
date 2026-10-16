@@ -6,7 +6,7 @@
 
 ## The principle
 
-FPMS is a project about protecting cultural heritage sites from wildfire, with a particular focus on Indigenous cultural burning practices as prevention. That framing carries responsibility. We are two Grade 7 students. We are not from the communities whose land, knowledge, and heritage this project centers. What we can do is approach carefully — to learn, not to extract.
+FPMS is a project about protecting cultural heritage sites from wildfire, with a particular focus on Indigenous cultural burning practices as prevention. That framing carries responsibility. We are two Grade 8 students. We are not from the communities whose land, knowledge, and heritage this project centers. What we can do is approach carefully — to learn, not to extract.
 
 Three commitments guide every step:
 
@@ -36,7 +36,7 @@ We are early in this process. This is the correct pace.
 
 **Approach:** Personal introduction as a Grade 7 student from Toronto. Brief description of the project. No ask for endorsement, funding, or partnership — only a conversation. Explicit acknowledgment that we come to learn, not to teach.
 
-**Status:** Email sent. Awaiting response. If no response, we do not follow up more than once — that's how relationships work.
+**Status:** He replied, and we talked on a video call in July 2026.
 
 ---
 
